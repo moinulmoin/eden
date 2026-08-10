@@ -80,6 +80,18 @@ describe("eden CLI project commands", () => {
     await expect(stat(join(root, "agent/tools/greet.ts"))).resolves.toBeDefined();
     await expect(stat(join(root, "package.json"))).resolves.toBeDefined();
     await expect(stat(join(root, "wrangler.jsonc"))).resolves.toBeDefined();
+    const wrangler = JSON.parse(
+      await readFile(join(root, "wrangler.jsonc"), "utf8"),
+    ) as {
+      readonly ai?: unknown;
+      readonly env?: {
+        readonly preview?: { readonly name?: unknown };
+        readonly production?: { readonly name?: unknown };
+      };
+    };
+    expect(wrangler.ai).toEqual({ binding: "AI" });
+    expect(wrangler.env?.preview?.name).toBe("eden-basic-agent-preview");
+    expect(wrangler.env?.production?.name).toBe("eden-basic-agent-production");
     expect((await readdir(root)).sort()).toEqual([
       "agent",
       "package.json",

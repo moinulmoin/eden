@@ -248,9 +248,13 @@ export default greet;
   {
     relativePath: "wrangler.jsonc",
     content: `{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "eden-basic-agent",
   "main": ".eden/agent-bundle.mjs",
   "compatibility_date": "2026-04-01",
+  "ai": {
+    "binding": "AI"
+  },
   "durable_objects": {
     "bindings": [
       {
@@ -264,7 +268,49 @@ export default greet;
       "tag": "v1",
       "new_sqlite_classes": ["EdenSession"]
     }
-  ]
+  ],
+  "env": {
+    "preview": {
+      "name": "eden-basic-agent-preview",
+      "ai": {
+        "binding": "AI"
+      },
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "EDEN_SESSIONS",
+            "class_name": "EdenSession"
+          }
+        ]
+      },
+      "migrations": [
+        {
+          "tag": "v1",
+          "new_sqlite_classes": ["EdenSession"]
+        }
+      ]
+    },
+    "production": {
+      "name": "eden-basic-agent-production",
+      "ai": {
+        "binding": "AI"
+      },
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "EDEN_SESSIONS",
+            "class_name": "EdenSession"
+          }
+        ]
+      },
+      "migrations": [
+        {
+          "tag": "v1",
+          "new_sqlite_classes": ["EdenSession"]
+        }
+      ]
+    }
+  }
 }
 `,
   },
