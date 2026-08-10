@@ -15,6 +15,19 @@ import {
   readJournalEvents,
   readLatestJournalCursor,
 } from "./session-journal.js";
+import {
+  enqueueRecoveryJob,
+  inspectRecoveryJobs,
+  MAX_RECOVERY_JOBS_PER_ALARM,
+  nextRecoveryJobDueAt,
+  processRecoveryJobs,
+  recoverRecoveryJob,
+  type RecoveryJobEnqueueResult,
+  type RecoveryJobInput,
+  type RecoveryJobInspection,
+  type RecoveryJobRecord,
+  type RecoveryJobRecoveryResult,
+} from "./session-jobs.js";
 
 export interface EdenSessionEnvironment {
   readonly [key: string]: unknown;
@@ -157,6 +170,34 @@ function readInitialization(
     .catch(() => null);
 }
 
+function readJsonObject(request: Request): Promise<Record<string, unknown> | null> {
+  return request
+    .json()
+    .then(parseObject)
+    .catch(() => null);
+}
+
+function isRecoveryJobInput(
+  value: unknown,
+): value is RecoveryJobInput {
+  const object = parseObject(value);
+  return (
+    object !== null &&
+    typeof object.jobId === "string" &&
+    typeof object.kind === "string" &&
+    typeof object.dueAt === "number" &&
+    typeof object.recoveryAction === "string" &&
+    (object.maxAttempts === undefined || typeof object.maxAttempts === "number")
+  );
+}
+
+function jsonJobResponse(
+  body: RecoveryJobEnqueueResult | RecoveryJobRecoveryResult,
+  status = 200,
+): Response {
+  return jsonResponse(body, status);
+}
+
 export class EdenSession extends DurableObject<EdenSessionEnvironment> {
   private readonly initialized: Promise<void>;
 
@@ -180,6 +221,31 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     if (url.pathname === "/_eden/events" && request.method === "GET") {
       return this.eventsResponse(url);
     }
+    if (url.pathname === "/_eden/jobs" && request.method === "GET") {
+      return this.recoveryJobsResponse();
+    }
+    if (url.pathname === "/_eden/jobs" && request.method === "POST") {
+      return this.enqueueRecoveryJobResponse(request);
+    }
+    const recoverPrefix = "/_eden/jobs/";
+    if (
+      url.pathname.startsWith(recoverPrefix) &&
+      url.pathname.endsWith("/recover") &&
+      request.method === "POST"
+    ) {
+      let jobId: string;
+      try {
+        jobId = decodeURIComponent(
+          url.pathname.slice(recoverPrefix.length, -"/recover".length),
+        );
+      } catch {
+        return jsonResponse(
+          { code: "invalid_recovery_operation", message: "Invalid recovery operation" },
+          400,
+        );
+      }
+      return this.recoverRecoveryJobResponse(request, jobId);
+    }
     if (
       url.pathname === "/_eden/initialize" &&
       request.method === "POST"
@@ -187,6 +253,60 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       return this.initialize(request);
     }
     return jsonResponse({ code: "not_found", message: "Not found" }, 404);
+  }
+
+  override async alarm(): Promise<void> {
+    await this.initialized;
+    const sessionId = sessionIdFromObjectName(this.ctx.id.name ?? "");
+    if (sessionId === null) return;
+
+    try {
+      await processRecoveryJobs(
+        this.ctx.storage,
+        sessionId,
+        async (job) => this.executeRecoveryJob(job),
+        {
+          limit: MAX_RECOVERY_JOBS_PER_ALARM,
+        },
+      );
+    } finally {
+      await this.rearmRecoveryAlarm(sessionId);
+    }
+  }
+
+  async enqueueRecoveryJob(
+    input: RecoveryJobInput,
+  ): Promise<RecoveryJobEnqueueResult> {
+    await this.initialized;
+    const sessionId = this.requireSessionId();
+    const result = enqueueRecoveryJob(this.ctx.storage, sessionId, input);
+    await this.rearmRecoveryAlarm(sessionId);
+    return result;
+  }
+
+  inspectRecoveryJobs(): RecoveryJobInspection {
+    const sessionId = this.requireSessionId();
+    return inspectRecoveryJobs(this.ctx.storage.sql, sessionId);
+  }
+
+  async recoverRecoveryJob(
+    jobId: string,
+    input: {
+      readonly recoveryAction?: string;
+      readonly dueAt?: number;
+    } = {},
+  ): Promise<RecoveryJobRecoveryResult> {
+    await this.initialized;
+    const sessionId = this.requireSessionId();
+    const result = recoverRecoveryJob(
+      this.ctx.storage,
+      sessionId,
+      jobId,
+      input.recoveryAction,
+      input.dueAt,
+    );
+    await this.rearmRecoveryAlarm(sessionId);
+    return result;
   }
 
   private schemaResponse(): Response {
@@ -331,5 +451,106 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       },
       201,
     );
+  }
+
+  private requireSessionId(): string {
+    const sessionId = sessionIdFromObjectName(this.ctx.id.name ?? "");
+    if (sessionId === null) {
+      throw new Error("Session mapping unavailable");
+    }
+    return sessionId;
+  }
+
+  private async recoveryJobsResponse(): Promise<Response> {
+    return jsonResponse(this.inspectRecoveryJobs());
+  }
+
+  private async enqueueRecoveryJobResponse(request: Request): Promise<Response> {
+    const body = await readJsonObject(request);
+    if (!isRecoveryJobInput(body)) {
+      return jsonResponse(
+        { code: "invalid_recovery_job", message: "Invalid recovery job" },
+        400,
+      );
+    }
+    try {
+      const result = await this.enqueueRecoveryJob(body);
+      return jsonJobResponse(result, result.status === "scheduled" ? 201 : 200);
+    } catch {
+      return jsonResponse(
+        {
+          code: "invalid_recovery_job",
+          message: "Invalid recovery job",
+        },
+        400,
+      );
+    }
+  }
+
+  private async recoverRecoveryJobResponse(
+    request: Request,
+    jobId: string,
+  ): Promise<Response> {
+    const body = await readJsonObject(request);
+    if (body === null) {
+      return jsonResponse(
+        { code: "invalid_recovery_operation", message: "Invalid recovery operation" },
+        400,
+      );
+    }
+    if (
+      body.recoveryAction !== undefined &&
+      typeof body.recoveryAction !== "string"
+    ) {
+      return jsonResponse(
+        { code: "invalid_recovery_operation", message: "Invalid recovery operation" },
+        400,
+      );
+    }
+    if (
+      body.dueAt !== undefined &&
+      (typeof body.dueAt !== "number" || !Number.isSafeInteger(body.dueAt))
+    ) {
+      return jsonResponse(
+        { code: "invalid_recovery_operation", message: "Invalid recovery operation" },
+        400,
+      );
+    }
+    try {
+      const result =
+        await this.recoverRecoveryJob(jobId, {
+          ...(body.recoveryAction === undefined
+            ? {}
+            : { recoveryAction: body.recoveryAction as string }),
+          ...(body.dueAt === undefined ? {} : { dueAt: body.dueAt as number }),
+        });
+      return jsonJobResponse(result);
+    } catch {
+      return jsonResponse(
+        {
+          code: "invalid_recovery_operation",
+          message: "Invalid recovery operation",
+        },
+        400,
+      );
+    }
+  }
+
+  private async rearmRecoveryAlarm(sessionId: string): Promise<void> {
+    const nextDueAt = nextRecoveryJobDueAt(this.ctx.storage.sql, sessionId);
+    if (nextDueAt === null) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    await this.ctx.storage.setAlarm(nextDueAt);
+  }
+
+  private async executeRecoveryJob(job: RecoveryJobRecord): Promise<void> {
+    if (job.recoveryAction === "always-fail") {
+      throw new Error("Configured recovery action failed");
+    }
+    if (job.recoveryAction === "fail") {
+      throw new Error("Configured recovery action failed");
+    }
   }
 }

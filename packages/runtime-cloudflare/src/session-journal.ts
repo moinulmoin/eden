@@ -155,6 +155,38 @@ export interface RecordErrorInput {
   readonly createdAt: string;
 }
 
+export type EdenJobStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "retryable"
+  | "dead";
+
+export interface InsertJobInput {
+  readonly jobId: string;
+  readonly kind: string;
+  readonly status?: EdenJobStatus;
+  readonly dueAt: number;
+  readonly attempts?: number;
+  readonly maxAttempts?: number;
+  readonly lastError?: string;
+  readonly recoveryAction?: string;
+  readonly createdAt: string;
+  readonly updatedAt?: string;
+  readonly completedAt?: string;
+}
+
+export interface UpdateJobInput {
+  readonly jobId: string;
+  readonly status: EdenJobStatus;
+  readonly dueAt?: number;
+  readonly attempts?: number;
+  readonly lastError?: string | null;
+  readonly recoveryAction?: string | null;
+  readonly updatedAt: string;
+  readonly completedAt?: string | null;
+}
+
 export interface JournalTransaction {
   appendEvent<TType extends EdenEventType>(
     input: AppendJournalEventInput<TType>,
@@ -179,6 +211,8 @@ export interface JournalTransaction {
   completeEffect(input: CompleteEffectInput): void;
   failEffect(input: FailEffectInput): void;
   recordError(input: RecordErrorInput): void;
+  insertJob(input: InsertJobInput): void;
+  updateJob(input: UpdateJobInput): void;
 }
 
 export function createOpaqueEventId(): string {
@@ -672,6 +706,70 @@ function createJournal(
         input.message,
         input.retryable ? 1 : 0,
         input.createdAt,
+      );
+    },
+
+    insertJob(input): void {
+      requireRow(
+        sql,
+        "SELECT EXISTS (SELECT 1 FROM session_meta WHERE session_id = ?) AS present",
+        sessionId,
+      );
+      sql.exec(
+        `INSERT INTO jobs (
+          job_id, session_id, kind, status, due_at, attempts, max_attempts,
+          last_error, recovery_action, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        input.jobId,
+        sessionId,
+        input.kind,
+        input.status ?? "pending",
+        input.dueAt,
+        input.attempts ?? 0,
+        input.maxAttempts ?? 3,
+        optional(input.lastError),
+        optional(input.recoveryAction),
+        input.createdAt,
+        input.updatedAt ?? input.createdAt,
+        optional(input.completedAt),
+      );
+    },
+
+    updateJob(input): void {
+      const assignments = ["status = ?", "updated_at = ?"];
+      const bindings: EdenSqlValue[] = [input.status, input.updatedAt];
+      if (input.dueAt !== undefined) {
+        assignments.push("due_at = ?");
+        bindings.push(input.dueAt);
+      }
+      if (input.attempts !== undefined) {
+        assignments.push("attempts = ?");
+        bindings.push(input.attempts);
+      }
+      if (input.lastError !== undefined) {
+        assignments.push("last_error = ?");
+        bindings.push(input.lastError);
+      }
+      if (input.recoveryAction !== undefined) {
+        assignments.push("recovery_action = ?");
+        bindings.push(input.recoveryAction);
+      }
+      if (input.completedAt !== undefined) {
+        assignments.push("completed_at = ?");
+        bindings.push(input.completedAt);
+      }
+      sql.exec(
+        `UPDATE jobs SET ${assignments.join(", ")}
+         WHERE job_id = ? AND session_id = ?`,
+        ...bindings,
+        input.jobId,
+        sessionId,
+      );
+      requireRow(
+        sql,
+        "SELECT EXISTS (SELECT 1 FROM jobs WHERE job_id = ? AND session_id = ?) AS present",
+        input.jobId,
+        sessionId,
       );
     },
   };
