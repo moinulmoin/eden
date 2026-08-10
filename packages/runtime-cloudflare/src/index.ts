@@ -50,6 +50,34 @@ export type {
   UpdateStepInput,
   UpdateTurnInput,
 } from "./session-journal.js";
+export {
+  createEffectIdempotencyKey,
+  createStableEffectIdempotencyKey,
+  MAX_CHECKPOINT_ATTEMPTS,
+  markCheckpointRetryable,
+  prepareCheckpointAttempt,
+  commitCheckpointResult,
+  reenterCheckpoint,
+} from "./session-checkpoint.js";
+export type {
+  CheckpointCommitResult,
+  CheckpointPreparation,
+  CheckpointRequest,
+  PreparedCheckpoint,
+  StableEffectIdentity,
+} from "./session-checkpoint.js";
+export { readSessionRehydratedState } from "./session-state.js";
+export type {
+  EdenEffectState,
+  EdenErrorState,
+  EdenJobState,
+  EdenMessageState,
+  EdenProjectionState,
+  EdenSessionMetaState,
+  EdenSessionRehydratedState,
+  EdenStepState,
+  EdenTurnState,
+} from "./session-state.js";
 
 export interface EdenRuntimeConfiguration {
   readonly versions: EdenVersionSet;
