@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/definitions" },
+    { "path": "./packages/compiler" },
+    { "path": "./packages/runtime-cloudflare" },
+    { "path": "./packages/client" },
+    { "path": "./packages/cli" },
+    { "path": "./examples/basic-agent" }
+  ]
+}
