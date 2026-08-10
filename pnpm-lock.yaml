@@ -98,6 +98,13 @@ importers:
       '@eden/definitions':
         specifier: workspace:*
         version: link:../definitions
+    devDependencies:
+      '@cloudflare/vitest-pool-workers':
+        specifier: 0.20.3
+        version: 0.20.3(@cloudflare/workers-types@5.20260810.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10(@types/node@24.0.0)(vite@8.2.1(@types/node@24.0.0)(esbuild@0.28.2)))
+      '@cloudflare/workers-types':
+        specifier: 5.20260810.1
+        version: 5.20260810.1
 
 packages:
 

@@ -1,0 +1,19 @@
+{
+  "name": "eden-runtime-session-tests",
+  "main": "src/test-worker.ts",
+  "compatibility_date": "2026-04-01",
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["EdenSession"]
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "EDEN_SESSIONS",
+        "class_name": "EdenSession"
+      }
+    ]
+  }
+}
