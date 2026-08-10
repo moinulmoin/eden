@@ -1,0 +1,27 @@
+Eden
+Copyright 2026 Eden contributors
+
+This repository contains Eden-owned modified derivative implementations
+informed by portable concepts from the Eve framework:
+
+  Eve, version 0.31.3
+  https://github.com/vercel/eve
+  reference commit: 0b102bc90e7cf2c3e294f6ca3af86c307d449b1a
+
+Eve is distributed under the Apache License, Version 2.0. The applicable
+Apache-2.0 terms are included in LICENSE. This notice is retained for the
+Eve attribution obligation; it does not grant ownership of Eden's original
+implementation.
+
+The following Eden source files are marked in-file as modified derivatives of
+portable Eve concepts:
+
+  packages/definitions/src/index.ts
+  packages/compiler/src/index.ts
+  packages/client/src/protocol.ts
+  packages/runtime-cloudflare/src/session-journal.ts
+  packages/runtime-cloudflare/src/model-normalizers.ts
+
+Eden does not include unmodified Eve source. The listed files are Eden-owned
+modifications and must retain their in-file modified-derivative notices when
+redistributed.

@@ -281,12 +281,12 @@ const USAGE = `Usage: eden <command> [options]
 Commands:
   init    Create a minimal Eden project scaffold
   build   Validate and build a Worker-safe Eden artifact
-  dev     Run the local Eden Worker on the approved Eden ports
-  deploy  Validate and dry-run the deployment
+  dev     Run the local Eden Worker on 127.0.0.1:8797 (inspector 9297)
+  deploy  Build and run a compatibility dry-run (no remote deployment)
 
 Options:
   --project <path>  Select the project root (defaults to the current directory)
-  --env <name>      Select preview or production for deploy
+  --env <name>      Select preview or production for deploy (defaults to preview)
   --help            Show this help
 `;
 

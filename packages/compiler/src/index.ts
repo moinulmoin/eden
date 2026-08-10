@@ -1,3 +1,8 @@
+/*
+ * Modified derivative of portable Eve concepts. Eve 0.31.3 reference commit:
+ * 0b102bc90e7cf2c3e294f6ca3af86c307d449b1a. See repository NOTICE and LICENSE.
+ */
+
 import { build } from "esbuild";
 import {
   createHash,
