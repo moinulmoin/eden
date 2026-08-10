@@ -15,8 +15,12 @@ export type {
 
 export {
   createOpaqueSessionId,
+  createOpaqueMessageId,
+  createOpaqueTurnId,
   createSessionObjectName,
+  isOpaqueMessageId,
   isOpaqueSessionId,
+  isOpaqueTurnId,
   sessionIdFromObjectName,
 } from "./session-identity.js";
 export {

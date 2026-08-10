@@ -2,6 +2,9 @@
   "name": "eden-runtime-session-tests",
   "main": "src/test-worker.ts",
   "compatibility_date": "2026-04-01",
+  "vars": {
+    "EDEN_BEARER_SECRET": "eden-unit-auth"
+  },
   "migrations": [
     {
       "tag": "v1",

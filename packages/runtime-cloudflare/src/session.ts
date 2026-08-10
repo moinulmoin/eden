@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { SqlStorage } from "@cloudflare/workers-types";
 import type {
   EdenSessionStatus,
+  EdenTurnStatus,
   EdenVersionSet,
 } from "@eden/definitions";
 
@@ -9,7 +10,11 @@ import {
   applySessionMigrations,
   SESSION_SCHEMA_TABLES,
 } from "./session-schema.js";
-import { sessionIdFromObjectName } from "./session-identity.js";
+import {
+  isOpaqueMessageId,
+  isOpaqueTurnId,
+  sessionIdFromObjectName,
+} from "./session-identity.js";
 import {
   commitSessionTransaction,
   readJournalEvents,
@@ -177,6 +182,22 @@ function readJsonObject(request: Request): Promise<Record<string, unknown> | nul
     .catch(() => null);
 }
 
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function readOwnerPrincipal(
+  body: Record<string, unknown>,
+): string | null {
+  return typeof body.ownerPrincipal === "string"
+    ? body.ownerPrincipal
+    : null;
+}
+
 function isRecoveryJobInput(
   value: unknown,
 ): value is RecoveryJobInput {
@@ -220,6 +241,15 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     }
     if (url.pathname === "/_eden/events" && request.method === "GET") {
       return this.eventsResponse(url);
+    }
+    if (
+      url.pathname === "/_eden/read-events" &&
+      request.method === "POST"
+    ) {
+      return this.readEventsResponse(request);
+    }
+    if (url.pathname === "/_eden/accept" && request.method === "POST") {
+      return this.acceptCommandResponse(request);
     }
     if (url.pathname === "/_eden/jobs" && request.method === "GET") {
       return this.recoveryJobsResponse();
@@ -451,6 +481,222 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       },
       201,
     );
+  }
+
+  private async acceptCommandResponse(request: Request): Promise<Response> {
+    const sessionId = sessionIdFromObjectName(this.ctx.id.name ?? "");
+    const body = await readJsonObject(request);
+    if (
+      sessionId === null ||
+      body === null ||
+      !hasOnlyKeys(body, [
+        "sessionId",
+        "ownerPrincipal",
+        "turnId",
+        "messageId",
+        "message",
+      ]) ||
+      body.sessionId !== sessionId ||
+      readOwnerPrincipal(body) === null ||
+      typeof body.turnId !== "string" ||
+      !isOpaqueTurnId(body.turnId) ||
+      typeof body.messageId !== "string" ||
+      !isOpaqueMessageId(body.messageId) ||
+      typeof body.message !== "string"
+    ) {
+      return jsonResponse(
+        { code: "invalid_command", message: "Invalid session command" },
+        400,
+      );
+    }
+    const message = body.message;
+    if (
+      message.trim().length === 0 ||
+      new TextEncoder().encode(message).byteLength > 16 * 1024
+    ) {
+      return jsonResponse(
+        { code: "invalid_command", message: "Invalid session command" },
+        400,
+      );
+    }
+
+    const sql = this.ctx.storage.sql;
+    const meta = readSessionMeta(sql);
+    if (meta === null || meta.owner_principal !== body.ownerPrincipal) {
+      return jsonResponse(
+        { code: "session_not_found", message: "Session was not found" },
+        404,
+      );
+    }
+
+    const existing = sql
+      .exec<{
+        readonly turn_id: string;
+        readonly status: EdenTurnStatus;
+        readonly message_id: string | null;
+        readonly message: string | null;
+      }>(
+        `SELECT turns.turn_id, turns.status, messages.message_id,
+                messages.content AS message
+         FROM turns
+         LEFT JOIN messages
+           ON messages.turn_id = turns.turn_id
+          AND messages.role = 'user'
+         WHERE turns.session_id = ? AND turns.turn_id = ?
+         LIMIT 1`,
+        sessionId,
+        body.turnId,
+      )
+      .toArray()[0];
+    if (existing !== undefined) {
+      if (
+        existing.status === "accepted" &&
+        existing.message_id === body.messageId &&
+        existing.message === message
+      ) {
+        return jsonResponse(
+          {
+            sessionId,
+            turnId: body.turnId,
+            messageId: body.messageId,
+            status: "accepted",
+          },
+          202,
+        );
+      }
+      return jsonResponse(
+        { code: "session_conflict", message: "Session command conflicts with durable state" },
+        409,
+      );
+    }
+
+    const timestamp = new Date().toISOString();
+    try {
+      commitSessionTransaction(this.ctx.storage, sessionId, (journal) => {
+        journal.insertTurn({
+          turnId: body.turnId as string,
+          status: "accepted",
+          acceptedAt: timestamp,
+        });
+        journal.insertMessage({
+          messageId: body.messageId as string,
+          turnId: body.turnId as string,
+          role: "user",
+          content: message,
+          createdAt: timestamp,
+        });
+        journal.setSessionStatus("running", timestamp);
+        journal.appendEvent({
+          type: "turn.started",
+          turnId: body.turnId as string,
+          data: { turnId: body.turnId as string },
+          committedAt: timestamp,
+        });
+        journal.appendEvent({
+          type: "message.received",
+          turnId: body.turnId as string,
+          data: {
+            messageId: body.messageId as string,
+            role: "user",
+          },
+          committedAt: timestamp,
+        });
+      });
+    } catch {
+      const durable = sql
+        .exec<{
+          readonly status: EdenTurnStatus;
+          readonly message_id: string | null;
+          readonly message: string | null;
+        }>(
+          `SELECT turns.status, messages.message_id,
+                  messages.content AS message
+           FROM turns
+           LEFT JOIN messages
+             ON messages.turn_id = turns.turn_id
+            AND messages.role = 'user'
+           WHERE turns.session_id = ? AND turns.turn_id = ?
+           LIMIT 1`,
+          sessionId,
+          body.turnId,
+        )
+        .toArray()[0];
+      if (
+        durable?.status === "accepted" &&
+        durable.message_id === body.messageId &&
+        durable.message === message
+      ) {
+        return jsonResponse(
+          {
+            sessionId,
+            turnId: body.turnId,
+            messageId: body.messageId,
+            status: "accepted",
+          },
+          202,
+        );
+      }
+      return jsonResponse(
+        { code: "session_conflict", message: "Session command could not be accepted" },
+        409,
+      );
+    }
+
+    return jsonResponse(
+      {
+        sessionId,
+        turnId: body.turnId,
+        messageId: body.messageId,
+        status: "accepted",
+      },
+      202,
+    );
+  }
+
+  private async readEventsResponse(request: Request): Promise<Response> {
+    const sessionId = sessionIdFromObjectName(this.ctx.id.name ?? "");
+    const body = await readJsonObject(request);
+    if (
+      sessionId === null ||
+      body === null ||
+      !hasOnlyKeys(body, [
+        "sessionId",
+        "ownerPrincipal",
+        "startIndex",
+        "follow",
+      ]) ||
+      body.sessionId !== sessionId ||
+      readOwnerPrincipal(body) === null ||
+      typeof body.startIndex !== "number" ||
+      !Number.isSafeInteger(body.startIndex) ||
+      body.startIndex < 0 ||
+      typeof body.follow !== "boolean"
+    ) {
+      return jsonResponse(
+        { code: "invalid_event_read", message: "Invalid event read" },
+        400,
+      );
+    }
+
+    const meta = readSessionMeta(this.ctx.storage.sql);
+    if (meta === null || meta.owner_principal !== body.ownerPrincipal) {
+      return jsonResponse(
+        { code: "session_not_found", message: "Session was not found" },
+        404,
+      );
+    }
+
+    const events = readJournalEvents(
+      this.ctx.storage.sql,
+      sessionId,
+      body.startIndex,
+    );
+    return jsonResponse({
+      sessionId,
+      startIndex: body.startIndex,
+      latestCursor: readLatestJournalCursor(this.ctx.storage.sql, sessionId),
+      events,
+    });
   }
 
   private requireSessionId(): string {
