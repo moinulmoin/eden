@@ -189,11 +189,15 @@ function buildFinalMessages(
   request: {
     readonly message: string;
     readonly toolName: string;
+    readonly systemPrompt?: string;
   },
   call: { readonly callId: string; readonly input: EdenJsonValue },
   output: EdenJsonValue,
 ): readonly EdenModelMessage[] {
   return [
+    ...(request.systemPrompt === undefined
+      ? []
+      : [{ role: "system" as const, content: request.systemPrompt }]),
     { role: "user", content: request.message },
     {
       role: "assistant",
@@ -285,7 +289,12 @@ export async function runBoundedTurn<
   } else {
     const modelOutcome = await request.model.call({
       ...(request.modelId === undefined ? {} : { modelId: request.modelId }),
-      messages: [{ role: "user", content: request.message }],
+      messages: [
+        ...(request.systemPrompt === undefined
+          ? []
+          : [{ role: "system" as const, content: request.systemPrompt }]),
+        { role: "user", content: request.message },
+      ],
       tools: [modelDefinition(request)],
       toolChoice: "required",
       ...(request.modelOptions === undefined

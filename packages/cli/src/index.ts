@@ -92,6 +92,48 @@ export interface EdenCliDryRunResult {
   readonly stderr: string;
 }
 
+export type EdenCliRemoteCommandKind =
+  | "secret-put"
+  | "secret-delete"
+  | "deploy"
+  | "delete";
+
+export interface EdenCliRemoteCommandRequest {
+  readonly kind: EdenCliRemoteCommandKind;
+  readonly cwd: string;
+  readonly args: readonly string[];
+  readonly stdin?: string;
+}
+
+export interface EdenCliRemoteCommandResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+export interface EdenCliRemoteValidationRequest {
+  readonly cwd: string;
+  readonly environment: "preview" | "production";
+  readonly workerName: string;
+  readonly url: string;
+  readonly expectedGeneration: {
+    readonly generationId: string;
+    readonly bundleDigest: string;
+    readonly manifestVersion: string;
+    readonly runtimeVersion: string;
+    readonly agentBundleVersion: string;
+    readonly protocolVersion: string;
+    readonly schemaVersion: number;
+    readonly toolNames: readonly string[];
+  };
+}
+
+export interface EdenCliRemoteValidationResult {
+  readonly ok: boolean;
+  readonly code?: string;
+  readonly message?: string;
+}
+
 export interface EdenCliProcessRequest {
   readonly command: string;
   readonly args: readonly string[];
@@ -127,12 +169,20 @@ export interface EdenCliRunOptions {
     request: EdenCliDryRunRequest,
   ) => Promise<EdenCliDryRunResult>;
   readonly processRunner?: EdenCliProcessRunner;
+  readonly remoteCommandRunner?: (
+    request: EdenCliRemoteCommandRequest,
+  ) => Promise<EdenCliRemoteCommandResult>;
+  readonly remoteValidationRunner?: (
+    request: EdenCliRemoteValidationRequest,
+  ) => Promise<EdenCliRemoteValidationResult>;
+  readonly remoteBearerSecret?: string;
 }
 
 interface ParsedInvocation {
   readonly command: EdenCliCommand;
   readonly projectRoot?: string;
   readonly environment?: "preview" | "production";
+  readonly workerName?: string;
 }
 
 interface CliErrorOptions {
@@ -328,11 +378,12 @@ Commands:
   init    Create a minimal Eden project scaffold
   build   Validate and build a Worker-safe Eden artifact
   dev     Run the local Eden Worker on 127.0.0.1:8797 (inspector 9297)
-  deploy  Build and run a compatibility dry-run (no remote deployment)
+  deploy  Build, validate, and deploy a selected remote environment
 
 Options:
   --project <path>  Select the project root (defaults to the current directory)
   --env <name>      Select preview or production for deploy (defaults to preview)
+  --name <name>     Select the deployed Worker name for deploy
   --help            Show this help
 `;
 
@@ -374,6 +425,22 @@ function parseEnvironmentValue(
   });
 }
 
+function parseWorkerNameValue(
+  value: string | undefined,
+): string {
+  if (
+    value === undefined ||
+    !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(value)
+  ) {
+    throw cliError({
+      code: "WORKER_NAME_INVALID",
+      message:
+        "The --name option must be a lowercase alphanumeric Worker name with optional dashes.",
+    });
+  }
+  return value;
+}
+
 function parseArguments(
   args: readonly string[],
 ): ParsedInvocation | "help" {
@@ -391,6 +458,7 @@ function parseArguments(
 
   let projectRoot: string | undefined;
   let environment: "preview" | "production" | undefined;
+  let workerName: string | undefined;
   let help = false;
   for (let index = 1; index < args.length; index += 1) {
     const argument = args[index];
@@ -440,6 +508,27 @@ function parseArguments(
       environment = parseEnvironmentValue(argument.slice("--env=".length));
       continue;
     }
+    if (argument === "--name") {
+      if (workerName !== undefined) {
+        throw cliError({
+          code: "WORKER_NAME_REPEATED",
+          message: "The --name option may be supplied only once.",
+        });
+      }
+      workerName = parseWorkerNameValue(args[index + 1]);
+      index += 1;
+      continue;
+    }
+    if (argument?.startsWith("--name=") === true) {
+      if (workerName !== undefined) {
+        throw cliError({
+          code: "WORKER_NAME_REPEATED",
+          message: "The --name option may be supplied only once.",
+        });
+      }
+      workerName = parseWorkerNameValue(argument.slice("--name=".length));
+      continue;
+    }
     throw cliError({
       code: "ARGUMENT_UNKNOWN",
       message: `Unknown option "${argument ?? ""}".`,
@@ -448,18 +537,19 @@ function parseArguments(
 
   if (help) return "help";
   if (
-    environment !== undefined &&
+    (environment !== undefined || workerName !== undefined) &&
     commandValue !== "deploy"
   ) {
     throw cliError({
-      code: "ENVIRONMENT_UNSUPPORTED",
-      message: "The --env option is supported only by eden deploy.",
+      code: "DEPLOY_OPTIONS_UNSUPPORTED",
+      message: "The --env and --name options are supported only by eden deploy.",
     });
   }
   return {
     command: commandValue,
     ...(projectRoot === undefined ? {} : { projectRoot }),
     ...(environment === undefined ? {} : { environment }),
+    ...(workerName === undefined ? {} : { workerName }),
   };
 }
 
@@ -804,6 +894,17 @@ interface RuntimeFiles {
   readonly entryPath: string;
 }
 
+interface RuntimeGeneration {
+  readonly generationId: string;
+  readonly bundleDigest: string;
+  readonly manifestVersion: string;
+  readonly runtimeVersion: string;
+  readonly agentBundleVersion: string;
+  readonly protocolVersion: string;
+  readonly schemaVersion: number;
+  readonly toolNames: readonly string[];
+}
+
 const DEV_STATE_FILE = ".eden-dev-state.json";
 
 interface DevState {
@@ -1001,7 +1102,9 @@ async function createRuntimeFiles(
   root: string,
   configPath: string,
   candidateDirectory: string,
+  executionMode: "local" | "remote" = "local",
 ): Promise<RuntimeFiles> {
+  const generation = await readRuntimeGeneration(candidateDirectory);
   const runtimeEntrypoint = await resolveRuntimeWorkerEntrypoint();
   const entryPath = join(
     root,
@@ -1019,14 +1122,17 @@ async function createRuntimeFiles(
     value.startsWith("./") || value.startsWith("../")
       ? value
       : `./${value}`;
-  const entryContents = `import runtimeWorker, { EdenSession } from ${JSON.stringify(
+  const entryContents = `import runtimeWorker, { EdenSession, configureEdenArtifact } from ${JSON.stringify(
     moduleSpecifier(runtimeImport),
   )};
 import agentArtifact from ${JSON.stringify(
     moduleSpecifier(bundleImport),
   )};
 
-void agentArtifact;
+configureEdenArtifact(agentArtifact, ${JSON.stringify({
+  ...generation,
+  executionMode,
+})});
 export { EdenSession };
 export default runtimeWorker;
 `;
@@ -1060,6 +1166,56 @@ export default runtimeWorker;
   }
 }
 
+async function readRuntimeGeneration(
+  directory: string,
+): Promise<RuntimeGeneration> {
+  const manifest = JSON.parse(
+    await readFile(join(directory, "manifest.json"), "utf8"),
+  ) as {
+    readonly version?: unknown;
+    readonly runtimeVersion?: unknown;
+    readonly agentBundleVersion?: unknown;
+    readonly protocolVersion?: unknown;
+    readonly schemaVersion?: unknown;
+    readonly bundleDigest?: unknown;
+    readonly tools?: readonly { readonly name?: unknown }[];
+  };
+  const metadata = JSON.parse(
+    await readFile(join(directory, "build-metadata.json"), "utf8"),
+  ) as {
+    readonly generationId?: unknown;
+    readonly bundleDigest?: unknown;
+  };
+  if (
+    typeof metadata.generationId !== "string" ||
+    typeof metadata.bundleDigest !== "string" ||
+    typeof manifest.version !== "string" ||
+    typeof manifest.runtimeVersion !== "string" ||
+    typeof manifest.agentBundleVersion !== "string" ||
+    typeof manifest.protocolVersion !== "string" ||
+    typeof manifest.schemaVersion !== "number" ||
+    typeof manifest.bundleDigest !== "string" ||
+    !Array.isArray(manifest.tools) ||
+    manifest.tools.some((tool) => typeof tool.name !== "string")
+  ) {
+    throw cliError({
+      code: "ARTIFACT_INCOHERENT",
+      message:
+        "The generated Worker metadata is incomplete and cannot configure the runtime.",
+    });
+  }
+  return {
+    generationId: metadata.generationId,
+    bundleDigest: metadata.bundleDigest,
+    manifestVersion: manifest.version,
+    runtimeVersion: manifest.runtimeVersion,
+    agentBundleVersion: manifest.agentBundleVersion,
+    protocolVersion: manifest.protocolVersion,
+    schemaVersion: manifest.schemaVersion,
+    toolNames: manifest.tools.map((tool) => tool.name as string),
+  };
+}
+
 function runDefaultDryRun(
   request: EdenCliDryRunRequest,
 ): Promise<EdenCliDryRunResult> {
@@ -1089,6 +1245,401 @@ function runDefaultDryRun(
       );
       }),
   );
+}
+
+function runDefaultRemoteCommand(
+  request: EdenCliRemoteCommandRequest,
+): Promise<EdenCliRemoteCommandResult> {
+  return resolveDeploymentExecutable(request.cwd).then(
+    (executable) =>
+      new Promise((resolveResult) => {
+        const child = spawnChild(executable, [...request.args], {
+          cwd: request.cwd,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout?.on("data", (chunk: Buffer) => {
+          stdout += chunk.toString();
+        });
+        child.stderr?.on("data", (chunk: Buffer) => {
+          stderr += chunk.toString();
+        });
+        if (request.stdin === undefined) {
+          child.stdin?.end();
+        } else {
+          child.stdin?.end(request.stdin);
+        }
+        child.once("error", () => {
+          resolveResult({ exitCode: 1, stdout, stderr });
+        });
+        child.once("exit", (exitCode) => {
+          resolveResult({
+            exitCode: exitCode ?? 1,
+            stdout,
+            stderr,
+          });
+        });
+      }),
+  );
+}
+
+function findDeploymentUrl(output: string): string | undefined {
+  const match = output.match(
+    /https:\/\/[a-z0-9][a-z0-9.-]*\.workers\.dev(?:\/[^\s]*)?/iu,
+  );
+  return match?.[0];
+}
+
+function remoteHeaders(secret: string): HeadersInit {
+  return { authorization: `Bearer ${secret}` };
+}
+
+async function fetchRemote(
+  url: string,
+  secret: string | undefined,
+  init: RequestInit = {},
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    return await fetch(url, {
+      ...init,
+      headers: {
+        ...(init.headers ?? {}),
+        ...(secret === undefined ? {} : remoteHeaders(secret)),
+      },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readRemoteJson(
+  response: Response,
+): Promise<Record<string, unknown>> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await response.text()) as unknown;
+  } catch {
+    throw cliError({
+      code: "REMOTE_RESPONSE_INVALID",
+      message: `The deployed Worker returned invalid JSON (HTTP ${response.status}).`,
+    });
+  }
+  if (!isRecord(value)) {
+    throw cliError({
+      code: "REMOTE_RESPONSE_INVALID",
+      message: `The deployed Worker returned an invalid response (HTTP ${response.status}).`,
+    });
+  }
+  return value;
+}
+
+function parseRemoteEvents(value: string): readonly Record<string, unknown>[] {
+  const events: Record<string, unknown>[] = [];
+  for (const line of value.split(/\r?\n/u)) {
+    if (line.length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      throw cliError({
+        code: "REMOTE_STREAM_INVALID",
+        message: "The deployed Worker returned an invalid NDJSON event.",
+      });
+    }
+    if (!isRecord(parsed)) {
+      throw cliError({
+        code: "REMOTE_STREAM_INVALID",
+        message: "The deployed Worker returned an invalid NDJSON event envelope.",
+      });
+    }
+    events.push(parsed);
+  }
+  return events;
+}
+
+function remoteDelay(milliseconds: number): Promise<void> {
+  return new Promise((resolveResult) => {
+    setTimeout(resolveResult, milliseconds);
+  });
+}
+
+async function runDefaultRemoteValidation(
+  request: EdenCliRemoteValidationRequest,
+  secret: string,
+): Promise<EdenCliRemoteValidationResult> {
+  const healthUrl = `${request.url}/eden/v1/health`;
+  const infoUrl = `${request.url}/eden/v1/info`;
+  const sessionUrl = `${request.url}/eden/v1/session`;
+  const startedAt = Date.now();
+  let info: Record<string, unknown> | undefined;
+  while (Date.now() - startedAt < 90_000) {
+    try {
+      const unauthorized = await fetchRemote(healthUrl, undefined);
+      if (unauthorized.status === 200) {
+        return {
+          ok: false,
+          code: "REMOTE_AUTHENTICATION_FAILED",
+          message: "The deployed Worker did not fail closed without its bearer.",
+        };
+      }
+      if (unauthorized.status !== 401) {
+        await remoteDelay(1_000);
+        continue;
+      }
+      const infoResponse = await fetchRemote(infoUrl, secret);
+      if (infoResponse.status !== 200) {
+        await remoteDelay(1_000);
+        continue;
+      }
+      const health = await fetchRemote(healthUrl, secret);
+      if (health.status !== 200) {
+        await remoteDelay(1_000);
+        continue;
+      }
+      const healthBody = await readRemoteJson(health);
+      if (healthBody.status !== "ok") {
+        return {
+          ok: false,
+          code: "REMOTE_HEALTH_FAILED",
+          message: "The deployed Worker returned an unexpected health status.",
+        };
+      }
+      info = await readRemoteJson(infoResponse);
+      break;
+    } catch {
+      // Edge propagation can leave DNS and Worker routes temporarily unavailable.
+    }
+    await remoteDelay(1_000);
+  }
+  if (info === undefined) {
+    return {
+      ok: false,
+      code: "REMOTE_PROPAGATION_TIMEOUT",
+      message: "The deployed Worker did not expose authenticated health and info after propagation.",
+    };
+  }
+
+  const generation = info.generation;
+  if (!isRecord(generation)) {
+    return {
+      ok: false,
+      code: "REMOTE_GENERATION_MISSING",
+      message: "The deployed Worker did not expose expected generation metadata.",
+    };
+  }
+  for (const key of [
+    "generationId",
+    "bundleDigest",
+    "manifestVersion",
+    "runtimeVersion",
+    "agentBundleVersion",
+    "protocolVersion",
+    "schemaVersion",
+  ] as const) {
+    if (generation[key] !== request.expectedGeneration[key]) {
+      return {
+        ok: false,
+        code: "REMOTE_GENERATION_MISMATCH",
+        message: "The reachable Worker exposed a stale or mixed generation.",
+      };
+    }
+  }
+  if (
+    JSON.stringify(generation.toolNames) !==
+    JSON.stringify(request.expectedGeneration.toolNames)
+  ) {
+    return {
+      ok: false,
+      code: "REMOTE_GENERATION_MISMATCH",
+      message: "The reachable Worker exposed a different tool identity set.",
+    };
+  }
+
+  let session: Record<string, unknown> | undefined;
+  const sessionStartedAt = Date.now();
+  while (Date.now() - sessionStartedAt < 90_000) {
+    try {
+      const sessionResponse = await fetchRemote(sessionUrl, secret, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      if (sessionResponse.status === 201) {
+        session = await readRemoteJson(sessionResponse);
+        break;
+      }
+    } catch {
+      // Durable Object namespace propagation can lag the Worker route.
+    }
+    await remoteDelay(1_000);
+  }
+  if (session === undefined) {
+    return {
+      ok: false,
+      code: "REMOTE_PROPAGATION_TIMEOUT",
+      message: "The deployed Worker did not create an authenticated session after propagation.",
+    };
+  }
+  if (
+    typeof session.sessionId !== "string" ||
+    !/^sess_[a-f0-9]{32}$/u.test(session.sessionId)
+  ) {
+    return {
+      ok: false,
+      code: "REMOTE_SESSION_FAILED",
+      message: "The deployed Worker returned an invalid opaque session identifier.",
+    };
+  }
+  const sessionId = session.sessionId;
+  const commandResponse = await fetchRemote(`${sessionUrl}/${sessionId}`, secret, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ message: "Say hello to Eden." }),
+  });
+  if (commandResponse.status !== 202) {
+    return {
+      ok: false,
+      code: "REMOTE_COMMAND_FAILED",
+      message: "The deployed Worker did not durably accept the validation command.",
+    };
+  }
+
+  const streamUrl = `${sessionUrl}/${sessionId}/stream`;
+  const firstEvents: Record<string, unknown>[] = [];
+  let cursor = 0;
+  const streamStartedAt = Date.now();
+  while (firstEvents.length < 5 && Date.now() - streamStartedAt < 60_000) {
+    const response = await fetchRemote(
+      `${streamUrl}?startIndex=${cursor}&follow=false`,
+      secret,
+    );
+    if (response.status !== 200) {
+      return {
+        ok: false,
+        code: "REMOTE_STREAM_FAILED",
+        message: "The deployed Worker did not expose an authenticated NDJSON stream.",
+      };
+    }
+    for (const event of parseRemoteEvents(await response.text())) {
+      const streamIndex = event.streamIndex;
+      if (
+        typeof streamIndex !== "number" ||
+        !Number.isSafeInteger(streamIndex) ||
+        streamIndex <= cursor
+      ) {
+        return {
+          ok: false,
+          code: "REMOTE_STREAM_INVALID",
+          message: "The deployed Worker returned an invalid or non-monotonic cursor.",
+        };
+      }
+      cursor = streamIndex;
+      firstEvents.push(event);
+      if (firstEvents.length === 5) break;
+    }
+    if (firstEvents.length < 5) await remoteDelay(250);
+  }
+  if (firstEvents.length < 5) {
+    return {
+      ok: false,
+      code: "REMOTE_STREAM_TIMEOUT",
+      message: "The deployed Worker did not reach the validation disconnect cursor.",
+    };
+  }
+  const disconnectedCursor = Number(firstEvents.at(-1)?.streamIndex);
+  const remaining: Record<string, unknown>[] = [];
+  let terminal = false;
+  const reconnectStartedAt = Date.now();
+  while (!terminal && Date.now() - reconnectStartedAt < 90_000) {
+    const response = await fetchRemote(
+      `${streamUrl}?startIndex=${disconnectedCursor}&follow=false`,
+      secret,
+    );
+    if (response.status !== 200) {
+      return {
+        ok: false,
+        code: "REMOTE_RECONNECT_FAILED",
+        message: "The deployed Worker rejected cursor reconnection.",
+      };
+    }
+    for (const event of parseRemoteEvents(await response.text())) {
+      const streamIndex = event.streamIndex;
+      if (
+        typeof streamIndex !== "number" ||
+        !Number.isSafeInteger(streamIndex) ||
+        streamIndex <= disconnectedCursor
+      ) {
+        return {
+          ok: false,
+          code: "REMOTE_RECONNECT_INVALID",
+          message: "The deployed Worker returned an event at or before the saved cursor.",
+        };
+      }
+      if (!remaining.some((existing) => existing.eventId === event.eventId)) {
+        remaining.push(event);
+      }
+      if (event.type === "session.waiting" || event.type === "session.failed") {
+        terminal = true;
+      }
+    }
+    if (!terminal) await remoteDelay(250);
+  }
+  if (!terminal) {
+    return {
+      ok: false,
+      code: "REMOTE_TURN_TIMEOUT",
+      message: "The deployed Worker did not complete the bounded validation turn.",
+    };
+  }
+  const allEvents = [...firstEvents, ...remaining];
+  const lifecycle = allEvents.map((event) => event.type);
+  const expectedLifecycle = [
+    "session.started",
+    "turn.started",
+    "message.received",
+    "step.started",
+    "actions.requested",
+    "action.result",
+    "step.completed",
+    "step.started",
+    "message.completed",
+    "step.completed",
+    "turn.completed",
+    "session.waiting",
+  ];
+  if (JSON.stringify(lifecycle) !== JSON.stringify(expectedLifecycle)) {
+    return {
+      ok: false,
+      code: "REMOTE_LIFECYCLE_INVALID",
+      message: "The deployed Worker returned an unexpected lifecycle order.",
+    };
+  }
+  const action = allEvents.find((event) => event.type === "action.result");
+  const actionData = isRecord(action?.data) ? action.data : undefined;
+  if (
+    actionData?.toolName !== request.expectedGeneration.toolNames[0] ||
+    !isRecord(actionData?.output)
+  ) {
+    return {
+      ok: false,
+      code: "REMOTE_TOOL_INVALID",
+      message: "The deployed Worker did not complete the expected typed tool action.",
+    };
+  }
+  const completed = allEvents.find((event) => event.type === "message.completed");
+  const completedData = isRecord(completed?.data) ? completed.data : undefined;
+  if (typeof completedData?.content !== "string") {
+    return {
+      ok: false,
+      code: "REMOTE_FINAL_INVALID",
+      message: "The deployed Worker did not commit an Eden-owned final response.",
+    };
+  }
+  return { ok: true };
 }
 
 async function buildProjectFromCli(
@@ -1595,23 +2146,98 @@ async function runDev(
   }
 }
 
+async function readConfiguredWorkerName(
+  configPath: string,
+  environment: "preview" | "production",
+): Promise<string | undefined> {
+  const source = await readFile(configPath, "utf8");
+  const extension = extname(configPath).toLowerCase();
+  if (extension !== ".toml") {
+    const withoutComments = source
+      .replace(/\/\*[\s\S]*?\*\//gu, "")
+      .replace(/^\s*\/\/.*$/gmu, "");
+    try {
+      const value = JSON.parse(withoutComments) as unknown;
+      if (isRecord(value)) {
+        const environments = isRecord(value.env) ? value.env : undefined;
+        const selected = environments?.[environment];
+        if (isRecord(selected) && typeof selected.name === "string") {
+          return parseWorkerNameValue(selected.name);
+        }
+        if (typeof value.name === "string") {
+          return parseWorkerNameValue(value.name);
+        }
+      }
+    } catch {
+      // The source-oriented fallback below preserves malformed config diagnostics.
+    }
+  }
+
+  const section = extension === ".toml"
+    ? new RegExp(
+        `\\[env\\.${environment}\\]([\\s\\S]*?)(?=\\n\\s*\\[|$)`,
+        "u",
+      ).exec(source)?.[1]
+    : undefined;
+  const selectedName = section?.match(
+    /^\s*name\s*=\s*["']([^"']+)["']/mu,
+  )?.[1];
+  const topLevelName = source.match(
+    /^\s*name\s*=\s*["']([^"']+)["']/mu,
+  )?.[1];
+  const name = selectedName ?? topLevelName;
+  return name === undefined ? undefined : parseWorkerNameValue(name);
+}
+
 async function runDeploy(
   root: string,
   options: EdenCliRunOptions,
   environment: "preview" | "production",
+  requestedWorkerName: string | undefined,
 ): Promise<void> {
   const configuration = await readProjectConfiguration(root);
   await buildProjectFromCli(root, options, environment);
   const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
+  const generation = await readRuntimeGeneration(canonicalOutput);
   const runtimeFiles = await createRuntimeFiles(
     root,
     configuration.configPath,
     canonicalOutput,
+    "remote",
   );
   const temporaryConfig = runtimeFiles.configPath;
+  const configuredWorkerName = await readConfiguredWorkerName(
+    configuration.configPath,
+    environment,
+  );
+  const workerName = requestedWorkerName ?? configuredWorkerName;
+  if (workerName === undefined) {
+    throw cliError({
+      code: "WORKER_NAME_MISSING",
+      message:
+        "The selected deployment environment must define a Worker name or eden deploy must receive --name.",
+    });
+  }
+  const secret = options.remoteBearerSecret ?? process.env.EDEN_BEARER_SECRET;
+  let secretProvisioned = false;
+  let workerDeployed = false;
+  let deploymentUrl: string | undefined;
+  const remoteCommand = options.remoteCommandRunner ?? runDefaultRemoteCommand;
+  const remoteValidate = options.remoteValidationRunner ??
+    ((request: EdenCliRemoteValidationRequest) => {
+      if (secret === undefined || secret.length === 0) {
+        return Promise.resolve({
+          ok: false,
+          code: "REMOTE_SECRET_REQUIRED",
+          message: "A bearer secret is required for remote validation.",
+        });
+      }
+      return runDefaultRemoteValidation(request, secret);
+    });
+  let deploymentFailure: unknown;
   try {
     await assertArtifactDirectory(canonicalOutput);
-    const request: EdenCliDryRunRequest = {
+    const compatibilityRequest: EdenCliDryRunRequest = {
       cwd: root,
       configPath: temporaryConfig,
       originalConfigPath: configuration.configPath,
@@ -1626,7 +2252,9 @@ async function runDeploy(
     };
     let dryRun: EdenCliDryRunResult;
     try {
-      dryRun = await (options.dryRunRunner ?? runDefaultDryRun)(request);
+      dryRun = await (options.dryRunRunner ?? runDefaultDryRun)(
+        compatibilityRequest,
+      );
     } catch (error: unknown) {
       throw cliError({
         code: "WRANGLER_DRY_RUN_FAILED",
@@ -1644,10 +2272,139 @@ async function runDeploy(
         }`,
       });
     }
-    options.stdout?.(
-      `Deployment dry-run passed for ${environment}; no remote deployment was performed.`,
+    if (secret === undefined || secret.length === 0) {
+      throw cliError({
+        code: "REMOTE_SECRET_REQUIRED",
+        message:
+          "Set EDEN_BEARER_SECRET outside the project before a real deployment.",
+      });
+    }
+
+    secretProvisioned = true;
+    const putSecret = await remoteCommand({
+      kind: "secret-put",
+      cwd: root,
+      args: [
+        "secret",
+        "put",
+        "EDEN_BEARER_SECRET",
+        "--name",
+        workerName,
+        "--config",
+        temporaryConfig,
+      ],
+      stdin: `${secret}\n`,
+    });
+    if (putSecret.exitCode !== 0) {
+      throw cliError({
+        code: "REMOTE_SECRET_FAILED",
+        message: `The deployment tool could not provision the validation secret for ${environment}.${
+          redactOutput(putSecret.stderr).length === 0
+            ? ""
+            : ` ${redactOutput(putSecret.stderr)}`
+        }`,
+      });
+    }
+    workerDeployed = true;
+    const deployment = await remoteCommand({
+      kind: "deploy",
+      cwd: root,
+      args: [
+        "deploy",
+        "--env",
+        environment,
+        "--name",
+        workerName,
+        "--config",
+        temporaryConfig,
+      ],
+    });
+    if (deployment.exitCode !== 0) {
+      throw cliError({
+        code: "REMOTE_DEPLOY_FAILED",
+        message: `The deployment tool failed for ${environment}.${
+          redactOutput(deployment.stderr).length === 0
+            ? ""
+            : ` ${redactOutput(deployment.stderr)}`
+        }`,
+      });
+    }
+    deploymentUrl = findDeploymentUrl(
+      `${deployment.stdout}\n${deployment.stderr}`,
     );
+    if (deploymentUrl === undefined) {
+      throw cliError({
+        code: "REMOTE_URL_MISSING",
+        message:
+          "The deployment tool completed without exposing a reachable workers.dev deployment URL.",
+      });
+    }
+    const validation = await remoteValidate({
+      cwd: root,
+      environment,
+      workerName,
+      url: deploymentUrl,
+      expectedGeneration: generation,
+    });
+    if (!validation.ok) {
+      throw cliError({
+        code: validation.code ?? "REMOTE_VALIDATION_FAILED",
+        message:
+          validation.message ??
+          "The deployed Worker failed post-deployment validation.",
+      });
+    }
+    options.stdout?.(
+      `Deployment passed for ${environment}; Worker ${workerName} exposed generation ${generation.generationId} at ${deploymentUrl}.`,
+    );
+  } catch (error: unknown) {
+    deploymentFailure = error;
+    throw error;
   } finally {
+    if (
+      deploymentFailure !== undefined &&
+      requestedWorkerName !== undefined &&
+      (secretProvisioned || workerDeployed)
+    ) {
+      let cleanupFailed = false;
+      if (secretProvisioned) {
+        const removed = await remoteCommand({
+          kind: "secret-delete",
+          cwd: root,
+          args: [
+            "secret",
+            "delete",
+            "EDEN_BEARER_SECRET",
+            "--name",
+            workerName,
+            "--config",
+            configuration.configPath,
+          ],
+        }).catch(() => ({ exitCode: 1 }));
+        cleanupFailed ||= removed.exitCode !== 0;
+      }
+      if (workerDeployed) {
+        const deleted = await remoteCommand({
+          kind: "delete",
+          cwd: root,
+          args: [
+            "delete",
+            workerName,
+            "--env",
+            environment,
+            "--config",
+            configuration.configPath,
+            "--force",
+          ],
+        }).catch(() => ({ exitCode: 1 }));
+        cleanupFailed ||= deleted.exitCode !== 0;
+      }
+      if (cleanupFailed) {
+        options.stderr?.(
+          `REMOTE_CLEANUP_FAILED: Validation cleanup did not remove every owned ${environment} resource for Worker ${workerName}.`,
+        );
+      }
+    }
     await rm(temporaryConfig, { force: true }).catch(() => undefined);
     await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
   }
@@ -1671,7 +2428,12 @@ async function runInvocation(
       await runDev(root, options);
       return;
     case "deploy":
-      await runDeploy(root, options, invocation.environment ?? "preview");
+      await runDeploy(
+        root,
+        options,
+        invocation.environment ?? "preview",
+        invocation.workerName,
+      );
       return;
   }
 }

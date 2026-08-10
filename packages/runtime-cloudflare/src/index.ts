@@ -5,6 +5,16 @@ import type {
   EdenVersionSet,
 } from "@eden/definitions";
 
+export {
+  configureEdenArtifact,
+  readConfiguredEdenArtifact,
+} from "./artifact-runtime.js";
+export type {
+  EdenArtifactGenerationMetadata,
+  EdenConfiguredArtifact,
+  EdenRuntimeAgentArtifact,
+} from "./artifact-runtime.js";
+
 export type {
   EdenEvent,
   EdenEventDataByType,

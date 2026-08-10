@@ -58,6 +58,7 @@ export interface EdenBoundedTurnRequest<
   readonly turnId: string;
   readonly messageId: string;
   readonly message: string;
+  readonly systemPrompt?: string;
   readonly model: EdenModelAdapter;
   readonly modelId?: string;
   readonly modelOptions?: EdenModelOptions;

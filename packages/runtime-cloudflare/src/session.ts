@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { SqlStorage } from "@cloudflare/workers-types";
 import type {
+  EdenAgentDefinition,
   EdenEvent,
   EdenEventType,
   EdenJsonValue,
@@ -11,6 +12,8 @@ import type {
 } from "@eden/definitions";
 
 import { createModelAdapter } from "./model-adapter.js";
+import { readConfiguredEdenArtifact } from "./artifact-runtime.js";
+import { createWorkersAIModelAdapter } from "./model-adapter-internal.js";
 import {
   applySessionMigrations,
   SESSION_SCHEMA_TABLES,
@@ -42,6 +45,7 @@ import { runBoundedTurn } from "./turn-runner.js";
 
 export interface EdenSessionEnvironment {
   readonly [key: string]: unknown;
+  readonly AI?: unknown;
 }
 
 type EdenSessionState = ConstructorParameters<typeof DurableObject>[0];
@@ -144,7 +148,10 @@ const BOUNDED_TURN_TOOL: EdenToolDefinition<
   },
 };
 
-function createBoundedTurnModel() {
+function createBoundedTurnModel(
+  toolName: string,
+  toolInput: EdenJsonValue,
+) {
   return createModelAdapter(async (request) => {
     if (request.messages.some((message) => message.role === "tool")) {
       return {
@@ -156,13 +163,46 @@ function createBoundedTurnModel() {
       toolCalls: [
         {
           toolCallId: "call_lookup",
-          toolName: "lookup",
-          input: { query: "eden" },
+          toolName,
+          input: toolInput,
         },
       ],
       finishReason: "tool-calls",
     };
   });
+}
+
+interface ConfiguredTurn {
+  readonly agent: EdenAgentDefinition;
+  readonly instructions: string;
+  readonly generation: {
+    readonly executionMode: "local" | "remote";
+  };
+  readonly toolName: string;
+  readonly tool: EdenToolDefinition;
+  readonly toolInputSchema: EdenJsonValue;
+  readonly bundleIdentity: string;
+}
+
+function configuredTurn(): ConfiguredTurn | undefined {
+  const configured = readConfiguredEdenArtifact();
+  if (configured === undefined) return undefined;
+  const toolName = configured.generation.toolNames[0];
+  if (toolName === undefined) return undefined;
+  const tool = configured.artifact.tools[toolName];
+  if (tool === undefined) return undefined;
+  return {
+    agent: configured.artifact.agent,
+    instructions: configured.artifact.instructions,
+    generation: configured.generation,
+    toolName,
+    tool,
+    toolInputSchema: configured.artifact.toolSchemas?.[toolName] ?? {
+      type: "object",
+      additionalProperties: true,
+    },
+    bundleIdentity: configured.generation.generationId,
+  };
 }
 
 function isTerminalEvent(type: EdenEventType): boolean {
@@ -1068,13 +1108,55 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       throw new Error("Bounded turn input is missing");
     }
 
+    const configured = configuredTurn();
+    const toolName = configured?.toolName ?? "lookup";
+    const toolInput = toolName === "greet"
+      ? { name: "Eden" }
+      : { query: "eden" };
+    const runtimeEnvironment = this.env as EdenSessionEnvironment;
+    const liveModel =
+      configured !== undefined &&
+      configured.generation.executionMode === "remote" &&
+      runtimeEnvironment.AI !== undefined
+        ? createWorkersAIModelAdapter({
+            binding: runtimeEnvironment.AI,
+            modelId: configured.agent.model,
+            gatewayId: "eden-dev",
+          })
+        : undefined;
+    if (
+      configured?.generation.executionMode === "remote" &&
+      runtimeEnvironment.AI === undefined
+    ) {
+      throw new Error("Remote model binding is unavailable");
+    }
+    if (configured !== undefined) {
+      await runBoundedTurn(this.ctx.storage, {
+        sessionId,
+        turnId: turn.turn_id,
+        messageId: turn.message_id,
+        message: turn.message,
+        model: liveModel ?? createBoundedTurnModel(toolName, toolInput),
+        modelId: configured.agent.model,
+        ...(configured.agent.options === undefined
+          ? {}
+          : { modelOptions: configured.agent.options }),
+        systemPrompt: configured.instructions,
+        toolName: configured.toolName,
+        tool: configured.tool,
+        toolInputSchema: configured.toolInputSchema,
+        bundleIdentity: configured.bundleIdentity,
+      });
+      return;
+    }
+
     await runBoundedTurn(this.ctx.storage, {
       sessionId,
       turnId: turn.turn_id,
       messageId: turn.message_id,
       message: turn.message,
-      model: createBoundedTurnModel(),
-      toolName: "lookup",
+      model: createBoundedTurnModel(toolName, toolInput),
+      toolName,
       tool: BOUNDED_TURN_TOOL,
       toolInputSchema: BOUNDED_TOOL_INPUT_SCHEMA,
       bundleIdentity: "eden-runtime-bounded-turn-v1",

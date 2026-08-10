@@ -1349,6 +1349,32 @@ function bundleEntrySource(
         `[${JSON.stringify(name)}, ${JSON.stringify(module)}]`,
     )
     .join(",\n    ");
+  const toolSchemaEntries = normalized.tools
+    .map((tool) => {
+      const candidate = tool.inputSchema as unknown as {
+        readonly jsonSchema?: unknown;
+        readonly toJSONSchema?: () => unknown;
+      };
+      let schema: EdenJsonValue = {
+        type: "object",
+        additionalProperties: true,
+      };
+      try {
+        const generated =
+          typeof candidate.toJSONSchema === "function"
+            ? candidate.toJSONSchema()
+            : candidate.jsonSchema;
+        if (generated !== undefined) {
+          schema = normalizeJsonValue(generated, tool.source.relativePath);
+        }
+      } catch {
+        // Some Standard Schema transforms cannot be represented as JSON Schema.
+        // The runtime still validates the provider's input through the authored
+        // schema before invoking the tool.
+      }
+      return `[${JSON.stringify(tool.name)}, ${JSON.stringify(schema)}]`;
+    })
+    .join(",\n    ");
 
   return `${imports}
 
@@ -1359,6 +1385,9 @@ const edenTools = Object.freeze(Object.fromEntries([
 export const agent = edenAgent;
 export const instructions = ${JSON.stringify(normalized.instructions.content)};
 export const tools = edenTools;
+export const toolSchemas = Object.freeze(Object.fromEntries([
+    ${toolSchemaEntries}
+  ]));
 export const moduleMap = Object.freeze({
   agent: ${JSON.stringify(moduleMap.agent.module)},
   instructions: ${JSON.stringify(moduleMap.instructions.module)},

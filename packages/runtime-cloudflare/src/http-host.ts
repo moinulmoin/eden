@@ -10,6 +10,7 @@ import {
   createSessionObjectName,
   isOpaqueSessionId,
 } from "./session-identity.js";
+import { readConfiguredEdenArtifact } from "./artifact-runtime.js";
 
 const HEALTH_PATH = "/eden/v1/health";
 const INFO_PATH = "/eden/v1/info";
@@ -488,11 +489,26 @@ export async function handleEdenRequest(
       : errorResponse("not_found", 404);
   }
   if (url.pathname === INFO_PATH) {
+    const generation = readConfiguredEdenArtifact()?.generation;
     return request.method === "GET"
       ? jsonResponse({
           service: "eden",
           protocol: EDEN_VERSIONS.protocol,
           versions: EDEN_VERSIONS,
+          ...(generation === undefined
+            ? {}
+            : {
+                generation: {
+                  generationId: generation.generationId,
+                  bundleDigest: generation.bundleDigest,
+                  manifestVersion: generation.manifestVersion,
+                  runtimeVersion: generation.runtimeVersion,
+                  agentBundleVersion: generation.agentBundleVersion,
+                  protocolVersion: generation.protocolVersion,
+                  schemaVersion: generation.schemaVersion,
+                  toolNames: generation.toolNames,
+                },
+              }),
         })
       : errorResponse("not_found", 404);
   }

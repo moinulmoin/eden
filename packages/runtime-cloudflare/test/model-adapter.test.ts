@@ -316,4 +316,81 @@ describe("Eden model adapter", () => {
     ]);
     expect(JSON.stringify(outcome)).not.toContain("eden-dev");
   });
+
+  test("maps typed tool requests and binding tool calls", async () => {
+    const runs: unknown[] = [];
+    const adapter = createWorkersAIModelAdapter({
+      binding: {
+        run: async (...args: unknown[]) => {
+          runs.push(args);
+          return {
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_lookup_01",
+                      type: "function",
+                      function: {
+                        name: "lookup",
+                        arguments: '{"query":"eden"}',
+                      },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          };
+        },
+      },
+      modelId: "@cf/zai-org/glm-4.7-flash",
+      gatewayId: "eden-dev",
+    });
+
+    const outcome = await adapter.call(request);
+
+    expect(outcome).toEqual({
+      status: "ok",
+      result: {
+        text: "",
+        calls: [
+          {
+            callId: "call_lookup_01",
+            toolName: "lookup",
+            input: { query: "eden" },
+          },
+        ],
+        results: [],
+        finishReason: "tool-calls",
+        correlation,
+      },
+    });
+    expect(runs[0]).toEqual([
+      "@cf/zai-org/glm-4.7-flash",
+      {
+        messages: [
+          { role: "system", content: "Use the lookup tool." },
+          { role: "user", content: "Find the answer." },
+        ],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "lookup",
+              description: "Look up a value.",
+              parameters: request.tools?.[0]?.inputSchema,
+            },
+          },
+        ],
+        tool_choice: "required",
+      },
+      expect.objectContaining({
+        gateway: { id: "eden-dev" },
+        signal: request.signal,
+      }),
+    ]);
+  });
 });

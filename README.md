@@ -31,21 +31,22 @@ corepack pnpm exec eslint . --max-warnings 0
 corepack pnpm exec vitest run --maxWorkers=1
 ```
 
-The four commands above are the milestone gate. They are reproducible without
+The checks above are the milestone gate. They are reproducible without
 Turbo and without a remote deployment.
 
 After `corepack pnpm run build`, invoke the local CLI entry point with:
 
 ```sh
-corepack pnpm --filter @eden/cli exec node dist/index.js --help
+node packages/cli/dist/index.js --help
 ```
 
-In the walkthrough below, `eden` means that same built entry point. A shell
-function keeps the command explicit without installing a global binary:
+In the walkthrough below, `eden` means that same built entry point. Run this
+from the repository root; the direct path keeps project-root and workspace
+dependency resolution stable without installing a global binary:
 
 ```sh
 eden() {
-  corepack pnpm --filter @eden/cli exec node dist/index.js "$@"
+  node packages/cli/dist/index.js "$@"
 }
 ```
 
@@ -111,14 +112,29 @@ repository and never paste it into a command transcript.
 ### `eden deploy`
 
 `eden deploy` accepts only `--env preview` and `--env production`. If `--env`
-is omitted, the preflight target is `preview`; production must be explicit.
-The command runs the build and an environment-specific Wrangler
-`--dry-run`. It reports that no remote deployment was performed. A dry-run
-success is not a deployed Worker and must not be reported as one.
+is omitted, the target is `preview`; production must be explicit.
+The command builds the selected generation, verifies its artifact identity,
+runs an environment-specific Wrangler compatibility dry-run, provisions
+`EDEN_BEARER_SECRET` through Wrangler stdin, deploys the generated runtime
+wrapper and bundle, waits for edge and Durable Object propagation, and validates
+authenticated health, generation metadata, session creation, cursor reconnect,
+the live `eden-dev` model/tool/final turn, and the expected lifecycle.
 
-The real remote deployment and live model gate are a separate, authorized
-validation step. This guard exists so an invalid or stale generation cannot be
-sent to Wrangler accidentally.
+Set `EDEN_BEARER_SECRET` outside the project and pass a unique `--name` for
+temporary validation:
+
+```sh
+export EDEN_BEARER_SECRET="$(node -e 'process.stdout.write(`eden-gate-${require("crypto").randomBytes(24).toString("hex")}`)')"
+eden deploy \
+  --project "$PROJECT_ROOT" \
+  --env preview \
+  --name "eden-gate-preview-$(date +%s)"
+```
+
+The secret is never placed in an argument, URL, artifact, or normal output.
+Successful deployment output includes the selected generation ID and reachable
+Worker URL. A deployment failure is reported separately from compatibility,
+propagation, authentication, lifecycle, model, and cleanup failures.
 
 ## Clean-room local validation
 
@@ -230,25 +246,17 @@ and temporary root are removed.
 
 ## Deployed validation
 
-This feature does not perform a real remote deployment. The documented
-`eden deploy` command is a dry-run guard, so the local gate above remains
-deployment-free. An authorized final deployment validator must use a unique
-temporary Worker name and isolated preview target, and must:
+An authorized remote validation uses a unique temporary Worker name and an
+isolated environment target. The repository-owned flow is:
 
 1. Build the exact generation that passed local validation.
-2. Provision `EDEN_BEARER_SECRET` through Wrangler secret management for the
-   selected environment. Supply the value through the secret command's input,
-   never as a CLI argument, repository file, URL, log, or artifact.
-
-   ```sh
-   printf '%s' "$EDEN_BEARER_SECRET" |
-     corepack pnpm exec wrangler secret put EDEN_BEARER_SECRET --env <environment>
-   ```
-
-3. Deploy the generated runtime wrapper and bundle, then poll the Worker until
-   `/eden/v1/health` and `/eden/v1/info` are reachable.
-4. Run authenticated session, command, NDJSON cursor-reconnect, and live
-   model/tool/final-response checks through the `eden-dev` AI Gateway path.
+2. Run `eden deploy --env <environment> --name <unique-worker-name>` with
+   `EDEN_BEARER_SECRET` held only in the invoking environment. `eden deploy`
+   supplies the secret to Wrangler through stdin.
+3. Poll the Worker until unauthenticated health fails closed and authenticated
+   health, info, session creation, and the Durable Object namespace are ready.
+4. Run authenticated command, NDJSON cursor-reconnect, and live model/tool/final
+   response checks through the `eden-dev` AI Gateway path.
 5. Compare the remote tool identity, normalized shapes, lifecycle order, safe
    version metadata, and final-message contract with the local run.
 6. Delete every validator-owned temporary Worker and secret, then verify that
@@ -256,10 +264,20 @@ temporary Worker name and isolated preview target, and must:
 
 Preview and production use separate Worker and Durable Object namespace targets.
 Never use production as an implicit temporary target, and never delete shared
-production resources during cleanup. Wrangler's supported cleanup operations
-are environment-scoped; use `wrangler secret delete EDEN_BEARER_SECRET
---env <environment>` and `wrangler delete <temporary-worker-name>
---env <environment>` only for resources owned by the validation run.
+production resources during cleanup. For a temporary Worker named explicitly
+with `--name`, Wrangler 4.120 cleanup is:
+
+```sh
+corepack pnpm exec wrangler secret delete EDEN_BEARER_SECRET \
+  --name "$WORKER_NAME" --config "$PROJECT_ROOT/wrangler.jsonc"
+corepack pnpm exec wrangler delete "$WORKER_NAME" \
+  --env "$ENVIRONMENT" --config "$PROJECT_ROOT/wrangler.jsonc" --force
+```
+
+Run both commands only for resources owned by that validation. Secret deletion
+does not accept `--force` in the pinned Wrangler version. When `--name`
+selects an explicit Worker, keep the secret commands name-scoped and omit
+`--env`; adding an environment there targets a suffixed Worker name.
 
 ## Authentication and request boundaries
 
@@ -298,8 +316,8 @@ agent/ source tree
 - `EdenSession` is the sole journal and state-transition authority. SQLite
   commits precede NDJSON delivery, model advancement, and tool-result
   advancement.
-- The model adapter keeps Workers AI, AI SDK, provider, and binding details
-  behind Eden-owned contracts.
+- The model adapter keeps Workers AI, AI Gateway, and binding details behind
+  Eden-owned contracts.
 - The typed client stores only the opaque session ID and last accepted
   absolute cursor. Transport connection state is not durability.
 - Durable Object alarms are bounded, at-least-once recovery support, not a
@@ -338,12 +356,10 @@ This milestone proves one narrow use case:
 External effects are not exactly-once unless the destination honors Eden's
 stable idempotency coordinate. Alarms are at-least-once and bounded. Long
 sleeps, approvals, external-event waits, extended retries, and dynamic hosted
-bundles are future seams, not current guarantees. `eden deploy` currently
-proves preflight compatibility only; it does not claim remote success.
-The local HTTP walkthrough uses a deterministic bounded runtime fixture for its
-lifecycle check; the generated scaffold tool identity is validated in the
-manifest and bundle, while full generated-bundle execution parity belongs to
-the final conformance and deployment gates.
+bundles are future seams, not current guarantees. The local HTTP walkthrough
+uses a deterministic bounded runtime fixture; `eden deploy` switches the same
+generated bundle to the live Workers AI adapter and verifies remote parity
+through the full bounded turn.
 
 ## Out of scope
 
