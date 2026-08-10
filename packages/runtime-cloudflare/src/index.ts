@@ -25,6 +25,31 @@ export {
   SESSION_SCHEMA_VERSION,
 } from "./session-schema.js";
 export type { SessionMigration } from "./session-schema.js";
+export {
+  commitSessionTransaction,
+  createOpaqueEventId,
+  readJournalEvents,
+  readLatestJournalCursor,
+} from "./session-journal.js";
+export type {
+  AppendJournalEventInput,
+  CompleteEffectInput,
+  EdenSessionStorage,
+  EdenSqlCursor,
+  EdenSqlStorage,
+  EdenSqlValue,
+  FailEffectInput,
+  InsertMessageInput,
+  InsertStepInput,
+  InsertTurnInput,
+  JournalTransaction,
+  RecordErrorInput,
+  RequestEffectInput,
+  StartEffectInput,
+  UpdateMessageInput,
+  UpdateStepInput,
+  UpdateTurnInput,
+} from "./session-journal.js";
 
 export interface EdenRuntimeConfiguration {
   readonly versions: EdenVersionSet;

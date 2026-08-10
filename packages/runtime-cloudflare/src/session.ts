@@ -10,6 +10,11 @@ import {
   SESSION_SCHEMA_TABLES,
 } from "./session-schema.js";
 import { sessionIdFromObjectName } from "./session-identity.js";
+import {
+  commitSessionTransaction,
+  readJournalEvents,
+  readLatestJournalCursor,
+} from "./session-journal.js";
 
 export interface EdenSessionEnvironment {
   readonly [key: string]: unknown;
@@ -172,6 +177,9 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     if (url.pathname === "/_eden/schema" && request.method === "GET") {
       return this.schemaResponse();
     }
+    if (url.pathname === "/_eden/events" && request.method === "GET") {
+      return this.eventsResponse(url);
+    }
     if (
       url.pathname === "/_eden/initialize" &&
       request.method === "POST"
@@ -197,6 +205,41 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       tables: readTables(sql),
       appliedMigrations: readMigrations(sql),
       sessionMeta: meta === null ? null : versionResponse(meta),
+    });
+  }
+
+  private eventsResponse(url: URL): Response {
+    const sessionId = sessionIdFromObjectName(this.ctx.id.name ?? "");
+    if (sessionId === null) {
+      return jsonResponse(
+        { code: "session_mapping_invalid", message: "Session mapping unavailable" },
+        500,
+      );
+    }
+
+    const rawStartIndex = url.searchParams.get("startIndex") ?? "0";
+    const startIndex = Number(rawStartIndex);
+    if (
+      !Number.isSafeInteger(startIndex) ||
+      startIndex < 0 ||
+      rawStartIndex !== String(startIndex)
+    ) {
+      return jsonResponse(
+        { code: "invalid_start_index", message: "Invalid event start index" },
+        400,
+      );
+    }
+
+    const events = readJournalEvents(
+      this.ctx.storage.sql,
+      sessionId,
+      startIndex,
+    );
+    return jsonResponse({
+      sessionId,
+      startIndex,
+      latestCursor: readLatestJournalCursor(this.ctx.storage.sql, sessionId),
+      events,
     });
   }
 
@@ -241,7 +284,7 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
 
     const timestamp = new Date().toISOString();
     try {
-      this.ctx.storage.transactionSync(() => {
+      commitSessionTransaction(this.ctx.storage, sessionId, (journal) => {
         sql.exec(
           `INSERT INTO session_meta (
             session_id, owner_principal, status, created_at, updated_at,
@@ -259,6 +302,15 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
           input.versions.protocol,
           input.versions.schema,
         );
+        journal.appendEvent({
+          type: "session.started",
+          data: {
+            sessionId,
+            status: "new",
+            versions: input.versions,
+          },
+          committedAt: timestamp,
+        });
       });
     } catch (error) {
       if (readSessionMeta(sql) !== null) {
