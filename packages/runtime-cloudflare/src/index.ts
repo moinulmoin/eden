@@ -130,6 +130,12 @@ export type {
   EdenModelToolResult,
   EdenModelUsage,
 } from "./model-adapter.js";
+export { executeTypedTool } from "./tool-harness.js";
+export type {
+  EdenToolFailure,
+  EdenToolHarnessRequest,
+  EdenToolHarnessResult,
+} from "./tool-harness.js";
 
 export interface EdenRuntimeConfiguration {
   readonly versions: EdenVersionSet;
