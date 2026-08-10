@@ -6,5 +6,8 @@
     "tsBuildInfoFile": "dist/tsconfig.tsbuildinfo"
   },
   "include": ["src"],
-  "references": [{ "path": "../compiler" }]
+  "references": [
+    { "path": "../compiler" },
+    { "path": "../runtime-cloudflare" }
+  ]
 }
