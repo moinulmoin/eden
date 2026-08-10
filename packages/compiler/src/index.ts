@@ -3,14 +3,19 @@ import {
   createHash,
 } from "crypto";
 import {
+  mkdir,
   lstat,
   readFile,
   readdir,
   realpath,
+  rename,
+  rm,
   stat,
+  writeFile,
 } from "fs/promises";
 import {
   basename,
+  dirname,
   isAbsolute,
   join,
   normalize,
@@ -22,14 +27,23 @@ import {
 import type {
   EdenAgentDefinition,
   EdenArtifactSet,
+  EdenBuildMetadata,
   EdenDiagnostic,
   EdenInstructionManifest,
   EdenJsonValue,
+  EdenModuleMap,
   EdenManifest,
   EdenSourceReference,
   EdenStandardSchemaIssue,
   EdenStandardSchemaV1,
   EdenToolContext,
+} from "@eden/definitions";
+import {
+  EDEN_AGENT_BUNDLE_VERSION,
+  EDEN_MANIFEST_VERSION,
+  EDEN_PROTOCOL_VERSION,
+  EDEN_RUNTIME_VERSION,
+  EDEN_SCHEMA_VERSION,
 } from "@eden/definitions";
 
 export {
@@ -46,6 +60,7 @@ export type {
   EdenDiagnostic,
   EdenDiscoveryRecord,
   EdenInstructionManifest,
+  EdenModuleMap,
   EdenManifest,
   EdenSourceReference,
   EdenToolManifest,
@@ -1237,4 +1252,747 @@ export async function normalizeProject(
     instructions,
     tools,
   };
+}
+
+const ARTIFACT_FILE_NAMES = {
+  discovery: "discovery.json",
+  diagnostics: "diagnostics.json",
+  manifest: "manifest.json",
+  moduleMap: "module-map.json",
+  bundle: "agent-bundle.mjs",
+  buildMetadata: "build-metadata.json",
+} as const;
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => stableValue(item));
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort(comparePath)
+        .map((key) => [key, stableValue(value[key])]),
+    );
+  }
+  return value;
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(stableValue(value));
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function jsonDocument(value: unknown): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function artifactModuleMap(
+  normalized: EdenNormalizedProject,
+): EdenModuleMap {
+  return {
+    kind: "eden.module-map",
+    version: EDEN_AGENT_BUNDLE_VERSION,
+    agent: {
+      name: "agent",
+      module: "agent:default",
+      source: normalized.discovery.agent,
+    },
+    instructions: {
+      name: "instructions",
+      module: "instructions:default",
+      source: normalized.discovery.instructions,
+    },
+    tools: normalized.tools.map((tool) => ({
+      name: tool.name,
+      module: `tool:${tool.name}`,
+      source: tool.source,
+    })),
+  };
+}
+
+function sourceImportPath(relativePath: string): string {
+  return `./${relativePath.split("/").map((segment) => encodeURIComponent(segment)).join("/")}`;
+}
+
+function bundleEntrySource(
+  normalized: EdenNormalizedProject,
+  moduleMap: EdenModuleMap,
+): string {
+  const agentImport = "edenAgent";
+  const toolImports = normalized.tools.map((tool, index) => ({
+    importName: `edenTool${index}`,
+    path: sourceImportPath(tool.source.relativePath),
+    tool,
+  }));
+  const imports = [
+    `import ${agentImport} from ${JSON.stringify(sourceImportPath(normalized.discovery.agent.relativePath))};`,
+    ...toolImports.map(
+      ({ importName, path }) =>
+        `import ${importName} from ${JSON.stringify(path)};`,
+    ),
+  ].join("\n");
+  const toolEntries = toolImports
+    .map(
+      ({ importName, tool }) =>
+        `[${JSON.stringify(tool.name)}, ${importName}]`,
+    )
+    .join(",\n    ");
+  const toolModuleEntries = moduleMap.tools
+    .map(
+      ({ name, module }) =>
+        `[${JSON.stringify(name)}, ${JSON.stringify(module)}]`,
+    )
+    .join(",\n    ");
+
+  return `${imports}
+
+const edenTools = Object.freeze(Object.fromEntries([
+    ${toolEntries}
+  ]));
+
+export const agent = edenAgent;
+export const instructions = ${JSON.stringify(normalized.instructions.content)};
+export const tools = edenTools;
+export const moduleMap = Object.freeze({
+  agent: ${JSON.stringify(moduleMap.agent.module)},
+  instructions: ${JSON.stringify(moduleMap.instructions.module)},
+  tools: Object.freeze(Object.fromEntries([
+    ${toolModuleEntries}
+  ]))
+});
+export default Object.freeze({ agent, instructions, tools, moduleMap });
+`;
+}
+
+function unsupportedBundleDependency(
+  bundle: string,
+): { readonly code: string; readonly message: string } | undefined {
+  const checks: readonly {
+    readonly code: string;
+    readonly pattern: RegExp;
+    readonly message: string;
+  }[] = [
+    {
+      code: "MODULE_IMPORT_UNSUPPORTED",
+      pattern: /\bimport\s*\(/u,
+      message:
+        "The Worker bundle contains a dynamic import; use a statically analyzable authored dependency.",
+    },
+    {
+      code: "MODULE_IMPORT_UNSUPPORTED",
+      pattern: /["']node:(?:fs|path|url|module|os|crypto|vm)(?:\/[^"']*)?["']/u,
+      message:
+        "The Worker bundle contains a Node-only builtin import; remove the Node dependency.",
+    },
+    {
+      code: "MODULE_IMPORT_UNSUPPORTED",
+      pattern: /(?:from|import)\s*["'](?:fs|path|url|module|os|crypto|vm)["']/u,
+      message:
+        "The Worker bundle contains a Node-only builtin import; remove the Node dependency.",
+    },
+    {
+      code: "MODULE_IMPORT_UNSUPPORTED",
+      pattern:
+        /\b(?:from|import)\s*["'](?:chokidar|wrangler|@eden\/compiler)["']/u,
+      message:
+        "The Worker bundle contains a compiler or development dependency; keep it on the Node build side.",
+    },
+    {
+      code: "MODULE_AMBIENT_BINDING",
+      pattern:
+        /\b(?:process\.env|process\.cwd|Buffer|require|__dirname|__filename)\b/u,
+      message:
+        "The Worker bundle depends on a Node or ambient runtime binding; use explicit Eden inputs instead.",
+    },
+  ];
+  return checks.find((check) => check.pattern.test(bundle));
+}
+
+function authoredWorkerDependency(
+  source: string,
+): { readonly code: string; readonly message: string } | undefined {
+  if (/\bimport\s*\(/u.test(source)) {
+    return {
+      code: "MODULE_IMPORT_UNSUPPORTED",
+      message:
+        "Dynamic imports are not supported in Worker artifacts; use a statically analyzable authored dependency.",
+    };
+  }
+  if (
+    /\b(?:from\s*|import\s*)["'](?:node:(?:fs|path|url|module|os|crypto|vm)|fs|path|url|module|os|crypto|vm)["']/u.test(
+      source,
+    )
+  ) {
+    return {
+      code: "MODULE_IMPORT_UNSUPPORTED",
+      message:
+        "Node-only builtin imports are not supported in Worker artifacts; remove the Node dependency.",
+    };
+  }
+  if (
+    /\b(?:process\s*\.\s*(?:env|cwd)|Buffer|require\s*\(|__dirname|__filename)\b/u.test(
+      source,
+    )
+  ) {
+    return {
+      code: "MODULE_AMBIENT_BINDING",
+      message:
+        "Node or ambient runtime bindings are not supported in Worker artifacts; use explicit Eden inputs instead.",
+    };
+  }
+  return undefined;
+}
+
+function importedSpecifiers(source: string): string[] {
+  const specifiers: string[] = [];
+  const pattern =
+    /(?:\bfrom\s*|\bimport\s*)["']([^"']+)["']/gu;
+  for (const match of source.matchAll(pattern)) {
+    const specifier = match[1];
+    if (specifier !== undefined) specifiers.push(specifier);
+  }
+  return specifiers;
+}
+
+async function resolveAuthoredImport(
+  projectRoot: string,
+  importerPath: string,
+  specifier: string,
+): Promise<string | undefined> {
+  if (!specifier.startsWith(".") && !specifier.startsWith("/")) {
+    return undefined;
+  }
+  const base = isAbsolute(specifier)
+    ? specifier
+    : resolve(dirname(importerPath), specifier);
+  if (!isWithinRoot(projectRoot, normalize(base))) {
+    throw new EdenCompilerError("Worker compatibility validation failed", [
+      diagnostic(
+        "PATH_OUTSIDE_PROJECT",
+        `Import "${specifier}" escapes the selected project root.`,
+        toPosixPath(relative(projectRoot, importerPath)),
+      ),
+    ]);
+  }
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    `${base}.mjs`,
+    join(base, "index.ts"),
+    join(base, "index.tsx"),
+    join(base, "index.js"),
+    join(base, "index.mjs"),
+  ];
+  for (const candidate of candidates) {
+    const canonical = await realpath(candidate).catch(() => undefined);
+    if (canonical === undefined) continue;
+    if (!isWithinRoot(projectRoot, canonical)) {
+      throw new EdenCompilerError("Worker compatibility validation failed", [
+        diagnostic(
+          "PATH_OUTSIDE_PROJECT",
+          `Import "${specifier}" resolves outside the selected project root.`,
+          toPosixPath(relative(projectRoot, importerPath)),
+        ),
+      ]);
+    }
+    const details = await stat(canonical).catch(() => undefined);
+    if (details?.isFile()) return canonical;
+  }
+  return undefined;
+}
+
+async function validateAuthoredWorkerSources(
+  normalized: EdenNormalizedProject,
+): Promise<void> {
+  const pending = [
+    normalized.discovery.agent.relativePath,
+    ...normalized.discovery.tools.map((source) => source.relativePath),
+  ];
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const relativePath = pending.shift();
+    if (relativePath === undefined) continue;
+    const sourcePath = join(normalized.projectRoot, relativePath);
+    const canonicalPath = await realpath(sourcePath).catch(() => sourcePath);
+    if (visited.has(canonicalPath)) continue;
+    visited.add(canonicalPath);
+    const contents = await readUtf8File(canonicalPath);
+    const issue = authoredWorkerDependency(contents);
+    if (issue !== undefined) {
+      throw new EdenCompilerError("Worker compatibility validation failed", [
+        diagnostic(issue.code, issue.message, relativePath),
+      ]);
+    }
+    for (const specifier of importedSpecifiers(contents)) {
+      const importedPath = await resolveAuthoredImport(
+        normalized.projectRoot,
+        canonicalPath,
+        specifier,
+      );
+      if (importedPath !== undefined) {
+        pending.push(toPosixPath(relative(normalized.projectRoot, importedPath)));
+      }
+    }
+  }
+}
+
+async function bundleProject(
+  normalized: EdenNormalizedProject,
+  moduleMap: EdenModuleMap,
+): Promise<string> {
+  const entry = bundleEntrySource(normalized, moduleMap);
+  let compatibilityIssue:
+    | {
+        readonly code: string;
+        readonly message: string;
+        readonly source: string;
+      }
+    | undefined;
+  try {
+    const result = await build({
+      absWorkingDir: normalized.projectRoot,
+      bundle: true,
+      charset: "utf8",
+      format: "esm",
+      logLevel: "silent",
+      nodePaths: [join(process.cwd(), "node_modules")],
+      stdin: {
+        contents: entry,
+        loader: "js",
+        resolveDir: normalized.projectRoot,
+        sourcefile: "eden-artifact-entry.mjs",
+      },
+      platform: "browser",
+      plugins: [
+        {
+          name: "eden-worker-contained-imports",
+          setup(context) {
+            context.onResolve(
+              {
+                filter:
+                  /^(?:node:(?:fs|path|url|module|os|crypto|vm)|fs|path|url|module|os|crypto|vm)$/,
+              },
+              (args) => {
+                const source = toPosixPath(
+                  relative(normalized.projectRoot, args.importer),
+                );
+                compatibilityIssue = {
+                  code: "MODULE_IMPORT_UNSUPPORTED",
+                  message:
+                    "Node-only builtin imports are not supported in Worker artifacts; remove the Node dependency.",
+                  source,
+                };
+                return {
+                  errors: [
+                    {
+                      text: compatibilityIssue.message,
+                    },
+                  ],
+                };
+              },
+            );
+            context.onResolve(
+              { filter: /^(?:\.{1,2}(?:\/|$)|\/)/ },
+              async (args) => {
+                const resolved = isAbsolute(args.path)
+                  ? args.path
+                  : resolve(args.resolveDir, args.path);
+                const canonical = await realpath(resolved).catch(
+                  () => resolved,
+                );
+                const dependencyRoots = await Promise.all(
+                  [
+                    join(normalized.projectRoot, "node_modules"),
+                    join(process.cwd(), "node_modules"),
+                  ].map((root) => realpath(root).catch(() => root)),
+                );
+                const importer = await realpath(args.resolveDir).catch(
+                  () => args.resolveDir,
+                );
+                if (
+                  dependencyRoots.some((root) =>
+                    isWithinRoot(root, importer),
+                  )
+                ) {
+                  return undefined;
+                }
+                if (!isWithinRoot(normalized.projectRoot, canonical)) {
+                  return {
+                    errors: [
+                      {
+                        text: `Import "${args.path}" from "${args.importer}" escapes the selected project root.`,
+                      },
+                    ],
+                  };
+                }
+                return undefined;
+              },
+            );
+          },
+        },
+      ],
+      legalComments: "none",
+      minify: false,
+      outfile: "eden-artifact.mjs",
+      sourcemap: false,
+      target: "es2022",
+      write: false,
+    });
+    const output = result.outputFiles?.[0]?.text;
+    if (output === undefined) throw new Error("esbuild emitted no Worker bundle");
+    const unsupported = unsupportedBundleDependency(output);
+    if (unsupported !== undefined) {
+      throw new EdenCompilerError("Worker compatibility validation failed", [
+        diagnostic(unsupported.code, unsupported.message),
+      ]);
+    }
+    return output;
+  } catch (error: unknown) {
+    if (error instanceof EdenCompilerError) throw error;
+    if (compatibilityIssue !== undefined) {
+      throw new EdenCompilerError(
+        "Worker compatibility validation failed",
+        [
+          diagnostic(
+            compatibilityIssue.code,
+            compatibilityIssue.message,
+            compatibilityIssue.source,
+          ),
+        ],
+      );
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new EdenCompilerError(
+      `Worker compatibility validation failed: ${message}`,
+      [
+        diagnostic(
+          "WORKER_BUNDLE_FAILED",
+          `Unable to create a self-contained Worker bundle: ${message}`,
+        ),
+      ],
+    );
+  }
+}
+
+function createGeneratedManifest(
+  normalized: EdenNormalizedProject,
+  moduleMap: EdenModuleMap,
+  bundleDigest: string,
+): EdenManifest {
+  const moduleByName = new Map(
+    moduleMap.tools.map((reference) => [reference.name, reference.module]),
+  );
+  return {
+    kind: "eden.manifest",
+    version: EDEN_MANIFEST_VERSION,
+    runtimeVersion: EDEN_RUNTIME_VERSION,
+    agentBundleVersion: EDEN_AGENT_BUNDLE_VERSION,
+    protocolVersion: EDEN_PROTOCOL_VERSION,
+    schemaVersion: EDEN_SCHEMA_VERSION,
+    agent: {
+      source: normalized.discovery.agent,
+      model: normalized.agent.model,
+      ...(normalized.agent.options === undefined
+        ? {}
+        : { options: normalized.agent.options }),
+    },
+    instructions: normalized.instructions,
+    tools: normalized.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      source: tool.source,
+      module: moduleByName.get(tool.name) as string,
+      schema: tool.schema,
+    })),
+    bundleDigest,
+  };
+}
+
+function createBuildMetadata(
+  manifest: EdenManifest,
+  moduleMap: EdenModuleMap,
+  bundle: string,
+): EdenBuildMetadata {
+  const moduleMapDigest = sha256(stableJson(moduleMap));
+  return {
+    generationId: createArtifactIdentity({
+      manifest,
+      moduleMap,
+      bundle,
+    }),
+    createdAt: new Date().toISOString(),
+    bundleDigest: sha256(bundle),
+    manifestVersion: manifest.version,
+    runtimeVersion: manifest.runtimeVersion,
+    agentBundleVersion: manifest.agentBundleVersion,
+    protocolVersion: manifest.protocolVersion,
+    schemaVersion: manifest.schemaVersion,
+    moduleMapDigest,
+  };
+}
+
+export function createArtifactIdentity(
+  artifacts: Pick<EdenArtifactSet, "manifest" | "moduleMap" | "bundle">,
+): string {
+  return `gen_${sha256(
+    stableJson({
+      bundle: sha256(artifacts.bundle),
+      manifest: artifacts.manifest,
+      moduleMap: artifacts.moduleMap,
+    }),
+  )}`;
+}
+
+function assertArtifactCoherence(
+  manifest: EdenManifest,
+  moduleMap: EdenModuleMap,
+  bundle: string,
+  buildMetadata: EdenBuildMetadata,
+): void {
+  const bundleDigest = sha256(bundle);
+  if (manifest.bundleDigest !== bundleDigest) {
+    throw new EdenCompilerError("Generated artifact digest mismatch", [
+      diagnostic(
+        "ARTIFACT_DIGEST_MISMATCH",
+        "Manifest bundleDigest does not match the generated bundle bytes.",
+      ),
+    ]);
+  }
+  if (buildMetadata.bundleDigest !== bundleDigest) {
+    throw new EdenCompilerError("Generated artifact digest mismatch", [
+      diagnostic(
+        "ARTIFACT_METADATA_DIGEST_MISMATCH",
+        "Build metadata bundleDigest does not match the generated bundle bytes.",
+      ),
+    ]);
+  }
+  if (buildMetadata.moduleMapDigest !== sha256(stableJson(moduleMap))) {
+    throw new EdenCompilerError("Generated module map digest mismatch", [
+      diagnostic(
+        "ARTIFACT_MODULE_MAP_DIGEST_MISMATCH",
+        "Build metadata moduleMapDigest does not match the static module map.",
+      ),
+    ]);
+  }
+  if (buildMetadata.generationId !== createArtifactIdentity({
+    manifest,
+    moduleMap,
+    bundle,
+  })) {
+    throw new EdenCompilerError("Generated artifact identity mismatch", [
+      diagnostic(
+        "ARTIFACT_IDENTITY_MISMATCH",
+        "Build metadata generationId does not describe the generated manifest, module map, and bundle.",
+      ),
+    ]);
+  }
+  const manifestModules = [
+    "agent:default",
+    "instructions:default",
+    ...manifest.tools.map((tool) => tool.module),
+  ];
+  const mappedModules = [
+    moduleMap.agent.module,
+    moduleMap.instructions.module,
+    ...moduleMap.tools.map((tool) => tool.module),
+  ];
+  if (
+    manifestModules.length !== mappedModules.length ||
+    manifestModules.some((module, index) => module !== mappedModules[index])
+  ) {
+    throw new EdenCompilerError("Generated module map mismatch", [
+      diagnostic(
+        "ARTIFACT_MODULE_MAP_MISMATCH",
+        "Manifest executable references do not match the static module map.",
+      ),
+    ]);
+  }
+  if (
+    !bundle.includes("agent:default") ||
+    !bundle.includes("instructions:default") ||
+    manifest.tools.some((tool) => !bundle.includes(tool.module))
+  ) {
+    throw new EdenCompilerError("Generated module reference is unresolved", [
+      diagnostic(
+        "ARTIFACT_MODULE_UNRESOLVED",
+        "Every manifest module reference must resolve in the generated Worker bundle.",
+      ),
+    ]);
+  }
+}
+
+async function outputDirectoryFor(
+  projectRoot: string,
+  outputDirectory: string | undefined,
+): Promise<string> {
+  const selected = outputDirectory ?? ".eden";
+  const candidate = isAbsolute(selected)
+    ? normalize(selected)
+    : resolve(projectRoot, selected);
+  if (!isWithinRoot(projectRoot, candidate)) {
+    throw new EdenCompilerError("Artifact output escapes the project root", [
+      diagnostic(
+        "OUTPUT_OUTSIDE_PROJECT",
+        `Artifact output "${selected}" escapes the selected project root.`,
+        selected,
+      ),
+    ]);
+  }
+  const parent = dirname(candidate);
+  let existingAncestor = parent;
+  while (true) {
+    const resolvedAncestor = await realpath(existingAncestor).catch(
+      () => undefined,
+    );
+    if (resolvedAncestor !== undefined) {
+      if (!isWithinRoot(projectRoot, resolvedAncestor)) {
+        throw new EdenCompilerError(
+          "Artifact output escapes the project root",
+          [
+            diagnostic(
+              "OUTPUT_OUTSIDE_PROJECT",
+              `Artifact output "${selected}" has a parent outside the selected project root.`,
+              selected,
+            ),
+          ],
+        );
+      }
+      break;
+    }
+    const next = dirname(existingAncestor);
+    if (next === existingAncestor) break;
+    existingAncestor = next;
+  }
+  if (!isWithinRoot(projectRoot, existingAncestor)) {
+    throw new EdenCompilerError("Artifact output escapes the project root", [
+      diagnostic(
+        "OUTPUT_OUTSIDE_PROJECT",
+        `Artifact output "${selected}" has a parent outside the selected project root.`,
+        selected,
+      ),
+    ]);
+  }
+  return candidate;
+}
+
+async function publishArtifacts(
+  outputDirectory: string,
+  artifacts: EdenArtifactSet,
+): Promise<void> {
+  const parent = dirname(outputDirectory);
+  await mkdir(parent, { recursive: true });
+  const stage = join(
+    parent,
+    `.${basename(outputDirectory)}.staging-${process.pid}-${Date.now()}-${Math.random()
+      .toString(16)
+      .slice(2)}`,
+  );
+  const backup = join(
+    parent,
+    `.${basename(outputDirectory)}.previous-${process.pid}-${Date.now()}-${Math.random()
+      .toString(16)
+      .slice(2)}`,
+  );
+  let movedCurrent = false;
+  try {
+    await mkdir(stage);
+    await Promise.all([
+      writeFile(
+        join(stage, ARTIFACT_FILE_NAMES.discovery),
+        jsonDocument(artifacts.discovery),
+        "utf8",
+      ),
+      writeFile(
+        join(stage, ARTIFACT_FILE_NAMES.diagnostics),
+        jsonDocument(artifacts.diagnostics),
+        "utf8",
+      ),
+      writeFile(
+        join(stage, ARTIFACT_FILE_NAMES.manifest),
+        jsonDocument(artifacts.manifest),
+        "utf8",
+      ),
+      writeFile(
+        join(stage, ARTIFACT_FILE_NAMES.moduleMap),
+        jsonDocument(artifacts.moduleMap),
+        "utf8",
+      ),
+      writeFile(
+        join(stage, ARTIFACT_FILE_NAMES.bundle),
+        artifacts.bundle,
+        "utf8",
+      ),
+      writeFile(
+        join(stage, ARTIFACT_FILE_NAMES.buildMetadata),
+        jsonDocument(artifacts.buildMetadata),
+        "utf8",
+      ),
+    ]);
+
+    const existing = await lstat(outputDirectory).catch(() => undefined);
+    if (existing !== undefined) {
+      if (!existing.isDirectory() || existing.isSymbolicLink()) {
+        throw new EdenCompilerError("Artifact output is not a directory", [
+          diagnostic(
+            "OUTPUT_INVALID",
+            `Artifact output "${outputDirectory}" must be a real directory.`,
+          ),
+        ]);
+      }
+      await rename(outputDirectory, backup);
+      movedCurrent = true;
+    }
+    await rename(stage, outputDirectory);
+    if (movedCurrent) await rm(backup, { recursive: true, force: true });
+  } catch (error: unknown) {
+    await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+    if (movedCurrent) {
+      const current = await lstat(outputDirectory).catch(() => undefined);
+      if (current === undefined) {
+        await rename(backup, outputDirectory).catch(() => undefined);
+      }
+    }
+    throw error;
+  }
+}
+
+export async function buildProject(
+  options: EdenCompilerOptions,
+): Promise<EdenCompilerResult> {
+  const projectRoot = await resolveProjectRoot({
+    projectRoot: options.projectRoot,
+  });
+  const outputDirectory = await outputDirectoryFor(
+    projectRoot,
+    options.outputDirectory,
+  );
+  const normalized = await normalizeProject({ projectRoot });
+  await validateAuthoredWorkerSources(normalized);
+  const moduleMap = artifactModuleMap(normalized);
+  const bundle = await bundleProject(normalized, moduleMap);
+  const manifest = createGeneratedManifest(normalized, moduleMap, sha256(bundle));
+  const buildMetadata = createBuildMetadata(manifest, moduleMap, bundle);
+  const diagnostics: readonly EdenDiagnostic[] = [];
+  const artifacts: EdenArtifactSet = {
+    discovery: normalized.discovery,
+    diagnostics,
+    manifest,
+    moduleMap,
+    bundle,
+    buildMetadata,
+  };
+  assertArtifactCoherence(manifest, moduleMap, bundle, buildMetadata);
+  await publishArtifacts(outputDirectory, artifacts);
+  return { artifacts, diagnostics };
+}
+
+export class EdenNodeCompiler implements EdenCompiler {
+  readonly version = EDEN_RUNTIME_VERSION;
+
+  async build(options: EdenCompilerOptions): Promise<EdenCompilerResult> {
+    return buildProject(options);
+  }
 }

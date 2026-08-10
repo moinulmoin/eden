@@ -110,6 +110,20 @@ export interface EdenToolManifest {
   };
 }
 
+export interface EdenModuleReference {
+  readonly name: string;
+  readonly module: string;
+  readonly source: EdenSourceReference;
+}
+
+export interface EdenModuleMap {
+  readonly kind: "eden.module-map";
+  readonly version: typeof EDEN_AGENT_BUNDLE_VERSION;
+  readonly agent: EdenModuleReference;
+  readonly instructions: EdenModuleReference;
+  readonly tools: readonly EdenModuleReference[];
+}
+
 export interface EdenManifest {
   readonly kind: "eden.manifest";
   readonly version: typeof EDEN_MANIFEST_VERSION;
@@ -145,12 +159,18 @@ export interface EdenBuildMetadata {
   readonly createdAt: string;
   readonly bundleDigest: string;
   readonly manifestVersion: typeof EDEN_MANIFEST_VERSION;
+  readonly runtimeVersion: typeof EDEN_RUNTIME_VERSION;
+  readonly agentBundleVersion: typeof EDEN_AGENT_BUNDLE_VERSION;
+  readonly protocolVersion: typeof EDEN_PROTOCOL_VERSION;
+  readonly schemaVersion: typeof EDEN_SCHEMA_VERSION;
+  readonly moduleMapDigest: string;
 }
 
 export interface EdenArtifactSet {
   readonly discovery: EdenDiscoveryRecord;
   readonly diagnostics: readonly EdenDiagnostic[];
   readonly manifest: EdenManifest;
+  readonly moduleMap: EdenModuleMap;
   readonly bundle: string;
   readonly buildMetadata: EdenBuildMetadata;
 }
