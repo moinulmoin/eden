@@ -15,6 +15,7 @@ import type {
 const MAX_MODEL_STRING_BYTES = 65_536;
 const MAX_MODEL_JSON_DEPTH = 32;
 const MAX_MODEL_CALLS = 32;
+const MAX_NORMALIZED_JSON_BYTES = 65_536;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -108,6 +109,21 @@ function parseJsonValue(value: unknown): EdenJsonValue | undefined {
   } catch {
     return undefined;
   }
+}
+
+export function normalizeEdenJsonValue(
+  value: unknown,
+): EdenJsonValue | undefined {
+  const normalized = normalizeJsonValue(value);
+  if (normalized === undefined) return undefined;
+  const serialized = JSON.stringify(normalized);
+  if (
+    serialized === undefined ||
+    new TextEncoder().encode(serialized).byteLength > MAX_NORMALIZED_JSON_BYTES
+  ) {
+    return undefined;
+  }
+  return normalized;
 }
 
 function normalizeToolCall(value: unknown): EdenModelToolCall | undefined {

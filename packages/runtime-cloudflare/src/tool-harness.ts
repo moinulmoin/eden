@@ -6,6 +6,7 @@ import type {
   EdenToolContext,
   EdenToolDefinition,
 } from "@eden/definitions";
+import { normalizeEdenJsonValue } from "./model-normalizers.js";
 
 import {
   commitCheckpointResult,
@@ -30,9 +31,13 @@ export interface EdenToolHarnessRequest<
   readonly signal?: AbortSignal;
 }
 
+export type EdenToolFailureCode =
+  | "tool_input_invalid"
+  | "tool_output_invalid";
+
 export interface EdenToolFailure {
-  readonly code: "tool_input_invalid";
-  readonly message: "Tool input failed schema validation.";
+  readonly code: EdenToolFailureCode;
+  readonly message: string;
   readonly retryable: false;
 }
 
@@ -60,6 +65,12 @@ export type EdenToolHarnessResult<
 const TOOL_INPUT_FAILURE: EdenToolFailure = Object.freeze({
   code: "tool_input_invalid",
   message: "Tool input failed schema validation.",
+  retryable: false,
+});
+
+const TOOL_OUTPUT_FAILURE: EdenToolFailure = Object.freeze({
+  code: "tool_output_invalid",
+  message: "Tool output was not JSON-compatible.",
   retryable: false,
 });
 
@@ -162,17 +173,21 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function failValidation<TInput, TOutput extends EdenJsonValue>(
+function failTool<TInput, TOutput extends EdenJsonValue>(
   storage: EdenSessionStorage,
   request: EdenToolHarnessRequest<TInput, TOutput>,
   prepared: PreparedCheckpoint,
+  toolFailure: EdenToolFailure,
 ): EdenToolHarnessResult<TOutput> {
   const committed = commitSessionTransaction(
     storage,
     request.sessionId,
     (journal) => {
       const timestamp = now();
-      const errorId = `err_tool_input_${request.stepId}`;
+      const errorId =
+        toolFailure.code === "tool_input_invalid"
+          ? `err_tool_input_${request.stepId}`
+          : `err_tool_output_${request.stepId}`;
       const step = storage.sql
         .exec<{
           readonly status: string;
@@ -209,9 +224,9 @@ function failValidation<TInput, TOutput extends EdenJsonValue>(
       journal.failEffect({
         effectId: request.effectId,
         error: {
-          code: TOOL_INPUT_FAILURE.code,
-          message: TOOL_INPUT_FAILURE.message,
-          retryable: TOOL_INPUT_FAILURE.retryable,
+          code: toolFailure.code,
+          message: toolFailure.message,
+          retryable: toolFailure.retryable,
         },
         updatedAt: timestamp,
       });
@@ -228,9 +243,9 @@ function failValidation<TInput, TOutput extends EdenJsonValue>(
         errorId,
         turnId: request.turnId,
         stepId: request.stepId,
-        code: TOOL_INPUT_FAILURE.code,
-        message: TOOL_INPUT_FAILURE.message,
-        retryable: TOOL_INPUT_FAILURE.retryable,
+        code: toolFailure.code,
+        message: toolFailure.message,
+        retryable: toolFailure.retryable,
         createdAt: timestamp,
       });
       journal.appendEvent({
@@ -239,9 +254,9 @@ function failValidation<TInput, TOutput extends EdenJsonValue>(
         stepId: request.stepId,
         data: {
           stepId: request.stepId,
-          code: TOOL_INPUT_FAILURE.code,
-          message: TOOL_INPUT_FAILURE.message,
-          retryable: TOOL_INPUT_FAILURE.retryable,
+          code: toolFailure.code,
+          message: toolFailure.message,
+          retryable: toolFailure.retryable,
         },
         committedAt: timestamp,
       });
@@ -259,7 +274,7 @@ function failValidation<TInput, TOutput extends EdenJsonValue>(
 
   return {
     status: "failed",
-    error: TOOL_INPUT_FAILURE,
+    error: toolFailure,
     idempotencyKey: prepared.idempotencyKey,
     attemptCount: prepared.attemptCount,
   };
@@ -323,7 +338,12 @@ export async function executeTypedTool<
     request.input,
   );
   if (validated.status === "invalid") {
-    return failValidation(storage, request, preparation.prepared);
+    return failTool(
+      storage,
+      request,
+      preparation.prepared,
+      TOOL_INPUT_FAILURE,
+    );
   }
 
   let output: TOutput;
@@ -337,10 +357,20 @@ export async function executeTypedTool<
     throw error;
   }
 
+  const normalizedOutput = normalizeEdenJsonValue(output);
+  if (normalizedOutput === undefined) {
+    return failTool(
+      storage,
+      request,
+      preparation.prepared,
+      TOOL_OUTPUT_FAILURE,
+    );
+  }
+
   const committed = commitCheckpointResult(
     storage,
     preparation.prepared,
-    output,
+    normalizedOutput,
   );
   if (committed.status === "committed" || committed.status === "replayed") {
     return {

@@ -32,6 +32,7 @@ export type {
 } from "./model-contracts.js";
 
 export {
+  normalizeEdenJsonValue,
   normalizeModelFailure,
   normalizeModelMessages,
   normalizeModelResult,

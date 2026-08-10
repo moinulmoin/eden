@@ -105,6 +105,7 @@ export type {
 } from "./session-state.js";
 export {
   createModelAdapter,
+  normalizeEdenJsonValue,
   normalizeModelFailure,
   normalizeModelMessages,
   normalizeModelResult,
@@ -133,9 +134,18 @@ export type {
 export { executeTypedTool } from "./tool-harness.js";
 export type {
   EdenToolFailure,
+  EdenToolFailureCode,
   EdenToolHarnessRequest,
   EdenToolHarnessResult,
 } from "./tool-harness.js";
+export { MAX_BOUNDED_TURN_ATTEMPTS } from "./turn-runner-types.js";
+export { runBoundedTurn } from "./turn-runner.js";
+export type {
+  EdenBoundedTurnRequest,
+  EdenBoundedTurnResult,
+  EdenTurnFailure,
+  EdenTurnFailureCode,
+} from "./turn-runner.js";
 
 export interface EdenRuntimeConfiguration {
   readonly versions: EdenVersionSet;
