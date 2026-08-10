@@ -298,11 +298,22 @@ function createJournal(
       assertPayloadSize(payload);
       const eventId = createOpaqueEventId();
       const committedAt = input.committedAt ?? now();
+      const streamIndex = readLatestJournalCursor(sql, sessionId) + 1;
+      const envelope = json({
+        streamIndex,
+        eventId,
+        type: input.type,
+        data: input.data,
+        committedAt,
+      });
+      assertPayloadSize(envelope);
 
       sql.exec(
         `INSERT INTO events (
-          event_id, session_id, turn_id, step_id, type, payload_json, committed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          stream_index, event_id, session_id, turn_id, step_id, type,
+          payload_json, committed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        streamIndex,
         eventId,
         sessionId,
         optional(input.turnId),
@@ -311,17 +322,6 @@ function createJournal(
         payload,
         committedAt,
       );
-
-      const rows = sql
-        .exec<{ stream_index: number }>(
-          "SELECT stream_index FROM events WHERE event_id = ?",
-          eventId,
-        )
-        .toArray();
-      const streamIndex = rows[0]?.stream_index;
-      if (streamIndex === undefined) {
-        throw new Error("Journal event was not written");
-      }
 
       return {
         streamIndex,

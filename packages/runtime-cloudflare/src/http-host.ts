@@ -1,8 +1,6 @@
 import {
   EDEN_VERSIONS,
   type EdenCommandRequest,
-  type EdenEvent,
-  type EdenEventType,
 } from "@eden/definitions";
 
 import {
@@ -21,7 +19,6 @@ const MAX_CREATE_BODY_BYTES = 1_024;
 const MAX_COMMAND_BODY_BYTES = 32 * 1_024;
 const MAX_MESSAGE_BYTES = 16 * 1_024;
 const MAX_JSON_DEPTH = 32;
-const MAX_STREAM_EVENTS = 256;
 const FIXED_PRINCIPAL = "principal:test";
 const UNSUPPORTED_IDENTITY_HEADERS = new Set([
   "x-eden-principal",
@@ -35,13 +32,6 @@ const UNSUPPORTED_IDENTITY_HEADERS = new Set([
 export interface EdenWorkerEnvironment {
   readonly EDEN_BEARER_SECRET?: string;
   readonly EDEN_SESSIONS?: DurableObjectNamespace;
-}
-
-interface InternalEventResponse {
-  readonly sessionId: string;
-  readonly startIndex: number;
-  readonly latestCursor: number;
-  readonly events: readonly EdenEvent<EdenEventType>[];
 }
 
 interface RequestBodyResult {
@@ -362,7 +352,7 @@ async function acceptCommand(
   return errorResponse("internal_error", 500);
 }
 
-async function readEvents(
+async function streamEvents(
   env: EdenWorkerEnvironment,
   sessionId: string,
   query: StreamQuery,
@@ -372,7 +362,7 @@ async function readEvents(
 
   let response: Response;
   try {
-    response = await stub.fetch("https://eden/_eden/read-events", {
+    response = await stub.fetch("https://eden/_eden/stream", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -394,36 +384,11 @@ async function readEvents(
     return errorResponse("internal_error", 500);
   }
 
-  let body: InternalEventResponse;
-  try {
-    body = (await response.json()) as InternalEventResponse;
-  } catch {
-    return errorResponse("internal_error", 500);
-  }
-  if (
-    !Array.isArray(body.events) ||
-    body.events.length > MAX_STREAM_EVENTS
-  ) {
-    return errorResponse("internal_error", 500);
-  }
-
-  const lines: string[] = [];
-  let totalBytes = 0;
-  for (const event of body.events) {
-    const serialized = JSON.stringify(event);
-    const lineBytes = new TextEncoder().encode(serialized).byteLength + 1;
-    if (lineBytes > 131_072 || totalBytes + lineBytes > 1_048_576) {
-      return errorResponse("internal_error", 500);
-    }
-    totalBytes += lineBytes;
-    lines.push(`${serialized}\n`);
-  }
-  return new Response(lines.join(""), {
+  return new Response(response.body, {
     status: 200,
     headers: {
       "content-type": "application/x-ndjson; charset=utf-8",
       "cache-control": "no-store",
-      "x-eden-cursor": String(body.latestCursor),
     },
   });
 }
@@ -502,7 +467,7 @@ async function handleStream(
   if (request.method !== "GET") return errorResponse("not_found", 404);
   const query = readStreamQuery(new URL(request.url));
   if (query === undefined) return errorResponse("invalid_request", 400);
-  return readEvents(env, sessionId, query);
+  return streamEvents(env, sessionId, query);
 }
 
 export async function handleEdenRequest(

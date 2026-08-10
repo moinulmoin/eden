@@ -1,11 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 import type { SqlStorage } from "@cloudflare/workers-types";
 import type {
+  EdenEvent,
+  EdenEventType,
+  EdenJsonValue,
   EdenSessionStatus,
+  EdenToolDefinition,
   EdenTurnStatus,
   EdenVersionSet,
 } from "@eden/definitions";
 
+import { createModelAdapter } from "./model-adapter.js";
 import {
   applySessionMigrations,
   SESSION_SCHEMA_TABLES,
@@ -27,12 +32,13 @@ import {
   nextRecoveryJobDueAt,
   processRecoveryJobs,
   recoverRecoveryJob,
+  type RecoveryJobRecord,
   type RecoveryJobEnqueueResult,
   type RecoveryJobInput,
   type RecoveryJobInspection,
-  type RecoveryJobRecord,
   type RecoveryJobRecoveryResult,
 } from "./session-jobs.js";
+import { runBoundedTurn } from "./turn-runner.js";
 
 export interface EdenSessionEnvironment {
   readonly [key: string]: unknown;
@@ -73,6 +79,109 @@ interface MigrationRow {
   readonly [key: string]: string | number | null;
   readonly version: number;
   readonly name: string;
+}
+
+interface AcceptedTurnRow {
+  readonly [key: string]: string | number | null;
+  readonly turn_id: string;
+  readonly message_id: string;
+  readonly message: string;
+}
+
+interface EventStreamRequest {
+  readonly sessionId: string;
+  readonly ownerPrincipal: string;
+  readonly startIndex: number;
+  readonly follow: boolean;
+}
+
+const BOUNDED_TURN_JOB_KIND = "bounded-turn";
+const BOUNDED_TURN_RECOVERY_ACTION = "run-bounded-turn";
+const BOUNDED_TURN_START_DELAY_MS = 100;
+const MAX_EVENT_LINE_BYTES = 131_072;
+
+const BOUNDED_TOOL_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    query: { type: "string" },
+  },
+  required: ["query"],
+  additionalProperties: false,
+} as const satisfies EdenJsonValue;
+
+const BOUNDED_TOOL_STANDARD_SCHEMA = {
+  "~standard": {
+    version: 1 as const,
+    vendor: "eden-runtime-bounded-turn",
+    validate(value: unknown) {
+      if (
+        typeof value !== "object" ||
+        value === null ||
+        Array.isArray(value) ||
+        typeof (value as { readonly query?: unknown }).query !== "string"
+      ) {
+        return {
+          issues: [{ message: "query must be a string", path: ["query"] }],
+        };
+      }
+      return {
+        value: {
+          query: (value as { readonly query: string }).query.trim(),
+        },
+      };
+    },
+  },
+} as const;
+
+const BOUNDED_TURN_TOOL: EdenToolDefinition<
+  { readonly query: string },
+  { readonly answer: string }
+> = {
+  description: "Return a bounded deterministic answer.",
+  inputSchema: BOUNDED_TOOL_STANDARD_SCHEMA,
+  execute(input) {
+    return { answer: `lookup:${input.query}` };
+  },
+};
+
+function createBoundedTurnModel() {
+  return createModelAdapter(async (request) => {
+    if (request.messages.some((message) => message.role === "tool")) {
+      return {
+        text: "Bounded Eden turn completed: ✓",
+        finishReason: "stop",
+      };
+    }
+    return {
+      toolCalls: [
+        {
+          toolCallId: "call_lookup",
+          toolName: "lookup",
+          input: { query: "eden" },
+        },
+      ],
+      finishReason: "tool-calls",
+    };
+  });
+}
+
+function isTerminalEvent(type: EdenEventType): boolean {
+  return type === "session.waiting" || type === "session.failed";
+}
+
+function eventLine(event: EdenEvent<EdenEventType>): Uint8Array {
+  const serialized = `${JSON.stringify(event)}\n`;
+  const bytes = new TextEncoder().encode(serialized);
+  if (bytes.byteLength > MAX_EVENT_LINE_BYTES) {
+    throw new Error("Stream event exceeds the 128 KiB limit");
+  }
+  return bytes;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
 }
 
 function jsonResponse(
@@ -182,6 +291,36 @@ function readJsonObject(request: Request): Promise<Record<string, unknown> | nul
     .catch(() => null);
 }
 
+function readEventStreamRequest(
+  request: Request,
+): Promise<EventStreamRequest | null> {
+  return readJsonObject(request).then((body) => {
+    if (
+      body === null ||
+      !hasOnlyKeys(body, [
+        "sessionId",
+        "ownerPrincipal",
+        "startIndex",
+        "follow",
+      ]) ||
+      typeof body.sessionId !== "string" ||
+      typeof body.ownerPrincipal !== "string" ||
+      typeof body.startIndex !== "number" ||
+      !Number.isSafeInteger(body.startIndex) ||
+      body.startIndex < 0 ||
+      typeof body.follow !== "boolean"
+    ) {
+      return null;
+    }
+    return {
+      sessionId: body.sessionId,
+      ownerPrincipal: body.ownerPrincipal,
+      startIndex: body.startIndex,
+      follow: body.follow,
+    };
+  });
+}
+
 function hasOnlyKeys(
   value: Record<string, unknown>,
   keys: readonly string[],
@@ -247,6 +386,9 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       request.method === "POST"
     ) {
       return this.readEventsResponse(request);
+    }
+    if (url.pathname === "/_eden/stream" && request.method === "POST") {
+      return this.streamEventsResponse(request);
     }
     if (url.pathname === "/_eden/accept" && request.method === "POST") {
       return this.acceptCommandResponse(request);
@@ -601,6 +743,13 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
           },
           committedAt: timestamp,
         });
+        journal.insertJob({
+          jobId: `turn:${body.turnId as string}`,
+          kind: BOUNDED_TURN_JOB_KIND,
+          dueAt: Date.now() + BOUNDED_TURN_START_DELAY_MS,
+          recoveryAction: BOUNDED_TURN_RECOVERY_ACTION,
+          createdAt: timestamp,
+        });
       });
     } catch {
       const durable = sql
@@ -642,6 +791,7 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       );
     }
 
+    await this.rearmRecoveryAlarm(sessionId);
     return jsonResponse(
       {
         sessionId,
@@ -696,6 +846,95 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       startIndex: body.startIndex,
       latestCursor: readLatestJournalCursor(this.ctx.storage.sql, sessionId),
       events,
+    });
+  }
+
+  private async streamEventsResponse(request: Request): Promise<Response> {
+    const sessionId = sessionIdFromObjectName(this.ctx.id.name ?? "");
+    const body = await readEventStreamRequest(request);
+    if (
+      sessionId === null ||
+      body === null ||
+      body.sessionId !== sessionId
+    ) {
+      return jsonResponse(
+        { code: "invalid_event_read", message: "Invalid event read" },
+        400,
+      );
+    }
+
+    const meta = readSessionMeta(this.ctx.storage.sql);
+    if (meta === null || meta.owner_principal !== body.ownerPrincipal) {
+      return jsonResponse(
+        { code: "session_not_found", message: "Session was not found" },
+        404,
+      );
+    }
+
+    const sql = this.ctx.storage.sql;
+    const highWater = body.follow
+      ? null
+      : readLatestJournalCursor(sql, sessionId);
+    let cursor = body.startIndex;
+    let cancelled = false;
+
+    const stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        const pump = async (): Promise<void> => {
+          try {
+            while (!cancelled) {
+              const events = readJournalEvents(sql, sessionId, cursor);
+              let emitted = false;
+              for (const event of events) {
+                if (highWater !== null && event.streamIndex > highWater) {
+                  break;
+                }
+                if (event.streamIndex <= cursor) continue;
+                controller.enqueue(eventLine(event));
+                cursor = event.streamIndex;
+                emitted = true;
+                if (body.follow && isTerminalEvent(event.type)) {
+                  controller.close();
+                  return;
+                }
+              }
+
+              if (!body.follow) {
+                if (cursor >= (highWater ?? cursor)) {
+                  controller.close();
+                  return;
+                }
+              } else if (!emitted) {
+                const current = readSessionMeta(sql);
+                if (
+                  current?.status === "waiting" ||
+                  current?.status === "failed" ||
+                  current?.status === "completed"
+                ) {
+                  controller.close();
+                  return;
+                }
+              }
+
+              await delay(10);
+            }
+          } catch (error) {
+            if (!cancelled) controller.error(error);
+          }
+        };
+        this.ctx.waitUntil(pump());
+      },
+      cancel: () => {
+        cancelled = true;
+      },
+    });
+
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "content-type": "application/x-ndjson; charset=utf-8",
+        "cache-control": "no-store",
+      },
     });
   }
 
@@ -792,11 +1031,53 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
   }
 
   private async executeRecoveryJob(job: RecoveryJobRecord): Promise<void> {
+    if (job.kind === BOUNDED_TURN_JOB_KIND) {
+      await this.executeBoundedTurnJob(job);
+      return;
+    }
     if (job.recoveryAction === "always-fail") {
       throw new Error("Configured recovery action failed");
     }
     if (job.recoveryAction === "fail") {
       throw new Error("Configured recovery action failed");
     }
+  }
+
+  private async executeBoundedTurnJob(
+    job: RecoveryJobRecord,
+  ): Promise<void> {
+    const sessionId = this.requireSessionId();
+    if (job.recoveryAction !== BOUNDED_TURN_RECOVERY_ACTION) {
+      throw new Error("Bounded turn recovery action is invalid");
+    }
+    const turn = this.ctx.storage.sql
+      .exec<AcceptedTurnRow>(
+        `SELECT turns.turn_id, messages.message_id, messages.content AS message
+         FROM turns
+         INNER JOIN messages
+           ON messages.session_id = turns.session_id
+          AND messages.turn_id = turns.turn_id
+          AND messages.role = 'user'
+         WHERE turns.session_id = ? AND turns.turn_id = ?
+         LIMIT 1`,
+        sessionId,
+        job.jobId.slice("turn:".length),
+      )
+      .toArray()[0];
+    if (turn === undefined) {
+      throw new Error("Bounded turn input is missing");
+    }
+
+    await runBoundedTurn(this.ctx.storage, {
+      sessionId,
+      turnId: turn.turn_id,
+      messageId: turn.message_id,
+      message: turn.message,
+      model: createBoundedTurnModel(),
+      toolName: "lookup",
+      tool: BOUNDED_TURN_TOOL,
+      toolInputSchema: BOUNDED_TOOL_INPUT_SCHEMA,
+      bundleIdentity: "eden-runtime-bounded-turn-v1",
+    });
   }
 }
