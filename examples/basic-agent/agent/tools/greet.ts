@@ -1,5 +1,6 @@
+import { z } from "zod";
+
 import type {
-  EdenStandardSchemaV1,
   EdenToolDefinition,
 } from "@eden/definitions";
 
@@ -7,24 +8,9 @@ interface GreetInput {
   readonly name: string;
 }
 
-const inputSchema: EdenStandardSchemaV1<GreetInput> = {
-  "~standard": {
-    version: 1,
-    vendor: "eden-example",
-    validate(value) {
-      if (
-        typeof value !== "object" ||
-        value === null ||
-        typeof (value as { name?: unknown }).name !== "string"
-      ) {
-        return {
-          issues: [{ message: "name must be a string", path: ["name"] }],
-        };
-      }
-      return { value: { name: (value as { name: string }).name.trim() } };
-    },
-  },
-};
+const inputSchema = z.object({
+  name: z.string().trim().min(1),
+});
 
 const greet: EdenToolDefinition<GreetInput, { readonly greeting: string }> = {
   description: "Greet a person by name.",

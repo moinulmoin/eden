@@ -11,7 +11,9 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "dependencies": {
     "@eden/definitions": "workspace:*",
     "chokidar": "5.0.0",
@@ -22,5 +24,8 @@
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src --max-warnings 0",
     "test": "vitest run --passWithNoTests --maxWorkers=1"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.0"
   }
 }

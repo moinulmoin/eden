@@ -11,11 +11,14 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "dependencies": {
     "@eden/client": "workspace:*",
     "@eden/definitions": "workspace:*",
-    "@eden/runtime-cloudflare": "workspace:*"
+    "@eden/runtime-cloudflare": "workspace:*",
+    "zod": "4.4.3"
   },
   "scripts": {
     "build": "tsc -b",
