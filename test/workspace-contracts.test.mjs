@@ -28,6 +28,7 @@ test("the repository declares the six Eden workspaces and root quality scripts",
     typecheck: "pnpm exec tsc -b --pretty false",
     lint: "pnpm exec eslint . --max-warnings 0",
     test: "pnpm exec vitest run --maxWorkers=1",
+    "conformance:local": "node scripts/local-conformance.mjs",
   });
   expect(lockfile).toMatch(/lockfileVersion: ['"]9\.0['"]/);
   expect(workspace).toMatch(/packages\/\*/);

@@ -211,6 +211,23 @@ Finish local validation by sending `Ctrl-C` to the `eden dev` process, confirmin
 that ports `8797` and `9297` are no longer listening, and removing only the
 temporary root created by this walkthrough.
 
+For the complete serial local conformance gate, run this repository-owned
+validator after the frozen install:
+
+```sh
+corepack pnpm run conformance:local
+```
+
+It creates and removes its own empty temporary root, runs the documented
+`init` → `build` → `dev` → authenticated session flow, disconnects after the
+first committed cursor and reconnects through `session.waiting`, then runs the
+deterministic Workers-pool fixtures for Durable Object eviction/replay,
+completed-effect reuse, invalid tool input, interrupted-step recovery, journal
+delivery replay, and typed-client cursor safety. The validator runs serially,
+uses only `127.0.0.1:8797` and `127.0.0.1:9297`, keeps its generated bearer
+outside the project and captured output, and verifies that its process, ports,
+and temporary root are removed.
+
 ## Deployed validation
 
 This feature does not perform a real remote deployment. The documented

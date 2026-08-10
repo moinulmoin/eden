@@ -12,7 +12,8 @@
     "build": "pnpm --recursive --if-present run build",
     "typecheck": "pnpm exec tsc -b --pretty false",
     "lint": "pnpm exec eslint . --max-warnings 0",
-    "test": "pnpm exec vitest run --maxWorkers=1"
+    "test": "pnpm exec vitest run --maxWorkers=1",
+    "conformance:local": "node scripts/local-conformance.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.20.3",
