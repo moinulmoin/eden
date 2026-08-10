@@ -103,6 +103,33 @@ export type {
   EdenStepState,
   EdenTurnState,
 } from "./session-state.js";
+export {
+  createModelAdapter,
+  normalizeModelFailure,
+  normalizeModelMessages,
+  normalizeModelResult,
+} from "./model-adapter.js";
+export type {
+  EdenModelAdapter,
+  EdenModelCorrelation,
+  EdenModelFailure,
+  EdenModelFailureCode,
+  EdenModelFinishReason,
+  EdenModelMessage,
+  EdenModelMessagePart,
+  EdenModelOptions,
+  EdenModelOutcome,
+  EdenModelAdapterCall,
+  EdenModelAdapterRequest,
+  EdenModelRequest,
+  EdenModelResult,
+  EdenModelRole,
+  EdenModelToolCall,
+  EdenModelToolChoice,
+  EdenModelToolDefinition,
+  EdenModelToolResult,
+  EdenModelUsage,
+} from "./model-adapter.js";
 
 export interface EdenRuntimeConfiguration {
   readonly versions: EdenVersionSet;

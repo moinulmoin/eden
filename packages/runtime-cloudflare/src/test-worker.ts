@@ -1,4 +1,5 @@
 import { EdenSession } from "./session.js";
+import "./model-adapter-internal.js";
 
 export { EdenSession };
 

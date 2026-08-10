@@ -98,6 +98,12 @@ importers:
       '@eden/definitions':
         specifier: workspace:*
         version: link:../definitions
+      ai:
+        specifier: 7.0.58
+        version: 7.0.58(zod@4.4.3)
+      workers-ai-provider:
+        specifier: 4.0.0
+        version: 4.0.0(@ai-sdk/provider@4.0.7)(ai@7.0.58(zod@4.4.3))
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 0.20.3

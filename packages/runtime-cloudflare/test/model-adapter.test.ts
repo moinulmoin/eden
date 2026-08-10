@@ -1,0 +1,319 @@
+import { describe, expect, test } from "vitest";
+
+import {
+  createModelAdapter,
+  normalizeModelFailure,
+  normalizeModelMessages,
+  type EdenModelRequest,
+} from "../src/model-adapter.js";
+import { createWorkersAIModelAdapter } from "../src/model-adapter-internal.js";
+
+const correlation = {
+  requestId: "req_fixture_01",
+  sessionId: "sess_00000000000000000000000000000000",
+  turnId: "turn_fixture_01",
+  stepId: "step_fixture_01",
+} as const;
+
+const request: EdenModelRequest = {
+  correlation,
+  messages: [
+    { role: "system", content: "Use the lookup tool." },
+    { role: "user", content: "Find the answer." },
+  ],
+  tools: [
+    {
+      name: "lookup",
+      description: "Look up a value.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
+    },
+  ],
+  toolChoice: "required",
+  signal: new AbortController().signal,
+};
+
+describe("Eden model adapter", () => {
+  test("normalizes provider-shaped messages, tool calls, results, and safe correlation", async () => {
+    const adapter = createModelAdapter(async (providerRequest) => {
+      expect(providerRequest).toEqual({
+        messages: [
+          { role: "system", content: "Use the lookup tool." },
+          { role: "user", content: "Find the answer." },
+        ],
+        tools: [
+          {
+            name: "lookup",
+            description: "Look up a value.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                query: { type: "string" },
+              },
+              required: ["query"],
+              additionalProperties: false,
+            },
+          },
+        ],
+        toolChoice: "required",
+        signal: request.signal,
+      });
+
+      return {
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call_fixture_01",
+            toolName: "lookup",
+            input: '{"query":"eden"}',
+          },
+        ],
+        toolCalls: [
+          {
+            toolCallId: "call_fixture_01",
+            toolName: "lookup",
+            input: '{"query":"eden"}',
+          },
+        ],
+        toolResults: [
+          {
+            toolCallId: "call_fixture_01",
+            toolName: "lookup",
+            output: {
+              type: "json",
+              value: { answer: "deterministic" },
+            },
+          },
+        ],
+        finishReason: { unified: "tool-calls", raw: "provider-secret" },
+        usage: {
+          inputTokens: 12,
+          outputTokens: 4,
+          totalTokens: 16,
+        },
+        response: {
+          id: "provider-secret-response-id",
+          headers: { authorization: "sentinel-secret" },
+        },
+        providerMetadata: {
+          workersai: { rawBinding: "sentinel-binding" },
+        },
+      };
+    });
+
+    const outcome = await adapter.call(request);
+
+    expect(outcome).toEqual({
+      status: "ok",
+      result: {
+        text: "",
+        calls: [
+          {
+            callId: "call_fixture_01",
+            toolName: "lookup",
+            input: { query: "eden" },
+          },
+        ],
+        results: [
+          {
+            callId: "call_fixture_01",
+            toolName: "lookup",
+            output: { answer: "deterministic" },
+          },
+        ],
+        finishReason: "tool-calls",
+        usage: {
+          inputTokens: 12,
+          outputTokens: 4,
+          totalTokens: 16,
+        },
+        correlation,
+      },
+    });
+
+    const serialized = JSON.stringify(outcome);
+    expect(serialized).not.toContain("provider-secret");
+    expect(serialized).not.toContain("sentinel-secret");
+    expect(serialized).not.toContain("sentinel-binding");
+    expect(serialized).not.toContain("workersai");
+  });
+
+  test("normalizes provider-shaped message parts without preserving provider metadata", () => {
+    expect(
+      normalizeModelMessages([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I will look." },
+            {
+              type: "tool-call",
+              toolCallId: "call_message_01",
+              toolName: "lookup",
+              input: { query: "eden" },
+              providerOptions: { workersai: { secret: "sentinel-secret" } },
+            },
+          ],
+          providerOptions: { workersai: { binding: "sentinel-binding" } },
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "call_message_01",
+              toolName: "lookup",
+              output: { type: "json", value: { answer: "deterministic" } },
+            },
+          ],
+        },
+      ]),
+    ).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "I will look." },
+          {
+            type: "tool-call",
+            callId: "call_message_01",
+            toolName: "lookup",
+            input: { query: "eden" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            callId: "call_message_01",
+            toolName: "lookup",
+            output: { answer: "deterministic" },
+          },
+        ],
+      },
+    ]);
+  });
+
+  test("returns bounded Eden failures for provider-shaped failures and invalid results", async () => {
+    const failed = normalizeModelFailure(
+      {
+        name: "ProviderSpecificError",
+        message: "provider secret sentinel-secret",
+        statusCode: 503,
+        responseBody: "binding sentinel-binding",
+      },
+      correlation,
+    );
+    expect(failed).toEqual({
+      code: "model_call_failed",
+      message: "Model call failed.",
+      retryable: true,
+      correlation,
+    });
+
+    const failedAdapter = createModelAdapter(async () => {
+      throw {
+        message: "provider secret sentinel-secret",
+        statusCode: 503,
+        responseBody: "binding sentinel-binding",
+      };
+    });
+    await expect(failedAdapter.call(request)).resolves.toEqual({
+      status: "error",
+      error: failed,
+    });
+
+    const invalidAdapter = createModelAdapter(async () => ({
+      text: "not valid",
+      toolCalls: [
+        {
+          toolCallId: "call_invalid",
+          toolName: "lookup",
+          input: undefined,
+        },
+      ],
+    }));
+    await expect(
+      invalidAdapter.call({
+        ...request,
+        tools: undefined,
+        toolChoice: undefined,
+      }),
+    ).resolves.toEqual({
+      status: "error",
+      error: {
+        code: "model_result_invalid",
+        message: "Model result was invalid.",
+        retryable: false,
+        correlation,
+      },
+    });
+  });
+
+  test("keeps Workers AI, gateway, and AI SDK wiring behind the internal adapter", async () => {
+    const runs: unknown[] = [];
+    const adapter = createWorkersAIModelAdapter({
+      binding: {
+        run: async (...args: unknown[]) => {
+          runs.push(args);
+          return {
+            choices: [
+              {
+                message: { role: "assistant", content: "fixture response" },
+                finish_reason: "stop",
+              },
+            ],
+            usage: {
+              prompt_tokens: 3,
+              completion_tokens: 2,
+              total_tokens: 5,
+            },
+          };
+        },
+      },
+      modelId: "@cf/zai-org/glm-4.7-flash",
+      gatewayId: "eden-dev",
+    });
+
+    const outcome = await adapter.call({
+      correlation,
+      messages: [{ role: "user", content: "fixture prompt" }],
+      options: { thinking: false, maxOutputTokens: 32 },
+    });
+
+    expect(outcome).toEqual({
+      status: "ok",
+      result: {
+        text: "fixture response",
+        calls: [],
+        results: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 3,
+          outputTokens: 2,
+          totalTokens: 5,
+        },
+        correlation,
+      },
+    });
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toEqual([
+      "@cf/zai-org/glm-4.7-flash",
+      {
+        messages: [{ role: "user", content: "fixture prompt" }],
+        max_tokens: 32,
+        reasoning_effort: null,
+      },
+      expect.objectContaining({
+        gateway: { id: "eden-dev" },
+      }),
+    ]);
+    expect(JSON.stringify(outcome)).not.toContain("eden-dev");
+  });
+});

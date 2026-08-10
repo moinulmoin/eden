@@ -13,7 +13,9 @@
   },
   "files": ["dist"],
   "dependencies": {
-    "@eden/definitions": "workspace:*"
+    "@eden/definitions": "workspace:*",
+    "ai": "7.0.58",
+    "workers-ai-provider": "4.0.0"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.20.3",
