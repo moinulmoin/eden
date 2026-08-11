@@ -1454,13 +1454,81 @@ export function normalizeJsonValue(
   return jsonValue(value, source);
 }
 
-function importSourceIsUnsupported(source: string): boolean {
+const NODE_ONLY_MODULES = new Set([
+  "assert",
+  "child_process",
+  "cluster",
+  "crypto",
+  "dgram",
+  "diagnostics_channel",
+  "dns",
+  "dns/promises",
+  "fs",
+  "fs/promises",
+  "http",
+  "http2",
+  "https",
+  "module",
+  "net",
+  "os",
+  "path",
+  "path/posix",
+  "path/win32",
+  "perf_hooks",
+  "process",
+  "punycode",
+  "readline",
+  "readline/promises",
+  "repl",
+  "stream",
+  "stream/consumers",
+  "stream/promises",
+  "stream/web",
+  "string_decoder",
+  "sys",
+  "timers",
+  "timers/promises",
+  "tls",
+  "trace_events",
+  "tty",
+  "url",
+  "util",
+  "util/types",
+  "v8",
+  "vm",
+  "wasi",
+  "worker_threads",
+  "zlib",
+]);
+
+function isUnsupportedModuleSpecifier(specifier: string): boolean {
   return (
-    /\bimport\s*\(/u.test(source) ||
-    /\b(?:from\s*|import\s*)["']node:/u.test(source) ||
-    /\b(?:from\s*|import\s*)["'](?:fs|path|url|module|os|crypto)["']/u.test(
-      source,
-    )
+    specifier.startsWith("node:") ||
+    NODE_ONLY_MODULES.has(specifier) ||
+    specifier === "chokidar" ||
+    specifier === "wrangler" ||
+    specifier === "@eden/compiler"
+  );
+}
+
+function sourceFileForValidation(
+  fileName: string,
+  source: string,
+): ts.SourceFile {
+  return ts.createSourceFile(
+    fileName,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    fileName.endsWith(".tsx")
+      ? ts.ScriptKind.TSX
+      : fileName.endsWith(".jsx")
+        ? ts.ScriptKind.JSX
+        : fileName.endsWith(".js") ||
+            fileName.endsWith(".mjs") ||
+            fileName.endsWith(".cjs")
+          ? ts.ScriptKind.JS
+          : ts.ScriptKind.TS,
   );
 }
 
@@ -1482,12 +1550,14 @@ async function loadDefaultExport(
     );
     return undefined;
   }
-  if (importSourceIsUnsupported(source)) {
+  const importIssue = authoredWorkerDependency(source);
+  if (importIssue !== undefined) {
     diagnostics.push(
       diagnostic(
-        "MODULE_IMPORT_UNSUPPORTED",
-        `Module "${sourceInfo.relativePath}" imports a Node-only or dynamic dependency that is not supported in Eden authoring.`,
+        importIssue.code,
+        importIssue.message,
         sourceInfo.relativePath,
+        importIssue.location,
       ),
     );
     return undefined;
@@ -1939,80 +2009,89 @@ export default Object.freeze({ agent, instructions, tools, toolSchemas, moduleMa
 function unsupportedBundleDependency(
   bundle: string,
 ): { readonly code: string; readonly message: string } | undefined {
-  const checks: readonly {
-    readonly code: string;
-    readonly pattern: RegExp;
-    readonly message: string;
-  }[] = [
-    {
-      code: "MODULE_IMPORT_UNSUPPORTED",
-      pattern: /\bimport\s*\(/u,
-      message:
-        "The Worker bundle contains a dynamic import; use a statically analyzable authored dependency.",
-    },
-    {
-      code: "MODULE_IMPORT_UNSUPPORTED",
-      pattern: /["']node:(?:fs|path|url|module|os|crypto|vm)(?:\/[^"']*)?["']/u,
-      message:
-        "The Worker bundle contains a Node-only builtin import; remove the Node dependency.",
-    },
-    {
-      code: "MODULE_IMPORT_UNSUPPORTED",
-      pattern: /(?:from|import)\s*["'](?:fs|path|url|module|os|crypto|vm)["']/u,
-      message:
-        "The Worker bundle contains a Node-only builtin import; remove the Node dependency.",
-    },
-    {
-      code: "MODULE_IMPORT_UNSUPPORTED",
-      pattern:
-        /\b(?:from|import)\s*["'](?:chokidar|wrangler|@eden\/compiler)["']/u,
-      message:
-        "The Worker bundle contains a compiler or development dependency; keep it on the Node build side.",
-    },
-    {
-      code: "MODULE_AMBIENT_BINDING",
-      pattern:
-        /\b(?:process\.env|process\.cwd|Buffer|require|__dirname|__filename)\b/u,
-      message:
-        "The Worker bundle depends on a Node or ambient runtime binding; use explicit Eden inputs instead.",
-    },
-  ];
-  return checks.find((check) => check.pattern.test(bundle));
+  const sourceFile = sourceFileForValidation("eden-artifact-bundle.mjs", bundle);
+  let issue:
+    | { readonly code: string; readonly message: string }
+    | undefined;
+  function visit(node: ts.Node): void {
+    if (issue !== undefined) return;
+    if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword
+    ) {
+      issue = {
+        code: "MODULE_IMPORT_UNSUPPORTED",
+        message:
+          "The Worker bundle contains a dynamic import; use a statically analyzable authored dependency.",
+      };
+      return;
+    }
+    if (
+      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+      node.moduleSpecifier !== undefined &&
+      ts.isStringLiteralLike(node.moduleSpecifier) &&
+      isUnsupportedModuleSpecifier(node.moduleSpecifier.text)
+    ) {
+      issue = {
+        code: "MODULE_IMPORT_UNSUPPORTED",
+        message:
+          "The Worker bundle contains a Node-only or compiler dependency; keep it on the Node build side.",
+      };
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  return issue;
 }
 
 function authoredWorkerDependency(
   source: string,
-): { readonly code: string; readonly message: string } | undefined {
-  if (/\bimport\s*\(/u.test(source)) {
-    return {
-      code: "MODULE_IMPORT_UNSUPPORTED",
-      message:
-        "Dynamic imports are not supported in Worker artifacts; use a statically analyzable authored dependency.",
-    };
+): {
+  readonly code: string;
+  readonly message: string;
+  readonly location?: { readonly line: number; readonly column: number };
+} | undefined {
+  const sourceFile = sourceFileForValidation("eden-authored-source.ts", source);
+  let issue:
+    | {
+        readonly code: string;
+        readonly message: string;
+        readonly location: { readonly line: number; readonly column: number };
+      }
+    | undefined;
+  function visit(node: ts.Node): void {
+    if (issue !== undefined) return;
+    if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword
+    ) {
+      issue = {
+        code: "MODULE_IMPORT_UNSUPPORTED",
+        message:
+          "Dynamic imports are not supported in Worker artifacts; use a statically analyzable authored dependency.",
+        location: semanticLocation(sourceFile, node),
+      };
+      return;
+    }
+    if (
+      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+      node.moduleSpecifier !== undefined &&
+      ts.isStringLiteralLike(node.moduleSpecifier) &&
+      isUnsupportedModuleSpecifier(node.moduleSpecifier.text)
+    ) {
+      issue = {
+        code: "MODULE_IMPORT_UNSUPPORTED",
+        message:
+          "Node-only or compiler dependencies are not supported in Worker artifacts; remove the dependency.",
+        location: semanticLocation(sourceFile, node.moduleSpecifier),
+      };
+      return;
+    }
+    ts.forEachChild(node, visit);
   }
-  if (
-    /\b(?:from\s*|import\s*)["'](?:node:(?:fs|path|url|module|os|crypto|vm)|fs|path|url|module|os|crypto|vm)["']/u.test(
-      source,
-    )
-  ) {
-    return {
-      code: "MODULE_IMPORT_UNSUPPORTED",
-      message:
-        "Node-only builtin imports are not supported in Worker artifacts; remove the Node dependency.",
-    };
-  }
-  if (
-    /\b(?:process\s*\.\s*(?:env|cwd)|Buffer|require\s*\(|__dirname|__filename)\b/u.test(
-      source,
-    )
-  ) {
-    return {
-      code: "MODULE_AMBIENT_BINDING",
-      message:
-        "Node or ambient runtime bindings are not supported in Worker artifacts; use explicit Eden inputs instead.",
-    };
-  }
-  return undefined;
+  visit(sourceFile);
+  return issue;
 }
 
 const SUPPORTED_WORKER_GLOBALS = new Set([
@@ -2032,7 +2111,6 @@ const SUPPORTED_WORKER_GLOBALS = new Set([
   "FinalizationRegistry",
   "Float32Array",
   "Float64Array",
-  "Function",
   "Infinity",
   "Int16Array",
   "Int32Array",
@@ -2072,7 +2150,6 @@ const SUPPORTED_WORKER_GLOBALS = new Set([
   "encodeURI",
   "encodeURIComponent",
   "escape",
-  "eval",
   "isFinite",
   "isNaN",
   "parseFloat",
@@ -2159,6 +2236,7 @@ const SUPPORTED_WORKER_GLOBALS = new Set([
   "WebSocketPair",
   "WebSocketRequestResponsePair",
   "IdentityTransformStream",
+  "WebAssembly",
 ]);
 
 const FORBIDDEN_AMBIENT_GLOBALS = new Set([
@@ -2172,6 +2250,8 @@ const FORBIDDEN_AMBIENT_GLOBALS = new Set([
   "process",
   "require",
 ]);
+
+const DYNAMIC_CODE_GLOBALS = new Set(["eval", "Function"]);
 
 function semanticLocation(
   sourceFile: ts.SourceFile,
@@ -2270,7 +2350,12 @@ function isNonReferenceIdentifier(node: ts.Identifier): boolean {
       parent.propertyName !== undefined
     );
   }
-  if (ts.isBindingElement(parent) && parent.name === node) return true;
+  if (
+    ts.isBindingElement(parent) &&
+    (parent.name === node || parent.propertyName === node)
+  ) {
+    return true;
+  }
   if (ts.isShorthandPropertyAssignment(parent)) {
     return false;
   }
@@ -2376,51 +2461,697 @@ function semanticWorkerBindingDiagnostics(
     return false;
   }
 
-  function ambientPropertyName(node: ts.Node): string | undefined {
-    if (ts.isPropertyAccessExpression(node)) {
-      const base = node.expression;
-      if (
-        ts.isIdentifier(base) &&
-        (base.text === "globalThis" || base.text === "self")
-      ) {
-        return node.name.text;
+  type AmbientValue =
+    | { readonly kind: "root"; readonly root: "globalThis" | "self" }
+    | {
+        readonly kind: "property";
+        readonly root: "globalThis" | "self";
+        readonly name: string;
       }
-      if (ts.isMetaProperty(base)) return node.name.text;
+    | {
+        readonly kind: "dynamic-property";
+        readonly root: "globalThis" | "self";
+      }
+    | { readonly kind: "dynamic-code"; readonly name: "eval" | "Function" };
+
+  const ambientValues = new Map<ts.Symbol, AmbientValue>();
+  const variableDeclarations: ts.VariableDeclaration[] = [];
+  const assignments: ts.BinaryExpression[] = [];
+
+  function collectAmbientCandidates(node: ts.Node): void {
+    if (ts.isVariableDeclaration(node)) {
+      variableDeclarations.push(node);
+    } else if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    ) {
+      assignments.push(node);
+    }
+    ts.forEachChild(node, collectAmbientCandidates);
+  }
+  collectAmbientCandidates(sourceFile);
+
+  function unwrapExpression(expression: ts.Expression): ts.Expression {
+    let current = expression;
+    while (
+      ts.isParenthesizedExpression(current) ||
+      ts.isAsExpression(current) ||
+      ts.isTypeAssertionExpression(current) ||
+      ts.isNonNullExpression(current) ||
+      ts.isSatisfiesExpression(current)
+    ) {
+      current = current.expression;
+    }
+    return current;
+  }
+
+  function constantStringExpression(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): string | undefined {
+    const current = unwrapExpression(expression);
+    if (ts.isStringLiteralLike(current)) return current.text;
+    if (ts.isTemplateExpression(current)) {
+      let value = current.head.text;
+      for (const span of current.templateSpans) {
+        const expressionValue = constantStringExpression(
+          span.expression,
+          seenSymbols,
+        );
+        if (expressionValue === undefined) return undefined;
+        value += expressionValue + span.literal.text;
+      }
+      return value;
     }
     if (
-      ts.isElementAccessExpression(node) &&
-      ts.isStringLiteralLike(node.argumentExpression)
+      ts.isBinaryExpression(current) &&
+      current.operatorToken.kind === ts.SyntaxKind.PlusToken
     ) {
-      const base = node.expression;
+      const left = constantStringExpression(current.left, seenSymbols);
+      const right = constantStringExpression(current.right, seenSymbols);
+      return left === undefined || right === undefined
+        ? undefined
+        : left + right;
+    }
+    if (ts.isConditionalExpression(current)) {
+      const whenTrue = constantStringExpression(
+        current.whenTrue,
+        seenSymbols,
+      );
+      const whenFalse = constantStringExpression(
+        current.whenFalse,
+        seenSymbols,
+      );
+      return whenTrue !== undefined && whenTrue === whenFalse
+        ? whenTrue
+        : undefined;
+    }
+    if (!ts.isIdentifier(current)) return undefined;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return undefined;
+    seenSymbols.add(symbol);
+    for (const declaration of symbol.declarations ?? []) {
       if (
-        ts.isIdentifier(base) &&
-        (base.text === "globalThis" || base.text === "self")
+        ts.isVariableDeclaration(declaration) &&
+        declaration.initializer !== undefined
       ) {
-        return node.argumentExpression.text;
+        const value = constantStringExpression(
+          declaration.initializer,
+          seenSymbols,
+        );
+        if (value !== undefined) return value;
       }
     }
     return undefined;
   }
 
-  function visit(node: ts.Node): void {
-    const ambientName = ambientPropertyName(node);
+  function ambientRootName(
+    expression: ts.Expression,
+  ): "globalThis" | "self" | undefined {
+    const current = unwrapExpression(expression);
     if (
-      ambientName !== undefined &&
-      (isSecretLikeAmbientName(ambientName) ||
-        FORBIDDEN_AMBIENT_GLOBALS.has(ambientName))
+      ts.isIdentifier(current) &&
+      (current.text === "globalThis" || current.text === "self") &&
+      !hasAuthoredBinding(current)
     ) {
-      const location = semanticLocation(
-        sourceFile,
-        ts.isPropertyAccessExpression(node) ? node.name : node,
+      return current.text;
+    }
+    return undefined;
+  }
+
+  function mergeAmbientValues(
+    left: AmbientValue | undefined,
+    right: AmbientValue,
+  ): AmbientValue {
+    if (left === undefined) return right;
+    if (
+      left.kind === "root" &&
+      right.kind === "root" &&
+      left.root === right.root
+    ) {
+      return left;
+    }
+    if (
+      left.kind === "dynamic-property" &&
+      right.kind === "dynamic-property" &&
+      left.root === right.root
+    ) {
+      return left;
+    }
+    if (
+      left.kind === "property" &&
+      right.kind === "property" &&
+      left.root === right.root &&
+      left.name === right.name
+    ) {
+      return left;
+    }
+    if (
+      left.kind === "dynamic-code" &&
+      right.kind === "dynamic-code" &&
+      left.name === right.name
+    ) {
+      return left;
+    }
+    if (left.kind === "dynamic-code" || right.kind === "dynamic-code") {
+      return {
+        kind: "dynamic-code",
+        name:
+          left.kind === "dynamic-code"
+            ? left.name
+            : (right as Extract<AmbientValue, { kind: "dynamic-code" }>).name,
+      };
+    }
+    const root =
+      left.kind === "root" || left.kind === "property"
+        ? left.root
+        : right.kind === "root" || right.kind === "property"
+          ? right.root
+          : "globalThis";
+    return {
+      kind: "dynamic-property",
+      root,
+    };
+  }
+
+  function addAmbientValue(
+    symbol: ts.Symbol,
+    value: AmbientValue,
+  ): void {
+    ambientValues.set(symbol, mergeAmbientValues(ambientValues.get(symbol), value));
+  }
+
+  function resolveAmbientValue(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): AmbientValue | undefined {
+    const current = unwrapExpression(expression);
+    const root = ambientRootName(current);
+    if (root !== undefined) return { kind: "root", root };
+    if (ts.isIdentifier(current)) {
+      if (
+        DYNAMIC_CODE_GLOBALS.has(current.text) &&
+        !hasAuthoredBinding(current)
+      ) {
+        return {
+          kind: "dynamic-code",
+          name: current.text as "eval" | "Function",
+        };
+      }
+      const symbol = checker.getSymbolAtLocation(current);
+      if (symbol === undefined || seenSymbols.has(symbol)) return undefined;
+      seenSymbols.add(symbol);
+      const symbols = [symbol];
+      if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        const aliased = checker.getAliasedSymbol(symbol);
+        if (aliased !== symbol) symbols.push(aliased);
+      }
+      for (const candidate of symbols) {
+        const known = ambientValues.get(candidate);
+        if (known !== undefined) return known;
+        for (const declaration of candidate.declarations ?? []) {
+          if (
+            ts.isVariableDeclaration(declaration) &&
+            declaration.initializer !== undefined
+          ) {
+            const value = resolveAmbientValue(
+              declaration.initializer,
+              seenSymbols,
+            );
+            if (value !== undefined) return value;
+          }
+        }
+      }
+      return undefined;
+    }
+    if (ts.isPropertyAccessExpression(current)) {
+      const base = resolveAmbientValue(current.expression, seenSymbols);
+      if (base?.kind === "root") {
+        if (DYNAMIC_CODE_GLOBALS.has(current.name.text)) {
+          return {
+            kind: "dynamic-code",
+            name: current.name.text as "eval" | "Function",
+          };
+        }
+        return {
+          kind: "property",
+          root: base.root,
+          name: current.name.text,
+        };
+      }
+      if (base?.kind === "dynamic-code") return base;
+      if (base?.kind === "property") {
+        return {
+          kind: "property",
+          root: base.root,
+          name: `${base.name}.${current.name.text}`,
+        };
+      }
+      if (base?.kind === "dynamic-property") {
+        return {
+          kind: "dynamic-property",
+          root: base.root,
+        };
+      }
+      return undefined;
+    }
+    if (ts.isElementAccessExpression(current)) {
+      const base = resolveAmbientValue(current.expression, seenSymbols);
+      if (base?.kind === "dynamic-code") return base;
+      if (base?.kind === "property" || base?.kind === "dynamic-property") {
+        if (base.kind === "dynamic-property") {
+          return {
+            kind: "dynamic-property",
+            root: base.root,
+          };
+        }
+        const name =
+          current.argumentExpression === undefined
+            ? undefined
+            : constantStringExpression(current.argumentExpression);
+        return name === undefined
+          ? {
+              kind: "dynamic-property",
+              root: base.root,
+            }
+          : {
+              kind: "property",
+              root: base.root,
+              name: `${base.name}.${name}`,
+            };
+      }
+      if (base?.kind !== "root") return undefined;
+      const name =
+        current.argumentExpression === undefined
+          ? undefined
+          : constantStringExpression(current.argumentExpression);
+      if (name === undefined) {
+        return { kind: "dynamic-property", root: base.root };
+      }
+      if (DYNAMIC_CODE_GLOBALS.has(name)) {
+        return {
+          kind: "dynamic-code",
+          name: name as "eval" | "Function",
+        };
+      }
+      return { kind: "property", root: base.root, name };
+    }
+    if (
+      ts.isBinaryExpression(current) &&
+      current.operatorToken.kind === ts.SyntaxKind.CommaToken
+    ) {
+      return resolveAmbientValue(current.right, seenSymbols);
+    }
+    if (
+      ts.isBinaryExpression(current) &&
+      (current.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+        current.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+        current.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)
+    ) {
+      const left = resolveAmbientValue(current.left, seenSymbols);
+      const right = resolveAmbientValue(current.right, seenSymbols);
+      if (left === undefined) return right;
+      if (right === undefined) return left;
+      return mergeAmbientValues(left, right);
+    }
+    if (ts.isObjectLiteralExpression(current)) {
+      for (const property of current.properties) {
+        const expression = ts.isSpreadAssignment(property)
+          ? property.expression
+          : ts.isPropertyAssignment(property)
+            ? property.initializer
+            : ts.isShorthandPropertyAssignment(property)
+              ? property.name
+              : undefined;
+        if (expression === undefined) continue;
+        const value = resolveAmbientValue(expression, seenSymbols);
+        if (value?.kind === "dynamic-code") return value;
+        if (value !== undefined) {
+          return {
+            kind: "dynamic-property",
+            root:
+              value.kind === "root" ||
+              value.kind === "property" ||
+              value.kind === "dynamic-property"
+                ? value.root
+                : "globalThis",
+          };
+        }
+      }
+      return undefined;
+    }
+    if (ts.isArrayLiteralExpression(current)) {
+      for (const element of current.elements) {
+        if (ts.isOmittedExpression(element)) continue;
+        const value = resolveAmbientValue(element, seenSymbols);
+        if (value?.kind === "dynamic-code") return value;
+        if (value !== undefined) {
+          return {
+            kind: "dynamic-property",
+            root:
+              value.kind === "root" ||
+              value.kind === "property" ||
+              value.kind === "dynamic-property"
+                ? value.root
+                : "globalThis",
+          };
+        }
+      }
+      return undefined;
+    }
+    if (ts.isConditionalExpression(current)) {
+      const whenTrue = resolveAmbientValue(current.whenTrue, seenSymbols);
+      const whenFalse = resolveAmbientValue(current.whenFalse, seenSymbols);
+      if (whenTrue === undefined) return whenFalse;
+      if (whenFalse === undefined) return whenTrue;
+      return mergeAmbientValues(whenTrue, whenFalse);
+    }
+    if (ts.isCallExpression(current)) {
+      const callee = resolveAmbientValue(current.expression, seenSymbols);
+      if (callee?.kind === "dynamic-code") return callee;
+      if (callee?.kind === "dynamic-property") return callee;
+      for (const argument of current.arguments) {
+        const value = resolveAmbientValue(argument, seenSymbols);
+        if (value?.kind === "dynamic-code") return value;
+        if (value !== undefined) {
+          return {
+            kind: "dynamic-property",
+            root:
+              value.kind === "root" ||
+              value.kind === "property" ||
+              value.kind === "dynamic-property"
+                ? value.root
+                : "globalThis",
+          };
+        }
+      }
+      if (!ts.isIdentifier(current.expression)) return undefined;
+      const symbol = checker.getSymbolAtLocation(current.expression);
+      if (symbol === undefined || seenSymbols.has(symbol)) return undefined;
+      seenSymbols.add(symbol);
+      const returns: AmbientValue[] = [];
+      for (const declaration of symbol.declarations ?? []) {
+        let body: ts.ConciseBody | undefined;
+        if (
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          (ts.isArrowFunction(declaration.initializer) ||
+            ts.isFunctionExpression(declaration.initializer))
+        ) {
+          body = declaration.initializer.body;
+        } else if (ts.isFunctionDeclaration(declaration)) {
+          body = declaration.body;
+        } else if (
+          ts.isMethodDeclaration(declaration) ||
+          ts.isGetAccessorDeclaration(declaration) ||
+          ts.isSetAccessorDeclaration(declaration)
+        ) {
+          body = declaration.body;
+        }
+        if (body === undefined) continue;
+        if (!ts.isBlock(body)) {
+          const value = resolveAmbientValue(body, new Set(seenSymbols));
+          if (value !== undefined) returns.push(value);
+          continue;
+        }
+        function collectReturns(node: ts.Node): void {
+          if (ts.isFunctionLike(node) && node !== body) return;
+          if (ts.isReturnStatement(node) && node.expression !== undefined) {
+            const value = resolveAmbientValue(
+              node.expression,
+              new Set(seenSymbols),
+            );
+            if (value !== undefined) returns.push(value);
+          }
+          ts.forEachChild(node, collectReturns);
+        }
+        collectReturns(body);
+      }
+      if (returns.length === 0) return undefined;
+      return returns.slice(1).reduce(
+        (currentValue, value) => mergeAmbientValues(currentValue, value),
+        returns[0] as AmbientValue,
       );
+    }
+    if (ts.isNewExpression(current)) {
+      const callee = resolveAmbientValue(current.expression, seenSymbols);
+      if (callee?.kind === "dynamic-code") return callee;
+      if (callee?.kind === "dynamic-property") return callee;
+      for (const argument of current.arguments ?? []) {
+        const value = resolveAmbientValue(argument, seenSymbols);
+        if (value?.kind === "dynamic-code") return value;
+        if (value !== undefined) {
+          return {
+            kind: "dynamic-property",
+            root:
+              value.kind === "root" ||
+              value.kind === "property" ||
+              value.kind === "dynamic-property"
+                ? value.root
+                : "globalThis",
+          };
+        }
+      }
+      return undefined;
+    }
+    return undefined;
+  }
+
+  function bindingPropertyName(
+    binding: ts.BindingElement,
+  ): string | undefined {
+    if (binding.dotDotDotToken !== undefined) return undefined;
+    if (binding.propertyName !== undefined) {
+      if (ts.isComputedPropertyName(binding.propertyName)) {
+        return constantStringExpression(binding.propertyName.expression);
+      }
+      return ts.isStringLiteralLike(binding.propertyName) ||
+        ts.isIdentifier(binding.propertyName)
+        ? binding.propertyName.text
+        : undefined;
+    }
+    return ts.isIdentifier(binding.name) ? binding.name.text : undefined;
+  }
+
+  function assignBindingPattern(
+    pattern: ts.BindingName,
+    value: AmbientValue,
+  ): void {
+    if (ts.isIdentifier(pattern)) {
+      const symbol = checker.getSymbolAtLocation(pattern);
+      if (symbol !== undefined) addAmbientValue(symbol, value);
+      return;
+    }
+    if (ts.isObjectBindingPattern(pattern)) {
+      for (const element of pattern.elements) {
+        const propertyName = bindingPropertyName(element);
+        const elementValue =
+          value.kind === "root" && propertyName !== undefined
+            ? DYNAMIC_CODE_GLOBALS.has(propertyName)
+              ? {
+                  kind: "dynamic-code" as const,
+                  name: propertyName as "eval" | "Function",
+                }
+              : {
+                  kind: "property" as const,
+                  root: value.root,
+                  name: propertyName,
+                }
+            : {
+                kind: "dynamic-property" as const,
+                root: value.kind === "root" ? value.root : "globalThis",
+              };
+        assignBindingPattern(element.name, elementValue);
+      }
+      return;
+    }
+    for (const element of pattern.elements) {
+      if (!ts.isBindingElement(element)) continue;
+      assignBindingPattern(element.name, {
+        kind: "dynamic-property",
+        root: value.kind === "root" ? value.root : "globalThis",
+      });
+    }
+  }
+
+  function assignExpressionPattern(
+    pattern: ts.Expression,
+    value: AmbientValue,
+  ): void {
+    const current = unwrapExpression(pattern);
+    if (ts.isIdentifier(current)) {
+      const symbol = checker.getSymbolAtLocation(current);
+      if (symbol !== undefined) addAmbientValue(symbol, value);
+      return;
+    }
+    if (ts.isObjectLiteralExpression(current)) {
+      for (const property of current.properties) {
+        if (ts.isShorthandPropertyAssignment(property)) {
+          const symbol = checker.getSymbolAtLocation(property.name);
+          if (symbol !== undefined) {
+            const name = property.name.text;
+            const propertyValue =
+              value.kind === "root"
+                ? DYNAMIC_CODE_GLOBALS.has(name)
+                  ? {
+                      kind: "dynamic-code" as const,
+                      name: name as "eval" | "Function",
+                    }
+                  : {
+                      kind: "property" as const,
+                      root: value.root,
+                      name,
+                    }
+                : {
+                    kind: "dynamic-property" as const,
+                    root:
+                      value.kind === "property" ||
+                      value.kind === "dynamic-property"
+                        ? value.root
+                        : "globalThis",
+                  };
+            addAmbientValue(symbol, propertyValue);
+          }
+          continue;
+        }
+        if (ts.isSpreadAssignment(property)) {
+          const propertyValue = resolveAmbientValue(property.expression);
+          if (propertyValue !== undefined) {
+            assignExpressionPattern(property.expression, propertyValue);
+          }
+          continue;
+        }
+        if (!ts.isPropertyAssignment(property)) continue;
+        const name = ts.isComputedPropertyName(property.name)
+          ? constantStringExpression(property.name.expression)
+          : ts.isStringLiteralLike(property.name) ||
+              ts.isIdentifier(property.name)
+            ? property.name.text
+            : undefined;
+        if (name === undefined) {
+          assignExpressionPattern(property.initializer, {
+            kind: "dynamic-property",
+            root:
+              value.kind === "root" ||
+              value.kind === "property" ||
+              value.kind === "dynamic-property"
+                ? value.root
+                : "globalThis",
+          });
+          continue;
+        }
+        const propertyValue =
+          value.kind === "root"
+            ? DYNAMIC_CODE_GLOBALS.has(name)
+              ? {
+                  kind: "dynamic-code" as const,
+                  name: name as "eval" | "Function",
+                }
+              : {
+                  kind: "property" as const,
+                  root: value.root,
+                  name,
+                }
+            : {
+                kind: "dynamic-property" as const,
+                root:
+                  value.kind === "property" ||
+                  value.kind === "dynamic-property"
+                    ? value.root
+                    : "globalThis",
+              };
+        assignExpressionPattern(property.initializer, propertyValue);
+      }
+      return;
+    }
+    if (ts.isArrayLiteralExpression(current)) {
+      for (const element of current.elements) {
+        if (ts.isOmittedExpression(element)) continue;
+        assignExpressionPattern(element, {
+          kind: "dynamic-property",
+          root:
+            value.kind === "root" ||
+            value.kind === "property" ||
+            value.kind === "dynamic-property"
+              ? value.root
+              : "globalThis",
+        });
+      }
+    }
+  }
+
+  for (let iteration = 0; iteration < variableDeclarations.length + assignments.length + 2; iteration += 1) {
+    for (const declaration of variableDeclarations) {
+      if (declaration.initializer === undefined) continue;
+      const value = resolveAmbientValue(declaration.initializer);
+      if (value !== undefined) {
+        assignBindingPattern(declaration.name, value);
+      }
+    }
+    for (const assignment of assignments) {
+      const value = resolveAmbientValue(assignment.right);
+      if (value !== undefined) {
+        assignExpressionPattern(assignment.left, value);
+      }
+    }
+  }
+
+  function reportResolvedAmbient(
+    node: ts.Node,
+    value: AmbientValue | undefined,
+  ): void {
+    if (value === undefined) return;
+    const location = semanticLocation(sourceFile, node);
+    if (value.kind === "dynamic-code") {
       diagnostics.push(
         diagnostic(
-          "MODULE_AMBIENT_BINDING",
-          `Property "${ambientName}" reads a secret-like or environment ambient binding; use explicit Eden inputs instead (line ${location.line}, column ${location.column}).`,
+          "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+          `Dynamic code generation through "${value.name}" is not supported in Worker artifacts; use statically authored code.`,
           relativePath,
           location,
         ),
       );
+      return;
+    }
+    if (value.kind === "dynamic-property") {
+      diagnostics.push(
+        diagnostic(
+          "MODULE_AMBIENT_BINDING",
+          `Dynamic property access through ${value.root} is not allowed because it may read a secret or environment binding; use explicit Eden inputs instead.`,
+          relativePath,
+          location,
+        ),
+      );
+      return;
+    }
+    if (
+      value.kind === "property" &&
+      (isSecretLikeAmbientName(value.name) ||
+        FORBIDDEN_AMBIENT_GLOBALS.has(value.name))
+    ) {
+      diagnostics.push(
+        diagnostic(
+          "MODULE_AMBIENT_BINDING",
+          `Property "${value.name}" reads a secret-like or environment ambient binding; use explicit Eden inputs instead (line ${location.line}, column ${location.column}).`,
+          relativePath,
+          location,
+        ),
+      );
+    }
+  }
+
+  function visit(node: ts.Node): void {
+    if (
+      ts.isPropertyAccessExpression(node) ||
+      ts.isElementAccessExpression(node)
+    ) {
+      reportResolvedAmbient(node, resolveAmbientValue(node));
+    }
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      const calleeValue = resolveAmbientValue(node.expression);
+      if (calleeValue === undefined) {
+        reportResolvedAmbient(node, resolveAmbientValue(node));
+      }
     }
     if (ts.isIdentifier(node) && !isNonReferenceIdentifier(node)) {
       const name = node.text;
@@ -2428,11 +3159,19 @@ function semanticWorkerBindingDiagnostics(
         name === "arguments" && hasArgumentsBinding(node);
       const declared =
         importedBindings.has(name) || hasAuthoredBinding(node);
+      const isPropertyBase =
+        (ts.isPropertyAccessExpression(node.parent) ||
+          ts.isElementAccessExpression(node.parent)) &&
+        node.parent.expression === node;
+      if (!isPropertyBase) {
+        reportResolvedAmbient(node, resolveAmbientValue(node));
+      }
       if (
         !SUPPORTED_WORKER_GLOBALS.has(name) &&
         !FORBIDDEN_AMBIENT_GLOBALS.has(name) &&
         !declared &&
-        !implicitlyBound
+        !implicitlyBound &&
+        !DYNAMIC_CODE_GLOBALS.has(name)
       ) {
         const location = semanticLocation(sourceFile, node);
         diagnostics.push(
@@ -2534,6 +3273,7 @@ async function validateAuthoredWorkerSources(
     rootNames: sourceFiles.map((item) => item.fileName),
   });
   const checker = program.getTypeChecker();
+  const diagnostics: EdenDiagnostic[] = [];
 
   for (const file of files) {
     if (
@@ -2556,19 +3296,14 @@ async function validateAuthoredWorkerSources(
         file.relativePath,
         checker,
       );
-      if (semanticDiagnostics.length > 0) {
-        throw new EdenCompilerError(
-          "Worker compatibility validation failed",
-          semanticDiagnostics,
-        );
-      }
+      diagnostics.push(...semanticDiagnostics);
     }
-    const issue = authoredWorkerDependency(contents);
-    if (issue !== undefined) {
-      throw new EdenCompilerError("Worker compatibility validation failed", [
-        diagnostic(issue.code, issue.message, file.relativePath),
-      ]);
-    }
+  }
+  if (diagnostics.length > 0) {
+    throw new EdenCompilerError(
+      "Worker compatibility validation failed",
+      diagnostics,
+    );
   }
 }
 

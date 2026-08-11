@@ -759,6 +759,9 @@ describe("artifact generation", () => {
         `
           const values = [Math.max(1, 2), JSON.stringify(input), Number.isFinite(1)];
           const argumentCount = arguments.length;
+          const fetcher = globalThis.fetch;
+          const dynamicSafeProperty = "fetch";
+          const safeFetcher = globalThis[dynamicSafeProperty];
           return {
             greeting: String(values.length + argumentCount),
             workerGlobals: [
@@ -768,6 +771,8 @@ describe("artifact generation", () => {
               typeof crypto,
               typeof fetch,
               typeof globalThis,
+              typeof fetcher,
+              typeof safeFetcher,
             ],
           };
         `,
@@ -777,6 +782,215 @@ describe("artifact generation", () => {
     const result = await buildProject({ projectRoot: root });
     expect(result.artifacts.manifest.tools).toEqual([
       expect.objectContaining({ name: "globals" }),
+    ]);
+  });
+
+  test.each([
+    [
+      "globalThis alias",
+      `
+        const runtime = globalThis;
+        export default {
+          description: "Global alias.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: runtime.EDEN_API_KEY ?? input.name }; }
+        };
+      `,
+    ],
+    [
+      "self destructuring",
+      `
+        const { EDEN_API_KEY: apiKey } = self;
+        export default {
+          description: "Destructured global.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: apiKey ?? input.name }; }
+        };
+      `,
+    ],
+    [
+      "computed global property",
+      `
+        const property = "EDEN_API_KEY";
+        export default {
+          description: "Computed global.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: globalThis[property] ?? input.name }; }
+        };
+      `,
+    ],
+    [
+      "template global property",
+      `
+        const property = \`EDEN_\${"API_KEY"}\`;
+        export default {
+          description: "Template global.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: self[property] ?? input.name }; }
+        };
+      `,
+    ],
+    [
+      "assigned global alias",
+      `
+        let runtime;
+        runtime = self;
+        export default {
+          description: "Assigned global alias.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: runtime["EDEN_API_KEY"] ?? input.name }; }
+        };
+      `,
+    ],
+    [
+      "destructuring assignment",
+      `
+        let apiKey;
+        ({ EDEN_API_KEY: apiKey } = globalThis);
+        export default {
+          description: "Destructuring assignment.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: apiKey ?? input.name }; }
+        };
+      `,
+    ],
+  ])("rejects %s used to reach ambient globals", async (_name, source) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Ambient alias fixture\n",
+      "agent/tools/ambient-alias.ts": source,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/ambient-alias.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
+      "direct eval",
+      `execute(input) { return { value: eval(input.name) }; }`,
+    ],
+    [
+      "indirect eval alias",
+      `execute(input) { const run = eval; return { value: run(input.name) }; }`,
+    ],
+    [
+      "globalThis eval",
+      `execute(input) { return { value: globalThis["eval"](input.name) }; }`,
+    ],
+    [
+      "Function constructor",
+      `execute(input) { const create = Function; return { value: create(input.name) }; }`,
+    ],
+    [
+      "new Function constructor",
+      `execute(input) { return { value: new Function(input.name)() }; }`,
+    ],
+    [
+      "destructured Function constructor",
+      `execute(input) { const { Function: create } = self; return { value: create(input.name) }; }`,
+    ],
+  ])("rejects %s before publication", async (_name, executeSource) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Dynamic code fixture\n",
+      "agent/tools/dynamic-code.ts": toolSource.replace(
+        'execute(input) {\n      return { greeting: "Hello " + input.name };\n    }',
+        executeSource,
+      ),
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+          source: "agent/tools/dynamic-code.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("accepts legitimate WebAssembly usage", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "WebAssembly fixture\n",
+      "agent/tools/wasm.ts": toolSource.replace(
+        'return { greeting: "Hello " + input.name };',
+        `
+          const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+          const module = new WebAssembly.Module(bytes);
+          return { greeting: String(module instanceof WebAssembly.Module) };
+        `,
+      ),
+    });
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "wasm" }),
+    ]);
+  });
+
+  test("follows ambient aliases through authored helper modules", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Cross-module ambient fixture\n",
+      "agent/runtime.ts": `
+        export const runtime = globalThis;
+        export const getRuntime = () => self;
+      `,
+      "agent/tools/cross-module.ts": `
+        import { getRuntime, runtime } from "../runtime.js";
+        const read = () => getRuntime()[\`EDEN_\${"API_KEY"}\`];
+        export default {
+          description: "Cross-module ambient access.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const { EDEN_API_KEY: apiKey } = runtime;
+            return { value: apiKey ?? read() ?? input.name };
+          }
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: expect.stringMatching(/agent\/(?:runtime|tools\/cross-module)\.ts/u),
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("ignores blocked-looking strings and comments", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "False-positive fixture\n",
+      "agent/tools/strings-comments.ts": toolSource.replace(
+        'return { greeting: "Hello " + input.name };',
+        `
+          // globalThis.EDEN_API_KEY self["TOKEN"] process.env.SECRET eval Function
+          const blockedText = "globalThis.EDEN_API_KEY self['TOKEN'] process.env.SECRET eval Function import('node:fs')";
+          return { greeting: blockedText + input.name };
+        `,
+      ),
+    });
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "strings-comments" }),
     ]);
   });
 
