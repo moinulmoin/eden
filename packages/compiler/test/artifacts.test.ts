@@ -298,4 +298,70 @@ describe("artifact generation", () => {
       readFile(join(root, ".eden", "manifest.json"), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  test("rejects bare imports supplied only by the compiler caller during bundling", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "caller dependency bundling\n",
+      "agent/tools/caller-zod.ts": `
+        import { z } from "zod";
+        export default {
+          description: "Must not use the caller's Zod.",
+          inputSchema: z.object({ name: z.string() }),
+          execute(input) {
+            return { greeting: input.name };
+          }
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          source: "agent/tools/caller-zod.ts",
+          code: "MODULE_LOAD_FAILED",
+        }),
+      ]),
+    });
+  });
+
+  test("bundles dependencies installed in the selected project", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "selected dependency bundling\n",
+      "agent/tools/selected-dependency.ts": `
+        import { inputSchema } from "selected-schema-fixture";
+        export default {
+          description: "Uses the selected project's dependency.",
+          inputSchema,
+          execute(input) {
+            return { value: input };
+          }
+        };
+      `,
+      "node_modules/selected-schema-fixture/package.json": JSON.stringify({
+        name: "selected-schema-fixture",
+        type: "module",
+        exports: "./index.js",
+      }),
+      "node_modules/selected-schema-fixture/index.js": `
+        export const inputSchema = {
+          "~standard": {
+            version: 1,
+            vendor: "selected-project",
+            validate(value) { return { value }; }
+          }
+        };
+      `,
+    });
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.bundle).toContain("selected-project");
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({
+        name: "selected-dependency",
+        module: "tool:selected-dependency",
+      }),
+    ]);
+  });
 });

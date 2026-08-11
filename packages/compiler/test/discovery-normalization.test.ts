@@ -13,15 +13,21 @@ import {
 
 const temporaryRoots: string[] = [];
 
-async function createProject(files: Record<string, string>): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "eden-discovery-"));
-  temporaryRoots.push(root);
-
+async function writeProject(
+  root: string,
+  files: Record<string, string>,
+): Promise<void> {
   for (const [relativePath, contents] of Object.entries(files)) {
     const absolutePath = join(root, relativePath);
     await mkdir(join(absolutePath, ".."), { recursive: true });
     await writeFile(absolutePath, contents, "utf8");
   }
+}
+
+async function createProject(files: Record<string, string>): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "eden-discovery-"));
+  temporaryRoots.push(root);
+  await writeProject(root, files);
 
   return root;
 }
@@ -283,6 +289,11 @@ describe("project discovery", () => {
         };
       `,
     });
+    await mkdir(join(root, "node_modules"), { recursive: true });
+    await symlink(
+      join(process.cwd(), "node_modules/zod"),
+      join(root, "node_modules/zod"),
+    );
 
     const normalized = await normalizeProject({ projectRoot: root });
     const asyncTool = normalized.tools.find(
@@ -401,6 +412,128 @@ describe("project discovery", () => {
         expect.objectContaining({
           code: "MODULE_LOAD_FAILED",
           source: "agent/tools/escape-import.ts",
+        }),
+      ]),
+    });
+  });
+
+  test("does not resolve bare imports from the compiler caller directory", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "caller dependency isolation\n",
+      "agent/tools/caller-zod.ts": `
+        import { z } from "zod";
+        export default {
+          description: "Must not use the caller's Zod.",
+          inputSchema: z.object({ name: z.string() }),
+          execute(input) {
+            return { greeting: input.name };
+          }
+        };
+      `,
+    });
+
+    await expect(
+      normalizeProject({ projectRoot: root, cwd: process.cwd() }),
+    ).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          source: "agent/tools/caller-zod.ts",
+          code: "MODULE_LOAD_FAILED",
+        }),
+      ]),
+    });
+  });
+
+  test("resolves dependencies installed in the selected project", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "selected dependency\n",
+      "agent/tools/selected-dependency.ts": `
+        import { inputSchema } from "selected-schema-fixture";
+        export default {
+          description: "Uses the selected project's dependency.",
+          inputSchema,
+          execute(input) {
+            return { value: input };
+          }
+        };
+      `,
+      "node_modules/selected-schema-fixture/package.json": JSON.stringify({
+        name: "selected-schema-fixture",
+        type: "module",
+        exports: "./index.js",
+      }),
+      "node_modules/selected-schema-fixture/index.js": `
+        export const inputSchema = {
+          "~standard": {
+            version: 1,
+            vendor: "selected-project",
+            validate(value) { return { value }; }
+          }
+        };
+      `,
+    });
+
+    const normalized = await normalizeProject({
+      projectRoot: root,
+      cwd: process.cwd(),
+    });
+    expect(normalized.tools[0]?.schema).toEqual({
+      vendor: "selected-project",
+      version: 1,
+    });
+  });
+
+  test("rejects bare imports resolved from a selected project's parent", async () => {
+    const container = await mkdtemp(join(tmpdir(), "eden-parent-"));
+    temporaryRoots.push(container);
+    const root = join(container, "project");
+    await writeProject(root, {
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "parent dependency\n",
+      "agent/tools/parent-dependency.ts": `
+        import { inputSchema } from "parent-schema-fixture";
+        export default {
+          description: "Must not use a parent dependency.",
+          inputSchema,
+          execute(input) {
+            return { value: input };
+          }
+        };
+      `,
+    });
+    await mkdir(join(container, "node_modules/parent-schema-fixture"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(container, "node_modules/parent-schema-fixture/package.json"),
+      JSON.stringify({
+        name: "parent-schema-fixture",
+        type: "module",
+        exports: "./index.js",
+      }),
+      "utf8",
+    );
+    await writeFile(
+      join(container, "node_modules/parent-schema-fixture/index.js"),
+      `
+        export const inputSchema = {
+          "~standard": {
+            version: 1,
+            vendor: "parent-project",
+            validate(value) { return { value }; }
+          }
+        };
+      `,
+      "utf8",
+    );
+
+    await expect(normalizeProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          source: "agent/tools/parent-dependency.ts",
+          code: "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
         }),
       ]),
     });

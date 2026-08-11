@@ -1028,34 +1028,49 @@ async function loadDefaultExport(
     return undefined;
   }
 
+  let dependencyIssue: EdenDiagnostic | undefined;
   try {
     const result = await build({
+      absWorkingDir: projectRoot,
       entryPoints: [sourceInfo.canonicalPath],
       bundle: true,
       format: "esm",
       platform: "node",
+      preserveSymlinks: true,
       target: "es2022",
       write: false,
       logLevel: "silent",
-      nodePaths: [
-        join(projectRoot, "node_modules"),
-        join(process.cwd(), "node_modules"),
-      ],
+      nodePaths: [join(projectRoot, "node_modules")],
       plugins: [
         {
           name: "eden-contained-source-imports",
           setup(context) {
+            context.onLoad({ filter: /./ }, (args) => {
+              if (isWithinRoot(projectRoot, normalize(args.path))) {
+                return undefined;
+              }
+              const message =
+                `Dependency loaded by "${sourceInfo.relativePath}" resolves outside ` +
+                "the selected project root; declare it in the selected project's install context.";
+              dependencyIssue = diagnostic(
+                "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+                message,
+                sourceInfo.relativePath,
+              );
+              return {
+                errors: [{ text: message }],
+              };
+            });
             context.onResolve({ filter: /^(?:\.{1,2}(?:\/|$)|\/)/ }, async (args) => {
-              const importerRoot = await realpath(args.resolveDir).catch(
-                () => args.resolveDir,
-              );
-              const allowedDependencyRoot = [
-                join(projectRoot, "node_modules"),
-                join(process.cwd(), "node_modules"),
-              ].some((dependencyRoot) =>
-                isWithinRoot(dependencyRoot, importerRoot),
-              );
-              if (allowedDependencyRoot) return undefined;
+              const importerRoot = normalize(args.resolveDir);
+              if (
+                isWithinRoot(
+                  normalize(join(projectRoot, "node_modules")),
+                  importerRoot,
+                )
+              ) {
+                return undefined;
+              }
 
               const resolvedImport = resolve(args.resolveDir, args.path);
               const canonicalImport = await realpath(resolvedImport).catch(
@@ -1083,6 +1098,10 @@ async function loadDefaultExport(
     );
     return module.default;
   } catch (error: unknown) {
+    if (dependencyIssue !== undefined) {
+      diagnostics.push(dependencyIssue);
+      return undefined;
+    }
     const message = error instanceof Error ? error.message : String(error);
     diagnostics.push(
       diagnostic(
@@ -1592,7 +1611,8 @@ async function bundleProject(
       charset: "utf8",
       format: "esm",
       logLevel: "silent",
-      nodePaths: [join(process.cwd(), "node_modules")],
+      nodePaths: [join(normalized.projectRoot, "node_modules")],
+      preserveSymlinks: true,
       stdin: {
         contents: entry,
         loader: "js",
@@ -1637,18 +1657,11 @@ async function bundleProject(
                 const canonical = await realpath(resolved).catch(
                   () => resolved,
                 );
-                const dependencyRoots = await Promise.all(
-                  [
-                    join(normalized.projectRoot, "node_modules"),
-                    join(process.cwd(), "node_modules"),
-                  ].map((root) => realpath(root).catch(() => root)),
-                );
-                const importer = await realpath(args.resolveDir).catch(
-                  () => args.resolveDir,
-                );
+                const importer = normalize(args.resolveDir);
                 if (
-                  dependencyRoots.some((root) =>
-                    isWithinRoot(root, importer),
+                  isWithinRoot(
+                    normalize(join(normalized.projectRoot, "node_modules")),
+                    importer,
                   )
                 ) {
                   return undefined;
@@ -1665,6 +1678,25 @@ async function bundleProject(
                 return undefined;
               },
             );
+            context.onLoad({ filter: /./ }, (args) => {
+              if (
+                isWithinRoot(
+                  normalized.projectRoot,
+                  normalize(args.path),
+                )
+              ) {
+                return undefined;
+              }
+              compatibilityIssue = {
+                code: "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+                message:
+                  "A bare dependency resolves outside the selected project root; declare it in the selected project's install context.",
+                source: normalized.discovery.agent.relativePath,
+              };
+              return {
+                errors: [{ text: compatibilityIssue.message }],
+              };
+            });
           },
         },
       ],
