@@ -4,6 +4,7 @@
  */
 
 import { build } from "esbuild";
+import * as ts from "typescript";
 import {
   createHash,
 } from "crypto";
@@ -217,11 +218,16 @@ function diagnostic(
   code: string,
   message: string,
   source?: string,
+  location?: {
+    readonly line: number;
+    readonly column: number;
+  },
 ): EdenDiagnostic {
   return {
     code,
     message,
     ...(source === undefined ? {} : { source }),
+    ...(location === undefined ? {} : location),
     severity: "error",
   };
 }
@@ -1633,6 +1639,7 @@ export async function normalizeProject(
   const projectRoot = await resolveProjectRoot(options);
   const snapshot = await captureSourceSnapshot(projectRoot);
   try {
+    await validateAuthoredWorkerSources(snapshot);
     const normalized = await normalizeSnapshot(snapshot);
     return {
       ...normalized,
@@ -1862,101 +1869,559 @@ function authoredWorkerDependency(
   return undefined;
 }
 
-function importedSpecifiers(source: string): string[] {
-  const specifiers: string[] = [];
-  const pattern =
-    /(?:\bfrom\s*|\bimport\s*)["']([^"']+)["']/gu;
-  for (const match of source.matchAll(pattern)) {
-    const specifier = match[1];
-    if (specifier !== undefined) specifiers.push(specifier);
-  }
-  return specifiers;
+const SUPPORTED_WORKER_GLOBALS = new Set([
+  // Standard ECMAScript values and constructors available in Workers.
+  "AggregateError",
+  "Array",
+  "ArrayBuffer",
+  "Atomics",
+  "BigInt",
+  "BigInt64Array",
+  "BigUint64Array",
+  "Boolean",
+  "DataView",
+  "Date",
+  "Error",
+  "EvalError",
+  "FinalizationRegistry",
+  "Float32Array",
+  "Float64Array",
+  "Function",
+  "Infinity",
+  "Int16Array",
+  "Int32Array",
+  "Int8Array",
+  "Intl",
+  "JSON",
+  "Map",
+  "Math",
+  "NaN",
+  "Number",
+  "Object",
+  "Promise",
+  "Proxy",
+  "RangeError",
+  "ReferenceError",
+  "Reflect",
+  "RegExp",
+  "Set",
+  "SharedArrayBuffer",
+  "String",
+  "Symbol",
+  "SyntaxError",
+  "TypeError",
+  "Uint16Array",
+  "Uint32Array",
+  "Uint8Array",
+  "Uint8ClampedArray",
+  "URIError",
+  "URL",
+  "URLSearchParams",
+  "undefined",
+  "WeakMap",
+  "WeakRef",
+  "WeakSet",
+  "decodeURI",
+  "decodeURIComponent",
+  "encodeURI",
+  "encodeURIComponent",
+  "escape",
+  "eval",
+  "isFinite",
+  "isNaN",
+  "parseFloat",
+  "parseInt",
+  "queueMicrotask",
+  "setInterval",
+  "setTimeout",
+  "structuredClone",
+  "unescape",
+  "clearInterval",
+  "clearTimeout",
+  // Web APIs and Worker globals intentionally supported by Eden artifacts.
+  "AbortController",
+  "AbortSignal",
+  "atob",
+  "btoa",
+  "Blob",
+  "BroadcastChannel",
+  "Cache",
+  "CacheStorage",
+  "CloseEvent",
+  "CompressionStream",
+  "CountQueuingStrategy",
+  "Crypto",
+  "CryptoKey",
+  "CustomEvent",
+  "DOMException",
+  "DecompressionStream",
+  "ErrorEvent",
+  "Event",
+  "EventTarget",
+  "File",
+  "FixedLengthStream",
+  "FormData",
+  "HTMLRewriter",
+  "Headers",
+  "MessageChannel",
+  "MessageEvent",
+  "MessagePort",
+  "Navigator",
+  "Performance",
+  "PerformanceEntry",
+  "PerformanceMark",
+  "PerformanceMeasure",
+  "PerformanceObserver",
+  "PerformanceObserverEntryList",
+  "PerformanceResourceTiming",
+  "ReadableByteStreamController",
+  "ReadableStream",
+  "ReadableStreamBYOBReader",
+  "ReadableStreamBYOBRequest",
+  "ReadableStreamDefaultController",
+  "ReadableStreamDefaultReader",
+  "Request",
+  "Response",
+  "scheduler",
+  "SubtleCrypto",
+  "TextDecoder",
+  "TextDecoderStream",
+  "TextEncoder",
+  "TextEncoderStream",
+  "TransformStream",
+  "TransformStreamDefaultController",
+  "URLPattern",
+  "WebSocket",
+  "WritableStream",
+  "WritableStreamDefaultController",
+  "WritableStreamDefaultWriter",
+  "console",
+  "addEventListener",
+  "clearImmediate",
+  "crypto",
+  "dispatchEvent",
+  "fetch",
+  "globalThis",
+  "caches",
+  "origin",
+  "performance",
+  "removeEventListener",
+  "reportError",
+  "self",
+  "setImmediate",
+  "navigator",
+  "WebSocketPair",
+  "WebSocketRequestResponsePair",
+  "IdentityTransformStream",
+]);
+
+const FORBIDDEN_AMBIENT_GLOBALS = new Set([
+  "Buffer",
+  "Deno",
+  "Bun",
+  "__dirname",
+  "__filename",
+  "global",
+  "module",
+  "process",
+  "require",
+]);
+
+function semanticLocation(
+  sourceFile: ts.SourceFile,
+  node: ts.Node,
+): { readonly line: number; readonly column: number } {
+  const position = sourceFile.getLineAndCharacterOfPosition(
+    node.getStart(sourceFile),
+  );
+  return {
+    line: position.line + 1,
+    column: position.character + 1,
+  };
 }
 
-async function resolveAuthoredImport(
-  projectRoot: string,
-  importerPath: string,
-  specifier: string,
-): Promise<string | undefined> {
-  if (!specifier.startsWith(".") && !specifier.startsWith("/")) {
+function isJavaScriptSourcePath(relativePath: string): boolean {
+  return /\.(?:[cm]?js|[cm]?ts|jsx|tsx)$/u.test(relativePath);
+}
+
+function isDeclarationIdentifier(node: ts.Identifier): boolean {
+  const parent = node.parent;
+  if (
+    (ts.isVariableDeclaration(parent) ||
+      ts.isFunctionDeclaration(parent) ||
+      ts.isClassDeclaration(parent) ||
+      ts.isInterfaceDeclaration(parent) ||
+      ts.isTypeAliasDeclaration(parent) ||
+      ts.isEnumDeclaration(parent) ||
+      ts.isModuleDeclaration(parent) ||
+      ts.isParameter(parent) ||
+      ts.isPropertyDeclaration(parent) ||
+      ts.isMethodDeclaration(parent) ||
+      ts.isPropertySignature(parent) ||
+      ts.isMethodSignature(parent) ||
+      ts.isEnumMember(parent) ||
+      ts.isTypeParameterDeclaration(parent)) &&
+    parent.name === node
+  ) {
+    return true;
+  }
+  if (
+    ts.isBindingElement(parent) &&
+    (parent.name === node || parent.propertyName === node)
+  ) {
+    return true;
+  }
+  if (
+    ts.isCatchClause(parent) &&
+    parent.variableDeclaration?.name === node
+  ) {
+    return true;
+  }
+  if (ts.isLabeledStatement(parent) && parent.label === node) return true;
+  if (ts.isBreakStatement(parent) && parent.label === node) return true;
+  if (ts.isContinueStatement(parent) && parent.label === node) return true;
+  return false;
+}
+
+function isNonReferenceIdentifier(node: ts.Identifier): boolean {
+  const parent = node.parent;
+  if (ts.isTypeNode(parent)) return true;
+  if (ts.isPropertyAccessExpression(parent) && parent.name === node) {
+    return true;
+  }
+  if (ts.isQualifiedName(parent) && parent.right === node) return true;
+  if (
+    (ts.isPropertyAssignment(parent) || ts.isMethodDeclaration(parent)) &&
+    parent.name === node
+  ) {
+    return true;
+  }
+  if (
+    (ts.isPropertyDeclaration(parent) || ts.isMethodSignature(parent)) &&
+    parent.name === node
+  ) {
+    return true;
+  }
+  if (
+    ts.isImportSpecifier(parent) ||
+    ts.isImportClause(parent) ||
+    ts.isNamespaceImport(parent) ||
+    ts.isImportEqualsDeclaration(parent) ||
+    ts.isNamespaceExportDeclaration(parent)
+  ) {
+    return true;
+  }
+  if (ts.isExportSpecifier(parent)) {
+    const exportDeclaration = parent.parent.parent;
+    if (
+      ts.isExportDeclaration(exportDeclaration) &&
+      exportDeclaration.moduleSpecifier !== undefined
+    ) {
+      return true;
+    }
+    return (
+      parent.name === node &&
+      parent.propertyName !== undefined
+    );
+  }
+  if (ts.isBindingElement(parent) && parent.name === node) return true;
+  if (ts.isShorthandPropertyAssignment(parent)) {
+    return false;
+  }
+  if (ts.isJsxAttribute(parent) && parent.name === node) return true;
+  if (ts.isJsxNamespacedName(parent)) return true;
+  if (ts.isLabeledStatement(parent) || ts.isBreakStatement(parent)) {
+    return true;
+  }
+  if (ts.isContinueStatement(parent)) return true;
+  return isDeclarationIdentifier(node);
+}
+
+function isSecretLikeAmbientName(name: string): boolean {
+  return /(?:secret|token|password|passwd|credential|api[_-]?key|private[_-]?key|access[_-]?key|binding|environment|env)/iu.test(
+    name,
+  );
+}
+
+function semanticWorkerBindingDiagnostics(
+  sourceFile: ts.SourceFile,
+  relativePath: string,
+  checker: ts.TypeChecker,
+): EdenDiagnostic[] {
+  const diagnostics: EdenDiagnostic[] = [];
+  const importedBindings = new Set<string>();
+  function isTypeOnlyImport(
+    declaration: ts.Declaration,
+  ): boolean {
+    if (ts.isImportSpecifier(declaration)) {
+      return (
+        declaration.isTypeOnly || declaration.parent.parent.isTypeOnly
+      );
+    }
+    if (ts.isNamespaceImport(declaration)) {
+      return declaration.parent.isTypeOnly;
+    }
+    if (ts.isImportClause(declaration)) return declaration.isTypeOnly;
+    return false;
+  }
+
+  function collectImportedBindings(node: ts.Node): void {
+    if (
+      ts.isImportClause(node) &&
+      !node.isTypeOnly &&
+      node.name !== undefined
+    ) {
+      importedBindings.add(node.name.text);
+    } else if (
+      ts.isNamespaceImport(node) &&
+      !node.parent.isTypeOnly
+    ) {
+      importedBindings.add(node.name.text);
+    } else if (
+      ts.isImportSpecifier(node) &&
+      !node.isTypeOnly &&
+      !node.parent.parent.isTypeOnly
+    ) {
+      importedBindings.add((node.name ?? node.propertyName).text);
+    } else if (ts.isImportEqualsDeclaration(node)) {
+      importedBindings.add(node.name.text);
+    }
+    ts.forEachChild(node, collectImportedBindings);
+  }
+  collectImportedBindings(sourceFile);
+
+  function hasAuthoredBinding(node: ts.Identifier): boolean {
+    const symbol = checker.getSymbolAtLocation(node);
+    return (
+      importedBindings.has(node.text) ||
+      (symbol?.declarations?.some(
+        (declaration) =>
+          declaration.getSourceFile().fileName === sourceFile.fileName &&
+          !isTypeOnlyImport(declaration) &&
+          (ts.getCombinedModifierFlags(declaration) &
+            ts.ModifierFlags.Ambient) ===
+            0 &&
+          !ts.isInterfaceDeclaration(declaration) &&
+          !ts.isTypeAliasDeclaration(declaration) &&
+          !ts.isTypeParameterDeclaration(declaration),
+      ) ?? false)
+    );
+  }
+
+  function hasArgumentsBinding(node: ts.Identifier): boolean {
+    let current: ts.Node | undefined = node.parent;
+    while (current !== undefined && !ts.isSourceFile(current)) {
+      if (ts.isArrowFunction(current)) {
+        current = current.parent;
+        continue;
+      }
+      if (
+        ts.isFunctionDeclaration(current) ||
+        ts.isFunctionExpression(current) ||
+        ts.isMethodDeclaration(current) ||
+        ts.isConstructorDeclaration(current) ||
+        ts.isGetAccessorDeclaration(current) ||
+        ts.isSetAccessorDeclaration(current)
+      ) {
+        return true;
+      }
+      current = current.parent;
+    }
+    return false;
+  }
+
+  function ambientPropertyName(node: ts.Node): string | undefined {
+    if (ts.isPropertyAccessExpression(node)) {
+      const base = node.expression;
+      if (
+        ts.isIdentifier(base) &&
+        (base.text === "globalThis" || base.text === "self")
+      ) {
+        return node.name.text;
+      }
+      if (ts.isMetaProperty(base)) return node.name.text;
+    }
+    if (
+      ts.isElementAccessExpression(node) &&
+      ts.isStringLiteralLike(node.argumentExpression)
+    ) {
+      const base = node.expression;
+      if (
+        ts.isIdentifier(base) &&
+        (base.text === "globalThis" || base.text === "self")
+      ) {
+        return node.argumentExpression.text;
+      }
+    }
     return undefined;
   }
-  const base = isAbsolute(specifier)
-    ? specifier
-    : resolve(dirname(importerPath), specifier);
-  if (!isWithinRoot(projectRoot, normalize(base))) {
-    throw new EdenCompilerError("Worker compatibility validation failed", [
-      diagnostic(
-        "PATH_OUTSIDE_PROJECT",
-        `Import "${specifier}" escapes the selected project root.`,
-        toPosixPath(relative(projectRoot, importerPath)),
-      ),
-    ]);
-  }
-  const candidates = [
-    base,
-    `${base}.ts`,
-    `${base}.tsx`,
-    `${base}.js`,
-    `${base}.mjs`,
-    join(base, "index.ts"),
-    join(base, "index.tsx"),
-    join(base, "index.js"),
-    join(base, "index.mjs"),
-  ];
-  for (const candidate of candidates) {
-    const canonical = await realpath(candidate).catch(() => undefined);
-    if (canonical === undefined) continue;
-    const logicalCandidate = normalize(candidate);
+
+  function visit(node: ts.Node): void {
+    const ambientName = ambientPropertyName(node);
     if (
-      !isWithinRoot(projectRoot, logicalCandidate) ||
-      !isWithinRoot(projectRoot, canonical)
+      ambientName !== undefined &&
+      (isSecretLikeAmbientName(ambientName) ||
+        FORBIDDEN_AMBIENT_GLOBALS.has(ambientName))
     ) {
-      throw new EdenCompilerError("Worker compatibility validation failed", [
+      const location = semanticLocation(
+        sourceFile,
+        ts.isPropertyAccessExpression(node) ? node.name : node,
+      );
+      diagnostics.push(
         diagnostic(
-          "PATH_OUTSIDE_PROJECT",
-          `Import "${specifier}" resolves outside the selected project root.`,
-          toPosixPath(relative(projectRoot, importerPath)),
+          "MODULE_AMBIENT_BINDING",
+          `Property "${ambientName}" reads a secret-like or environment ambient binding; use explicit Eden inputs instead (line ${location.line}, column ${location.column}).`,
+          relativePath,
+          location,
         ),
-      ]);
+      );
     }
-    const details = await stat(canonical).catch(() => undefined);
-    if (details?.isFile()) return logicalCandidate;
+    if (ts.isIdentifier(node) && !isNonReferenceIdentifier(node)) {
+      const name = node.text;
+      const implicitlyBound =
+        name === "arguments" && hasArgumentsBinding(node);
+      const declared =
+        importedBindings.has(name) || hasAuthoredBinding(node);
+      if (
+        !SUPPORTED_WORKER_GLOBALS.has(name) &&
+        !FORBIDDEN_AMBIENT_GLOBALS.has(name) &&
+        !declared &&
+        !implicitlyBound
+      ) {
+        const location = semanticLocation(sourceFile, node);
+        diagnostics.push(
+          diagnostic(
+            "MODULE_UNDECLARED_IDENTIFIER",
+            `Identifier "${name}" is not declared in the authored Worker graph or the supported Worker global allowlist (line ${location.line}, column ${location.column}).`,
+            relativePath,
+            location,
+          ),
+        );
+      } else if (FORBIDDEN_AMBIENT_GLOBALS.has(name) && !declared) {
+        const location = semanticLocation(sourceFile, node);
+        diagnostics.push(
+          diagnostic(
+            "MODULE_AMBIENT_BINDING",
+            `Identifier "${name}" is a forbidden Node or ambient binding; use explicit Eden inputs instead (line ${location.line}, column ${location.column}).`,
+            relativePath,
+            location,
+          ),
+        );
+      }
+    }
+    ts.forEachChild(node, visit);
   }
-  return undefined;
+  visit(sourceFile);
+  return diagnostics;
 }
 
 async function validateAuthoredWorkerSources(
-  normalized: EdenNormalizedProject,
+  snapshot: EdenSourceSnapshot,
 ): Promise<void> {
-  const pending = [
-    normalized.discovery.agent.relativePath,
-    ...normalized.discovery.tools.map((source) => source.relativePath),
-  ];
-  const visited = new Set<string>();
-  while (pending.length > 0) {
-    const relativePath = pending.shift();
-    if (relativePath === undefined) continue;
-    const sourcePath = join(normalized.projectRoot, relativePath);
-    const canonicalPath = await realpath(sourcePath).catch(() => sourcePath);
-    if (visited.has(canonicalPath)) continue;
-    visited.add(canonicalPath);
-    const contents = await readUtf8File(canonicalPath);
+  const files = [...snapshot.files.values()].sort((left, right) =>
+    comparePath(left.relativePath, right.relativePath),
+  );
+  const sourceFiles = files
+    .filter(
+      (file) =>
+        isJavaScriptSourcePath(file.relativePath) &&
+        !file.relativePath.startsWith("node_modules/"),
+    )
+    .map((file) => ({
+      file,
+      fileName: join(snapshot.sourceRoot, file.relativePath),
+      contents: new TextDecoder("utf-8", { fatal: true }).decode(file.contents),
+    }));
+  const sourceByFileName = new Map(
+    sourceFiles.map((item) => [item.fileName, item]),
+  );
+  const compilerOptions: ts.CompilerOptions = {
+    allowJs: true,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    noLib: true,
+    skipLibCheck: true,
+    target: ts.ScriptTarget.ES2022,
+  };
+  const host = ts.createCompilerHost(compilerOptions);
+  const originalGetSourceFile = host.getSourceFile.bind(host);
+  const originalReadFile = host.readFile?.bind(host);
+  const originalFileExists = host.fileExists.bind(host);
+  host.getSourceFile = (
+    fileName,
+    languageVersion,
+    onError,
+    shouldCreateNewSourceFile,
+  ) => {
+    const authored = sourceByFileName.get(fileName);
+    if (authored !== undefined) {
+      return ts.createSourceFile(
+        fileName,
+        authored.contents,
+        languageVersion,
+        true,
+        fileName.endsWith(".tsx")
+          ? ts.ScriptKind.TSX
+          : fileName.endsWith(".jsx")
+            ? ts.ScriptKind.JSX
+            : fileName.endsWith(".js") ||
+                fileName.endsWith(".mjs") ||
+                fileName.endsWith(".cjs")
+              ? ts.ScriptKind.JS
+              : ts.ScriptKind.TS,
+      );
+    }
+    return originalGetSourceFile(
+      fileName,
+      languageVersion,
+      onError,
+      shouldCreateNewSourceFile,
+    );
+  };
+  host.readFile = (fileName) =>
+    sourceByFileName.get(fileName)?.contents ?? originalReadFile?.(fileName);
+  host.fileExists = (fileName) =>
+    sourceByFileName.has(fileName) || originalFileExists(fileName);
+  const program = ts.createProgram({
+    host,
+    options: compilerOptions,
+    rootNames: sourceFiles.map((item) => item.fileName),
+  });
+  const checker = program.getTypeChecker();
+
+  for (const file of files) {
+    if (
+      !isJavaScriptSourcePath(file.relativePath) ||
+      file.relativePath.startsWith("node_modules/")
+    ) {
+      continue;
+    }
+    const contents = sourceByFileName.get(
+      join(snapshot.sourceRoot, file.relativePath),
+    )?.contents;
+    if (contents === undefined) continue;
+    if (!file.relativePath.endsWith(".d.ts")) {
+      const sourceFile = program.getSourceFile(
+        join(snapshot.sourceRoot, file.relativePath),
+      );
+      if (sourceFile === undefined) continue;
+      const semanticDiagnostics = semanticWorkerBindingDiagnostics(
+        sourceFile,
+        file.relativePath,
+        checker,
+      );
+      if (semanticDiagnostics.length > 0) {
+        throw new EdenCompilerError(
+          "Worker compatibility validation failed",
+          semanticDiagnostics,
+        );
+      }
+    }
     const issue = authoredWorkerDependency(contents);
     if (issue !== undefined) {
       throw new EdenCompilerError("Worker compatibility validation failed", [
-        diagnostic(issue.code, issue.message, relativePath),
+        diagnostic(issue.code, issue.message, file.relativePath),
       ]);
-    }
-    for (const specifier of importedSpecifiers(contents)) {
-      const importedPath = await resolveAuthoredImport(
-        normalized.projectRoot,
-        canonicalPath,
-        specifier,
-      );
-      if (importedPath !== undefined) {
-        pending.push(toPosixPath(relative(normalized.projectRoot, importedPath)));
-      }
     }
   }
 }
@@ -2608,8 +3073,8 @@ export async function buildProject(
   const snapshot = await captureSourceSnapshot(projectRoot);
   try {
     await options.hooks?.afterSourceSnapshot?.();
+    await validateAuthoredWorkerSources(snapshot);
     const normalized = await normalizeSnapshot(snapshot);
-    await validateAuthoredWorkerSources(normalized);
     const moduleMap = artifactModuleMap(normalized);
     const bundle = await bundleProject(normalized, moduleMap);
     const manifest = createGeneratedManifest(

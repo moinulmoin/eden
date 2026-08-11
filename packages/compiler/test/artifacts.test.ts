@@ -437,12 +437,135 @@ describe("artifact generation", () => {
         expect.objectContaining({
           code: "MODULE_AMBIENT_BINDING",
           source: "agent/tools/ambient.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
         }),
       ]),
     });
     await expect(
       readFile(join(root, ".eden", "manifest.json"), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("rejects undeclared identifiers with source locations", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Undeclared fixture\n",
+      "agent/tools/undeclared.ts": toolSource.replace(
+        'return { greeting: "Hello " + input.name };',
+        'return { greeting: missingAmbientBinding(input.name) };',
+      ),
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_UNDECLARED_IDENTIFIER",
+          source: "agent/tools/undeclared.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("rejects secret-like and environment identifiers semantically", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Secret fixture\n",
+      "agent/tools/secret.ts": toolSource.replace(
+        'return { greeting: "Hello " + input.name };',
+        'return { greeting: EDEN_API_KEY ?? runtimeEnvironment };',
+      ),
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_UNDECLARED_IDENTIFIER",
+          source: "agent/tools/secret.ts",
+          message: expect.stringContaining("EDEN_API_KEY"),
+        }),
+        expect.objectContaining({
+          code: "MODULE_UNDECLARED_IDENTIFIER",
+          source: "agent/tools/secret.ts",
+          message: expect.stringContaining("runtimeEnvironment"),
+        }),
+      ]),
+    });
+  });
+
+  test("rejects ambient property access through supported Worker globals", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Ambient property fixture\n",
+      "agent/tools/ambient-property.ts": toolSource.replace(
+        'return { greeting: "Hello " + input.name };',
+        "return { greeting: globalThis.EDEN_API_KEY };",
+      ),
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/ambient-property.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("reports top-level undeclared identifiers before module evaluation", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource.replace(
+        '"@cf/zai-org/glm-4.7-flash"',
+        "undeclaredModel",
+      ),
+      "agent/instructions.md": "Top-level fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_UNDECLARED_IDENTIFIER",
+          source: "agent/agent.ts",
+          message: expect.stringContaining("undeclaredModel"),
+        }),
+      ]),
+    });
+  });
+
+  test("allows supported JavaScript and Worker globals", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Supported globals fixture\n",
+      "agent/tools/globals.ts": toolSource.replace(
+        'return { greeting: "Hello " + input.name };',
+        `
+          const values = [Math.max(1, 2), JSON.stringify(input), Number.isFinite(1)];
+          const argumentCount = arguments.length;
+          return {
+            greeting: String(values.length + argumentCount),
+            workerGlobals: [
+              typeof TextEncoder,
+              typeof Request,
+              typeof Response,
+              typeof crypto,
+              typeof fetch,
+              typeof globalThis,
+            ],
+          };
+        `,
+      ),
+    });
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "globals" }),
+    ]);
   });
 
   test("rejects bare imports supplied only by the compiler caller during bundling", async () => {

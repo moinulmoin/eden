@@ -154,6 +154,8 @@ export interface EdenDiagnostic {
   readonly code: string;
   readonly message: string;
   readonly source?: string;
+  readonly line?: number;
+  readonly column?: number;
   readonly severity: "error" | "warning" | "info";
 }
 
