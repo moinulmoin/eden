@@ -6,6 +6,7 @@ import {
   mkdir,
   readdir,
   readFile,
+  readlink,
   realpath,
   rm,
   symlink,
@@ -25,6 +26,14 @@ import {
 
 const temporaryRoots: string[] = [];
 const execFileAsync = promisify(execFile);
+const artifactNames = [
+  "discovery.json",
+  "diagnostics.json",
+  "manifest.json",
+  "module-map.json",
+  "agent-bundle.mjs",
+  "build-metadata.json",
+] as const;
 
 async function createProject(
   files: Record<string, string>,
@@ -249,6 +258,209 @@ describe("artifact generation", () => {
     expect(resolved.artifacts.bundle).not.toContain("Second generation.");
   });
 
+  test("validates and migrates a coherent legacy set before creating CURRENT", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "legacy migration fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const previous = await readArtifactGeneration(join(root, ".eden"));
+    const legacyContents = await Promise.all(
+      artifactNames.map(async (name) => [
+        name,
+        await readFile(join(previous.directory, name)),
+      ] as const),
+    );
+    await rm(join(root, ".eden"), { recursive: true, force: true });
+    await mkdir(join(root, ".eden"), { recursive: true });
+    await Promise.all(
+      legacyContents.map(([name, contents]) =>
+        writeFile(join(root, ".eden", name), contents),
+      ),
+    );
+
+    let currentAtStageBoundary: boolean | undefined;
+    await buildProject({
+      projectRoot: root,
+      hooks: {
+        onPublicationBoundary: async (boundary) => {
+          if (boundary !== "before-stage-write") return;
+          currentAtStageBoundary =
+            await lstat(join(root, ".eden", "CURRENT"))
+              .then(() => true)
+              .catch(() => false);
+        },
+      },
+    });
+
+    expect(currentAtStageBoundary).toBe(false);
+    const migrated = await readArtifactGeneration(join(root, ".eden"));
+    expect(migrated.artifacts.buildMetadata.generationId).toBe(
+      previous.artifacts.buildMetadata.generationId,
+    );
+    expect(migrated.directory).toBe(
+      await realpath(
+        join(
+          root,
+          ".eden",
+          "generations",
+          previous.artifacts.buildMetadata.generationId,
+        ),
+      ),
+    );
+  });
+
+  test.each(artifactNames)(
+    "rejects a legacy set missing %s before creating CURRENT",
+    async (missingArtifact) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "legacy incomplete fixture\n",
+        "agent/tools/greet.ts": toolSource,
+      });
+
+      await buildProject({ projectRoot: root });
+      const previous = await readArtifactGeneration(join(root, ".eden"));
+      const legacyContents = await Promise.all(
+        artifactNames.map(async (name) => [
+          name,
+          await readFile(join(previous.directory, name)),
+        ] as const),
+      );
+      await rm(join(root, ".eden"), { recursive: true, force: true });
+      await mkdir(join(root, ".eden"), { recursive: true });
+      await Promise.all(
+        artifactNames
+          .filter((name) => name !== missingArtifact)
+          .map((name) =>
+            writeFile(
+              join(root, ".eden", name),
+              legacyContents.find(([candidate]) => candidate === name)?.[1] ??
+                new Uint8Array(),
+            ),
+          ),
+      );
+
+      await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+        name: "EdenCompilerError",
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({ code: "OUTPUT_INVALID" }),
+        ]),
+      } satisfies Partial<EdenCompilerError>);
+      await expect(
+        lstat(join(root, ".eden", "CURRENT")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(
+        readdir(join(root, ".eden", "generations")),
+      ).resolves.toEqual([]);
+      for (const name of artifactNames) {
+        const details = await lstat(join(root, ".eden", name)).catch(
+          () => undefined,
+        );
+        expect(details?.isSymbolicLink() ?? false).toBe(false);
+      }
+    },
+  );
+
+  test.each(artifactNames)(
+    "rejects a legacy set with tampered %s before creating CURRENT",
+    async (tamperedArtifact) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "legacy tamper fixture\n",
+        "agent/tools/greet.ts": toolSource,
+      });
+
+      await buildProject({ projectRoot: root });
+      const previous = await readArtifactGeneration(join(root, ".eden"));
+      const legacyContents = await Promise.all(
+        artifactNames.map(async (name) => [
+          name,
+          await readFile(join(previous.directory, name)),
+        ] as const),
+      );
+      await rm(join(root, ".eden"), { recursive: true, force: true });
+      await mkdir(join(root, ".eden"), { recursive: true });
+      await Promise.all(
+        artifactNames.map(async (name) => {
+          const contents =
+            name === tamperedArtifact
+              ? name === "agent-bundle.mjs"
+                ? Buffer.from("tampered bundle", "utf8")
+                : Buffer.from("{}", "utf8")
+              : legacyContents.find(([candidate]) => candidate === name)?.[1] ??
+                new Uint8Array();
+          await writeFile(join(root, ".eden", name), contents);
+        }),
+      );
+
+      await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+        name: "EdenCompilerError",
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            code: expect.stringMatching(/^(?:OUTPUT_INVALID|ARTIFACT_)/u),
+          }),
+        ]),
+      } satisfies Partial<EdenCompilerError>);
+      await expect(
+        lstat(join(root, ".eden", "CURRENT")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(
+        readdir(join(root, ".eden", "generations")),
+      ).resolves.toEqual([]);
+      for (const name of artifactNames) {
+        const details = await lstat(join(root, ".eden", name)).catch(
+          () => undefined,
+        );
+        expect(details?.isSymbolicLink() ?? false).toBe(false);
+      }
+    },
+  );
+
+  test("repairs every stale compatibility alias to the exact current regular file", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "alias repair fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const first = await readArtifactGeneration(join(root, ".eden"));
+    await writeFile(
+      join(root, "agent/tools/greet.ts"),
+      toolSource.replace("Greet a person.", "Second generation."),
+      "utf8",
+    );
+    await buildProject({ projectRoot: root });
+    const second = await readArtifactGeneration(join(root, ".eden"));
+    expect(second.directory).not.toBe(first.directory);
+
+    const outputRoot = await realpath(join(root, ".eden"));
+    for (const name of artifactNames) {
+      const alias = join(outputRoot, name);
+      await rm(alias, { force: true });
+      await symlink(
+        relative(outputRoot, join(first.directory, name)),
+        alias,
+      );
+    }
+
+    await buildProject({ projectRoot: root });
+
+    for (const name of artifactNames) {
+      const alias = join(outputRoot, name);
+      await expect(readlink(alias)).resolves.toBe(join("CURRENT", name));
+      await expect(realpath(alias)).resolves.toBe(
+        join(second.directory, name),
+      );
+      await expect(lstat(await realpath(alias))).resolves.toSatisfy(
+        (details) => details.isFile() && !details.isSymbolicLink(),
+      );
+    }
+  });
+
   test("keeps executable identity stable while timestamps remain diagnostic", async () => {
     const root = await createProject({
       "agent/agent.ts": agentSource,
@@ -362,9 +574,7 @@ describe("artifact generation", () => {
       await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
         name: "EdenCompilerError",
         diagnostics: expect.arrayContaining([
-          expect.objectContaining({
-            code: "OUTPUT_INVALID",
-          }),
+          expect.objectContaining({ code: "OUTPUT_INVALID" }),
         ]),
       } satisfies Partial<EdenCompilerError>);
 

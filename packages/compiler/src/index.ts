@@ -17,6 +17,7 @@ import {
   readdir,
   realpath,
   rename,
+  readlink,
   rm,
   stat,
   symlink,
@@ -3841,50 +3842,32 @@ async function readPublishedGeneration(
         ),
       ]);
     }
-    const [discovery, diagnostics, manifest, moduleMap, buildMetadata, bundle] =
-      await Promise.all([
-        readFile(join(directory, ARTIFACT_FILE_NAMES.discovery), "utf8").then(
-          (value) => JSON.parse(value) as EdenDiscoveryRecord,
-        ),
-        readFile(join(directory, ARTIFACT_FILE_NAMES.diagnostics), "utf8").then(
-          (value) => JSON.parse(value) as unknown,
-        ),
-        readFile(join(directory, ARTIFACT_FILE_NAMES.manifest), "utf8").then(
-          (value) => JSON.parse(value) as EdenManifest,
-        ),
-        readFile(join(directory, ARTIFACT_FILE_NAMES.moduleMap), "utf8").then(
-          (value) => JSON.parse(value) as EdenModuleMap,
-        ),
-        readFile(
-          join(directory, ARTIFACT_FILE_NAMES.buildMetadata),
-          "utf8",
-        ).then((value) => JSON.parse(value) as EdenBuildMetadata),
-        readFile(join(directory, ARTIFACT_FILE_NAMES.bundle), "utf8"),
-      ]);
-    assertPublishedArtifactCoherence(
+    const [
       discovery,
       diagnostics,
       manifest,
       moduleMap,
-      bundle,
       buildMetadata,
+      bundle,
+    ] = await Promise.all([
+      readFile(join(directory, ARTIFACT_FILE_NAMES.discovery), "utf8"),
+      readFile(join(directory, ARTIFACT_FILE_NAMES.diagnostics), "utf8"),
+      readFile(join(directory, ARTIFACT_FILE_NAMES.manifest), "utf8"),
+      readFile(join(directory, ARTIFACT_FILE_NAMES.moduleMap), "utf8"),
+      readFile(join(directory, ARTIFACT_FILE_NAMES.buildMetadata), "utf8"),
+      readFile(join(directory, ARTIFACT_FILE_NAMES.bundle), "utf8"),
+    ]);
+    return decodePublishedArtifactSet(
+      {
+        discovery,
+        diagnostics,
+        manifest,
+        moduleMap,
+        buildMetadata,
+        bundle,
+      },
+      directory,
     );
-    if (basename(directory) !== buildMetadata.generationId) {
-      throw new EdenCompilerError("Published artifact identity is invalid", [
-        diagnostic(
-          "OUTPUT_INVALID",
-          `Existing artifact generation "${basename(directory)}" does not match its recorded generation identity.`,
-        ),
-      ]);
-    }
-    return {
-      discovery,
-      diagnostics: diagnostics as readonly EdenDiagnostic[],
-      manifest,
-      moduleMap,
-      bundle,
-      buildMetadata,
-    };
   } catch (error: unknown) {
     if (error instanceof EdenCompilerError) throw error;
     throw new EdenCompilerError("Published artifact generation is invalid", [
@@ -3896,11 +3879,207 @@ async function readPublishedGeneration(
   }
 }
 
+interface PublishedArtifactContents {
+  readonly discovery: string;
+  readonly diagnostics: string;
+  readonly manifest: string;
+  readonly moduleMap: string;
+  readonly bundle: string;
+  readonly buildMetadata: string;
+}
+
+function decodePublishedArtifactSet(
+  contents: PublishedArtifactContents,
+  directory?: string,
+): EdenArtifactSet {
+  const discovery = JSON.parse(contents.discovery) as EdenDiscoveryRecord;
+  const diagnostics = JSON.parse(contents.diagnostics) as unknown;
+  const manifest = JSON.parse(contents.manifest) as EdenManifest;
+  const moduleMap = JSON.parse(contents.moduleMap) as EdenModuleMap;
+  const buildMetadata = JSON.parse(
+    contents.buildMetadata,
+  ) as EdenBuildMetadata;
+  const bundle = contents.bundle;
+  assertPublishedArtifactCoherence(
+    discovery,
+    diagnostics,
+    manifest,
+    moduleMap,
+    bundle,
+    buildMetadata,
+  );
+  if (directory !== undefined && basename(directory) !== buildMetadata.generationId) {
+    throw new EdenCompilerError("Published artifact identity is invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Existing artifact generation "${basename(directory)}" does not match its recorded generation identity.`,
+      ),
+    ]);
+  }
+  return {
+    discovery,
+    diagnostics: diagnostics as readonly EdenDiagnostic[],
+    manifest,
+    moduleMap,
+    bundle,
+    buildMetadata,
+  };
+}
+
+async function readLegacyArtifactSet(
+  outputDirectory: string,
+): Promise<{
+  readonly artifacts: EdenArtifactSet;
+  readonly contents: PublishedArtifactContents;
+} | undefined> {
+  const artifactPaths = Object.values(ARTIFACT_FILE_NAMES).map((name) => ({
+    name,
+    path: join(outputDirectory, name),
+  }));
+  const details = await Promise.all(
+    artifactPaths.map(({ path }) => lstat(path).catch(() => undefined)),
+  );
+  const present = details.filter((detail) => detail !== undefined);
+  if (present.length === 0) return undefined;
+  if (
+    present.length !== artifactPaths.length ||
+    details.some(
+      (detail) =>
+        detail === undefined ||
+        !detail.isFile() ||
+        detail.isSymbolicLink(),
+    )
+  ) {
+    throw new EdenCompilerError("Legacy artifact set is invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Legacy artifact output "${outputDirectory}" must contain all six regular artifact files before migration.`,
+        outputDirectory,
+      ),
+    ]);
+  }
+  try {
+    const [
+      discovery,
+      diagnostics,
+      manifest,
+      moduleMap,
+      bundle,
+      buildMetadata,
+    ] = await Promise.all([
+      readFile(join(outputDirectory, ARTIFACT_FILE_NAMES.discovery), "utf8"),
+      readFile(join(outputDirectory, ARTIFACT_FILE_NAMES.diagnostics), "utf8"),
+      readFile(join(outputDirectory, ARTIFACT_FILE_NAMES.manifest), "utf8"),
+      readFile(join(outputDirectory, ARTIFACT_FILE_NAMES.moduleMap), "utf8"),
+      readFile(join(outputDirectory, ARTIFACT_FILE_NAMES.bundle), "utf8"),
+      readFile(
+        join(outputDirectory, ARTIFACT_FILE_NAMES.buildMetadata),
+        "utf8",
+      ),
+    ]);
+    const contents: PublishedArtifactContents = {
+      discovery,
+      diagnostics,
+      manifest,
+      moduleMap,
+      bundle,
+      buildMetadata,
+    };
+    return {
+      contents,
+      artifacts: decodePublishedArtifactSet(contents),
+    };
+  } catch (error: unknown) {
+    if (error instanceof EdenCompilerError) {
+      throw error;
+    }
+    const message = error instanceof Error ? `: ${error.message}` : "";
+    throw new EdenCompilerError(`Legacy artifact set is invalid${message}`, [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Legacy artifact output "${outputDirectory}" is malformed or incoherent and cannot become CURRENT${message}.`,
+        outputDirectory,
+      ),
+    ]);
+  }
+}
+
+async function writePublishedArtifactContents(
+  directory: string,
+  contents: PublishedArtifactContents,
+): Promise<void> {
+  await Promise.all([
+    writeFile(
+      join(directory, ARTIFACT_FILE_NAMES.discovery),
+      contents.discovery,
+      "utf8",
+    ),
+    writeFile(
+      join(directory, ARTIFACT_FILE_NAMES.diagnostics),
+      contents.diagnostics,
+      "utf8",
+    ),
+    writeFile(
+      join(directory, ARTIFACT_FILE_NAMES.manifest),
+      contents.manifest,
+      "utf8",
+    ),
+    writeFile(
+      join(directory, ARTIFACT_FILE_NAMES.moduleMap),
+      contents.moduleMap,
+      "utf8",
+    ),
+    writeFile(
+      join(directory, ARTIFACT_FILE_NAMES.bundle),
+      contents.bundle,
+      "utf8",
+    ),
+    writeFile(
+      join(directory, ARTIFACT_FILE_NAMES.buildMetadata),
+      contents.buildMetadata,
+      "utf8",
+    ),
+  ]);
+}
+
 async function assertPublishedGeneration(
   projectRoot: string,
   directory: string,
 ): Promise<void> {
   await readPublishedGeneration(projectRoot, directory);
+}
+
+async function assertArtifactCompatibilityLinks(
+  outputDirectory: string,
+  generationDirectory: string,
+): Promise<void> {
+  for (const name of Object.values(ARTIFACT_FILE_NAMES)) {
+    const alias = join(outputDirectory, name);
+    const details = await lstat(alias).catch(() => undefined);
+    const expected = join(generationDirectory, name);
+    const expectedDetails = await lstat(expected).catch(() => undefined);
+    const target = details?.isSymbolicLink()
+      ? await readlink(alias).catch(() => undefined)
+      : undefined;
+    const resolved = await realpath(alias).catch(() => undefined);
+    if (
+      details === undefined ||
+      !details.isSymbolicLink() ||
+      target !== join("CURRENT", name) ||
+      expectedDetails === undefined ||
+      !expectedDetails.isFile() ||
+      expectedDetails.isSymbolicLink() ||
+      resolved !== expected
+    ) {
+      throw new EdenCompilerError("Artifact compatibility links are invalid", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          `Generated artifact alias "${name}" must target the exact regular file under the resolved CURRENT generation.`,
+          name,
+        ),
+      ]);
+    }
+  }
 }
 
 /**
@@ -4246,27 +4425,22 @@ async function publishArtifacts(
         const existing = await lstat(destination).catch(() => undefined);
         if (existing?.isSymbolicLink() === true) {
           const resolved = await realpath(destination).catch(() => undefined);
+          const expected = join(generationDirectory, name);
+          const target = await readlink(destination).catch(() => undefined);
           if (
-            resolved === undefined ||
-            !isWithinRoot(projectRoot, resolved) ||
-            !isWithinRoot(generationsDirectory, resolved)
+            target === join("CURRENT", name) &&
+            resolved === expected &&
+            (await lstat(expected).catch(() => undefined))?.isFile() === true
           ) {
-            throw new EdenCompilerError("Artifact compatibility link is unsafe", [
-              diagnostic(
-                "OUTPUT_OUTSIDE_PROJECT",
-                `Generated artifact link "${name}" resolves outside the selected generation root.`,
-                name,
-              ),
-            ]);
+            continue;
           }
-          continue;
         }
         if (existing !== undefined) {
-          if (!existing.isFile()) {
+          if (!existing.isFile() && !existing.isSymbolicLink()) {
             throw new EdenCompilerError("Artifact compatibility link is invalid", [
               diagnostic(
                 "OUTPUT_INVALID",
-                `Generated artifact link "${name}" must replace a regular file or symlink.`,
+                `Generated artifact link "${name}" must replace a regular file, directory, or symlink.`,
                 name,
               ),
             ]);
@@ -4324,39 +4498,40 @@ async function publishArtifacts(
   try {
     const currentExists = await readCurrent();
     if (!currentExists) {
-      const legacyFiles = await Promise.all(
-        artifactNames.map(async (name) => {
-          const path = join(outputDirectory, name);
-          const details = await lstat(path).catch(() => undefined);
-          if (details === undefined || details.isSymbolicLink() || !details.isFile()) {
-            return undefined;
-          }
-          return { name, contents: await readFile(path) };
-        }),
-      );
-      if (legacyFiles.every((file) => file !== undefined)) {
+      const legacy = await readLegacyArtifactSet(outputDirectory);
+      if (legacy !== undefined) {
         const legacyDirectory = join(
           generationsDirectory,
-          `.legacy-${process.pid}-${Date.now()}-${Math.random()
-            .toString(16)
-            .slice(2)}`,
+          legacy.artifacts.buildMetadata.generationId,
         );
-        await mkdir(legacyDirectory);
-        try {
-          await Promise.all(
-            legacyFiles.map(async (file) => {
-              if (file === undefined) return;
-              await writeFile(join(legacyDirectory, file.name), file.contents, {
-                flag: "wx",
-              });
-            }),
-          );
-          await makePointer(legacyDirectory);
-        } catch (error: unknown) {
-          await rm(legacyDirectory, { recursive: true, force: true }).catch(
-            () => undefined,
-          );
-          throw error;
+        const existingLegacy = await lstat(legacyDirectory).catch(
+          () => undefined,
+        );
+        if (existingLegacy === undefined) {
+          await mkdir(legacyDirectory);
+          try {
+            await writePublishedArtifactContents(
+              legacyDirectory,
+              legacy.contents,
+            );
+            await assertPublishedGeneration(projectRoot, legacyDirectory);
+          } catch (error: unknown) {
+            await rm(legacyDirectory, { recursive: true, force: true }).catch(
+              () => undefined,
+            );
+            throw error;
+          }
+        } else {
+          if (!existingLegacy.isDirectory() || existingLegacy.isSymbolicLink()) {
+            throw new EdenCompilerError("Legacy artifact set is invalid", [
+              diagnostic(
+                "OUTPUT_INVALID",
+                `Legacy generation "${legacy.artifacts.buildMetadata.generationId}" is not a real directory.`,
+                legacy.artifacts.buildMetadata.generationId,
+              ),
+            ]);
+          }
+          await assertPublishedGeneration(projectRoot, legacyDirectory);
         }
       }
     }
@@ -4376,38 +4551,14 @@ async function publishArtifacts(
     );
     await assertNoGeneratedSymlinks(projectRoot, generationsDirectory);
     await mkdir(stage);
-    await Promise.all([
-      writeFile(
-        join(stage, ARTIFACT_FILE_NAMES.discovery),
-        jsonDocument(artifacts.discovery),
-        "utf8",
-      ),
-      writeFile(
-        join(stage, ARTIFACT_FILE_NAMES.diagnostics),
-        jsonDocument(artifacts.diagnostics),
-        "utf8",
-      ),
-      writeFile(
-        join(stage, ARTIFACT_FILE_NAMES.manifest),
-        jsonDocument(artifacts.manifest),
-        "utf8",
-      ),
-      writeFile(
-        join(stage, ARTIFACT_FILE_NAMES.moduleMap),
-        jsonDocument(artifacts.moduleMap),
-        "utf8",
-      ),
-      writeFile(
-        join(stage, ARTIFACT_FILE_NAMES.bundle),
-        artifacts.bundle,
-        "utf8",
-      ),
-      writeFile(
-        join(stage, ARTIFACT_FILE_NAMES.buildMetadata),
-        jsonDocument(artifacts.buildMetadata),
-        "utf8",
-      ),
-    ]);
+    await writePublishedArtifactContents(stage, {
+      discovery: jsonDocument(artifacts.discovery),
+      diagnostics: jsonDocument(artifacts.diagnostics),
+      manifest: jsonDocument(artifacts.manifest),
+      moduleMap: jsonDocument(artifacts.moduleMap),
+      bundle: artifacts.bundle,
+      buildMetadata: jsonDocument(artifacts.buildMetadata),
+    });
 
     await assertNoGeneratedSymlinks(projectRoot, stage);
     const stagedBundle = await readFile(join(stage, ARTIFACT_FILE_NAMES.bundle), "utf8");
@@ -4463,6 +4614,7 @@ async function publishArtifacts(
     generationPromoted = true;
     await hooks.onPublicationBoundary?.("after-current-promotion");
     await cleanupBackups(artifactLinkTransaction.backups);
+    await assertArtifactCompatibilityLinks(outputDirectory, generationDirectory);
   } catch (error: unknown) {
     await rm(stage, { recursive: true, force: true }).catch(() => undefined);
     if (!generationPromoted && artifactLinkTransaction !== undefined) {
