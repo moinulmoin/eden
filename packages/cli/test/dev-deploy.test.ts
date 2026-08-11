@@ -352,6 +352,217 @@ describe("eden dev and deploy orchestration", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  test("cancels a hung initial compatibility child before dev cleanup settles", async () => {
+    const root = await createRoot("eden-cli-dev-initial-dry-run-signal-");
+    await initRoot(root);
+    let releaseResult: (() => void) | undefined;
+    let terminateSignal: NodeJS.Signals | undefined;
+    let dryRunStarted: (() => void) | undefined;
+    const dryRunStartedPromise = new Promise<void>((resolve) => {
+      dryRunStarted = resolve;
+    });
+    const result = new Promise<{
+      readonly exitCode: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    }>((resolve) => {
+      releaseResult = () => resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    const dryRunProcess = {
+      pid: 41_012,
+      startIdentity: "fixture-initial-dry-run",
+      exited: result.then(() => ({ exitCode: 0, signal: null })),
+      async terminate(signal?: NodeJS.Signals) {
+        terminateSignal = signal;
+        releaseResult?.();
+      },
+    };
+    const dryRun = { process: dryRunProcess, result };
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      dryRunRunner: () => {
+        dryRunStarted?.();
+        return dryRun as never;
+      },
+    });
+
+    await dryRunStartedPromise;
+    process.emit("SIGTERM");
+    await expect(
+      Promise.race([
+        devPromise,
+        new Promise<number>((resolve) => {
+          setTimeout(() => resolve(-1), 2_000);
+        }),
+      ]),
+    ).resolves.toBe(0);
+    expect(terminateSignal).toBe("SIGTERM");
+  });
+
+  test("cancels a hung watch compatibility child and the runtime child together", async () => {
+    const root = await createRoot("eden-cli-dev-watch-dry-run-signal-");
+    await initRoot(root);
+    let dryRunCount = 0;
+    let watchDryRunStarted: (() => void) | undefined;
+    const watchDryRunStartedPromise = new Promise<void>((resolve) => {
+      watchDryRunStarted = resolve;
+    });
+    let releaseWatchResult: (() => void) | undefined;
+    let watchTerminateSignal: NodeJS.Signals | undefined;
+    let runtimeTerminateSignal: NodeJS.Signals | undefined;
+    let releaseRuntime: (() => void) | undefined;
+    const runtimeExited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseRuntime = () => resolve({ exitCode: 0, signal: null });
+    });
+    const watchResult = new Promise<{
+      readonly exitCode: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    }>((resolve) => {
+      releaseWatchResult = () => resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    const watchDryRunProcess = {
+      pid: 41_013,
+      startIdentity: "fixture-watch-dry-run",
+      exited: watchResult.then(() => ({ exitCode: 0, signal: null })),
+      async terminate(signal?: NodeJS.Signals) {
+        watchTerminateSignal = signal;
+        releaseWatchResult?.();
+      },
+    };
+    const watchDryRun = {
+      process: watchDryRunProcess,
+      result: watchResult,
+    };
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      processRunner: {
+        spawn() {
+          return {
+            pid: 41_014,
+            startIdentity: "fixture-runtime",
+            ready: Promise.resolve(),
+            exited: runtimeExited,
+            async terminate(signal?: NodeJS.Signals) {
+              runtimeTerminateSignal = signal;
+              releaseRuntime?.();
+            },
+          };
+        },
+      },
+      dryRunRunner: () => {
+        dryRunCount += 1;
+        if (dryRunCount === 1) {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        watchDryRunStarted?.();
+        return watchDryRun as never;
+      },
+      stdout: (line) => {
+        if (line.includes("Eden dev ready")) {
+          void writeFile(
+            join(root, "agent/tools/greet.ts"),
+            `export default {
+  description: "watch signal fixture",
+  inputSchema: {
+    "~standard": {
+      version: 1,
+      vendor: "fixture",
+      validate(value: unknown) {
+        return { value };
+      },
+    },
+  },
+  execute() {
+    return { greeting: "watch signal fixture" };
+  },
+};
+`,
+            "utf8",
+          );
+        }
+      },
+    });
+
+    await watchDryRunStartedPromise;
+    process.emit("SIGINT");
+    await expect(
+      Promise.race([
+        devPromise,
+        new Promise<number>((resolve) => {
+          setTimeout(() => resolve(-1), 2_000);
+        }),
+      ]),
+    ).resolves.toBe(0);
+    expect(watchTerminateSignal).toBe("SIGINT");
+    expect(runtimeTerminateSignal).toBe("SIGINT");
+  }, 10_000);
+
+  test("keeps a replacement ownership marker with a different token", async () => {
+    const root = await createRoot("eden-cli-dev-state-token-");
+    await initRoot(root);
+    const statePath = join(root, ".eden-dev-state.json");
+    let observedToken: unknown;
+    let release: (() => void) | undefined;
+    const exited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      release = () => resolve({ exitCode: 0, signal: null });
+    });
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      processRunner: {
+        spawn() {
+          return {
+            pid: 41_015,
+            startIdentity: "fixture-token-owner",
+            ready: Promise.resolve(),
+            exited,
+            async terminate() {
+              const current = JSON.parse(
+                await readFile(statePath, "utf8"),
+              ) as { readonly token?: unknown };
+              observedToken = current.token;
+              await writeFile(
+                statePath,
+                JSON.stringify({
+                  pid: 41_015,
+                  startedAt: "fixture-token-owner",
+                  token: "replacement-token",
+                  workerHost: EDEN_LOCAL_HOST,
+                  workerPort: EDEN_LOCAL_PORT,
+                  inspectorHost: EDEN_LOCAL_HOST,
+                  inspectorPort: EDEN_LOCAL_INSPECTOR_PORT,
+                }),
+                "utf8",
+              );
+              release?.();
+            },
+          };
+        },
+      },
+      dryRunRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      }),
+      stdout: (line) => {
+        if (line.includes("Eden dev ready")) process.emit("SIGTERM");
+      },
+    });
+
+    await expect(devPromise).resolves.toBe(0);
+    expect(observedToken).toEqual(expect.any(String));
+    await expect(readFile(statePath, "utf8")).resolves.toContain(
+      "replacement-token",
+    );
+  });
+
   test("stops startup before spawning when a signal arrives during the initial build", async () => {
     const root = await createRoot("eden-cli-dev-build-signal-");
     await initRoot(root);
@@ -474,6 +685,7 @@ describe("eden dev and deploy orchestration", () => {
       JSON.stringify({
         pid: childPid,
         startedAt: identity,
+        token: "owned-stop-token",
         workerHost: EDEN_LOCAL_HOST,
         workerPort: EDEN_LOCAL_PORT,
         inspectorHost: EDEN_LOCAL_HOST,

@@ -176,12 +176,17 @@ test("executes the eden-local manifest lifecycle without disturbing a sentinel",
   expect(commands.start).toContain("EDEN_PORT=8797");
   expect(commands.start).toContain("EDEN_INSPECTOR_PORT=9297");
   expect(commands.stop).toContain("stopEdenDev");
+  expect(commands.stop).toContain("env -u EDEN_BEARER_SECRET");
   expect(commands.healthcheck).toContain("printf");
   expect(commands.healthcheck).toContain("curl --config -");
   const secret = `manifest-test-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const env = {
     ...process.env,
     EDEN_BEARER_SECRET: secret,
+  };
+  const stopEnv = {
+    ...env,
+    EDEN_BEARER_SECRET: undefined,
   };
   const sentinel = spawn(
     process.execPath,
@@ -195,7 +200,7 @@ test("executes the eden-local manifest lifecycle without disturbing a sentinel",
     expect(healthy).toBe(true);
     expect(sentinel.exitCode).toBeNull();
 
-    const stopped = await runShell(commands.stop, env);
+    const stopped = await runShell(commands.stop, stopEnv);
     expect(stopped.code).toBe(0);
     await waitForExit(service);
     expect(service.exitCode).not.toBeNull();
@@ -204,7 +209,7 @@ test("executes the eden-local manifest lifecycle without disturbing a sentinel",
     expect(sentinel.exitCode).toBeNull();
   } finally {
     if (healthy || service.exitCode === null) {
-      await runShell(commands.stop, env);
+      await runShell(commands.stop, stopEnv);
     }
     if (await ownedServiceAlive(service)) {
       if (process.platform !== "win32") {
