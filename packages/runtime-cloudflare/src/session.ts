@@ -35,6 +35,7 @@ import {
   MAX_RECOVERY_JOBS_PER_ALARM,
   nextRecoveryJobDueAt,
   processRecoveryJobs,
+  quarantineLegacyCompletedUnknownActions,
   recoverRecoveryJob,
   type RecoveryJobInspectionOptions,
   type RecoveryJobRecord,
@@ -358,6 +359,10 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     super(ctx, env);
     this.initialized = ctx.blockConcurrencyWhile(async () => {
       applySessionMigrations(ctx.storage);
+      const sessionId = sessionIdFromObjectName(ctx.id.name ?? "");
+      if (sessionId !== null) {
+        quarantineLegacyCompletedUnknownActions(ctx.storage, sessionId);
+      }
     });
   }
 
@@ -450,7 +455,7 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     options: RecoveryJobInspectionOptions = {},
   ): RecoveryJobInspection {
     const sessionId = this.requireSessionId();
-    return inspectRecoveryJobs(this.ctx.storage.sql, sessionId, options);
+    return inspectRecoveryJobs(this.ctx.storage, sessionId, options);
   }
 
   async recoverRecoveryJob(

@@ -17,6 +17,7 @@ import {
   createSessionObjectName,
 } from "../src/session-identity.js";
 import { SESSION_SCHEMA_VERSION } from "../src/session-schema.js";
+import { readSessionRehydratedState } from "../src/session-state.js";
 
 function sessionStub(sessionId: string): DurableObjectStub {
   return env.EDEN_SESSIONS.getByName(createSessionObjectName(sessionId));
@@ -470,6 +471,133 @@ describe("EdenSession recovery jobs and alarms", () => {
       "https://session/_eden/jobs?cursor=not-a-valid-cursor",
     );
     expect(invalidResponse.status).toBe(400);
+  }, 15_000);
+
+  test("keeps inspection complete when recovery mutates an unseen job between pages", async () => {
+    const sessionId = createOpaqueSessionId();
+    const stub = sessionStub(sessionId);
+    await initializeSession(stub, sessionId);
+    const createdAt = "2026-08-11T00:00:00.000Z";
+
+    await runInDurableObject(stub, (_instance, state) => {
+      for (let index = 0; index < 5; index += 1) {
+        state.storage.sql.exec(
+          `INSERT INTO jobs (
+            job_id, session_id, kind, status, due_at, attempts, max_attempts,
+            last_error, recovery_action, created_at, updated_at, completed_at
+          ) VALUES (?, ?, ?, 'dead', ?, 3, 3, ?, ?, ?, ?, ?)`,
+          `job_mutation_${index}`,
+          sessionId,
+          "checkpoint",
+          1_000,
+          "safe failure",
+          "mark-complete",
+          createdAt,
+          createdAt,
+          createdAt,
+        );
+      }
+    });
+
+    const first = await runInDurableObject(stub, (instance) =>
+      (instance as EdenSession).inspectRecoveryJobs({ limit: 2 }),
+    );
+    expect(first.jobs.map(({ jobId }) => jobId)).toEqual([
+      "job_mutation_0",
+      "job_mutation_1",
+    ]);
+    expect(first.nextCursor).not.toBeNull();
+
+    await runInDurableObject(stub, (instance) =>
+      (instance as EdenSession).recoverRecoveryJob("job_mutation_2", {
+        recoveryAction: "mark-complete",
+        dueAt: 1,
+      }),
+    );
+
+    const seen = new Set(first.jobs.map(({ jobId }) => jobId));
+    let cursor = first.nextCursor;
+    while (cursor !== null) {
+      const page = await runInDurableObject(stub, (instance) =>
+        (instance as EdenSession).inspectRecoveryJobs({
+          cursor: cursor ?? undefined,
+          limit: 2,
+        }),
+      );
+      for (const job of page.jobs) {
+        expect(seen.has(job.jobId)).toBe(false);
+        seen.add(job.jobId);
+      }
+      cursor = page.nextCursor;
+    }
+
+    expect(seen).toEqual(
+      new Set([
+        "job_mutation_0",
+        "job_mutation_1",
+        "job_mutation_2",
+        "job_mutation_3",
+        "job_mutation_4",
+      ]),
+    );
+  }, 15_000);
+
+  test("quarantines completed legacy jobs with unknown actions during rehydration", async () => {
+    const sessionId = createOpaqueSessionId();
+    const stub = sessionStub(sessionId);
+    await initializeSession(stub, sessionId);
+    const createdAt = "2026-08-11T00:00:00.000Z";
+
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO jobs (
+          job_id, session_id, kind, status, due_at, attempts, max_attempts,
+          last_error, recovery_action, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, 'completed', ?, 1, 3, NULL, ?, ?, ?, ?)`,
+        "job_completed_legacy_unknown",
+        sessionId,
+        "checkpoint",
+        1_000,
+        "removed-action",
+        createdAt,
+        createdAt,
+        createdAt,
+      );
+    });
+
+    await import("cloudflare:test").then(({ evictDurableObject }) =>
+      evictDurableObject(stub),
+    );
+
+    const snapshot = await runInDurableObject(stub, (_instance, state) =>
+      readSessionRehydratedState(state.storage.sql, sessionId),
+    );
+    expect(snapshot.jobs).toEqual([
+      expect.objectContaining({
+        jobId: "job_completed_legacy_unknown",
+        status: "dead",
+        recoveryAction: "removed-action",
+        lastError: "Unknown recovery action",
+        completedAt: null,
+      }),
+    ]);
+    expect(snapshot.errors).toEqual([
+      expect.objectContaining({
+        errorId: "err_job_job_completed_legacy_unknown",
+        code: "recovery_job_failed",
+        message: "Unknown recovery action",
+        retryable: false,
+        status: "open",
+      }),
+    ]);
+
+    const inspected = await runInDurableObject(stub, (instance) =>
+      (instance as EdenSession).inspectRecoveryJobs(),
+    );
+    expect(inspected.jobs[0]).toMatchObject({
+      jobId: "job_completed_legacy_unknown",
+      status: "dead",
+    });
   }, 15_000);
 
   test("persists each version dimension independently across eviction", async () => {

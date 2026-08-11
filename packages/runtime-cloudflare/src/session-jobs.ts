@@ -251,15 +251,15 @@ function readNextDueAt(
 }
 
 interface RecoveryJobInspectionCursor {
-  readonly version: 1;
-  readonly dueAt: number;
+  readonly version: 2;
+  readonly createdAt: string;
   readonly jobId: string;
 }
 
 function encodeInspectionCursor(job: RecoveryJobRecord): string {
   const payload: RecoveryJobInspectionCursor = {
-    version: 1,
-    dueAt: job.dueAt,
+    version: 2,
+    createdAt: job.createdAt,
     jobId: job.jobId,
   };
   const encoded = new TextEncoder().encode(JSON.stringify(payload));
@@ -282,13 +282,17 @@ function decodeInspectionCursor(cursor: string): RecoveryJobInspectionCursor {
       typeof parsed !== "object" ||
       parsed === null ||
       Array.isArray(parsed) ||
-      (parsed as { readonly version?: unknown }).version !== 1 ||
-      !Number.isSafeInteger((parsed as { readonly dueAt?: unknown }).dueAt) ||
-      (parsed as { readonly dueAt: number }).dueAt < 0 ||
+      (parsed as { readonly version?: unknown }).version !== 2 ||
+      typeof (parsed as { readonly createdAt?: unknown }).createdAt !== "string" ||
       typeof (parsed as { readonly jobId?: unknown }).jobId !== "string"
     ) {
       throw new Error("Recovery inspection cursor is invalid");
     }
+    assertBoundedText(
+      (parsed as { readonly createdAt: string }).createdAt,
+      "Recovery inspection cursor creation time",
+      MAX_RECOVERY_TIMESTAMP_BYTES,
+    );
     assertJobId((parsed as { readonly jobId: string }).jobId);
     return parsed as RecoveryJobInspectionCursor;
   } catch {
@@ -320,7 +324,7 @@ function readInspectionPage(
         completed_at
        FROM jobs
        WHERE session_id = ?
-       ORDER BY due_at ASC, job_id ASC
+       ORDER BY created_at ASC, job_id ASC
        LIMIT ?`,
       sessionId,
       limit + 1,
@@ -331,12 +335,12 @@ function readInspectionPage(
         completed_at
        FROM jobs
        WHERE session_id = ?
-         AND (due_at > ? OR (due_at = ? AND job_id > ?))
-       ORDER BY due_at ASC, job_id ASC
+         AND (created_at > ? OR (created_at = ? AND job_id > ?))
+       ORDER BY created_at ASC, job_id ASC
        LIMIT ?`,
       sessionId,
-      cursor.dueAt,
-      cursor.dueAt,
+      cursor.createdAt,
+      cursor.createdAt,
       cursor.jobId,
       limit + 1,
     ).toArray();
@@ -349,6 +353,51 @@ function readInspectionPage(
         ? encodeInspectionCursor(lastJob)
         : null,
   };
+}
+
+export function quarantineLegacyCompletedUnknownActions(
+  storage: RecoveryJobStorage,
+  sessionId: string,
+): void {
+  storage.transactionSync(() => {
+    const placeholders = REGISTERED_RECOVERY_ACTIONS.map(() => "?").join(", ");
+    const legacyRows = storage.sql
+      .exec<RecoveryJobRow>(
+        `SELECT job_id, session_id, kind, status, due_at, attempts,
+          max_attempts, last_error, recovery_action, created_at, updated_at,
+          completed_at
+         FROM jobs
+         WHERE session_id = ?
+           AND status = 'completed'
+           AND (
+             recovery_action IS NULL
+             OR recovery_action NOT IN (${placeholders})
+           )`,
+        sessionId,
+        ...REGISTERED_RECOVERY_ACTIONS,
+      )
+      .toArray();
+    if (legacyRows.length === 0) return;
+
+    const timestamp = nowIso();
+    for (const row of legacyRows) {
+      const summary = "Unknown recovery action";
+      storage.sql.exec(
+        `UPDATE jobs
+         SET status = 'dead', last_error = ?, updated_at = ?,
+             completed_at = NULL
+         WHERE session_id = ? AND job_id = ? AND status = 'completed'`,
+        summary,
+        timestamp,
+        sessionId,
+        row.job_id,
+      );
+      const job = readJob(storage.sql, sessionId, row.job_id);
+      if (job !== null) {
+        upsertJobError(storage.sql, sessionId, job, summary, timestamp);
+      }
+    }
+  });
 }
 
 function requireSession(sql: EdenSqlStorage, sessionId: string): void {
@@ -417,7 +466,7 @@ function upsertJobError(
     sessionId,
     "recovery_job_failed",
     summary,
-    job.attempts < job.maxAttempts ? 1 : 0,
+    job.status !== "dead" && job.attempts < job.maxAttempts ? 1 : 0,
     timestamp,
   );
 }
@@ -558,15 +607,16 @@ function failJob(
 }
 
 export function inspectRecoveryJobs(
-  sql: EdenSqlStorage,
+  storage: RecoveryJobStorage,
   sessionId: string,
   options: RecoveryJobInspectionOptions = {},
 ): RecoveryJobInspection {
-  requireSession(sql, sessionId);
-  const page = readInspectionPage(sql, sessionId, options);
+  quarantineLegacyCompletedUnknownActions(storage, sessionId);
+  requireSession(storage.sql, sessionId);
+  const page = readInspectionPage(storage.sql, sessionId, options);
   return {
     jobs: page.jobs,
-    nextDueAt: readNextDueAt(sql, sessionId),
+    nextDueAt: readNextDueAt(storage.sql, sessionId),
     nextCursor: page.nextCursor,
   };
 }
@@ -631,6 +681,7 @@ export function recoverRecoveryJob(
   ) {
     throw new Error("Recovery operation is invalid");
   }
+  quarantineLegacyCompletedUnknownActions(storage, sessionId);
   requireSession(storage.sql, sessionId);
 
   return storage.transactionSync(() => {
@@ -673,6 +724,7 @@ export async function processRecoveryJobs(
     throw new Error("Recovery job batch limit is invalid");
   }
   const limit = Math.min(requestedLimit, MAX_RECOVERY_JOBS_PER_ALARM);
+  quarantineLegacyCompletedUnknownActions(storage, sessionId);
   requireSession(storage.sql, sessionId);
 
   let processed = 0;
