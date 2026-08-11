@@ -32,12 +32,14 @@ import {
   resolve,
   sep,
 } from "path";
+import { createRequire } from "module";
 
 import type {
   EdenAgentDefinition,
   EdenArtifactSet,
   EdenBuildMetadata,
   EdenDiagnostic,
+  EdenDiscoveryRecord,
   EdenInstructionManifest,
   EdenJsonValue,
   EdenModuleMap,
@@ -262,6 +264,45 @@ function sourcePath(
 
 function hashBytes(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function resolveSelectedProjectDependency(
+  projectRoot: string,
+  importer: string,
+  specifier: string,
+): string | undefined {
+  try {
+    const require = createRequire(join(projectRoot, ".eden-resolver.cjs"));
+    const importerPath = isAbsolute(importer)
+      ? importer
+      : resolve(projectRoot, importer);
+    return require.resolve(specifier, {
+      paths: [
+        dirname(importerPath),
+        join(projectRoot, "node_modules"),
+        projectRoot,
+      ],
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function dependencyPackageName(specifier: string): string {
+  const segments = specifier.split("/");
+  return specifier.startsWith("@")
+    ? segments.slice(0, 2).join("/")
+    : segments[0] ?? specifier;
+}
+
+async function hasSelectedProjectDependency(
+  projectRoot: string,
+  specifier: string,
+): Promise<boolean> {
+  const details = await lstat(
+    join(projectRoot, "node_modules", dependencyPackageName(specifier)),
+  ).catch(() => undefined);
+  return details !== undefined;
 }
 
 function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
@@ -557,7 +598,28 @@ async function collectAuthoredImportClosure(
   }
 
   let dependencyIssue: EdenDiagnostic | undefined;
-  let dependencySource: string | undefined;
+  const dependencyOrigins = new Map<string, string>();
+  const entryOrigins = new Map(
+    entries.map((entry) => [normalize(entry.canonicalPath), entry.relativePath]),
+  );
+  const authoredSourceFor = (importer: string): string | undefined => {
+    const normalizedImporter = normalize(
+      isAbsolute(importer) ? importer : resolve(projectRoot, importer),
+    );
+    const entryOrigin = entryOrigins.get(normalizedImporter);
+    if (entryOrigin !== undefined) return entryOrigin;
+    const knownOrigin = dependencyOrigins.get(normalizedImporter);
+    if (knownOrigin !== undefined) return knownOrigin;
+    if (!isWithinRoot(projectRoot, normalizedImporter)) return undefined;
+    const relativeImporter = toPosixPath(relative(projectRoot, normalizedImporter));
+    if (
+      relativeImporter.startsWith("..") ||
+      relativeImporter.startsWith("node_modules/")
+    ) {
+      return undefined;
+    }
+    return relativeImporter;
+  };
   try {
     const result = await build({
       absWorkingDir: projectRoot,
@@ -578,11 +640,30 @@ async function collectAuthoredImportClosure(
         {
           name: "eden-snapshot-contained-imports",
           setup(context) {
-            context.onResolve({ filter: /^[^./]/ }, (args) => {
-              dependencySource =
-                args.importer.length === 0
-                  ? undefined
-                  : toPosixPath(relative(projectRoot, args.importer));
+            context.onResolve({ filter: /^[^./]/ }, async (args) => {
+              const origin =
+                authoredSourceFor(args.importer) ??
+                (args.importer.length === 0 ? undefined : args.importer);
+              const resolved = resolveSelectedProjectDependency(
+                projectRoot,
+                args.importer,
+                args.path,
+              );
+              if (
+                origin !== undefined &&
+                resolved !== undefined &&
+                !isWithinRoot(projectRoot, normalize(resolved)) &&
+                !(await hasSelectedProjectDependency(projectRoot, args.path))
+              ) {
+                dependencyIssue ??= diagnostic(
+                  "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+                  "An authored dependency resolved outside the selected project root.",
+                  origin,
+                );
+              }
+              if (resolved !== undefined && origin !== undefined) {
+                dependencyOrigins.set(normalize(resolved), origin);
+              }
               return undefined;
             });
             context.onLoad({ filter: /./ }, (args) => {
@@ -597,10 +678,10 @@ async function collectAuthoredImportClosure(
               }
               const message =
                 "An authored dependency resolved outside the selected project root.";
-              dependencyIssue = diagnostic(
+              dependencyIssue ??= diagnostic(
                 "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
                 message,
-                dependencySource,
+                authoredSourceFor(args.path),
               );
               return { errors: [{ text: message }] };
             });
@@ -622,15 +703,26 @@ async function collectAuthoredImportClosure(
                 const canonicalImport = await realpath(resolvedImport).catch(
                   () => resolvedImport,
                 );
+                const origin =
+                  authoredSourceFor(args.importer) ??
+                  toPosixPath(relative(projectRoot, args.importer));
+                if (origin !== undefined) {
+                  dependencyOrigins.set(normalize(canonicalImport), origin);
+                }
                 if (
                   !isWithinRoot(projectRoot, normalize(resolvedImport)) ||
                   !isWithinRoot(projectRoot, canonicalImport)
                 ) {
+                  dependencyIssue ??= diagnostic(
+                    "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+                    `Import "${args.path}" from "${origin}" escapes the selected project root.`,
+                    origin,
+                  );
                   return {
                     errors: [
                       {
                         text:
-                          `Import "${args.path}" from "${args.importer}" ` +
+                          `Import "${args.path}" from "${origin}" ` +
                           "escapes the selected project root.",
                       },
                     ],
@@ -1389,6 +1481,22 @@ async function loadDefaultExport(
   }
 
   let dependencyIssue: EdenDiagnostic | undefined;
+  const dependencyOrigins = new Map<string, string>();
+  const authoredSourceFor = (importer: string): string => {
+    const normalizedImporter = normalize(
+      isAbsolute(importer) ? importer : resolve(projectRoot, importer),
+    );
+    if (normalizedImporter === normalize(sourceInfo.canonicalPath)) {
+      return sourceInfo.relativePath;
+    }
+    const knownOrigin = dependencyOrigins.get(normalizedImporter);
+    if (knownOrigin !== undefined) return knownOrigin;
+    const relativeImporter = toPosixPath(relative(projectRoot, normalizedImporter));
+    return relativeImporter.startsWith("../") ||
+      relativeImporter.startsWith("node_modules/")
+      ? sourceInfo.relativePath
+      : relativeImporter;
+  };
   try {
     const result = await build({
       absWorkingDir: projectRoot,
@@ -1405,17 +1513,40 @@ async function loadDefaultExport(
         {
           name: "eden-contained-source-imports",
           setup(context) {
+            context.onResolve({ filter: /^[^./]/ }, async (args) => {
+              const origin = authoredSourceFor(args.importer);
+              const resolved = resolveSelectedProjectDependency(
+                projectRoot,
+                args.importer,
+                args.path,
+              );
+              if (
+                resolved !== undefined &&
+                !isWithinRoot(projectRoot, normalize(resolved)) &&
+                !(await hasSelectedProjectDependency(projectRoot, args.path))
+              ) {
+                dependencyIssue ??= diagnostic(
+                  "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+                  "An authored dependency resolved outside the selected project root.",
+                  origin,
+                );
+              }
+              if (resolved !== undefined) {
+                dependencyOrigins.set(normalize(resolved), origin);
+              }
+              return undefined;
+            });
             context.onLoad({ filter: /./ }, (args) => {
               if (isWithinRoot(projectRoot, normalize(args.path))) {
                 return undefined;
               }
               const message =
-                `Dependency loaded by "${sourceInfo.relativePath}" resolves outside ` +
+                `Dependency loaded by "${authoredSourceFor(args.path)}" resolves outside ` +
                 "the selected project root; declare it in the selected project's install context.";
-              dependencyIssue = diagnostic(
+              dependencyIssue ??= diagnostic(
                 "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
                 message,
-                sourceInfo.relativePath,
+                authoredSourceFor(args.path),
               );
               return {
                 errors: [{ text: message }],
@@ -1436,11 +1567,13 @@ async function loadDefaultExport(
               const canonicalImport = await realpath(resolvedImport).catch(
                 () => resolvedImport,
               );
+              const origin = authoredSourceFor(args.importer);
+              dependencyOrigins.set(normalize(canonicalImport), origin);
               if (!isWithinRoot(projectRoot, canonicalImport)) {
                 return {
                   errors: [
                     {
-                      text: `Import "${args.path}" from "${sourceInfo.relativePath}" escapes the selected project root.`,
+                      text: `Import "${args.path}" from "${origin}" escapes the selected project root.`,
                     },
                   ],
                 };
@@ -2458,15 +2591,63 @@ async function bundleProject(
         {
           name: "eden-worker-contained-imports",
           setup(context) {
+            const dependencyOrigins = new Map<string, string>();
+            const authoredSources = [
+              normalized.discovery.agent,
+              normalized.discovery.instructions,
+              ...normalized.discovery.tools,
+            ];
+            for (const source of authoredSources) {
+              dependencyOrigins.set(
+                normalize(join(normalized.projectRoot, source.relativePath)),
+                source.relativePath,
+              );
+            }
+            const authoredSourceFor = (importer: string): string => {
+              const normalizedImporter = normalize(
+                isAbsolute(importer)
+                  ? importer
+                  : resolve(normalized.projectRoot, importer),
+              );
+              const knownOrigin = dependencyOrigins.get(normalizedImporter);
+              if (knownOrigin !== undefined) return knownOrigin;
+              const relativeImporter = toPosixPath(
+                relative(normalized.projectRoot, normalizedImporter),
+              );
+              return relativeImporter.startsWith("../") ||
+                relativeImporter.startsWith("node_modules/") ||
+                relativeImporter === "eden-artifact-entry.mjs"
+                ? normalized.discovery.agent.relativePath
+                : relativeImporter;
+            };
+            context.onResolve({ filter: /^[^./]/ }, (args) => {
+              const resolved = resolveSelectedProjectDependency(
+                normalized.projectRoot,
+                args.importer,
+                args.path,
+              );
+              const origin = authoredSourceFor(args.importer);
+              if (resolved !== undefined) {
+                dependencyOrigins.set(normalize(resolved), origin);
+                if (!isWithinRoot(normalized.projectRoot, normalize(resolved))) {
+                  compatibilityIssue = {
+                    code: "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+                    message:
+                      `Authored import from "${origin}" resolves outside the selected project root; ` +
+                      "declare it in the selected project's install context.",
+                    source: origin,
+                  };
+                }
+              }
+              return undefined;
+            });
             context.onResolve(
               {
                 filter:
                   /^(?:node:(?:fs|path|url|module|os|crypto|vm)|fs|path|url|module|os|crypto|vm)$/,
               },
               (args) => {
-                const source = toPosixPath(
-                  relative(normalized.projectRoot, args.importer),
-                );
+                const source = authoredSourceFor(args.importer);
                 compatibilityIssue = {
                   code: "MODULE_IMPORT_UNSUPPORTED",
                   message:
@@ -2492,23 +2673,33 @@ async function bundleProject(
                   () => resolved,
                 );
                 const importer = normalize(args.resolveDir);
+                const origin = authoredSourceFor(args.importer);
                 if (
                   isWithinRoot(
                     normalize(join(normalized.projectRoot, "node_modules")),
                     importer,
                   )
                 ) {
+                  dependencyOrigins.set(normalize(canonical), origin);
                   return undefined;
                 }
                 if (!isWithinRoot(normalized.projectRoot, canonical)) {
+                  compatibilityIssue = {
+                    code: "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+                    message:
+                      `Authored import from "${origin}" resolves outside the selected project root.`,
+                    source: origin,
+                  };
                   return {
                     errors: [
                       {
-                        text: `Import "${args.path}" from "${args.importer}" escapes the selected project root.`,
+                        text:
+                          `Import "${args.path}" from "${origin}" escapes the selected project root.`,
                       },
                     ],
                   };
                 }
+                dependencyOrigins.set(normalize(canonical), origin);
                 return undefined;
               },
             );
@@ -2524,8 +2715,9 @@ async function bundleProject(
               compatibilityIssue = {
                 code: "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
                 message:
-                  "A bare dependency resolves outside the selected project root; declare it in the selected project's install context.",
-                source: normalized.discovery.agent.relativePath,
+                  `Authored import from "${authoredSourceFor(args.path)}" resolves outside the selected project root; ` +
+                  "declare it in the selected project's install context.",
+                source: authoredSourceFor(args.path),
               };
               return {
                 errors: [{ text: compatibilityIssue.message }],
@@ -2724,24 +2916,219 @@ function assertArtifactCoherence(
   }
 }
 
+function sourceReferenceEqual(
+  left: EdenSourceReference,
+  right: EdenSourceReference,
+): boolean {
+  return stableJson(left) === stableJson(right);
+}
+
+function assertDiscoveryCoherence(
+  discovery: EdenDiscoveryRecord,
+  manifest: EdenManifest,
+  moduleMap: EdenModuleMap,
+): void {
+  if (
+    moduleMap.kind !== "eden.module-map" ||
+    moduleMap.version !== EDEN_AGENT_BUNDLE_VERSION ||
+    manifest.kind !== "eden.manifest" ||
+    manifest.version !== EDEN_MANIFEST_VERSION ||
+    manifest.runtimeVersion !== EDEN_RUNTIME_VERSION ||
+    manifest.agentBundleVersion !== EDEN_AGENT_BUNDLE_VERSION ||
+    manifest.protocolVersion !== EDEN_PROTOCOL_VERSION ||
+    manifest.schemaVersion !== EDEN_SCHEMA_VERSION
+  ) {
+    throw new EdenCompilerError("Published artifact metadata is malformed", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Published artifact kind or version metadata is not compatible with Eden.",
+      ),
+    ]);
+  }
+  if (!sourceReferenceEqual(discovery.agent, manifest.agent.source)) {
+    throw new EdenCompilerError("Published discovery metadata is incoherent", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Discovery agent metadata does not match the generated manifest.",
+      ),
+    ]);
+  }
+  if (!sourceReferenceEqual(discovery.instructions, manifest.instructions.source)) {
+    throw new EdenCompilerError("Published discovery metadata is incoherent", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Discovery instruction metadata does not match the generated manifest.",
+      ),
+    ]);
+  }
+  if (
+    discovery.tools.length !== manifest.tools.length ||
+    discovery.tools.some(
+      (source, index) =>
+        !sourceReferenceEqual(source, manifest.tools[index]?.source as EdenSourceReference),
+    )
+  ) {
+    throw new EdenCompilerError("Published discovery metadata is incoherent", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Discovery tool metadata does not match the generated manifest.",
+      ),
+    ]);
+  }
+  if (
+    !sourceReferenceEqual(moduleMap.agent.source, discovery.agent) ||
+    moduleMap.agent.name !== "agent" ||
+    moduleMap.agent.module !== "agent:default" ||
+    !sourceReferenceEqual(moduleMap.instructions.source, discovery.instructions) ||
+    moduleMap.instructions.name !== "instructions" ||
+    moduleMap.instructions.module !== "instructions:default" ||
+    moduleMap.tools.length !== discovery.tools.length ||
+    moduleMap.tools.some(
+      (reference, index) =>
+        !sourceReferenceEqual(
+          reference.source,
+          discovery.tools[index] as EdenSourceReference,
+        ) ||
+        reference.name !== manifest.tools[index]?.name ||
+        reference.module !== manifest.tools[index]?.module,
+    )
+  ) {
+    throw new EdenCompilerError("Published discovery metadata is incoherent", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Static module-map source metadata does not match discovery metadata.",
+      ),
+    ]);
+  }
+}
+
+function assertDiagnosticRecords(value: unknown): asserts value is readonly EdenDiagnostic[] {
+  if (
+    !Array.isArray(value) ||
+    value.some(
+      (item) =>
+        !isRecord(item) ||
+        typeof item.code !== "string" ||
+        typeof item.message !== "string" ||
+        !["error", "warning", "info"].includes(String(item.severity)) ||
+        (item.source !== undefined && typeof item.source !== "string") ||
+        (item.line !== undefined && !Number.isInteger(item.line)) ||
+        (item.column !== undefined && !Number.isInteger(item.column)),
+    )
+  ) {
+    throw new EdenCompilerError("Published diagnostics are malformed", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "The generated diagnostics artifact must contain Eden diagnostic records.",
+      ),
+    ]);
+  }
+}
+
+function assertPublishedArtifactCoherence(
+  discovery: EdenDiscoveryRecord,
+  diagnostics: unknown,
+  manifest: EdenManifest,
+  moduleMap: EdenModuleMap,
+  bundle: string,
+  buildMetadata: EdenBuildMetadata,
+): void {
+  assertDiagnosticRecords(diagnostics);
+  if (diagnostics.length !== 0) {
+    throw new EdenCompilerError("Published diagnostics are not coherent", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "A successful generated artifact generation must contain no error diagnostics.",
+      ),
+    ]);
+  }
+  assertArtifactCoherence(manifest, moduleMap, bundle, buildMetadata);
+  assertDiscoveryCoherence(discovery, manifest, moduleMap);
+  if (
+    buildMetadata.manifestVersion !== manifest.version ||
+    buildMetadata.runtimeVersion !== manifest.runtimeVersion ||
+    buildMetadata.agentBundleVersion !== manifest.agentBundleVersion ||
+    buildMetadata.protocolVersion !== manifest.protocolVersion ||
+    buildMetadata.schemaVersion !== manifest.schemaVersion
+  ) {
+    throw new EdenCompilerError("Published artifact versions are incoherent", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Build metadata versions do not match the generated manifest versions.",
+      ),
+    ]);
+  }
+}
+
 async function assertPublishedGeneration(
+  projectRoot: string,
   directory: string,
 ): Promise<void> {
   try {
-    const [manifest, moduleMap, buildMetadata, bundle] = await Promise.all([
-      readFile(join(directory, ARTIFACT_FILE_NAMES.manifest), "utf8").then(
-        (value) => JSON.parse(value) as EdenManifest,
-      ),
-      readFile(join(directory, ARTIFACT_FILE_NAMES.moduleMap), "utf8").then(
-        (value) => JSON.parse(value) as EdenModuleMap,
-      ),
-      readFile(
-        join(directory, ARTIFACT_FILE_NAMES.buildMetadata),
-        "utf8",
-      ).then((value) => JSON.parse(value) as EdenBuildMetadata),
-      readFile(join(directory, ARTIFACT_FILE_NAMES.bundle), "utf8"),
-    ]);
-    assertArtifactCoherence(manifest, moduleMap, bundle, buildMetadata);
+    await assertNoGeneratedSymlinks(projectRoot, directory);
+    const directoryDetails = await lstat(directory);
+    if (!directoryDetails.isDirectory() || directoryDetails.isSymbolicLink()) {
+      throw new EdenCompilerError("Published artifact generation is invalid", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          `Existing artifact generation "${basename(directory)}" is not a real directory.`,
+        ),
+      ]);
+    }
+    const artifactPaths = Object.values(ARTIFACT_FILE_NAMES).map((name) =>
+      join(directory, name),
+    );
+    const artifactDetails = await Promise.all(
+      artifactPaths.map((path) => lstat(path)),
+    );
+    if (
+      artifactDetails.some(
+        (details) => !details.isFile() || details.isSymbolicLink(),
+      )
+    ) {
+      throw new EdenCompilerError("Published artifact generation is invalid", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          `Existing artifact generation "${basename(directory)}" is incomplete or contains symbolic links.`,
+        ),
+      ]);
+    }
+    const [discovery, diagnostics, manifest, moduleMap, buildMetadata, bundle] =
+      await Promise.all([
+        readFile(join(directory, ARTIFACT_FILE_NAMES.discovery), "utf8").then(
+          (value) => JSON.parse(value) as EdenDiscoveryRecord,
+        ),
+        readFile(join(directory, ARTIFACT_FILE_NAMES.diagnostics), "utf8").then(
+          (value) => JSON.parse(value) as unknown,
+        ),
+        readFile(join(directory, ARTIFACT_FILE_NAMES.manifest), "utf8").then(
+          (value) => JSON.parse(value) as EdenManifest,
+        ),
+        readFile(join(directory, ARTIFACT_FILE_NAMES.moduleMap), "utf8").then(
+          (value) => JSON.parse(value) as EdenModuleMap,
+        ),
+        readFile(
+          join(directory, ARTIFACT_FILE_NAMES.buildMetadata),
+          "utf8",
+        ).then((value) => JSON.parse(value) as EdenBuildMetadata),
+        readFile(join(directory, ARTIFACT_FILE_NAMES.bundle), "utf8"),
+      ]);
+    assertPublishedArtifactCoherence(
+      discovery,
+      diagnostics,
+      manifest,
+      moduleMap,
+      bundle,
+      buildMetadata,
+    );
+    if (basename(directory) !== buildMetadata.generationId) {
+      throw new EdenCompilerError("Published artifact identity is invalid", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          `Existing artifact generation "${basename(directory)}" does not match its recorded generation identity.`,
+        ),
+      ]);
+    }
   } catch (error: unknown) {
     if (error instanceof EdenCompilerError) throw error;
     throw new EdenCompilerError("Published artifact generation is invalid", [
@@ -2807,7 +3194,83 @@ async function outputDirectoryFor(
   return candidate;
 }
 
+async function assertContainedGeneratedPath(
+  projectRoot: string,
+  path: string,
+  description: string,
+  requiredDirectory = false,
+): Promise<void> {
+  const details = await lstat(path).catch(() => undefined);
+  if (details === undefined) return;
+  if (details.isSymbolicLink()) {
+    const resolved = await realpath(path).catch(() => undefined);
+    throw new EdenCompilerError("Generated output path is unsafe", [
+      diagnostic(
+        "OUTPUT_OUTSIDE_PROJECT",
+        resolved === undefined || !isWithinRoot(projectRoot, resolved)
+          ? `${description} is a symbolic link that escapes the selected project root.`
+          : `${description} must be a real directory, not a symbolic link.`,
+        path,
+      ),
+    ]);
+  }
+  if (requiredDirectory && !details.isDirectory()) {
+    throw new EdenCompilerError("Generated output path is invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `${description} must be a real directory.`,
+        path,
+      ),
+    ]);
+  }
+  const resolved = await realpath(path).catch(() => undefined);
+  if (resolved === undefined || !isWithinRoot(projectRoot, resolved)) {
+    throw new EdenCompilerError("Generated output path escapes the project root", [
+      diagnostic(
+        "OUTPUT_OUTSIDE_PROJECT",
+        `${description} resolves outside the selected project root.`,
+        path,
+      ),
+    ]);
+  }
+}
+
+async function assertNoGeneratedSymlinks(
+  projectRoot: string,
+  directory: string,
+): Promise<void> {
+  await assertContainedGeneratedPath(
+    projectRoot,
+    directory,
+    `Generated directory "${directory}"`,
+    true,
+  );
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    const child = join(directory, entry.name);
+    if (entry.isSymbolicLink()) {
+      throw new EdenCompilerError("Generated output path is unsafe", [
+        diagnostic(
+          "OUTPUT_OUTSIDE_PROJECT",
+          `Generated descendant "${child}" must not be a symbolic link.`,
+          child,
+        ),
+      ]);
+    }
+    if (entry.isDirectory()) {
+      await assertNoGeneratedSymlinks(projectRoot, child);
+    } else {
+      await assertContainedGeneratedPath(
+        projectRoot,
+        child,
+        `Generated descendant "${child}"`,
+      );
+    }
+  }
+}
+
 async function publishArtifacts(
+  projectRoot: string,
   outputDirectory: string,
   artifacts: EdenArtifactSet,
   hooks: EdenCompilerHooks = {},
@@ -2827,7 +3290,26 @@ async function publishArtifacts(
   await mkdir(outputDirectory, { recursive: true });
   const generationsDirectory = join(outputDirectory, "generations");
   const currentPointer = join(outputDirectory, "CURRENT");
+  await assertContainedGeneratedPath(
+    projectRoot,
+    outputDirectory,
+    `Artifact output "${outputDirectory}"`,
+    true,
+  );
+  await assertContainedGeneratedPath(
+    projectRoot,
+    generationsDirectory,
+    `Artifact generations directory "${generationsDirectory}"`,
+    true,
+  );
   await mkdir(generationsDirectory, { recursive: true });
+  await assertContainedGeneratedPath(
+    projectRoot,
+    generationsDirectory,
+    `Artifact generations directory "${generationsDirectory}"`,
+    true,
+  );
+  await assertNoGeneratedSymlinks(projectRoot, generationsDirectory);
   const stage = join(
     generationsDirectory,
     `.staging-${process.pid}-${Date.now()}-${Math.random()
@@ -2848,6 +3330,30 @@ async function publishArtifacts(
         diagnostic(
           "OUTPUT_INVALID",
           `Artifact output "${outputDirectory}" has a non-symbolic CURRENT pointer.`,
+        ),
+      ]);
+    }
+    const resolved = await realpath(currentPointer).catch(() => undefined);
+    if (
+      resolved === undefined ||
+      !isWithinRoot(projectRoot, resolved) ||
+      !isWithinRoot(generationsDirectory, resolved)
+    ) {
+      throw new EdenCompilerError("Artifact CURRENT pointer is unsafe", [
+        diagnostic(
+          "OUTPUT_OUTSIDE_PROJECT",
+          `Artifact output "${outputDirectory}" has a CURRENT pointer outside its selected generation root.`,
+          "CURRENT",
+        ),
+      ]);
+    }
+    const resolvedDetails = await lstat(resolved).catch(() => undefined);
+    if (resolvedDetails === undefined || !resolvedDetails.isDirectory()) {
+      throw new EdenCompilerError("Artifact CURRENT pointer is invalid", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          `Artifact output "${outputDirectory}" CURRENT must target a generation directory.`,
+          "CURRENT",
         ),
       ]);
     }
@@ -2881,9 +3387,32 @@ async function publishArtifacts(
         const destination = join(outputDirectory, name);
         const existing = await lstat(destination).catch(() => undefined);
         if (existing?.isSymbolicLink() === true) {
+          const resolved = await realpath(destination).catch(() => undefined);
+          if (
+            resolved === undefined ||
+            !isWithinRoot(projectRoot, resolved) ||
+            !isWithinRoot(generationsDirectory, resolved)
+          ) {
+            throw new EdenCompilerError("Artifact compatibility link is unsafe", [
+              diagnostic(
+                "OUTPUT_OUTSIDE_PROJECT",
+                `Generated artifact link "${name}" resolves outside the selected generation root.`,
+                name,
+              ),
+            ]);
+          }
           continue;
         }
         if (existing !== undefined) {
+          if (!existing.isFile()) {
+            throw new EdenCompilerError("Artifact compatibility link is invalid", [
+              diagnostic(
+                "OUTPUT_INVALID",
+                `Generated artifact link "${name}" must replace a regular file or symlink.`,
+                name,
+              ),
+            ]);
+          }
           const backup = join(
             outputDirectory,
             `.${name}.previous-${process.pid}-${Date.now()}-${Math.random()
@@ -2975,6 +3504,19 @@ async function publishArtifacts(
     }
 
     await hooks.onPublicationBoundary?.("before-stage-write");
+    await assertContainedGeneratedPath(
+      projectRoot,
+      outputDirectory,
+      `Artifact output "${outputDirectory}"`,
+      true,
+    );
+    await assertContainedGeneratedPath(
+      projectRoot,
+      generationsDirectory,
+      `Artifact generations directory "${generationsDirectory}"`,
+      true,
+    );
+    await assertNoGeneratedSymlinks(projectRoot, generationsDirectory);
     await mkdir(stage);
     await Promise.all([
       writeFile(
@@ -3009,7 +3551,14 @@ async function publishArtifacts(
       ),
     ]);
 
+    await assertNoGeneratedSymlinks(projectRoot, stage);
     const stagedBundle = await readFile(join(stage, ARTIFACT_FILE_NAMES.bundle), "utf8");
+    const stagedDiscovery = JSON.parse(
+      await readFile(join(stage, ARTIFACT_FILE_NAMES.discovery), "utf8"),
+    ) as EdenDiscoveryRecord;
+    const stagedDiagnostics = JSON.parse(
+      await readFile(join(stage, ARTIFACT_FILE_NAMES.diagnostics), "utf8"),
+    ) as unknown;
     const stagedManifest = JSON.parse(
       await readFile(join(stage, ARTIFACT_FILE_NAMES.manifest), "utf8"),
     ) as EdenManifest;
@@ -3019,7 +3568,9 @@ async function publishArtifacts(
     const stagedMetadata = JSON.parse(
       await readFile(join(stage, ARTIFACT_FILE_NAMES.buildMetadata), "utf8"),
     ) as EdenBuildMetadata;
-    assertArtifactCoherence(
+    assertPublishedArtifactCoherence(
+      stagedDiscovery,
+      stagedDiagnostics,
       stagedManifest,
       stagedModuleMap,
       stagedBundle,
@@ -3027,11 +3578,13 @@ async function publishArtifacts(
     );
     await hooks.onPublicationBoundary?.("after-stage-write");
 
+    await assertNoGeneratedSymlinks(projectRoot, generationsDirectory);
     const existingGeneration = await lstat(generationDirectory).catch(
       () => undefined,
     );
     if (existingGeneration === undefined) {
       await rename(stage, generationDirectory);
+      await assertPublishedGeneration(projectRoot, generationDirectory);
     } else {
       if (!existingGeneration.isDirectory() || existingGeneration.isSymbolicLink()) {
         throw new EdenCompilerError("Artifact output is not a directory", [
@@ -3041,12 +3594,13 @@ async function publishArtifacts(
           ),
         ]);
       }
-      await assertPublishedGeneration(generationDirectory);
+      await assertPublishedGeneration(projectRoot, generationDirectory);
       await rm(stage, { recursive: true, force: true });
     }
 
     artifactLinkTransaction = await makeArtifactLinks();
     await hooks.onPublicationBoundary?.("before-current-promotion");
+    await assertPublishedGeneration(projectRoot, generationDirectory);
     await makePointer(generationDirectory);
     generationPromoted = true;
     await hooks.onPublicationBoundary?.("after-current-promotion");
@@ -3093,7 +3647,7 @@ export async function buildProject(
       buildMetadata,
     };
     assertArtifactCoherence(manifest, moduleMap, bundle, buildMetadata);
-    await publishArtifacts(outputDirectory, artifacts, options.hooks);
+    await publishArtifacts(projectRoot, outputDirectory, artifacts, options.hooks);
     return { artifacts, diagnostics };
   } finally {
     await snapshot.cleanup();

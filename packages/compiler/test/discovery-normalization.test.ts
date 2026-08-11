@@ -539,6 +539,59 @@ describe("project discovery", () => {
     });
   });
 
+  test("attributes transitive dependency escapes to the authored import source", async () => {
+    const container = await mkdtemp(join(tmpdir(), "eden-transitive-parent-"));
+    temporaryRoots.push(container);
+    const root = join(container, "project");
+    await writeProject(root, {
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "transitive dependency\n",
+      "agent/tools/transitive-dependency.ts": `
+        import { inputSchema } from "selected-schema-fixture";
+        export default {
+          description: "Uses a transitive dependency.",
+          inputSchema,
+          execute(input) {
+            return { value: input };
+          }
+        };
+      `,
+      "node_modules/selected-schema-fixture/package.json": JSON.stringify({
+        name: "selected-schema-fixture",
+        type: "module",
+        exports: "./index.js",
+      }),
+      "node_modules/selected-schema-fixture/index.js": `
+        import { escapedValue } from "outside-schema-fixture";
+        export const inputSchema = {
+          "~standard": {
+            version: 1,
+            vendor: escapedValue,
+            validate(value) { return { value }; }
+          }
+        };
+      `,
+    });
+    await writeProject(join(container, "node_modules/outside-schema-fixture"), {
+      "package.json": JSON.stringify({
+        name: "outside-schema-fixture",
+        type: "module",
+        exports: "./index.js",
+      }),
+      "index.js": "export const escapedValue = 'outside';\n",
+    });
+
+    await expect(normalizeProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+          source: "agent/tools/transitive-dependency.ts",
+          message: expect.stringContaining("selected project"),
+        }),
+      ]),
+    });
+  });
+
   test("normalizes the checked-in Zod-authored example tool", async () => {
     const normalized = await normalizeProject(
       join(process.cwd(), "examples/basic-agent"),

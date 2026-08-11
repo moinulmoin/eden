@@ -4,8 +4,10 @@ import {
   lstat,
   mkdtemp,
   mkdir,
+  readdir,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -261,6 +263,151 @@ describe("artifact generation", () => {
     expect(after.moduleMap).toEqual(before.moduleMap);
     expect(after.buildMetadata).toEqual(before.buildMetadata);
   });
+
+  test.each([
+    "discovery.json",
+    "diagnostics.json",
+    "manifest.json",
+    "module-map.json",
+    "agent-bundle.mjs",
+    "build-metadata.json",
+  ])(
+    "does not reuse a same-identity generation missing %s",
+    async (missingArtifact) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "generation reuse fixture\n",
+        "agent/tools/greet.ts": toolSource,
+      });
+
+      await buildProject({ projectRoot: root });
+      const before = await readGeneration(root);
+      await writeFile(
+        join(root, "agent/tools/greet.ts"),
+        toolSource.replace("Greet a person.", "Second generation."),
+        "utf8",
+      );
+
+      await expect(
+        buildProject({
+          projectRoot: root,
+          hooks: {
+            onPublicationBoundary: (boundary) => {
+              if (boundary === "before-current-promotion") {
+                throw new Error("leave second generation uncurrent");
+              }
+            },
+          },
+        }),
+      ).rejects.toThrow("leave second generation uncurrent");
+
+      const generationNames = await readdir(
+        join(root, ".eden", "generations"),
+      );
+      const candidate = generationNames.find(
+        (name) =>
+          name.startsWith("gen_") &&
+          name !== before.buildMetadata.generationId,
+      );
+      expect(candidate).toBeDefined();
+      await rm(
+        join(root, ".eden", "generations", candidate as string, missingArtifact),
+        { force: true },
+      );
+
+      await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+        name: "EdenCompilerError",
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            code: "OUTPUT_INVALID",
+          }),
+        ]),
+      } satisfies Partial<EdenCompilerError>);
+
+      const after = await readGeneration(root);
+      expect(after.bundle).toBe(before.bundle);
+      expect(after.manifest).toEqual(before.manifest);
+      expect(after.moduleMap).toEqual(before.moduleMap);
+      expect(after.buildMetadata).toEqual(before.buildMetadata);
+    },
+  );
+
+  test("rejects tampered discovery metadata before reusing a generation", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "generation coherence fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    const first = await buildProject({ projectRoot: root });
+    const generationDirectory = join(
+      root,
+      ".eden",
+      "generations",
+      first.artifacts.buildMetadata.generationId,
+    );
+    await writeFile(
+      join(generationDirectory, "discovery.json"),
+      JSON.stringify({
+        ...first.artifacts.discovery,
+        agent: {
+          ...first.artifacts.discovery.agent,
+          relativePath: "agent/tampered.ts",
+        },
+      }),
+      "utf8",
+    );
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      name: "EdenCompilerError",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "OUTPUT_INVALID",
+        }),
+      ]),
+    } satisfies Partial<EdenCompilerError>);
+  });
+
+  test.each([
+    "generations",
+    join("generations", "pre-existing-escape"),
+  ])(
+    "fails closed for a pre-existing symlinked generated path: %s",
+    async (relativePath) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "symlink publication fixture\n",
+        "agent/tools/greet.ts": toolSource,
+      });
+      const outside = await mkdtemp(join(tmpdir(), "eden-publish-outside-"));
+      temporaryRoots.push(outside);
+      await mkdir(join(root, ".eden"), { recursive: true });
+      if (relativePath.includes("/")) {
+        await mkdir(join(root, ".eden", "generations"), {
+          recursive: true,
+        });
+      }
+      await symlink(
+        outside,
+        join(root, ".eden", relativePath),
+        "dir",
+      );
+
+      await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+        name: "EdenCompilerError",
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            code: expect.stringMatching(/OUTPUT_(?:INVALID|OUTSIDE_PROJECT)/u),
+          }),
+        ]),
+      } satisfies Partial<EdenCompilerError>);
+
+      await expect(readdir(outside)).resolves.toEqual([]);
+      await expect(
+        readFile(join(root, ".eden", "CURRENT"), "utf8"),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
 
   test("compiles every artifact from the captured source snapshot", async () => {
     const root = await createProject({
