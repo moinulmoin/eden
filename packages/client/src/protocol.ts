@@ -324,7 +324,7 @@ export function parseEdenEvent(value: unknown): EdenEvent<EdenEventType> {
     type,
     data: value.data as EdenEventDataByType[EdenEventType],
     committedAt: value.committedAt,
-  };
+  } as EdenEvent<EdenEventType>;
 }
 
 export function parseEdenNdjson(

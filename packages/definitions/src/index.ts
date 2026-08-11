@@ -263,13 +263,15 @@ export interface EdenEventDataByType {
   };
 }
 
-export interface EdenEvent<TType extends EdenEventType = EdenEventType> {
-  readonly streamIndex: number;
-  readonly eventId: string;
-  readonly type: TType;
-  readonly data: EdenEventDataByType[TType];
-  readonly committedAt: string;
-}
+export type EdenEvent<TType extends EdenEventType = EdenEventType> = {
+  [TEventType in TType]: {
+    readonly streamIndex: number;
+    readonly eventId: string;
+    readonly type: TEventType;
+    readonly data: EdenEventDataByType[TEventType];
+    readonly committedAt: string;
+  };
+}[TType];
 
 export interface EdenSessionSnapshot {
   readonly sessionId: string;

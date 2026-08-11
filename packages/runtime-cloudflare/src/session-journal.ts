@@ -797,7 +797,7 @@ function parseEvent(row: EventRow): EdenEvent {
     type: row.type,
     data: JSON.parse(row.payload_json) as EdenEvent["data"],
     committedAt: row.committed_at,
-  };
+  } as EdenEvent;
 }
 
 export function readJournalEvents(
