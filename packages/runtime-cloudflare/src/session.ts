@@ -16,6 +16,7 @@ import { readConfiguredEdenArtifact } from "./artifact-runtime.js";
 import { createWorkersAIModelAdapter } from "./model-adapter-internal.js";
 import {
   applySessionMigrations,
+  readAppliedSessionSchemaVersion,
   SESSION_SCHEMA_TABLES,
 } from "./session-schema.js";
 import {
@@ -66,6 +67,7 @@ interface SessionMetaRow {
   readonly manifest_version: string;
   readonly protocol_version: string;
   readonly schema_version: number;
+  readonly artifact_schema_version: number;
 }
 
 interface SessionMetaResponse {
@@ -77,6 +79,7 @@ interface SessionMetaResponse {
   readonly manifestVersion: string;
   readonly protocolVersion: string;
   readonly schemaVersion: number;
+  readonly artifactSchemaVersion: number;
 }
 
 interface MigrationRow {
@@ -254,7 +257,10 @@ function isVersionSet(value: unknown): value is EdenVersionSet {
   );
 }
 
-function versionResponse(row: SessionMetaRow): SessionMetaResponse {
+function versionResponse(
+  row: SessionMetaRow,
+  installedSchemaVersion: number,
+): SessionMetaResponse {
   return {
     sessionId: row.session_id,
     ownerPrincipal: row.owner_principal,
@@ -263,7 +269,18 @@ function versionResponse(row: SessionMetaRow): SessionMetaResponse {
     agentBundleVersion: row.agent_bundle_version,
     manifestVersion: row.manifest_version,
     protocolVersion: row.protocol_version,
-    schemaVersion: row.schema_version,
+    schemaVersion: installedSchemaVersion,
+    artifactSchemaVersion: row.artifact_schema_version,
+  };
+}
+
+function artifactVersionsFromMeta(row: SessionMetaRow): EdenVersionSet {
+  return {
+    runtime: row.runtime_version,
+    agentBundle: row.agent_bundle_version,
+    manifest: row.manifest_version,
+    protocol: row.protocol_version,
+    schema: row.artifact_schema_version,
   };
 }
 
@@ -271,7 +288,8 @@ function readSessionMeta(sql: SqlStorage): SessionMetaRow | null {
   const rows = sql
     .exec<SessionMetaRow>(
       `SELECT session_id, owner_principal, status, runtime_version,
-        agent_bundle_version, manifest_version, protocol_version, schema_version
+        agent_bundle_version, manifest_version, protocol_version, schema_version,
+        artifact_schema_version
        FROM session_meta
        LIMIT 1`,
     )
@@ -532,11 +550,14 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
 
     const sql = this.ctx.storage.sql;
     const meta = readSessionMeta(sql);
+    const installedSchemaVersion = readAppliedSessionSchemaVersion(sql);
     return jsonResponse({
       sessionId,
       tables: readTables(sql),
       appliedMigrations: readMigrations(sql),
-      sessionMeta: meta === null ? null : versionResponse(meta),
+      installedSchemaVersion,
+      sessionMeta:
+        meta === null ? null : versionResponse(meta, installedSchemaVersion),
     });
   }
 
@@ -586,6 +607,7 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     }
 
     const sql = this.ctx.storage.sql;
+    const installedSchemaVersion = readAppliedSessionSchemaVersion(sql);
     const existing = readSessionMeta(sql);
     if (existing !== null) {
       if (
@@ -594,7 +616,8 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
         existing.agent_bundle_version !== input.versions.agentBundle ||
         existing.manifest_version !== input.versions.manifest ||
         existing.protocol_version !== input.versions.protocol ||
-        existing.schema_version !== input.versions.schema
+        existing.schema_version !== installedSchemaVersion ||
+        existing.artifact_schema_version !== input.versions.schema
       ) {
         return jsonResponse(
           { code: "session_initialization_conflict", message: "Session already initialized" },
@@ -604,13 +627,7 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       return jsonResponse({
         sessionId,
         status: existing.status,
-        versions: {
-          runtime: existing.runtime_version,
-          agentBundle: existing.agent_bundle_version,
-          manifest: existing.manifest_version,
-          protocol: existing.protocol_version,
-          schema: existing.schema_version,
-        },
+        versions: artifactVersionsFromMeta(existing),
       });
     }
 
@@ -621,8 +638,8 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
           `INSERT INTO session_meta (
             session_id, owner_principal, status, created_at, updated_at,
             runtime_version, agent_bundle_version, manifest_version,
-            protocol_version, schema_version
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            protocol_version, schema_version, artifact_schema_version
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           sessionId,
           input.ownerPrincipal,
           "new",
@@ -632,6 +649,7 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
           input.versions.agentBundle,
           input.versions.manifest,
           input.versions.protocol,
+          installedSchemaVersion,
           input.versions.schema,
         );
         journal.appendEvent({
@@ -645,11 +663,12 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
         });
       });
     } catch (error) {
-      if (readSessionMeta(sql) !== null) {
+      const durable = readSessionMeta(sql);
+      if (durable !== null) {
         return jsonResponse({
           sessionId,
-          status: "new",
-          versions: input.versions,
+          status: durable.status,
+          versions: artifactVersionsFromMeta(durable),
         });
       }
       throw error;

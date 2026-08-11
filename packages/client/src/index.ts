@@ -438,10 +438,18 @@ class EdenClientImplementation implements EdenClient {
     const value = await this.readJsonSuccess(response);
     if (
       !isRecord(value) ||
-      !hasOnlyKeys(value, ["sessionId", "status", "versions"]) ||
+      !hasOnlyKeys(value, [
+        "sessionId",
+        "status",
+        "versions",
+        "sqliteSchemaVersion",
+      ]) ||
       !isOpaqueSessionId(value.sessionId) ||
       !isSessionStatus(value.status) ||
-      !isVersionSet(value.versions)
+      !isVersionSet(value.versions) ||
+      typeof value.sqliteSchemaVersion !== "number" ||
+      !Number.isSafeInteger(value.sqliteSchemaVersion) ||
+      value.sqliteSchemaVersion < 0
     ) {
       invalidResponse("Eden returned an invalid session snapshot.");
     }
@@ -449,6 +457,7 @@ class EdenClientImplementation implements EdenClient {
       sessionId: value.sessionId,
       status: value.status,
       versions: value.versions as EdenSessionSnapshot["versions"],
+      sqliteSchemaVersion: value.sqliteSchemaVersion,
     };
   }
 

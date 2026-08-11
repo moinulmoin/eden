@@ -34,6 +34,7 @@ export {
   sessionIdFromObjectName,
 } from "./session-identity.js";
 export {
+  readAppliedSessionSchemaVersion,
   SESSION_SCHEMA_MIGRATIONS,
   SESSION_SCHEMA_TABLES,
   SESSION_SCHEMA_VERSION,

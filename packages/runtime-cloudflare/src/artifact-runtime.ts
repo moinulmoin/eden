@@ -11,6 +11,7 @@ export interface EdenArtifactGenerationMetadata {
   readonly runtimeVersion: string;
   readonly agentBundleVersion: string;
   readonly protocolVersion: string;
+  /** Generated artifact/schema-contract version, not the installed SQLite level. */
   readonly schemaVersion: number;
   readonly toolNames: readonly string[];
   readonly executionMode: "local" | "remote";

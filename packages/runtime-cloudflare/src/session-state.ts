@@ -10,6 +10,7 @@ import type {
 
 import type { EdenSqlStorage } from "./session-journal.js";
 import { readJournalEvents, readLatestJournalCursor } from "./session-journal.js";
+import { readAppliedSessionSchemaVersion } from "./session-schema.js";
 
 interface SessionMetaRow {
   readonly [key: string]: string | number | null;
@@ -23,6 +24,7 @@ interface SessionMetaRow {
   readonly manifest_version: string;
   readonly protocol_version: string;
   readonly schema_version: number;
+  readonly artifact_schema_version: number;
 }
 
 interface TurnRow {
@@ -120,6 +122,7 @@ export interface EdenSessionMetaState {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly versions: EdenVersionSet;
+  readonly sqliteSchemaVersion: number;
 }
 
 export interface EdenTurnState {
@@ -228,7 +231,7 @@ function readMeta(
     .exec<SessionMetaRow>(
       `SELECT session_id, owner_principal, status, created_at, updated_at,
         runtime_version, agent_bundle_version, manifest_version,
-        protocol_version, schema_version
+        protocol_version, schema_version, artifact_schema_version
        FROM session_meta
        WHERE session_id = ?`,
       sessionId,
@@ -247,8 +250,9 @@ function readMeta(
       agentBundle: row.agent_bundle_version,
       manifest: row.manifest_version,
       protocol: row.protocol_version,
-      schema: row.schema_version,
+      schema: row.artifact_schema_version,
     },
+    sqliteSchemaVersion: readAppliedSessionSchemaVersion(sql),
   };
 }
 

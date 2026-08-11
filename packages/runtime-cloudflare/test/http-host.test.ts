@@ -6,6 +6,7 @@ import {
   createOpaqueSessionId,
   createSessionObjectName,
 } from "../src/session-identity.js";
+import { SESSION_SCHEMA_VERSION } from "../src/session-schema.js";
 
 const BEARER = "eden-unit-auth";
 const SENTINEL = "prompt-secret-sentinel";
@@ -47,6 +48,7 @@ describe("Eden authenticated HTTP host", () => {
         protocol: expect.any(String),
         schema: expect.any(Number),
       },
+      sqliteSchemaVersion: SESSION_SCHEMA_VERSION,
     });
     expect(JSON.stringify(body)).not.toContain("EDEN_BEARER_SECRET");
     expect(JSON.stringify(body)).not.toContain("eden-session:");
@@ -104,6 +106,7 @@ describe("Eden authenticated HTTP host", () => {
         protocol: expect.any(String),
         schema: expect.any(Number),
       },
+      sqliteSchemaVersion: SESSION_SCHEMA_VERSION,
     });
     expect(JSON.stringify(created)).not.toContain("eden-session:");
 

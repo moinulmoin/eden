@@ -1,5 +1,14 @@
 import type { SqlStorage } from "@cloudflare/workers-types";
 
+interface SessionSchemaSql {
+  exec(
+    query: string,
+    ...bindings: (ArrayBuffer | string | number | null)[]
+  ): {
+    toArray(): Record<string, ArrayBuffer | string | number | null>[];
+  };
+}
+
 export interface SessionMigration {
   readonly version: number;
   readonly name: string;
@@ -152,6 +161,14 @@ export const SESSION_SCHEMA_MIGRATIONS: readonly SessionMigration[] = [
       "CREATE INDEX IF NOT EXISTS stream_chunks_by_session_cursor ON stream_chunks (session_id, stream_index)",
     ],
   },
+  {
+    version: 3,
+    name: "separate-artifact-schema-version",
+    statements: [
+      "ALTER TABLE session_meta ADD COLUMN artifact_schema_version INTEGER NOT NULL DEFAULT 0",
+      "UPDATE session_meta SET artifact_schema_version = schema_version",
+    ],
+  },
 ] as const;
 
 export const SESSION_SCHEMA_VERSION =
@@ -172,36 +189,77 @@ export const SESSION_SCHEMA_TABLES = [
 ] as const;
 
 function readAppliedMigrations(
-  sql: SqlStorage,
+  sql: SessionSchemaSql,
 ): Map<number, { readonly name: string }> {
   const rows = sql
-    .exec<{ version: number; name: string }>(
+    .exec(
       "SELECT version, name FROM schema_migrations ORDER BY version ASC",
     )
-    .toArray();
+    .toArray() as { version: number; name: string }[];
   return new Map(
     rows.map((row) => [row.version, { name: row.name }] as const),
   );
 }
 
-function hasMigrationLedger(sql: SqlStorage): boolean {
+export function readAppliedSessionSchemaVersion(sql: SessionSchemaSql): number {
+  if (!hasMigrationLedger(sql)) {
+    throw new Error("Session migration ledger is unavailable");
+  }
+
+  const applied = readAppliedMigrations(sql);
+  const appliedVersions = Array.from(applied.keys()).sort((left, right) => left - right);
+  const expectedVersions = SESSION_SCHEMA_MIGRATIONS.map(
+    ({ version }) => version,
+  );
+  if (
+    appliedVersions.length !== expectedVersions.length ||
+    appliedVersions.some((version, index) => version !== expectedVersions[index])
+  ) {
+    throw new Error("Session migration ledger is incomplete or unexpected");
+  }
+
+  let latestVersion = 0;
+  for (const migration of SESSION_SCHEMA_MIGRATIONS) {
+    const recorded = applied.get(migration.version);
+    if (recorded === undefined) {
+      throw new Error(
+        `Session migration ${migration.version} is not recorded`,
+      );
+    }
+    if (recorded.name !== migration.name) {
+      throw new Error(
+        `Session migration ${migration.version} is recorded as ${recorded.name}, expected ${migration.name}`,
+      );
+    }
+    latestVersion = migration.version;
+  }
+
+  if (latestVersion !== SESSION_SCHEMA_VERSION) {
+    throw new Error(
+      `Session schema version ${latestVersion} does not match expected ${SESSION_SCHEMA_VERSION}`,
+    );
+  }
+  return latestVersion;
+}
+
+function hasMigrationLedger(sql: SessionSchemaSql): boolean {
   const rows = sql
-    .exec<{ name: string }>(
+    .exec(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
       "schema_migrations",
     )
-    .toArray();
+    .toArray() as { name: string }[];
   return rows.length > 0;
 }
 
-function assertCompleteSchema(sql: SqlStorage): void {
+function assertCompleteSchema(sql: SessionSchemaSql): void {
   const expectedTables = new Set<string>(SESSION_SCHEMA_TABLES);
   const rows = sql
-    .exec<{ name: string }>(
+    .exec(
       `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${SESSION_SCHEMA_TABLES.map(() => "?").join(", ")})`,
       ...SESSION_SCHEMA_TABLES,
     )
-    .toArray();
+    .toArray() as { name: string }[];
 
   for (const row of rows) {
     expectedTables.delete(row.name);
@@ -248,6 +306,10 @@ export function applySessionMigrations(
         migration.version,
         migration.name,
         new Date().toISOString(),
+      );
+      sql.exec(
+        "UPDATE session_meta SET schema_version = ?",
+        migration.version,
       );
       assertCompleteSchema(sql);
     };

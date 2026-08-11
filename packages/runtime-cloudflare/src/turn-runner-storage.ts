@@ -245,10 +245,10 @@ export function beginTurn<TInput, TOutput extends EdenJsonValue>(
           readonly agent_bundle_version: string;
           readonly manifest_version: string;
           readonly protocol_version: string;
-          readonly schema_version: number;
+          readonly artifact_schema_version: number;
         }>(
           `SELECT runtime_version, agent_bundle_version, manifest_version,
-            protocol_version, schema_version
+            protocol_version, artifact_schema_version
            FROM session_meta
            WHERE session_id = ?`,
           request.sessionId,
@@ -267,7 +267,7 @@ export function beginTurn<TInput, TOutput extends EdenJsonValue>(
             agentBundle: version.agent_bundle_version,
             manifest: version.manifest_version,
             protocol: version.protocol_version,
-            schema: version.schema_version,
+            schema: version.artifact_schema_version,
           },
         },
         committedAt: timestamp,

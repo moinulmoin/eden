@@ -19,6 +19,7 @@ import {
   createOpaqueSessionId,
   createSessionObjectName,
 } from "../src/session-identity.js";
+import { SESSION_SCHEMA_VERSION } from "../src/session-schema.js";
 
 function sessionStub(sessionId: string): DurableObjectStub {
   return env.EDEN_SESSIONS.getByName(createSessionObjectName(sessionId));
@@ -160,6 +161,8 @@ describe("EdenSession checkpoint recovery", () => {
 
     expect(after).toEqual(before);
     expect(after.sessionMeta?.status).toBe("waiting");
+    expect(after.sessionMeta?.versions.schema).toBe(EDEN_VERSIONS.schema);
+    expect(after.sessionMeta?.sqliteSchemaVersion).toBe(SESSION_SCHEMA_VERSION);
     expect(after.turns).toHaveLength(1);
     expect(after.steps[0]).toMatchObject({
       status: "completed",

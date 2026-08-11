@@ -55,6 +55,7 @@ function snapshotResponse(): Response {
       sessionId: "sess_123",
       status: "new",
       versions: VERSIONS,
+      sqliteSchemaVersion: 2,
     }),
     {
       status: 201,
@@ -97,6 +98,7 @@ describe("Eden typed client stream protocol", () => {
     const store = new EdenMemoryEventStore();
 
     const created = await client.createSession();
+    expect(created.sqliteSchemaVersion).toBe(2);
     const session = client.attach(created.sessionId, store);
     await expect(session.sendMessage({ message: "hello" })).resolves.toEqual({
       sessionId: "sess_123",

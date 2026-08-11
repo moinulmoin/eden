@@ -11,6 +11,7 @@ import {
   isOpaqueSessionId,
 } from "./session-identity.js";
 import { readConfiguredEdenArtifact } from "./artifact-runtime.js";
+import { SESSION_SCHEMA_VERSION } from "./session-schema.js";
 
 const HEALTH_PATH = "/eden/v1/health";
 const INFO_PATH = "/eden/v1/info";
@@ -422,7 +423,12 @@ async function handleCreate(
     return errorResponse("internal_error", 500);
   }
   return jsonResponse(
-    { sessionId, status: "new", versions: EDEN_VERSIONS },
+    {
+      sessionId,
+      status: "new",
+      versions: EDEN_VERSIONS,
+      sqliteSchemaVersion: SESSION_SCHEMA_VERSION,
+    },
     201,
   );
 }
@@ -495,6 +501,7 @@ export async function handleEdenRequest(
           service: "eden",
           protocol: EDEN_VERSIONS.protocol,
           versions: EDEN_VERSIONS,
+          sqliteSchemaVersion: SESSION_SCHEMA_VERSION,
           ...(generation === undefined
             ? {}
             : {

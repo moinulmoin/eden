@@ -19,6 +19,7 @@ export interface EdenVersionSet {
   readonly agentBundle: string;
   readonly manifest: string;
   readonly protocol: string;
+  /** Generated artifact/schema-contract compatibility version. */
   readonly schema: number;
 }
 
@@ -279,6 +280,11 @@ export interface EdenSessionSnapshot {
   readonly sessionId: string;
   readonly status: EdenSessionStatus;
   readonly versions: EdenVersionSet;
+  /**
+   * The installed SQLite migration level. This is distinct from
+   * `versions.schema`, which identifies the generated artifact contract.
+   */
+  readonly sqliteSchemaVersion: number;
 }
 
 export interface EdenTurnSnapshot {

@@ -15,6 +15,7 @@ import {
   createOpaqueSessionId,
   createSessionObjectName,
 } from "../src/session-identity.js";
+import { SESSION_SCHEMA_VERSION } from "../src/session-schema.js";
 
 function sessionStub(sessionId: string): DurableObjectStub {
   return env.EDEN_SESSIONS.getByName(createSessionObjectName(sessionId));
@@ -308,6 +309,7 @@ describe("EdenSession recovery jobs and alarms", () => {
         readonly manifestVersion: string;
         readonly protocolVersion: string;
         readonly schemaVersion: number;
+        readonly artifactSchemaVersion: number;
       };
     };
     expect(body.sessionMeta).toMatchObject({
@@ -315,7 +317,8 @@ describe("EdenSession recovery jobs and alarms", () => {
       agentBundleVersion: versions.agentBundle,
       manifestVersion: versions.manifest,
       protocolVersion: versions.protocol,
-      schemaVersion: versions.schema,
+      schemaVersion: SESSION_SCHEMA_VERSION,
+      artifactSchemaVersion: versions.schema,
     });
   }, 15_000);
 });
