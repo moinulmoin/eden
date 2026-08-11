@@ -484,10 +484,12 @@ async function assertCleanRoomArtifacts(projectRoot) {
 
   const artifactNames = (await readdir(join(projectRoot, ".eden"))).sort();
   const expectedArtifacts = [
+    "CURRENT",
     "agent-bundle.mjs",
     "build-metadata.json",
     "diagnostics.json",
     "discovery.json",
+    "generations",
     "manifest.json",
     "module-map.json",
   ];

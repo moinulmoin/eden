@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import {
+  lstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -242,6 +243,151 @@ describe("artifact generation", () => {
     expect(after.manifest).toEqual(before.manifest);
     expect(after.moduleMap).toEqual(before.moduleMap);
     expect(after.buildMetadata).toEqual(before.buildMetadata);
+  });
+
+  test("compiles every artifact from the captured source snapshot", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "snapshot instructions\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const changedToolSource = toolSource.replace(
+      "Greet a person.",
+      "Changed after snapshot.",
+    );
+    const changedDuringValidation = toolSource.replace(
+      "Greet a person.",
+      "Changed during validation.",
+    );
+    const result = await buildProject({
+      projectRoot: root,
+      hooks: {
+        afterSourceSnapshot: async () => {
+          await writeFile(
+            join(root, "agent/tools/greet.ts"),
+            changedToolSource,
+            "utf8",
+          );
+        },
+        onPublicationBoundary: async (boundary) => {
+          if (boundary === "after-stage-write") {
+            await writeFile(
+              join(root, "agent/tools/greet.ts"),
+              changedDuringValidation,
+              "utf8",
+            );
+          }
+        },
+      },
+    });
+
+    const generation = await readGeneration(root);
+    const liveSourceHash = createHash("sha256")
+      .update(await readFile(join(root, "agent/tools/greet.ts")))
+      .digest("hex");
+
+    expect(result.artifacts.manifest.tools[0]?.description).toBe(
+      "Greet a person.",
+    );
+    expect(generation.manifest.tools[0]?.description).toBe(
+      "Greet a person.",
+    );
+    expect(generation.bundle).toContain("Greet a person.");
+    expect(generation.bundle).not.toContain("Changed after snapshot.");
+    expect(generation.bundle).not.toContain("Changed during validation.");
+    expect(generation.manifest.tools[0]?.source.sha256).not.toBe(
+      liveSourceHash,
+    );
+    expect(generation.manifest.bundleDigest).toBe(
+      createHash("sha256").update(generation.bundle).digest("hex"),
+    );
+  });
+
+  test.each([
+    "before-stage-write",
+    "after-stage-write",
+    "before-current-promotion",
+  ] as const)(
+    "keeps the prior current generation across %s interruption",
+    async (boundary) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "publication instructions\n",
+        "agent/tools/greet.ts": toolSource,
+      });
+
+      await buildProject({ projectRoot: root });
+      const before = await readGeneration(root);
+      const beforeCurrent = await lstat(join(root, ".eden", "CURRENT"));
+      expect(beforeCurrent.isSymbolicLink()).toBe(true);
+
+      await writeFile(
+        join(root, "agent/tools/greet.ts"),
+        toolSource.replace("Greet a person.", "New generation."),
+        "utf8",
+      );
+
+      await expect(
+        buildProject({
+          projectRoot: root,
+          hooks: {
+            onPublicationBoundary: (currentBoundary) => {
+              if (currentBoundary === boundary) {
+                throw new Error(`injected ${boundary} interruption`);
+              }
+            },
+          },
+        }),
+      ).rejects.toThrow(`injected ${boundary} interruption`);
+
+      const after = await readGeneration(root);
+      const afterCurrent = await lstat(join(root, ".eden", "CURRENT"));
+      expect(afterCurrent.isSymbolicLink()).toBe(true);
+      expect(after.bundle).toBe(before.bundle);
+      expect(after.manifest).toEqual(before.manifest);
+      expect(after.moduleMap).toEqual(before.moduleMap);
+      expect(after.buildMetadata).toEqual(before.buildMetadata);
+    },
+  );
+
+  test("publishes a complete new generation after the final promotion boundary", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "publication instructions\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const before = await readGeneration(root);
+    await writeFile(
+      join(root, "agent/tools/greet.ts"),
+      toolSource.replace("Greet a person.", "New generation."),
+      "utf8",
+    );
+
+    await expect(
+      buildProject({
+        projectRoot: root,
+        hooks: {
+          onPublicationBoundary: (boundary) => {
+            if (boundary === "after-current-promotion") {
+              throw new Error("injected after-current-promotion interruption");
+            }
+          },
+        },
+      }),
+    ).rejects.toThrow("injected after-current-promotion interruption");
+
+    const after = await readGeneration(root);
+    const current = await lstat(join(root, ".eden", "CURRENT"));
+    expect(current.isSymbolicLink()).toBe(true);
+    expect(after.bundle).not.toBe(before.bundle);
+    expect(after.manifest.tools[0]?.description).toBe("New generation.");
+    expect(after.buildMetadata.generationId).not.toBe(
+      before.buildMetadata.generationId,
+    );
   });
 
   test(

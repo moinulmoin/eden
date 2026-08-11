@@ -7,8 +7,10 @@ import { build } from "esbuild";
 import {
   createHash,
 } from "crypto";
+import { tmpdir } from "os";
 import {
   mkdir,
+  mkdtemp,
   lstat,
   readFile,
   readdir,
@@ -16,6 +18,7 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "fs/promises";
 import {
@@ -74,6 +77,20 @@ export type {
 export interface EdenCompilerOptions {
   readonly projectRoot: string;
   readonly outputDirectory?: string;
+  readonly hooks?: EdenCompilerHooks;
+}
+
+export type EdenPublicationBoundary =
+  | "before-stage-write"
+  | "after-stage-write"
+  | "before-current-promotion"
+  | "after-current-promotion";
+
+export interface EdenCompilerHooks {
+  readonly afterSourceSnapshot?: () => void | Promise<void>;
+  readonly onPublicationBoundary?: (
+    boundary: EdenPublicationBoundary,
+  ) => void | Promise<void>;
 }
 
 export interface EdenCompilerResult {
@@ -184,6 +201,7 @@ interface SourcePathInfo {
   readonly absolutePath: string;
   readonly canonicalPath: string;
   readonly source: EdenSourceReference;
+  readonly contents: Uint8Array;
 }
 
 interface DiscoveryCandidate extends SourcePathInfo {
@@ -232,12 +250,20 @@ function sourcePath(
     absolutePath: candidate,
     canonicalPath,
     source: EMPTY_SOURCE(toPosixPath(relative(root, candidate))),
+    contents: new Uint8Array(),
   };
 }
 
-async function hashFile(path: string): Promise<string> {
-  const bytes = await readFile(path);
+function hashBytes(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
 }
 
 async function readUtf8File(path: string): Promise<string> {
@@ -304,15 +330,17 @@ async function readSourcePath(
   }
 
   try {
+    const contents = await readFile(canonicalPath);
     const source = {
       relativePath: toPosixPath(relative(root, lexicalPath)),
-      sha256: await hashFile(canonicalPath),
+      sha256: hashBytes(contents),
     };
     return {
       relativePath: source.relativePath,
       absolutePath: lexicalPath,
       canonicalPath,
       source,
+      contents,
     };
   } catch {
     diagnostics.push(
@@ -440,13 +468,15 @@ async function inspectToolEntries(
       continue;
     }
 
+    const contents = await readFile(canonicalPath);
     const source: EdenSourceReference = {
       relativePath,
-      sha256: await hashFile(canonicalPath),
+      sha256: hashBytes(contents),
     };
     candidates.push({
       ...sourcePath(root, absolutePath, canonicalPath),
       source,
+      contents,
       name: basename(entry.name, ".ts"),
     });
   }
@@ -457,6 +487,330 @@ async function inspectToolEntries(
     return comparePath(leftKey, rightKey) || comparePath(left.relativePath, right.relativePath);
   });
   return candidates;
+}
+
+interface SnapshotFile {
+  readonly relativePath: string;
+  readonly sourcePath: string;
+  readonly contents: Uint8Array;
+}
+
+interface EdenSourceSnapshot {
+  readonly projectRoot: string;
+  readonly sourceRoot: string;
+  readonly diagnostics: readonly EdenDiagnostic[];
+  readonly discovery: EdenDiscoveryResult["discovery"];
+  readonly files: ReadonlyMap<string, SnapshotFile>;
+  readonly cleanup: () => Promise<void>;
+}
+
+async function copySnapshotFile(
+  snapshotRoot: string,
+  file: SnapshotFile,
+): Promise<string> {
+  const destination = join(snapshotRoot, file.relativePath);
+  await mkdir(dirname(destination), { recursive: true });
+  await writeFile(destination, file.contents, { flag: "wx" });
+  return destination;
+}
+
+async function packageJsonFor(
+  projectRoot: string,
+  sourcePath: string,
+): Promise<SnapshotFile | undefined> {
+  const nodeModulesRoot = normalize(join(projectRoot, "node_modules"));
+  let directory = dirname(sourcePath);
+  while (isWithinRoot(nodeModulesRoot, directory)) {
+    const packagePath = join(directory, "package.json");
+    const contents = await readFile(packagePath).catch(() => undefined);
+    if (contents !== undefined) {
+      return {
+        relativePath: toPosixPath(relative(projectRoot, packagePath)),
+        sourcePath: packagePath,
+        contents,
+      };
+    }
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return undefined;
+}
+
+async function collectAuthoredImportClosure(
+  projectRoot: string,
+  entries: readonly SourcePathInfo[],
+): Promise<readonly SnapshotFile[]> {
+  const files = new Map<string, SnapshotFile>();
+  for (const entry of entries) {
+    files.set(entry.relativePath, {
+      relativePath: entry.relativePath,
+      sourcePath: entry.absolutePath,
+      contents: entry.contents,
+    });
+  }
+
+  let dependencyIssue: EdenDiagnostic | undefined;
+  let dependencySource: string | undefined;
+  try {
+    const result = await build({
+      absWorkingDir: projectRoot,
+      entryPoints: entries
+        .filter((entry) => entry.relativePath.endsWith(".ts"))
+        .map((entry) => entry.relativePath),
+      bundle: true,
+      format: "esm",
+      metafile: true,
+      outdir: join(projectRoot, ".eden-compiler-closure"),
+      nodePaths: [join(projectRoot, "node_modules")],
+      platform: "node",
+      preserveSymlinks: true,
+      target: "es2022",
+      write: false,
+      logLevel: "silent",
+      plugins: [
+        {
+          name: "eden-snapshot-contained-imports",
+          setup(context) {
+            context.onResolve({ filter: /^[^./]/ }, (args) => {
+              dependencySource =
+                args.importer.length === 0
+                  ? undefined
+                  : toPosixPath(relative(projectRoot, args.importer));
+              return undefined;
+            });
+            context.onLoad({ filter: /./ }, (args) => {
+              if (
+                isWithinRoot(projectRoot, normalize(args.path)) ||
+                isWithinRoot(
+                  normalize(join(projectRoot, "node_modules")),
+                  normalize(args.path),
+                )
+              ) {
+                return undefined;
+              }
+              const message =
+                "An authored dependency resolved outside the selected project root.";
+              dependencyIssue = diagnostic(
+                "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+                message,
+                dependencySource,
+              );
+              return { errors: [{ text: message }] };
+            });
+            context.onResolve(
+              { filter: /^(?:\.{1,2}(?:\/|$)|\/)/ },
+              async (args) => {
+                const importerRoot = normalize(args.resolveDir);
+                if (
+                  isWithinRoot(
+                    normalize(join(projectRoot, "node_modules")),
+                    importerRoot,
+                  )
+                ) {
+                  return undefined;
+                }
+                const resolvedImport = isAbsolute(args.path)
+                  ? args.path
+                  : resolve(args.resolveDir, args.path);
+                const canonicalImport = await realpath(resolvedImport).catch(
+                  () => resolvedImport,
+                );
+                if (
+                  !isWithinRoot(projectRoot, normalize(resolvedImport)) ||
+                  !isWithinRoot(projectRoot, canonicalImport)
+                ) {
+                  return {
+                    errors: [
+                      {
+                        text:
+                          `Import "${args.path}" from "${args.importer}" ` +
+                          "escapes the selected project root.",
+                      },
+                    ],
+                  };
+                }
+                return undefined;
+              },
+            );
+          },
+        },
+      ],
+    });
+    for (const input of Object.keys(result.metafile?.inputs ?? {})) {
+      const logicalPath = isAbsolute(input)
+        ? normalize(input)
+        : resolve(projectRoot, input);
+      if (!isWithinRoot(projectRoot, logicalPath)) {
+        throw new EdenCompilerError("Worker source snapshot escaped the project", [
+          diagnostic(
+            "MODULE_DEPENDENCY_OUTSIDE_PROJECT",
+            `Dependency "${input}" resolves outside the selected project root.`,
+          ),
+        ]);
+      }
+      const relativePath = toPosixPath(relative(projectRoot, logicalPath));
+      const contents = await readFile(logicalPath);
+      if (!files.has(relativePath)) {
+        files.set(relativePath, {
+          relativePath,
+          sourcePath: logicalPath,
+          contents,
+        });
+      }
+      const packageJson = await packageJsonFor(projectRoot, logicalPath);
+      if (packageJson !== undefined) {
+        if (!files.has(packageJson.relativePath)) {
+          files.set(packageJson.relativePath, packageJson);
+        }
+      }
+    }
+  } catch (error: unknown) {
+    if (dependencyIssue !== undefined) {
+      throw new EdenCompilerError(
+        "Unable to capture the authored source snapshot",
+        [dependencyIssue],
+      );
+    }
+    if (error instanceof EdenCompilerError) throw error;
+    // Invalid authored syntax is diagnosed during normalization from the
+    // captured entry bytes; the direct source snapshot is still sufficient.
+  }
+  return [...files.values()];
+}
+
+async function captureSourceSnapshot(
+  projectRoot: string,
+): Promise<EdenSourceSnapshot> {
+  const discovered = await discoverProject({ projectRoot });
+  const diagnostics = [...discovered.diagnostics];
+  const sourceEntries: SourcePathInfo[] = [];
+  const agent = await readSourcePath(projectRoot, REQUIRED_AGENT_PATH, diagnostics);
+  const instructions = await readSourcePath(
+    projectRoot,
+    REQUIRED_INSTRUCTIONS_PATH,
+    diagnostics,
+  );
+  if (agent !== undefined) sourceEntries.push(agent);
+  if (instructions !== undefined) sourceEntries.push(instructions);
+
+  const tools: SourcePathInfo[] = [];
+  for (const source of discovered.discovery.tools) {
+    const absolutePath = await resolveContainedProjectPath(
+      projectRoot,
+      source.relativePath,
+    ).catch(() => join(projectRoot, source.relativePath));
+    const canonicalPath = await realpath(absolutePath).catch(() => absolutePath);
+    const contents = await readFile(canonicalPath).catch(() => undefined);
+    if (contents === undefined) continue;
+    const sourceReference: EdenSourceReference = {
+      relativePath: source.relativePath,
+      sha256: hashBytes(contents),
+    };
+    const candidate: SourcePathInfo = {
+      relativePath: source.relativePath,
+      absolutePath,
+      canonicalPath,
+      source: sourceReference,
+      contents,
+    };
+    tools.push(candidate);
+    sourceEntries.push(candidate);
+  }
+
+  const files = new Map<string, SnapshotFile>(
+    sourceEntries.map((entry) => [
+      entry.relativePath,
+      {
+        relativePath: entry.relativePath,
+        sourcePath: entry.absolutePath,
+        contents: entry.contents,
+      },
+    ]),
+  );
+  try {
+    for (const file of await collectAuthoredImportClosure(projectRoot, sourceEntries)) {
+      files.set(file.relativePath, file);
+    }
+  } catch (error: unknown) {
+    if (error instanceof EdenCompilerError) {
+      diagnostics.push(...error.diagnostics);
+    } else {
+      diagnostics.push(
+        diagnostic(
+          "MODULE_SNAPSHOT_FAILED",
+          "Unable to capture the authored source/import closure.",
+        ),
+      );
+    }
+  }
+  for (const file of files.values()) {
+    const currentContents = await readFile(file.sourcePath).catch(
+      () => undefined,
+    );
+    if (
+      currentContents === undefined ||
+      !bytesEqual(file.contents, currentContents)
+    ) {
+      diagnostics.push(
+        diagnostic(
+          "SOURCE_CHANGED_DURING_BUILD",
+          `Source "${file.relativePath}" changed while its import closure was being captured; retry the build.`,
+          file.relativePath,
+        ),
+      );
+    }
+  }
+  const afterCaptureDiscovery = await discoverProject({ projectRoot });
+  if (
+    stableJson({
+      discovery: discovered.discovery,
+      diagnostics: discovered.diagnostics,
+    }) !==
+    stableJson({
+      discovery: afterCaptureDiscovery.discovery,
+      diagnostics: afterCaptureDiscovery.diagnostics,
+    })
+  ) {
+    diagnostics.push(
+      diagnostic(
+        "SOURCE_CHANGED_DURING_BUILD",
+        "Authored source or tool discovery changed while its import closure was being captured; retry the build.",
+      ),
+    );
+  }
+
+  const temporarySnapshotRoot = await mkdtemp(
+    join(tmpdir(), "eden-compiler-snapshot-"),
+  );
+  const snapshotRoot = await realpath(temporarySnapshotRoot);
+  try {
+    for (const file of files.values()) {
+      await copySnapshotFile(snapshotRoot, file);
+    }
+  } catch (error: unknown) {
+    await rm(snapshotRoot, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+
+  const snapshotDiscovery: EdenDiscoveryResult["discovery"] = {
+    agent: agent?.source ?? EMPTY_SOURCE(REQUIRED_AGENT_PATH),
+    instructions: instructions?.source ?? EMPTY_SOURCE(REQUIRED_INSTRUCTIONS_PATH),
+    tools: tools
+      .sort((left, right) => comparePath(left.relativePath, right.relativePath))
+      .map((tool) => tool.source),
+  };
+
+  return {
+    projectRoot,
+    sourceRoot: snapshotRoot,
+    diagnostics,
+    discovery: snapshotDiscovery,
+    files,
+    cleanup: async () => {
+      await rm(snapshotRoot, { recursive: true, force: true });
+    },
+  };
 }
 
 function emptyDiscovery(): EdenDiscoveryResult["discovery"] {
@@ -1114,39 +1468,35 @@ async function loadDefaultExport(
   }
 }
 
-async function sourceInfoFor(
-  projectRoot: string,
+function snapshotSourceInfo(
+  snapshot: EdenSourceSnapshot,
   relativePath: string,
-): Promise<SourcePathInfo | undefined> {
-  const candidate = await resolveContainedProjectPath(projectRoot, relativePath);
-  const canonicalPath = await realpath(candidate);
-  const source: EdenSourceReference = {
-    relativePath,
-    sha256: await hashFile(canonicalPath),
-  };
+): SourcePathInfo | undefined {
+  const file = snapshot.files.get(relativePath);
+  if (file === undefined) return undefined;
+  const absolutePath = join(snapshot.sourceRoot, relativePath);
   return {
     relativePath,
-    absolutePath: candidate,
-    canonicalPath,
-    source,
+    absolutePath,
+    canonicalPath: absolutePath,
+    source: {
+      relativePath,
+      sha256: hashBytes(file.contents),
+    },
+    contents: file.contents,
   };
 }
 
-export async function normalizeProject(
-  selection: EdenProjectSelection,
+async function normalizeSnapshot(
+  snapshot: EdenSourceSnapshot,
 ): Promise<EdenNormalizedProject> {
-  const options =
-    typeof selection === "string" ? { projectRoot: selection } : selection;
-  const discovered = await discoverProject(options);
-  const diagnostics = [...discovered.diagnostics];
-  const root = discovered.projectRoot;
-  const agentInfo = await sourceInfoFor(root, REQUIRED_AGENT_PATH).catch(
-    () => undefined,
-  );
-  const instructionsInfo = await sourceInfoFor(
-    root,
+  const diagnostics = [...snapshot.diagnostics];
+  const root = snapshot.sourceRoot;
+  const agentInfo = snapshotSourceInfo(snapshot, REQUIRED_AGENT_PATH);
+  const instructionsInfo = snapshotSourceInfo(
+    snapshot,
     REQUIRED_INSTRUCTIONS_PATH,
-  ).catch(() => undefined);
+  );
 
   const agentValue =
     agentInfo === undefined
@@ -1162,7 +1512,9 @@ export async function normalizeProject(
     try {
       instructions = {
         source: instructionsInfo.source,
-        content: await readUtf8File(instructionsInfo.canonicalPath),
+        content: new TextDecoder("utf-8", { fatal: true }).decode(
+          instructionsInfo.contents,
+        ),
         sha256: instructionsInfo.source.sha256,
       };
     } catch {
@@ -1177,14 +1529,9 @@ export async function normalizeProject(
   }
 
   const candidates: SourcePathInfo[] = [];
-  for (const source of discovered.discovery.tools) {
-    const absolutePath = join(root, source.relativePath);
-    candidates.push({
-      source,
-      absolutePath,
-      canonicalPath: await realpath(absolutePath).catch(() => absolutePath),
-      relativePath: source.relativePath,
-    });
+  for (const source of snapshot.discovery.tools) {
+    const candidate = snapshotSourceInfo(snapshot, source.relativePath);
+    if (candidate !== undefined) candidates.push(candidate);
   }
   candidates.sort((left, right) =>
     comparePath(left.relativePath, right.relativePath),
@@ -1271,11 +1618,29 @@ export async function normalizeProject(
 
   return {
     projectRoot: root,
-    discovery: discovered.discovery,
+    discovery: snapshot.discovery,
     agent,
     instructions,
     tools,
   };
+}
+
+export async function normalizeProject(
+  selection: EdenProjectSelection,
+): Promise<EdenNormalizedProject> {
+  const options =
+    typeof selection === "string" ? { projectRoot: selection } : selection;
+  const projectRoot = await resolveProjectRoot(options);
+  const snapshot = await captureSourceSnapshot(projectRoot);
+  try {
+    const normalized = await normalizeSnapshot(snapshot);
+    return {
+      ...normalized,
+      projectRoot,
+    };
+  } finally {
+    await snapshot.cleanup();
+  }
 }
 
 const ARTIFACT_FILE_NAMES = {
@@ -1542,7 +1907,11 @@ async function resolveAuthoredImport(
   for (const candidate of candidates) {
     const canonical = await realpath(candidate).catch(() => undefined);
     if (canonical === undefined) continue;
-    if (!isWithinRoot(projectRoot, canonical)) {
+    const logicalCandidate = normalize(candidate);
+    if (
+      !isWithinRoot(projectRoot, logicalCandidate) ||
+      !isWithinRoot(projectRoot, canonical)
+    ) {
       throw new EdenCompilerError("Worker compatibility validation failed", [
         diagnostic(
           "PATH_OUTSIDE_PROJECT",
@@ -1552,7 +1921,7 @@ async function resolveAuthoredImport(
       ]);
     }
     const details = await stat(canonical).catch(() => undefined);
-    if (details?.isFile()) return canonical;
+    if (details?.isFile()) return logicalCandidate;
   }
   return undefined;
 }
@@ -1890,6 +2259,35 @@ function assertArtifactCoherence(
   }
 }
 
+async function assertPublishedGeneration(
+  directory: string,
+): Promise<void> {
+  try {
+    const [manifest, moduleMap, buildMetadata, bundle] = await Promise.all([
+      readFile(join(directory, ARTIFACT_FILE_NAMES.manifest), "utf8").then(
+        (value) => JSON.parse(value) as EdenManifest,
+      ),
+      readFile(join(directory, ARTIFACT_FILE_NAMES.moduleMap), "utf8").then(
+        (value) => JSON.parse(value) as EdenModuleMap,
+      ),
+      readFile(
+        join(directory, ARTIFACT_FILE_NAMES.buildMetadata),
+        "utf8",
+      ).then((value) => JSON.parse(value) as EdenBuildMetadata),
+      readFile(join(directory, ARTIFACT_FILE_NAMES.bundle), "utf8"),
+    ]);
+    assertArtifactCoherence(manifest, moduleMap, bundle, buildMetadata);
+  } catch (error: unknown) {
+    if (error instanceof EdenCompilerError) throw error;
+    throw new EdenCompilerError("Published artifact generation is invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Existing artifact generation "${basename(directory)}" is incomplete or malformed.`,
+      ),
+    ]);
+  }
+}
+
 async function outputDirectoryFor(
   projectRoot: string,
   outputDirectory: string | undefined,
@@ -1947,23 +2345,171 @@ async function outputDirectoryFor(
 async function publishArtifacts(
   outputDirectory: string,
   artifacts: EdenArtifactSet,
+  hooks: EdenCompilerHooks = {},
 ): Promise<void> {
-  const parent = dirname(outputDirectory);
-  await mkdir(parent, { recursive: true });
+  const outputDetails = await lstat(outputDirectory).catch(() => undefined);
+  if (
+    outputDetails !== undefined &&
+    (!outputDetails.isDirectory() || outputDetails.isSymbolicLink())
+  ) {
+    throw new EdenCompilerError("Artifact output is not a directory", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Artifact output "${outputDirectory}" must be a real directory.`,
+      ),
+    ]);
+  }
+  await mkdir(outputDirectory, { recursive: true });
+  const generationsDirectory = join(outputDirectory, "generations");
+  const currentPointer = join(outputDirectory, "CURRENT");
+  await mkdir(generationsDirectory, { recursive: true });
   const stage = join(
-    parent,
-    `.${basename(outputDirectory)}.staging-${process.pid}-${Date.now()}-${Math.random()
+    generationsDirectory,
+    `.staging-${process.pid}-${Date.now()}-${Math.random()
       .toString(16)
       .slice(2)}`,
   );
-  const backup = join(
-    parent,
-    `.${basename(outputDirectory)}.previous-${process.pid}-${Date.now()}-${Math.random()
-      .toString(16)
-      .slice(2)}`,
+  const generationDirectory = join(
+    generationsDirectory,
+    artifacts.buildMetadata.generationId,
   );
-  let movedCurrent = false;
+
+  const artifactNames = Object.values(ARTIFACT_FILE_NAMES);
+  const readCurrent = async (): Promise<boolean> => {
+    const current = await lstat(currentPointer).catch(() => undefined);
+    if (current === undefined) return false;
+    if (!current.isSymbolicLink()) {
+      throw new EdenCompilerError("Artifact output is not a directory", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          `Artifact output "${outputDirectory}" has a non-symbolic CURRENT pointer.`,
+        ),
+      ]);
+    }
+    return true;
+  };
+
+  const makePointer = async (target: string): Promise<void> => {
+    const pointerStage = join(
+      outputDirectory,
+      `.CURRENT-${process.pid}-${Date.now()}-${Math.random()
+        .toString(16)
+        .slice(2)}`,
+    );
+    const relativeTarget = relative(outputDirectory, target);
+    try {
+      await symlink(relativeTarget, pointerStage);
+      await rename(pointerStage, currentPointer);
+    } finally {
+      await rm(pointerStage, { force: true }).catch(() => undefined);
+    }
+  };
+
+  const makeArtifactLinks = async (): Promise<{
+    readonly backups: readonly string[];
+    readonly createdLinks: readonly string[];
+  }> => {
+    const backups: string[] = [];
+    const createdLinks: string[] = [];
+    try {
+      for (const name of artifactNames) {
+        const destination = join(outputDirectory, name);
+        const existing = await lstat(destination).catch(() => undefined);
+        if (existing?.isSymbolicLink() === true) {
+          continue;
+        }
+        if (existing !== undefined) {
+          const backup = join(
+            outputDirectory,
+            `.${name}.previous-${process.pid}-${Date.now()}-${Math.random()
+              .toString(16)
+              .slice(2)}`,
+          );
+          await rename(destination, backup);
+          backups.push(backup);
+        }
+        await symlink(join("CURRENT", name), destination);
+        createdLinks.push(destination);
+      }
+    } catch (error: unknown) {
+      await restoreArtifactLinks({ backups, createdLinks });
+      throw error;
+    }
+    return { backups, createdLinks };
+  };
+
+  const restoreArtifactLinks = async (transaction: {
+    readonly backups: readonly string[];
+    readonly createdLinks: readonly string[];
+  }): Promise<void> => {
+    for (const destination of transaction.createdLinks) {
+      await rm(destination, { force: true }).catch(() => undefined);
+    }
+    for (const backup of [...transaction.backups].reverse()) {
+      const name = basename(backup).replace(
+        /^\.([^/]+)\.previous-\d+-\d+-[a-f0-9]+$/u,
+        "$1",
+      );
+      await rename(backup, join(outputDirectory, name)).catch(() => undefined);
+    }
+  };
+
+  const cleanupBackups = async (backups: readonly string[]): Promise<void> => {
+    await Promise.all(
+      backups.map((backup) =>
+        rm(backup, { recursive: true, force: true }).catch(() => undefined),
+      ),
+    );
+  };
+
+  let artifactLinkTransaction:
+    | {
+        readonly backups: readonly string[];
+        readonly createdLinks: readonly string[];
+      }
+    | undefined;
+  let generationPromoted = false;
   try {
+    const currentExists = await readCurrent();
+    if (!currentExists) {
+      const legacyFiles = await Promise.all(
+        artifactNames.map(async (name) => {
+          const path = join(outputDirectory, name);
+          const details = await lstat(path).catch(() => undefined);
+          if (details === undefined || details.isSymbolicLink() || !details.isFile()) {
+            return undefined;
+          }
+          return { name, contents: await readFile(path) };
+        }),
+      );
+      if (legacyFiles.every((file) => file !== undefined)) {
+        const legacyDirectory = join(
+          generationsDirectory,
+          `.legacy-${process.pid}-${Date.now()}-${Math.random()
+            .toString(16)
+            .slice(2)}`,
+        );
+        await mkdir(legacyDirectory);
+        try {
+          await Promise.all(
+            legacyFiles.map(async (file) => {
+              if (file === undefined) return;
+              await writeFile(join(legacyDirectory, file.name), file.contents, {
+                flag: "wx",
+              });
+            }),
+          );
+          await makePointer(legacyDirectory);
+        } catch (error: unknown) {
+          await rm(legacyDirectory, { recursive: true, force: true }).catch(
+            () => undefined,
+          );
+          throw error;
+        }
+      }
+    }
+
+    await hooks.onPublicationBoundary?.("before-stage-write");
     await mkdir(stage);
     await Promise.all([
       writeFile(
@@ -1998,28 +2544,52 @@ async function publishArtifacts(
       ),
     ]);
 
-    const existing = await lstat(outputDirectory).catch(() => undefined);
-    if (existing !== undefined) {
-      if (!existing.isDirectory() || existing.isSymbolicLink()) {
+    const stagedBundle = await readFile(join(stage, ARTIFACT_FILE_NAMES.bundle), "utf8");
+    const stagedManifest = JSON.parse(
+      await readFile(join(stage, ARTIFACT_FILE_NAMES.manifest), "utf8"),
+    ) as EdenManifest;
+    const stagedModuleMap = JSON.parse(
+      await readFile(join(stage, ARTIFACT_FILE_NAMES.moduleMap), "utf8"),
+    ) as EdenModuleMap;
+    const stagedMetadata = JSON.parse(
+      await readFile(join(stage, ARTIFACT_FILE_NAMES.buildMetadata), "utf8"),
+    ) as EdenBuildMetadata;
+    assertArtifactCoherence(
+      stagedManifest,
+      stagedModuleMap,
+      stagedBundle,
+      stagedMetadata,
+    );
+    await hooks.onPublicationBoundary?.("after-stage-write");
+
+    const existingGeneration = await lstat(generationDirectory).catch(
+      () => undefined,
+    );
+    if (existingGeneration === undefined) {
+      await rename(stage, generationDirectory);
+    } else {
+      if (!existingGeneration.isDirectory() || existingGeneration.isSymbolicLink()) {
         throw new EdenCompilerError("Artifact output is not a directory", [
           diagnostic(
             "OUTPUT_INVALID",
-            `Artifact output "${outputDirectory}" must be a real directory.`,
+            `Artifact generation "${artifacts.buildMetadata.generationId}" is not a real directory.`,
           ),
         ]);
       }
-      await rename(outputDirectory, backup);
-      movedCurrent = true;
+      await assertPublishedGeneration(generationDirectory);
+      await rm(stage, { recursive: true, force: true });
     }
-    await rename(stage, outputDirectory);
-    if (movedCurrent) await rm(backup, { recursive: true, force: true });
+
+    artifactLinkTransaction = await makeArtifactLinks();
+    await hooks.onPublicationBoundary?.("before-current-promotion");
+    await makePointer(generationDirectory);
+    generationPromoted = true;
+    await hooks.onPublicationBoundary?.("after-current-promotion");
+    await cleanupBackups(artifactLinkTransaction.backups);
   } catch (error: unknown) {
     await rm(stage, { recursive: true, force: true }).catch(() => undefined);
-    if (movedCurrent) {
-      const current = await lstat(outputDirectory).catch(() => undefined);
-      if (current === undefined) {
-        await rename(backup, outputDirectory).catch(() => undefined);
-      }
+    if (!generationPromoted && artifactLinkTransaction !== undefined) {
+      await restoreArtifactLinks(artifactLinkTransaction);
     }
     throw error;
   }
@@ -2035,24 +2605,34 @@ export async function buildProject(
     projectRoot,
     options.outputDirectory,
   );
-  const normalized = await normalizeProject({ projectRoot });
-  await validateAuthoredWorkerSources(normalized);
-  const moduleMap = artifactModuleMap(normalized);
-  const bundle = await bundleProject(normalized, moduleMap);
-  const manifest = createGeneratedManifest(normalized, moduleMap, sha256(bundle));
-  const buildMetadata = createBuildMetadata(manifest, moduleMap, bundle);
-  const diagnostics: readonly EdenDiagnostic[] = [];
-  const artifacts: EdenArtifactSet = {
-    discovery: normalized.discovery,
-    diagnostics,
-    manifest,
-    moduleMap,
-    bundle,
-    buildMetadata,
-  };
-  assertArtifactCoherence(manifest, moduleMap, bundle, buildMetadata);
-  await publishArtifacts(outputDirectory, artifacts);
-  return { artifacts, diagnostics };
+  const snapshot = await captureSourceSnapshot(projectRoot);
+  try {
+    await options.hooks?.afterSourceSnapshot?.();
+    const normalized = await normalizeSnapshot(snapshot);
+    await validateAuthoredWorkerSources(normalized);
+    const moduleMap = artifactModuleMap(normalized);
+    const bundle = await bundleProject(normalized, moduleMap);
+    const manifest = createGeneratedManifest(
+      normalized,
+      moduleMap,
+      sha256(bundle),
+    );
+    const buildMetadata = createBuildMetadata(manifest, moduleMap, bundle);
+    const diagnostics: readonly EdenDiagnostic[] = [];
+    const artifacts: EdenArtifactSet = {
+      discovery: normalized.discovery,
+      diagnostics,
+      manifest,
+      moduleMap,
+      bundle,
+      buildMetadata,
+    };
+    assertArtifactCoherence(manifest, moduleMap, bundle, buildMetadata);
+    await publishArtifacts(outputDirectory, artifacts, options.hooks);
+    return { artifacts, diagnostics };
+  } finally {
+    await snapshot.cleanup();
+  }
 }
 
 export class EdenNodeCompiler implements EdenCompiler {
