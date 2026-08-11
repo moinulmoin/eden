@@ -1,12 +1,24 @@
 import type { EdenSessionStorage, EdenSqlStorage } from "./session-journal.js";
 
 export const MAX_RECOVERY_JOBS_PER_ALARM = 4;
+export const MAX_RECOVERY_JOBS_PER_INSPECTION_PAGE = 32;
 export const MAX_RECOVERY_JOB_ATTEMPTS = 3;
 export const RECOVERY_RETRY_DELAY_MS = 1_000;
 const MAX_RECOVERY_JOB_ID_BYTES = 256;
 const MAX_RECOVERY_JOB_KIND_BYTES = 128;
 const MAX_RECOVERY_ACTION_BYTES = 256;
 const MAX_RECOVERY_ERROR_BYTES = 512;
+const MAX_RECOVERY_TIMESTAMP_BYTES = 64;
+const MAX_RECOVERY_INSPECTION_CURSOR_BYTES = 1_024;
+
+export const REGISTERED_RECOVERY_ACTIONS = [
+  "mark-complete",
+  "always-fail",
+  "fail",
+  "run-bounded-turn",
+] as const;
+
+export type RecoveryAction = (typeof REGISTERED_RECOVERY_ACTIONS)[number];
 
 type SqlRow = Record<string, string | number | null>;
 
@@ -43,6 +55,12 @@ export interface RecoveryJobRecord {
 export interface RecoveryJobInspection {
   readonly jobs: readonly RecoveryJobRecord[];
   readonly nextDueAt: number | null;
+  readonly nextCursor: string | null;
+}
+
+export interface RecoveryJobInspectionOptions {
+  readonly cursor?: string;
+  readonly limit?: number;
 }
 
 export type RecoveryJobEnqueueResult =
@@ -103,6 +121,21 @@ function assertJobId(jobId: string): void {
   assertBoundedText(jobId, "Recovery job identity", MAX_RECOVERY_JOB_ID_BYTES);
 }
 
+export function isRegisteredRecoveryAction(
+  action: string | null | undefined,
+): action is RecoveryAction {
+  return (
+    typeof action === "string" &&
+    (REGISTERED_RECOVERY_ACTIONS as readonly string[]).includes(action)
+  );
+}
+
+function assertRecoveryAction(action: string | null | undefined): asserts action is RecoveryAction {
+  if (!isRegisteredRecoveryAction(action)) {
+    throw new Error("Unknown recovery action");
+  }
+}
+
 function assertJobInput(input: RecoveryJobInput): void {
   assertJobId(input.jobId);
   assertBoundedText(input.kind, "Recovery job kind", MAX_RECOVERY_JOB_KIND_BYTES);
@@ -122,6 +155,14 @@ function assertJobInput(input: RecoveryJobInput): void {
   ) {
     throw new Error("Recovery job attempt bound is invalid");
   }
+  if (input.createdAt !== undefined) {
+    assertBoundedText(
+      input.createdAt,
+      "Recovery job creation time",
+      MAX_RECOVERY_TIMESTAMP_BYTES,
+    );
+  }
+  assertRecoveryAction(input.recoveryAction);
 }
 
 function nowIso(now = Date.now()): string {
@@ -209,22 +250,105 @@ function readNextDueAt(
   return row?.due_at ?? null;
 }
 
-function readAllJobs(
+interface RecoveryJobInspectionCursor {
+  readonly version: 1;
+  readonly dueAt: number;
+  readonly jobId: string;
+}
+
+function encodeInspectionCursor(job: RecoveryJobRecord): string {
+  const payload: RecoveryJobInspectionCursor = {
+    version: 1,
+    dueAt: job.dueAt,
+    jobId: job.jobId,
+  };
+  const encoded = new TextEncoder().encode(JSON.stringify(payload));
+  let binary = "";
+  for (const byte of encoded) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+}
+
+function decodeInspectionCursor(cursor: string): RecoveryJobInspectionCursor {
+  if (cursor.length === 0 || bytes(cursor) > MAX_RECOVERY_INSPECTION_CURSOR_BYTES) {
+    throw new Error("Recovery inspection cursor is invalid");
+  }
+  try {
+    const padded = cursor.replace(/-/g, "+").replace(/_/g, "/");
+    const padding = padded.length % 4;
+    const binary = atob(padded + (padding === 0 ? "" : "=".repeat(4 - padding)));
+    const encoded = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(encoded));
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      (parsed as { readonly version?: unknown }).version !== 1 ||
+      !Number.isSafeInteger((parsed as { readonly dueAt?: unknown }).dueAt) ||
+      (parsed as { readonly dueAt: number }).dueAt < 0 ||
+      typeof (parsed as { readonly jobId?: unknown }).jobId !== "string"
+    ) {
+      throw new Error("Recovery inspection cursor is invalid");
+    }
+    assertJobId((parsed as { readonly jobId: string }).jobId);
+    return parsed as RecoveryJobInspectionCursor;
+  } catch {
+    throw new Error("Recovery inspection cursor is invalid");
+  }
+}
+
+function readInspectionPage(
   sql: EdenSqlStorage,
   sessionId: string,
-): readonly RecoveryJobRecord[] {
-  return sql
-    .exec<RecoveryJobRow>(
+  options: RecoveryJobInspectionOptions,
+): {
+  readonly jobs: readonly RecoveryJobRecord[];
+  readonly nextCursor: string | null;
+} {
+  const requestedLimit = options.limit ?? MAX_RECOVERY_JOBS_PER_INSPECTION_PAGE;
+  if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+    throw new Error("Recovery inspection page limit is invalid");
+  }
+  const limit = Math.min(requestedLimit, MAX_RECOVERY_JOBS_PER_INSPECTION_PAGE);
+  const cursor =
+    options.cursor === undefined
+      ? null
+      : decodeInspectionCursor(options.cursor);
+  const rows = cursor === null
+    ? sql.exec<RecoveryJobRow>(
       `SELECT job_id, session_id, kind, status, due_at, attempts,
         max_attempts, last_error, recovery_action, created_at, updated_at,
         completed_at
        FROM jobs
        WHERE session_id = ?
-       ORDER BY due_at ASC, job_id ASC`,
+       ORDER BY due_at ASC, job_id ASC
+       LIMIT ?`,
       sessionId,
-    )
-    .toArray()
-    .map(mapJob);
+      limit + 1,
+    ).toArray()
+    : sql.exec<RecoveryJobRow>(
+      `SELECT job_id, session_id, kind, status, due_at, attempts,
+        max_attempts, last_error, recovery_action, created_at, updated_at,
+        completed_at
+       FROM jobs
+       WHERE session_id = ?
+         AND (due_at > ? OR (due_at = ? AND job_id > ?))
+       ORDER BY due_at ASC, job_id ASC
+       LIMIT ?`,
+      sessionId,
+      cursor.dueAt,
+      cursor.dueAt,
+      cursor.jobId,
+      limit + 1,
+    ).toArray();
+  const jobs = rows.slice(0, limit).map(mapJob);
+  const lastJob = jobs[jobs.length - 1];
+  return {
+    jobs,
+    nextCursor:
+      rows.length > limit && lastJob !== undefined
+        ? encodeInspectionCursor(lastJob)
+        : null,
+  };
 }
 
 function requireSession(sql: EdenSqlStorage, sessionId: string): void {
@@ -331,9 +455,11 @@ function claimJob(
 
     const timestamp = nowIso(now);
     if (candidate.attempts >= candidate.maxAttempts) {
-      const summary = sanitizeRecoveryError(
-        candidate.lastError ?? "Recovery job retry limit reached",
-      );
+      const summary = isRegisteredRecoveryAction(candidate.recoveryAction)
+        ? sanitizeRecoveryError(
+            candidate.lastError ?? "Recovery job retry limit reached",
+          )
+        : "Unknown recovery action";
       storage.sql.exec(
         `UPDATE jobs
          SET status = 'dead', last_error = ?,
@@ -434,11 +560,14 @@ function failJob(
 export function inspectRecoveryJobs(
   sql: EdenSqlStorage,
   sessionId: string,
+  options: RecoveryJobInspectionOptions = {},
 ): RecoveryJobInspection {
   requireSession(sql, sessionId);
+  const page = readInspectionPage(sql, sessionId, options);
   return {
-    jobs: readAllJobs(sql, sessionId),
+    jobs: page.jobs,
     nextDueAt: readNextDueAt(sql, sessionId),
+    nextCursor: page.nextCursor,
   };
 }
 
@@ -509,6 +638,7 @@ export function recoverRecoveryJob(
     if (existing === null) throw new Error("Recovery job was not found");
     const action = recoveryAction ?? existing.recoveryAction;
     if (action === null) throw new Error("Recovery action is required");
+    assertRecoveryAction(action);
     storage.sql.exec(
       `UPDATE jobs
        SET status = 'pending', due_at = ?, attempts = 0, last_error = NULL,
@@ -563,6 +693,7 @@ export async function processRecoveryJobs(
 
     processed += 1;
     try {
+      assertRecoveryAction(job.recoveryAction);
       await execute(job);
       completeJob(storage, sessionId, job, now);
       completed += 1;

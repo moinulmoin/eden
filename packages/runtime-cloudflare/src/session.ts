@@ -36,6 +36,7 @@ import {
   nextRecoveryJobDueAt,
   processRecoveryJobs,
   recoverRecoveryJob,
+  type RecoveryJobInspectionOptions,
   type RecoveryJobRecord,
   type RecoveryJobEnqueueResult,
   type RecoveryJobInput,
@@ -452,7 +453,7 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       return this.acceptCommandResponse(request);
     }
     if (url.pathname === "/_eden/jobs" && request.method === "GET") {
-      return this.recoveryJobsResponse();
+      return this.recoveryJobsResponse(url);
     }
     if (url.pathname === "/_eden/jobs" && request.method === "POST") {
       return this.enqueueRecoveryJobResponse(request);
@@ -514,9 +515,11 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     return result;
   }
 
-  inspectRecoveryJobs(): RecoveryJobInspection {
+  inspectRecoveryJobs(
+    options: RecoveryJobInspectionOptions = {},
+  ): RecoveryJobInspection {
     const sessionId = this.requireSessionId();
-    return inspectRecoveryJobs(this.ctx.storage.sql, sessionId);
+    return inspectRecoveryJobs(this.ctx.storage.sql, sessionId, options);
   }
 
   async recoverRecoveryJob(
@@ -1005,8 +1008,57 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     return sessionId;
   }
 
-  private async recoveryJobsResponse(): Promise<Response> {
-    return jsonResponse(this.inspectRecoveryJobs());
+  private async recoveryJobsResponse(url: URL): Promise<Response> {
+    const allowed = new Set(["cursor", "limit"]);
+    let hasUnknownQuery = false;
+    url.searchParams.forEach((_value, key) => {
+      if (!allowed.has(key)) hasUnknownQuery = true;
+    });
+    if (hasUnknownQuery) {
+      return jsonResponse(
+        { code: "invalid_recovery_inspection", message: "Invalid recovery inspection" },
+        400,
+      );
+    }
+    const rawLimit = url.searchParams.get("limit");
+    const rawCursor = url.searchParams.get("cursor");
+    let limitValue: number | undefined;
+    let cursorValue: string | undefined;
+    if (rawLimit !== null) {
+      const limit = Number(rawLimit);
+      if (
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        rawLimit !== String(limit)
+      ) {
+        return jsonResponse(
+          { code: "invalid_recovery_inspection", message: "Invalid recovery inspection" },
+          400,
+        );
+      }
+      limitValue = limit;
+    }
+    if (rawCursor !== null) {
+      if (rawCursor.length === 0) {
+        return jsonResponse(
+          { code: "invalid_recovery_inspection", message: "Invalid recovery inspection" },
+          400,
+        );
+      }
+      cursorValue = rawCursor;
+    }
+    try {
+      const options: RecoveryJobInspectionOptions = {
+        ...(limitValue === undefined ? {} : { limit: limitValue }),
+        ...(cursorValue === undefined ? {} : { cursor: cursorValue }),
+      };
+      return jsonResponse(this.inspectRecoveryJobs(options));
+    } catch {
+      return jsonResponse(
+        { code: "invalid_recovery_inspection", message: "Invalid recovery inspection" },
+        400,
+      );
+    }
   }
 
   private async enqueueRecoveryJobResponse(request: Request): Promise<Response> {
@@ -1090,15 +1142,26 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
   }
 
   private async executeRecoveryJob(job: RecoveryJobRecord): Promise<void> {
-    if (job.kind === BOUNDED_TURN_JOB_KIND) {
-      await this.executeBoundedTurnJob(job);
-      return;
-    }
-    if (job.recoveryAction === "always-fail") {
-      throw new Error("Configured recovery action failed");
-    }
-    if (job.recoveryAction === "fail") {
-      throw new Error("Configured recovery action failed");
+    switch (job.recoveryAction) {
+      case "mark-complete":
+        if (job.kind === BOUNDED_TURN_JOB_KIND) {
+          throw new Error("Bounded turn recovery action is invalid");
+        }
+        return;
+      case "always-fail":
+      case "fail":
+        if (job.kind === BOUNDED_TURN_JOB_KIND) {
+          throw new Error("Bounded turn recovery action is invalid");
+        }
+        throw new Error("Configured recovery action failed");
+      case BOUNDED_TURN_RECOVERY_ACTION:
+        if (job.kind !== BOUNDED_TURN_JOB_KIND) {
+          throw new Error("Bounded turn recovery action is invalid");
+        }
+        await this.executeBoundedTurnJob(job);
+        return;
+      default:
+        throw new Error("Unknown recovery action");
     }
   }
 

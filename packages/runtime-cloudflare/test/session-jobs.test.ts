@@ -8,6 +8,7 @@ import { describe, expect, test } from "vitest";
 import { EdenSession } from "../src/session.js";
 import {
   MAX_RECOVERY_JOBS_PER_ALARM,
+  MAX_RECOVERY_JOBS_PER_INSPECTION_PAGE,
   type RecoveryJobInput,
 } from "../src/session-jobs.js";
 import { EDEN_VERSIONS } from "@eden/definitions";
@@ -84,6 +85,141 @@ async function inspect(stub: DurableObjectStub): Promise<{
 }
 
 describe("EdenSession recovery jobs and alarms", () => {
+  test("returns bounded resumable inspection pages for complete job histories", async () => {
+    const sessionId = createOpaqueSessionId();
+    const stub = sessionStub(sessionId);
+    await initializeSession(stub, sessionId);
+
+    const totalJobs = MAX_RECOVERY_JOBS_PER_INSPECTION_PAGE * 2 + 3;
+    for (let index = 0; index < totalJobs; index += 1) {
+      await enqueue(stub, {
+        jobId: `job_page_${String(index).padStart(3, "0")}`,
+        kind: "checkpoint",
+        recoveryAction: "mark-complete",
+        dueAt: 1_000,
+      });
+    }
+
+    const seen = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const page = await runInDurableObject(stub, (instance) =>
+        (instance as EdenSession).inspectRecoveryJobs({
+          cursor,
+          limit: 3,
+        }),
+      );
+      pages += 1;
+      expect(page.jobs.length).toBeLessThanOrEqual(3);
+      expect(page.jobs.length).toBeLessThanOrEqual(
+        MAX_RECOVERY_JOBS_PER_INSPECTION_PAGE,
+      );
+      for (const job of page.jobs) {
+        expect(seen.has(job.jobId)).toBe(false);
+        seen.add(job.jobId);
+      }
+      if (page.nextCursor === null) {
+        cursor = undefined;
+      } else {
+        expect(page.nextCursor.length).toBeGreaterThan(0);
+        expect(page.nextCursor).not.toBe(page.jobs.at(-1)?.jobId);
+        expect(cursors.has(page.nextCursor)).toBe(false);
+        cursors.add(page.nextCursor);
+        cursor = page.nextCursor;
+      }
+    } while (cursor !== undefined);
+
+    expect(pages).toBeGreaterThan(1);
+    expect(seen).toHaveLength(totalJobs);
+  }, 15_000);
+
+  test("rejects unknown actions and durably dead-letters legacy unknown jobs", async () => {
+    const sessionId = createOpaqueSessionId();
+    const stub = sessionStub(sessionId);
+    await initializeSession(stub, sessionId);
+
+    await expect(
+      enqueue(stub, {
+        jobId: "job_unknown_enqueue",
+        kind: "checkpoint",
+        recoveryAction: "not-registered",
+      }),
+    ).rejects.toThrow(/unknown recovery action/i);
+
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO jobs (
+          job_id, session_id, kind, status, due_at, attempts, max_attempts,
+          last_error, recovery_action, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, 'pending', ?, 0, 3, NULL, ?, ?, ?, NULL)`,
+        "job_unknown_legacy",
+        sessionId,
+        "checkpoint",
+        Date.now() - 1,
+        "not-registered",
+        new Date().toISOString(),
+        new Date().toISOString(),
+      );
+    });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await runAlarm(stub, ["job_unknown_legacy"]);
+    }
+
+    const dead = await inspect(stub);
+    expect(dead.jobs).toEqual([
+      expect.objectContaining({
+        jobId: "job_unknown_legacy",
+        status: "dead",
+        attempts: 3,
+        recoveryAction: "not-registered",
+        lastError: "Unknown recovery action",
+      }),
+    ]);
+    const durableError = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql
+        .exec<{
+          readonly code: string;
+          readonly message: string;
+          readonly retryable: number;
+          readonly status: string;
+        }>(
+          "SELECT code, message, retryable, status FROM errors WHERE error_id = ?",
+          "err_job_job_unknown_legacy",
+        )
+        .toArray(),
+    );
+    expect(durableError).toEqual([
+      {
+        code: "recovery_job_failed",
+        message: "Unknown recovery action",
+        retryable: 0,
+        status: "open",
+      },
+    ]);
+
+    await expect(
+      runInDurableObject(stub, (instance) =>
+        (instance as EdenSession).recoverRecoveryJob("job_unknown_legacy"),
+      ),
+    ).rejects.toThrow(/unknown recovery action/i);
+
+    await runInDurableObject(stub, (instance) =>
+      (instance as EdenSession).recoverRecoveryJob("job_unknown_legacy", {
+        recoveryAction: "mark-complete",
+        dueAt: Date.now() + 60_000,
+      }),
+    );
+    await runAlarm(stub, ["job_unknown_legacy"]);
+    expect((await inspect(stub)).jobs[0]).toMatchObject({
+      status: "completed",
+      attempts: 1,
+      recoveryAction: "mark-complete",
+    });
+  }, 15_000);
+
   test("deduplicates stable jobs, bounds one alarm batch, and rearms the next due job", async () => {
     const sessionId = createOpaqueSessionId();
     const stub = sessionStub(sessionId);
@@ -278,7 +414,62 @@ describe("EdenSession recovery jobs and alarms", () => {
           recoveryAction: "mark-complete",
         }),
       ],
+      nextCursor: null,
     });
+  }, 15_000);
+
+  test("paginates the internal inspection endpoint with an opaque cursor", async () => {
+    const sessionId = createOpaqueSessionId();
+    const stub = sessionStub(sessionId);
+    await initializeSession(stub, sessionId);
+
+    for (let index = 0; index < 5; index += 1) {
+      await enqueue(stub, {
+        jobId: `job_endpoint_page_${index}`,
+        kind: "checkpoint",
+        recoveryAction: "mark-complete",
+        dueAt: 1_000,
+      });
+    }
+
+    const firstResponse = await stub.fetch(
+      "https://session/_eden/jobs?limit=2",
+    );
+    expect(firstResponse.status).toBe(200);
+    const first = (await firstResponse.json()) as {
+      readonly jobs: readonly { readonly jobId: string }[];
+      readonly nextCursor: string | null;
+    };
+    expect(first.jobs).toHaveLength(2);
+    expect(first.nextCursor).not.toBeNull();
+    expect(first.nextCursor).not.toContain(first.jobs[1]?.jobId ?? "");
+
+    const secondResponse = await stub.fetch(
+      `https://session/_eden/jobs?limit=2&cursor=${encodeURIComponent(first.nextCursor ?? "")}`,
+    );
+    expect(secondResponse.status).toBe(200);
+    const second = (await secondResponse.json()) as {
+      readonly jobs: readonly { readonly jobId: string }[];
+      readonly nextCursor: string | null;
+    };
+    expect(second.jobs).toHaveLength(2);
+    expect(second.nextCursor).not.toBeNull();
+
+    const thirdResponse = await stub.fetch(
+      `https://session/_eden/jobs?limit=2&cursor=${encodeURIComponent(second.nextCursor ?? "")}`,
+    );
+    expect(thirdResponse.status).toBe(200);
+    const third = (await thirdResponse.json()) as {
+      readonly jobs: readonly { readonly jobId: string }[];
+      readonly nextCursor: string | null;
+    };
+    expect(third.jobs).toHaveLength(1);
+    expect(third.nextCursor).toBeNull();
+
+    const invalidResponse = await stub.fetch(
+      "https://session/_eden/jobs?cursor=not-a-valid-cursor",
+    );
+    expect(invalidResponse.status).toBe(400);
   }, 15_000);
 
   test("persists each version dimension independently across eviction", async () => {
