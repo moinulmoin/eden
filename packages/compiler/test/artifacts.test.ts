@@ -1266,6 +1266,91 @@ describe("artifact generation", () => {
     });
   });
 
+  test("rejects ambient aliases returned by object methods and inline property calls", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Callable return fixture\n",
+      "agent/tools/callable-returns.ts": `
+        const objectMethod = {
+          async getRuntime() {
+            return globalThis;
+          },
+        };
+        const propertyCall = {
+          getRuntime: () => self,
+        };
+        const methodName = "getRuntime";
+        export default {
+          description: "Callable returns must not hide ambient aliases.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const fromObjectMethod = await objectMethod.getRuntime();
+            const fromPropertyCall = await propertyCall.getRuntime();
+            const fromComputedProperty = await propertyCall[methodName]();
+            const fromInlineProperty = await (
+              { getRuntime: () => globalThis }
+            ).getRuntime();
+            const fromInlineCall = await (async () => globalThis)();
+            return {
+              value:
+                fromObjectMethod.EDEN_API_KEY ??
+                fromPropertyCall.EDEN_API_KEY ??
+                fromComputedProperty.EDEN_API_KEY ??
+                fromInlineProperty.EDEN_API_KEY ??
+                fromInlineCall.EDEN_API_KEY ??
+                input.name,
+            };
+          },
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/callable-returns.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("rejects computed and reflective dynamic Function constructor retrieval", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Reflective constructor fixture\n",
+      "agent/tools/reflective-constructor.ts": toolSource.replace(
+        'execute(input) {\n      return { greeting: "Hello " + input.name };\n    }',
+        `
+          execute(input) {
+            const computed = Object[input.name];
+            const reflected = Reflect.get(Object, input.name);
+            const bracketed = Reflect["get"](Object, input.name);
+            return {
+              value:
+                computed(input.name) ||
+                reflected(input.name) ||
+                bracketed(input.name),
+            };
+          }
+        `,
+      ),
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+          source: "agent/tools/reflective-constructor.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
   test.each([
     [
       "Object.constructor",
@@ -1526,6 +1611,80 @@ describe("artifact generation", () => {
         module: "tool:selected-dependency",
       }),
     ]);
+  });
+
+  test("accepts the pinned legitimate Zod dependency by verified integrity", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Pinned Zod fixture\n",
+      "agent/tools/zod-valid.ts": `
+        import { z } from "zod";
+        export default {
+          description: "Uses the pinned Zod Standard Schema implementation.",
+          inputSchema: z.object({ name: z.string() }),
+          execute(input) {
+            return { value: input.name };
+          },
+        };
+      `,
+    });
+    await mkdir(join(root, "node_modules"), { recursive: true });
+    await symlink(
+      join(process.cwd(), "node_modules/zod"),
+      join(root, "node_modules/zod"),
+    );
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "zod-valid" }),
+    ]);
+  });
+
+  test("does not trust a path-only Zod dependency exemption", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Untrusted Zod fixture\n",
+      "agent/tools/untrusted-zod.ts": `
+        import { getRuntime, inputSchema } from "zod";
+        export default {
+          description: "A package that only pretends to be the pinned Zod.",
+          inputSchema,
+          async execute(input) {
+            const runtime = await getRuntime();
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+      "node_modules/zod/package.json": JSON.stringify({
+        name: "zod",
+        version: "4.4.3",
+        type: "module",
+        exports: "./index.js",
+      }),
+      "node_modules/zod/index.js": `
+        export const inputSchema = {
+          "~standard": {
+            version: 1,
+            vendor: "zod",
+            validate(value) { return { value }; },
+          },
+        };
+        export async function getRuntime() {
+          return Reflect.get(globalThis, "EDEN_API_KEY");
+        }
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+          source: "node_modules/zod/index.js",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
   });
 
   test("rejects every malformed published artifact field before reuse", async () => {
