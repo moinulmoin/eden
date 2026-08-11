@@ -108,21 +108,29 @@ function runProcess(
   },
 ) {
   return new Promise((resolve, reject) => {
+    const processIdentity = `eden-conformance-${randomUUID()}`;
     const childEnv = { ...process.env, ...env };
     if (env.EDEN_BEARER_SECRET === undefined) {
       delete childEnv.EDEN_BEARER_SECRET;
     }
     const child = spawn(command, args, {
+      argv0: processIdentity,
       cwd,
       env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const owner = { pid: child.pid, startedAt: processIdentity };
     const collectOutput = readStreamOutput(child);
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      setTimeout(() => {
-        if (child.exitCode === null) child.kill("SIGKILL");
-      }, 2_000);
+      void (async () => {
+        if (child.exitCode === null && await ownedProcessAlive(owner)) {
+          child.kill("SIGTERM");
+          await delay(2_000);
+          if (child.exitCode === null && await ownedProcessAlive(owner)) {
+            child.kill("SIGKILL");
+          }
+        }
+      })();
     }, timeoutMs);
     waitForChild(child).then((exit) => {
       clearTimeout(timer);
@@ -203,19 +211,25 @@ function processAlive(pid) {
   }
 }
 
-function readProcessStartMarker(pid) {
+function readProcessCommand(pid) {
   return new Promise((resolve) => {
     execFile(
       "ps",
-      ["-p", String(pid), "-o", "lstart="],
-      { encoding: "utf8" },
+      ["-p", String(pid), "-o", "command="],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          EDEN_BEARER_SECRET: undefined,
+        },
+      },
       (error, stdout) => {
         if (error !== null) {
           resolve(undefined);
           return;
         }
-        const marker = String(stdout).trim();
-        resolve(marker.length === 0 ? undefined : marker);
+        const command = String(stdout).trim();
+        resolve(command.length === 0 ? undefined : command);
       },
     );
   });
@@ -223,8 +237,9 @@ function readProcessStartMarker(pid) {
 
 async function ownedProcessAlive(owner) {
   if (!processAlive(owner.pid)) return false;
-  if (owner.startedAt === undefined) return true;
-  return (await readProcessStartMarker(owner.pid)) === owner.startedAt;
+  if (owner.startedAt === undefined) return false;
+  const command = await readProcessCommand(owner.pid);
+  return command?.includes(owner.startedAt) === true;
 }
 
 async function waitForProcessExit(owner, timeoutMs = 5_000) {
@@ -402,10 +417,20 @@ async function readOwnedProcess(projectRoot) {
   }
 }
 
-function terminateProcessGroup(pid, signal) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+async function signalOwnedChild(devProcess, signal) {
+  if (!(await ownedProcessAlive(devProcess.owner))) return false;
   try {
-    process.kill(-pid, signal);
+    devProcess.child.kill(signal);
+    return true;
+  } catch (error) {
+    return error?.code === "ESRCH";
+  }
+}
+
+async function terminateProcessGroup(owner, signal) {
+  if (!(await ownedProcessAlive(owner))) return false;
+  try {
+    process.kill(-owner.pid, signal);
     return true;
   } catch (error) {
     return error?.code === "ESRCH";
@@ -416,22 +441,23 @@ async function stopLocalRuntime(projectRoot, devProcess) {
   let processStopped = true;
   let childExited = devProcess === undefined;
   if (devProcess !== undefined) {
-    if (devProcess.child.exitCode === null) {
-      try {
-        devProcess.child.kill("SIGINT");
-      } catch (error) {
-        if (error?.code !== "ESRCH") processStopped = false;
-      }
+    if (
+      devProcess.child.exitCode === null &&
+      !(await signalOwnedChild(devProcess, "SIGINT")) &&
+      await ownedProcessAlive(devProcess.owner)
+    ) {
+      processStopped = false;
     }
     childExited = (await Promise.race([
       devProcess.exited,
       delay(5_000),
     ])) !== undefined;
     if (!childExited) {
-      try {
-        devProcess.child.kill("SIGTERM");
-      } catch (error) {
-        if (error?.code !== "ESRCH") processStopped = false;
+      if (
+        !(await signalOwnedChild(devProcess, "SIGTERM")) &&
+        await ownedProcessAlive(devProcess.owner)
+      ) {
+        processStopped = false;
       }
       childExited = (await Promise.race([
         devProcess.exited,
@@ -442,11 +468,11 @@ async function stopLocalRuntime(projectRoot, devProcess) {
 
   const ownedProcess = await readOwnedProcess(projectRoot);
   if (ownedProcess !== undefined && await ownedProcessAlive(ownedProcess)) {
-    if (!terminateProcessGroup(ownedProcess.pid, "SIGTERM")) {
+    if (!(await terminateProcessGroup(ownedProcess, "SIGTERM"))) {
       processStopped = false;
     }
     if (!(await waitForProcessExit(ownedProcess))) {
-      if (!terminateProcessGroup(ownedProcess.pid, "SIGKILL")) {
+      if (!(await terminateProcessGroup(ownedProcess, "SIGKILL"))) {
         processStopped = false;
       }
       if (!(await waitForProcessExit(ownedProcess))) {
@@ -455,10 +481,11 @@ async function stopLocalRuntime(projectRoot, devProcess) {
     }
   }
   if (!childExited && devProcess !== undefined) {
-    try {
-      devProcess.child.kill("SIGKILL");
-    } catch (error) {
-      if (error?.code !== "ESRCH") processStopped = false;
+    if (
+      !(await signalOwnedChild(devProcess, "SIGKILL")) &&
+      await ownedProcessAlive(devProcess.owner)
+    ) {
+      processStopped = false;
     }
     childExited = (await Promise.race([
       devProcess.exited,
@@ -671,10 +698,12 @@ async function runLocalFirstUse(
 }
 
 function startDev(repositoryRoot, projectRoot, secret) {
+  const processIdentity = `eden-conformance-${randomUUID()}`;
   const child = spawn(
     process.execPath,
     [join(repositoryRoot, EDEN_CLI_PATH), "dev", "--project", projectRoot],
     {
+      argv0: processIdentity,
       cwd: repositoryRoot,
       env: { ...process.env, EDEN_BEARER_SECRET: secret },
       stdio: ["ignore", "pipe", "pipe"],
@@ -683,6 +712,10 @@ function startDev(repositoryRoot, projectRoot, secret) {
   const output = readStreamOutput(child);
   return {
     child,
+    owner: {
+      pid: child.pid,
+      startedAt: processIdentity,
+    },
     exited: waitForChild(child),
     output,
   };

@@ -9,6 +9,10 @@ import {
   writeFile,
 } from "fs/promises";
 import { statSync } from "fs";
+import { execFile, spawn } from "node:child_process";
+import {
+  randomUUID,
+} from "node:crypto";
 import {
   createServer,
 } from "net";
@@ -245,6 +249,7 @@ describe("eden dev and deploy orchestration", () => {
     await initRoot(root);
     vi.stubEnv("EDEN_BEARER_SECRET", "local-secret-signal-cleanup");
     let secretFilePath: string | undefined;
+    let receivedSignal: NodeJS.Signals | undefined;
     let release: ((exit: { readonly exitCode: number | null; readonly signal: null }) => void) | undefined;
     let ready: (() => void) | undefined;
     const readyPromise = new Promise<void>((resolve) => {
@@ -266,7 +271,8 @@ describe("eden dev and deploy orchestration", () => {
             pid: 41_009,
             startIdentity: "fixture-start",
             exited,
-            async terminate() {
+            async terminate(signal?: NodeJS.Signals) {
+              receivedSignal = signal;
               release?.({ exitCode: 0, signal: null });
             },
           };
@@ -284,9 +290,94 @@ describe("eden dev and deploy orchestration", () => {
     await readyPromise;
     process.emit("SIGTERM");
     await expect(devPromise).resolves.toBe(0);
+    expect(receivedSignal).toBe("SIGTERM");
     expect(secretFilePath).toBeDefined();
     await expect(readFile(secretFilePath as string, "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("installs startup cleanup before spawning and awaiting readiness", async () => {
+    const root = await createRoot("eden-cli-dev-startup-signal-");
+    await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "local-secret-startup-signal");
+    let secretFilePath: string | undefined;
+    let terminated = false;
+    let receivedSignal: NodeJS.Signals | undefined;
+    let releaseReady: (() => void) | undefined;
+    let releaseExit: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => {
+      releaseReady = resolve;
+    });
+    const exited = new Promise<{ readonly exitCode: number; readonly signal: null }>(
+      (resolve) => {
+        releaseExit = () => resolve({ exitCode: 0, signal: null });
+      },
+    );
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      processRunner: {
+        spawn(request: EdenCliProcessRequest) {
+          const secretIndex = request.args.indexOf("--env-file");
+          secretFilePath = request.args[secretIndex + 1];
+          const startIdentity = new Promise<string>((resolve) => {
+            queueMicrotask(() => resolve("fixture-startup-signal"));
+          });
+          process.emit("SIGTERM");
+          return {
+            pid: 41_011,
+            startIdentity,
+            ready,
+            exited,
+            async terminate(signal?: NodeJS.Signals) {
+              terminated = true;
+              receivedSignal = signal;
+              releaseReady?.();
+              releaseExit?.();
+            },
+          };
+        },
+      },
+      dryRunRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      }),
+    });
+
+    await expect(devPromise).resolves.toBe(0);
+    expect(terminated).toBe(true);
+    expect(receivedSignal).toBe("SIGTERM");
+    expect(secretFilePath).toBeDefined();
+    await expect(readFile(secretFilePath as string, "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("stops startup before spawning when a signal arrives during the initial build", async () => {
+    const root = await createRoot("eden-cli-dev-build-signal-");
+    await initRoot(root);
+    let spawned = false;
+
+    await expect(
+      runEdenCli(["dev", "--project", root], {
+        cwd: root,
+        processRunner: {
+          spawn() {
+            spawned = true;
+            throw new Error("startup signal should prevent spawn");
+          },
+        },
+        dryRunRunner: async () => {
+          process.emit("SIGINT");
+          return {
+            exitCode: 0,
+            stdout: "",
+            stderr: "",
+          };
+        },
+      }),
+    ).resolves.toBe(0);
+
+    expect(spawned).toBe(false);
   });
 
   test("does not signal a dev PID when the persisted start identity is missing", async () => {
@@ -337,6 +428,78 @@ describe("eden dev and deploy orchestration", () => {
       kill.mockRestore();
     }
   });
+
+  test("revalidates the owned identity before SIGTERM and SIGKILL escalation", async () => {
+    const root = await createRoot("eden-cli-dev-stop-escalation-");
+    const marker = `eden-stop-test-${randomUUID()}`;
+    const child = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);",
+      ],
+      {
+        argv0: marker,
+        detached: true,
+        stdio: "ignore",
+      },
+    );
+    const childPid = child.pid;
+    expect(childPid).toBeGreaterThan(0);
+    let identity: string | undefined;
+    for (let attempt = 0; attempt < 50 && identity === undefined; attempt += 1) {
+      identity = await new Promise<string | undefined>((resolve) => {
+        execFile(
+          "ps",
+          ["-p", String(childPid), "-o", "command="],
+          { encoding: "utf8" },
+          (error, stdout) => {
+            if (error !== null) {
+              resolve(undefined);
+              return;
+            }
+            const value = String(stdout).trim().split(/\s+/u)[0] ?? "";
+            resolve(value.length === 0 ? undefined : value);
+          },
+        );
+      });
+      if (identity === undefined) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    expect(identity).toContain(marker);
+    await writeFile(
+      join(root, ".eden-dev-state.json"),
+      JSON.stringify({
+        pid: childPid,
+        startedAt: identity,
+        workerHost: EDEN_LOCAL_HOST,
+        workerPort: EDEN_LOCAL_PORT,
+        inspectorHost: EDEN_LOCAL_HOST,
+        inspectorPort: EDEN_LOCAL_INSPECTOR_PORT,
+      }),
+      "utf8",
+    );
+
+    try {
+      await expect(
+        stopEdenDev({ cwd: root, projectRoot: root }),
+      ).resolves.toBe(0);
+      await new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        child.once("exit", () => resolve());
+      });
+      expect(child.signalCode).toBe("SIGKILL");
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+    }
+  }, 15_000);
 
   test("does not spawn when the initial build fails", async () => {
     const root = await createRoot("eden-cli-dev-invalid-");

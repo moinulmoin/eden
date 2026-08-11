@@ -22,6 +22,7 @@ import {
   type FSWatcher,
 } from "chokidar";
 import {
+  basename,
   dirname,
   extname,
   isAbsolute,
@@ -145,6 +146,7 @@ export interface EdenCliProcessRequest {
   readonly args: readonly string[];
   readonly cwd: string;
   readonly env: Readonly<Record<string, string | undefined>>;
+  readonly processIdentity?: string;
   readonly readiness?: readonly {
     readonly host: string;
     readonly port: number;
@@ -760,7 +762,7 @@ async function acquireInitPublicationLock(
 ): Promise<{ readonly release: () => Promise<void> }> {
   const lockPath = join(root, INIT_LOCK_FILE);
   const startedAt =
-    (await readProcessStartMarker(process.pid)) ?? `pid:${process.pid}`;
+    (await readProcessStartTime(process.pid)) ?? `pid:${process.pid}`;
   const state: InitPublicationLockState = {
     kind: "eden.init.lock",
     version: 1,
@@ -827,7 +829,7 @@ async function acquireInitPublicationLock(
         readonly pid: number;
         readonly startedAt: string;
       };
-      const ownerStart = await readProcessStartMarker(existingLock.pid);
+      const ownerStart = await readProcessStartTime(existingLock.pid);
       if (ownerStart === existingLock.startedAt) {
         throw cliError({
           code: "INIT_BUSY",
@@ -1841,23 +1843,86 @@ interface DevState {
   readonly inspectorPort: typeof EDEN_LOCAL_INSPECTOR_PORT;
 }
 
-function readProcessStartMarker(pid: number): Promise<string | undefined> {
+const PROCESS_IDENTITY_PREFIX = "eden-dev-process-";
+
+function scrubChildEnvironment(
+  overrides: Readonly<Record<string, string | undefined>> = {},
+): NodeJS.ProcessEnv {
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...overrides,
+  };
+  delete childEnv.EDEN_BEARER_SECRET;
+  return childEnv;
+}
+
+function processCommandContainsMarker(
+  command: string,
+  marker: string,
+): boolean {
+  return command.includes(marker);
+}
+
+function readProcessCommand(
+  pid: number,
+): Promise<string | undefined> {
   if (process.platform === "win32") return Promise.resolve(undefined);
   return new Promise((resolveResult) => {
     execFile(
       "ps",
-      ["-p", String(pid), "-o", "lstart="],
-      { encoding: "utf8" },
+      ["-p", String(pid), "-o", "command="],
+      {
+        encoding: "utf8",
+        env: scrubChildEnvironment(),
+      },
       (error, stdout) => {
         if (error !== null) {
           resolveResult(undefined);
           return;
         }
-        const marker = String(stdout).trim();
-        resolveResult(marker.length === 0 ? undefined : marker);
+        const command = String(stdout).trim();
+        resolveResult(command.length === 0 ? undefined : command);
       },
     );
   });
+}
+
+function readProcessStartTime(pid: number): Promise<string | undefined> {
+  if (process.platform === "win32") return Promise.resolve(undefined);
+  return new Promise((resolveResult) => {
+    execFile(
+      "ps",
+      ["-p", String(pid), "-o", "lstart="],
+      {
+        encoding: "utf8",
+        env: scrubChildEnvironment(),
+      },
+      (error, stdout) => {
+        if (error !== null) {
+          resolveResult(undefined);
+          return;
+        }
+        const startedAt = String(stdout).trim();
+        resolveResult(startedAt.length === 0 ? undefined : startedAt);
+      },
+    );
+  });
+}
+
+async function verifyProcessIdentity(
+  pid: number,
+  expectedIdentity: string,
+): Promise<boolean> {
+  if (
+    pid <= 0 ||
+    expectedIdentity.length === 0 ||
+    process.platform === "win32"
+  ) {
+    return false;
+  }
+  const command = await readProcessCommand(pid);
+  return command !== undefined &&
+    processCommandContainsMarker(command, expectedIdentity);
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -1889,8 +1954,7 @@ async function writeDevState(
     const previous = await readDevState(root);
     let alive = true;
     if (previous !== undefined) {
-      const currentStart = await readProcessStartMarker(previous.pid);
-      alive = currentStart !== undefined && currentStart === previous.startedAt;
+      alive = await verifyProcessIdentity(previous.pid, previous.startedAt);
     }
     if (alive) {
       throw cliError({
@@ -1978,20 +2042,53 @@ async function readDevState(root: string): Promise<DevState | undefined> {
   return state as DevState;
 }
 
+async function removeOwnedDevState(
+  root: string,
+  owner: Pick<DevState, "pid" | "startedAt">,
+): Promise<void> {
+  const current = await readDevState(root).catch(() => undefined);
+  if (
+    current?.pid !== owner.pid ||
+    current.startedAt !== owner.startedAt
+  ) {
+    return;
+  }
+  await rm(
+    await resolveContainedProjectPath(root, DEV_STATE_FILE),
+    { force: true },
+  ).catch(() => undefined);
+}
+
+async function signalOwnedProcess(
+  pid: number,
+  expectedIdentity: string,
+  signal: NodeJS.Signals,
+): Promise<boolean> {
+  if (!(await verifyProcessIdentity(pid, expectedIdentity))) return false;
+  try {
+    if (process.platform !== "win32") {
+      process.kill(-pid, signal);
+    } else {
+      process.kill(pid, signal);
+    }
+    return true;
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
 async function waitForProcessExit(
   pid: number,
-  expectedStart: string,
-): Promise<void> {
+  expectedIdentity: string,
+): Promise<boolean> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < 5_000) {
-    const currentStart = await readProcessStartMarker(pid);
-    if (currentStart === undefined || currentStart !== expectedStart) return;
+    if (!(await verifyProcessIdentity(pid, expectedIdentity))) return true;
     await new Promise((resolveResult) => setTimeout(resolveResult, 50));
   }
-  throw cliError({
-    code: "DEV_STOP_TIMEOUT",
-    message: "The owned Eden dev process did not exit after termination.",
-  });
+  return !(await verifyProcessIdentity(pid, expectedIdentity));
 }
 
 export async function stopEdenDev(
@@ -2005,29 +2102,41 @@ export async function stopEdenDev(
   });
   const state = await readDevState(root);
   if (state === undefined) return 0;
+  let removeState = false;
   try {
-    const currentStart = await readProcessStartMarker(state.pid);
-    if (currentStart === undefined || currentStart !== state.startedAt) {
+    if (!(await verifyProcessIdentity(state.pid, state.startedAt))) {
       return 0;
     }
-    try {
-      if (process.platform !== "win32") {
-        process.kill(-state.pid, "SIGTERM");
-      } else {
-        process.kill(state.pid, "SIGTERM");
+    const termSent = await signalOwnedProcess(
+      state.pid,
+      state.startedAt,
+      "SIGTERM",
+    );
+    if (!termSent) return 0;
+    const exitedAfterTerm = await waitForProcessExit(
+      state.pid,
+      state.startedAt,
+    );
+    if (!exitedAfterTerm) {
+      const killSent = await signalOwnedProcess(
+        state.pid,
+        state.startedAt,
+        "SIGKILL",
+      );
+      if (killSent && !(await waitForProcessExit(state.pid, state.startedAt))) {
+        throw cliError({
+          code: "DEV_STOP_TIMEOUT",
+          message: "The owned Eden dev process did not exit after termination.",
+        });
       }
-    } catch (error: unknown) {
-      const code = error as NodeJS.ErrnoException;
-      if (code.code !== "ESRCH") throw error;
     }
-    await waitForProcessExit(state.pid, state.startedAt);
     await waitForApprovedPortsAvailable();
+    removeState = true;
     return 0;
   } finally {
-    await rm(
-      await resolveContainedProjectPath(root, DEV_STATE_FILE),
-      { force: true },
-    ).catch(() => undefined);
+    if (removeState) {
+      await removeOwnedDevState(root, state);
+    }
   }
 }
 
@@ -2140,6 +2249,7 @@ function runDefaultDryRun(
         cwd: request.cwd,
         encoding: "utf8",
         maxBuffer: 4 * 1024 * 1024,
+        env: scrubChildEnvironment(),
       },
       (error, stdout, stderr) => {
         const rawCode = error === null
@@ -2166,6 +2276,7 @@ function runDefaultRemoteCommand(
       new Promise((resolveResult) => {
         const child = spawnChild(executable, [...request.args], {
           cwd: request.cwd,
+          env: scrubChildEnvironment(),
           stdio: ["pipe", "pipe", "pipe"],
         });
         let stdout = "";
@@ -2821,6 +2932,19 @@ async function waitForApprovedPortsAvailable(
   });
 }
 
+async function waitForProcessIdentity(
+  pid: number,
+  marker: string,
+  timeoutMs = 5_000,
+): Promise<string | undefined> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await verifyProcessIdentity(pid, marker)) return marker;
+    await new Promise((resolveResult) => setTimeout(resolveResult, 25));
+  }
+  return undefined;
+}
+
 function waitForTcpPort(
   host: string,
   port: number,
@@ -2861,15 +2985,12 @@ function waitForTcpPort(
 function defaultProcessRunner(): EdenCliProcessRunner {
   return {
     spawn(request) {
+      const processMarker =
+        request.processIdentity ?? `${PROCESS_IDENTITY_PREFIX}${randomUUID()}`;
       const child = spawnChild(request.command, [...request.args], {
+        argv0: processMarker,
         cwd: request.cwd,
-        env: (() => {
-          const childEnv = { ...process.env, ...request.env };
-          if (request.env.EDEN_BEARER_SECRET === undefined) {
-            delete childEnv.EDEN_BEARER_SECRET;
-          }
-          return childEnv;
-        })(),
+        env: scrubChildEnvironment(request.env),
         detached: process.platform !== "win32",
         stdio: "inherit",
       });
@@ -2889,55 +3010,63 @@ function defaultProcessRunner(): EdenCliProcessRunner {
               waitForTcpPort(port.host, port.port, 10_000),
             ),
           ).then(() => undefined);
-      const startIdentity = readProcessStartMarker(pid);
+      const startIdentity = Promise.race([
+        waitForProcessIdentity(pid, processMarker),
+        exited.then(() => undefined),
+      ]);
+      let termination: Promise<void> | undefined;
+      const signalOwnedProcess = async (
+        signal: NodeJS.Signals,
+      ): Promise<boolean> => {
+        const expected = await startIdentity;
+        if (
+          expected === undefined ||
+          !(await verifyProcessIdentity(pid, expected))
+        ) {
+          return false;
+        }
+        try {
+          if (process.platform !== "win32") {
+            process.kill(-pid, signal);
+          } else {
+            child.kill(signal);
+          }
+          return true;
+        } catch (error: unknown) {
+          const code = error as NodeJS.ErrnoException;
+          if (code.code === "ESRCH") return false;
+          throw error;
+        }
+      };
       return {
         pid,
         startIdentity,
         exited,
         ready,
         async terminate(signal = "SIGTERM") {
-          if (pid <= 0) return;
-          const expected = await startIdentity;
-          if (
-            expected === undefined ||
-            (await readProcessStartMarker(pid)) !== expected
-          ) {
+          if (termination !== undefined) {
+            await termination;
             return;
           }
-          try {
-            if (process.platform !== "win32") {
-              process.kill(-pid, signal);
-            } else {
-              child.kill(signal);
-            }
-          } catch (error: unknown) {
-            const code = error as NodeJS.ErrnoException;
-            if (code.code !== "ESRCH") throw error;
-          }
-          const graceful = await Promise.race([
-            exited,
-            new Promise<void>((resolveExit) => {
-              setTimeout(resolveExit, 5_000);
-            }),
-          ]);
-          if (graceful === undefined) {
-            try {
-              if (process.platform !== "win32") {
-                process.kill(-pid, "SIGKILL");
-              } else {
-                child.kill("SIGKILL");
-              }
-            } catch (error: unknown) {
-              const code = error as NodeJS.ErrnoException;
-              if (code.code !== "ESRCH") throw error;
-            }
-            await Promise.race([
+          termination = (async () => {
+            if (pid <= 0) return;
+            await signalOwnedProcess(signal);
+            const graceful = await Promise.race([
               exited,
-              new Promise<void>((resolveExit) => {
-                setTimeout(resolveExit, 5_000);
+              new Promise<undefined>((resolveExit) => {
+                setTimeout(() => resolveExit(undefined), 5_000);
               }),
             ]);
-          }
+            if (graceful !== undefined) return;
+            await signalOwnedProcess("SIGKILL");
+            await Promise.race([
+              exited,
+              new Promise<undefined>((resolveExit) => {
+                setTimeout(() => resolveExit(undefined), 5_000);
+              }),
+            ]);
+          })();
+          await termination;
         },
       };
     },
@@ -2953,55 +3082,9 @@ async function runDev(
   root: string,
   options: EdenCliRunOptions,
 ): Promise<void> {
-  await readProjectConfiguration(root);
-  await assertApprovedPortsAvailable();
-  await buildProjectFromCli(root, options);
-
-  const configuration = await readProjectConfiguration(root);
-  const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
-  const generation = await readArtifactGeneration(canonicalOutput);
-  const runtimeFiles = await createRuntimeFiles(
-    root,
-    configuration.configPath,
-    generation,
-  );
-  const temporaryConfig = runtimeFiles.configPath;
-  const localSecret = process.env.EDEN_BEARER_SECRET;
-  const localSecretPath = localSecret === undefined
-    ? undefined
-    : join(tmpdir(), uniqueTemporaryName("eden-dev-vars"));
-  if (localSecretPath !== undefined) {
-    if (
-      typeof localSecret !== "string" ||
-      localSecret.length === 0 ||
-      /[\r\n]/u.test(localSecret)
-    ) {
-      await rm(temporaryConfig, { force: true }).catch(() => undefined);
-      await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
-      throw cliError({
-        code: "DEV_SECRET_INVALID",
-        message:
-          "EDEN_BEARER_SECRET must be a non-empty single-line value for local dev.",
-      });
-    }
-    try {
-      await writeFile(
-        localSecretPath,
-        `EDEN_BEARER_SECRET=${JSON.stringify(localSecret)}\n`,
-        {
-          encoding: "utf8",
-          mode: 0o600,
-          flag: "wx",
-        },
-      );
-    } catch (error: unknown) {
-      await rm(localSecretPath, { force: true }).catch(() => undefined);
-      await rm(temporaryConfig, { force: true }).catch(() => undefined);
-      await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
-      throw error;
-    }
-  }
   let child: EdenCliProcess | undefined;
+  let childExited = false;
+  let startupComplete = false;
   let watcher: FSWatcher | undefined;
   let stopped = false;
   let rebuildTimer: NodeJS.Timeout | undefined;
@@ -3009,38 +3092,21 @@ async function runDev(
   let rebuildPending = false;
   const rebuildTasks = new Set<Promise<void>>();
   let statePath: string | undefined;
+  let stateOwner: Pick<DevState, "pid" | "startedAt"> | undefined;
+  let temporaryConfig: string | undefined;
+  let runtimeEntryPath: string | undefined;
+  let localSecretPath: string | undefined;
+  let cleanupPromise: Promise<void> | undefined;
+  let cleanupRunning = false;
+  let childCleanupRequested = false;
   let requestedStop = false;
-  let ownershipVerified = false;
-  let stopOnSignal: (() => void) | undefined;
+  let requestedSignal: NodeJS.Signals = "SIGTERM";
+  let signalResolve: (() => void) | undefined;
+  const signalReceived = new Promise<void>((resolveResult) => {
+    signalResolve = resolveResult;
+  });
+  const startupStopped = Symbol("eden.startup.stopped");
   const runner = options.processRunner ?? defaultProcessRunner();
-  const executable = await resolveDeploymentExecutable(root);
-  const processRequest: EdenCliProcessRequest = {
-    command: executable,
-    args: [
-      "dev",
-      "--local",
-      "--ip",
-      EDEN_LOCAL_HOST,
-      "--port",
-      String(EDEN_LOCAL_PORT),
-      "--inspector-port",
-      String(EDEN_LOCAL_INSPECTOR_PORT),
-      "--inspector-ip",
-      EDEN_LOCAL_INSPECTOR_HOST,
-      "--config",
-      temporaryConfig,
-      ...(localSecretPath === undefined
-        ? []
-        : ["--env-file", localSecretPath]),
-    ],
-    cwd: root,
-    env: {
-      EDEN_HOST: EDEN_LOCAL_HOST,
-      EDEN_PORT: String(EDEN_LOCAL_PORT),
-      EDEN_INSPECTOR_PORT: String(EDEN_LOCAL_INSPECTOR_PORT),
-    },
-    readiness: APPROVED_PORTS.map(({ host, port }) => ({ host, port })),
-  };
 
   const rebuild = async (): Promise<void> => {
     if (stopped) return;
@@ -3065,10 +3131,187 @@ async function runDev(
     }
   };
 
+  const cleanup = (): Promise<void> => {
+    if (cleanupRunning && cleanupPromise !== undefined) return cleanupPromise;
+    cleanupRunning = true;
+    cleanupPromise = (async () => {
+      stopped = true;
+      if (rebuildTimer !== undefined) {
+        clearTimeout(rebuildTimer);
+        rebuildTimer = undefined;
+      }
+      await closeWatcher(watcher);
+      watcher = undefined;
+
+      const ownedChild = child;
+      if (
+        ownedChild !== undefined &&
+        !childCleanupRequested &&
+        (!childExited || !startupComplete || requestedStop)
+      ) {
+        let startIdentity: string | undefined;
+        try {
+          const identity = await Promise.race([
+            Promise.resolve(ownedChild.startIdentity),
+            new Promise<undefined>((resolveResult) => {
+              setTimeout(() => resolveResult(undefined), 1_000);
+            }),
+          ]);
+          startIdentity =
+            typeof identity === "string" && identity.length > 0
+              ? identity
+              : undefined;
+        } catch {
+          startIdentity = undefined;
+        }
+        if (startIdentity !== undefined) {
+          childCleanupRequested = true;
+          await ownedChild.terminate(requestedSignal).catch(() => undefined);
+        }
+      }
+
+      await Promise.all([...rebuildTasks]);
+      if (temporaryConfig !== undefined) {
+        await rm(temporaryConfig, { force: true }).catch(() => undefined);
+        temporaryConfig = undefined;
+      }
+      if (runtimeEntryPath !== undefined) {
+        await rm(runtimeEntryPath, { force: true }).catch(() => undefined);
+        runtimeEntryPath = undefined;
+      }
+      if (localSecretPath !== undefined) {
+        await rm(localSecretPath, { force: true }).catch(() => undefined);
+        localSecretPath = undefined;
+      }
+      if (statePath !== undefined && stateOwner !== undefined) {
+        await removeOwnedDevState(root, stateOwner);
+        statePath = undefined;
+        stateOwner = undefined;
+      }
+    })();
+    void cleanupPromise.then(
+      () => {
+        cleanupRunning = false;
+      },
+      () => {
+        cleanupRunning = false;
+      },
+    );
+    return cleanupPromise;
+  };
+
+  const requestStop = (signal: NodeJS.Signals): void => {
+    requestedStop = true;
+    stopped = true;
+    requestedSignal = signal;
+    signalResolve?.();
+    void cleanup();
+  };
+  const stopOnSigint = (): void => requestStop("SIGINT");
+  const stopOnSigterm = (): void => requestStop("SIGTERM");
+  process.once("SIGINT", stopOnSigint);
+  process.once("SIGTERM", stopOnSigterm);
+
   try {
+    await readProjectConfiguration(root);
+    if (stopped) return;
+    await assertApprovedPortsAvailable();
+    if (stopped) return;
+    await buildProjectFromCli(root, options);
+    if (stopped) return;
+
+    const resolvedConfiguration = await readProjectConfiguration(root);
+    if (stopped) return;
+    const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
+    if (stopped) return;
+    const generation = await readArtifactGeneration(canonicalOutput);
+    if (stopped) return;
+    const runtimeFiles = await createRuntimeFiles(
+      root,
+      resolvedConfiguration.configPath,
+      generation,
+    );
+    temporaryConfig = runtimeFiles.configPath;
+    runtimeEntryPath = runtimeFiles.entryPath;
+    if (stopped) return;
+
+    const localSecret = process.env.EDEN_BEARER_SECRET;
+    localSecretPath = localSecret === undefined
+      ? undefined
+      : join(tmpdir(), uniqueTemporaryName("eden-dev-vars"));
+    if (localSecretPath !== undefined) {
+      if (
+        typeof localSecret !== "string" ||
+        localSecret.length === 0 ||
+        /[\r\n]/u.test(localSecret)
+      ) {
+        throw cliError({
+          code: "DEV_SECRET_INVALID",
+          message:
+            "EDEN_BEARER_SECRET must be a non-empty single-line value for local dev.",
+        });
+      }
+      await writeFile(
+        localSecretPath,
+        `EDEN_BEARER_SECRET=${JSON.stringify(localSecret)}\n`,
+        {
+          encoding: "utf8",
+          mode: 0o600,
+          flag: "wx",
+        },
+      );
+      if (stopped) return;
+    }
+
+    const executable = await resolveDeploymentExecutable(root);
+    if (stopped) return;
+    const processRequest: EdenCliProcessRequest = {
+      command: executable,
+      args: [
+        "dev",
+        "--local",
+        "--ip",
+        EDEN_LOCAL_HOST,
+        "--port",
+        String(EDEN_LOCAL_PORT),
+        "--inspector-port",
+        String(EDEN_LOCAL_INSPECTOR_PORT),
+        "--inspector-ip",
+        EDEN_LOCAL_INSPECTOR_HOST,
+        "--config",
+        temporaryConfig as string,
+        ...(localSecretPath === undefined
+          ? []
+          : ["--env-file", localSecretPath]),
+      ],
+      cwd: root,
+      processIdentity: basename(temporaryConfig as string),
+      env: {
+        EDEN_HOST: EDEN_LOCAL_HOST,
+        EDEN_PORT: String(EDEN_LOCAL_PORT),
+        EDEN_INSPECTOR_PORT: String(EDEN_LOCAL_INSPECTOR_PORT),
+      },
+      readiness: APPROVED_PORTS.map(({ host, port }) => ({ host, port })),
+    };
+
     try {
       child = runner.spawn(processRequest);
-      const startIdentity = await child.startIdentity;
+      void child.exited.then(
+        () => {
+          childExited = true;
+        },
+        () => {
+          childExited = true;
+        },
+      );
+      const startIdentityResult = await Promise.race<
+        string | undefined | typeof startupStopped
+      >([
+        Promise.resolve(child.startIdentity),
+        signalReceived.then(() => startupStopped),
+      ]);
+      if (startIdentityResult === startupStopped) return;
+      const startIdentity = startIdentityResult;
       if (typeof startIdentity !== "string" || startIdentity.length === 0) {
         throw cliError({
           code: "DEV_PROCESS_IDENTITY_UNAVAILABLE",
@@ -3077,12 +3320,21 @@ async function runDev(
           source: DEV_STATE_FILE,
         });
       }
-      ownershipVerified = true;
+      if (stopped) return;
       const readiness = child.ready ?? Promise.resolve();
       void readiness.catch(() => undefined);
       statePath = await writeDevState(root, child.pid, startIdentity);
+      stateOwner = {
+        pid: child.pid,
+        startedAt: startIdentity,
+      };
+      if (stopped) return;
       try {
-        await readiness;
+        const readinessResult = await Promise.race<void | typeof startupStopped>([
+          readiness,
+          signalReceived.then(() => startupStopped),
+        ]);
+        if (readinessResult === startupStopped) return;
       } catch (error: unknown) {
         throw error instanceof EdenCliError
           ? error
@@ -3093,6 +3345,8 @@ async function runDev(
                 : "The local runtime did not become ready.",
             });
       }
+      if (stopped) return;
+      startupComplete = true;
     } catch (error: unknown) {
       throw error instanceof EdenCliError
         ? error
@@ -3103,15 +3357,6 @@ async function runDev(
               : "The local runtime could not be started.",
           });
     }
-    stopOnSignal = (): void => {
-      requestedStop = true;
-      stopped = true;
-      if (child !== undefined && ownershipVerified) {
-        void child.terminate().catch(() => undefined);
-      }
-    };
-    process.once("SIGINT", stopOnSignal);
-    process.once("SIGTERM", stopOnSignal);
     options.stdout?.(
       `Eden dev ready at http://${EDEN_LOCAL_HOST}:${EDEN_LOCAL_PORT} ` +
       `(inspector ${EDEN_LOCAL_INSPECTOR_HOST}:${EDEN_LOCAL_INSPECTOR_PORT}).`,
@@ -3137,7 +3382,12 @@ async function runDev(
       }, 75);
     });
 
-    const exit = await child.exited;
+    const exitResult = await Promise.race<EdenCliProcessExit | typeof startupStopped>([
+      child.exited,
+      signalReceived.then(() => startupStopped),
+    ]);
+    if (exitResult === startupStopped) return;
+    const exit = exitResult;
     stopped = true;
     if (!requestedStop && exit.exitCode !== 0) {
       throw cliError({
@@ -3149,29 +3399,10 @@ async function runDev(
       });
     }
     await assertApprovedPortsAvailable();
-  } catch (error: unknown) {
-    stopped = true;
-    if (child !== undefined && ownershipVerified) {
-      await child.terminate().catch(() => undefined);
-    }
-    throw error;
   } finally {
-    stopped = true;
-    if (stopOnSignal !== undefined) {
-      process.removeListener("SIGINT", stopOnSignal);
-      process.removeListener("SIGTERM", stopOnSignal);
-    }
-    if (rebuildTimer !== undefined) clearTimeout(rebuildTimer);
-    await closeWatcher(watcher);
-    await Promise.all([...rebuildTasks]);
-    await rm(temporaryConfig, { force: true }).catch(() => undefined);
-    await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
-    if (localSecretPath !== undefined) {
-      await rm(localSecretPath, { force: true }).catch(() => undefined);
-    }
-    if (statePath !== undefined) {
-      await rm(statePath, { force: true }).catch(() => undefined);
-    }
+    process.removeListener("SIGINT", stopOnSigint);
+    process.removeListener("SIGTERM", stopOnSigterm);
+    await cleanup();
   }
 }
 

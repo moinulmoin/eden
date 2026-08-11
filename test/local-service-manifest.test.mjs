@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import process from "node:process";
 import { setTimeout as delayTimer } from "node:timers/promises";
@@ -13,6 +15,13 @@ const missionManifestPath = process.env.EDEN_SERVICES_MANIFEST ??
   (process.env.FACTORY_RUNTIME_SETTINGS_PATH === undefined
     ? undefined
     : join(dirname(process.env.FACTORY_RUNTIME_SETTINGS_PATH), "services.yaml"));
+
+if (missionManifestPath === undefined) {
+  throw new Error(
+    "eden-local lifecycle validation requires EDEN_SERVICES_MANIFEST or " +
+    "FACTORY_RUNTIME_SETTINGS_PATH pointing to the mission harness configuration.",
+  );
+}
 
 function manifestCommands(source) {
   const lines = source.split(/\r?\n/u);
@@ -48,12 +57,46 @@ function runShell(command, env) {
 }
 
 function startShell(command, env) {
-  return spawn("/bin/sh", ["-c", command], {
+  const processIdentity = `eden-manifest-${randomUUID()}`;
+  const child = spawn("/bin/sh", ["-c", command], {
+    argv0: processIdentity,
     cwd: repositoryRoot,
     env,
     detached: process.platform !== "win32",
     stdio: ["ignore", "ignore", "ignore"],
   });
+  child.processIdentity = processIdentity;
+  return child;
+}
+
+function readProcessCommand(pid) {
+  return new Promise((resolve) => {
+    execFile(
+      "ps",
+      ["-p", String(pid), "-o", "command="],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          EDEN_BEARER_SECRET: undefined,
+        },
+      },
+      (error, stdout) => {
+        if (error !== null) {
+          resolve(undefined);
+          return;
+        }
+        const command = String(stdout).trim();
+        resolve(command.length === 0 ? undefined : command);
+      },
+    );
+  });
+}
+
+async function ownedServiceAlive(service) {
+  if (service.exitCode !== null || service.pid === undefined) return false;
+  const command = await readProcessCommand(service.pid);
+  return command?.includes(service.processIdentity) === true;
 }
 
 function delay(milliseconds) {
@@ -127,9 +170,6 @@ test("checks in isolated preview and production Wrangler targets for basic-agent
 });
 
 test("executes the eden-local manifest lifecycle without disturbing a sentinel", async () => {
-  if (missionManifestPath === undefined) {
-    return;
-  }
   const manifest = await readFile(missionManifestPath, "utf8");
   const commands = manifestCommands(manifest);
   expect(commands.start).toContain("packages/cli/dist/index.js dev");
@@ -166,7 +206,7 @@ test("executes the eden-local manifest lifecycle without disturbing a sentinel",
     if (healthy || service.exitCode === null) {
       await runShell(commands.stop, env);
     }
-    if (service.exitCode === null) {
+    if (await ownedServiceAlive(service)) {
       if (process.platform !== "win32") {
         try {
           process.kill(-service.pid, "SIGTERM");
