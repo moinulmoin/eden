@@ -1,4 +1,5 @@
 import {
+  mkdir,
   mkdtemp,
   readFile,
   rm,
@@ -153,5 +154,195 @@ export default agent;
     expect(dryRunCount).toBe(2);
     expect(remoteCommands).toEqual([]);
     expect(errors.join("\n")).toMatch(/source|configuration|changed|stale/i);
+  });
+
+  test("rejects selected dependency mutation before remote secret provisioning", async () => {
+    const root = await createRoot();
+    const dependencyDirectory = join(
+      root,
+      "node_modules/selected-schema-fixture",
+    );
+    const toolPath = join(root, "agent/tools/greet.ts");
+    const remoteCommands: EdenCliRemoteCommandRequest[] = [];
+    const errors: string[] = [];
+    let dryRunCount = 0;
+
+    await initRoot(root);
+    await mkdir(dependencyDirectory, { recursive: true });
+    await writeFile(
+      join(dependencyDirectory, "package.json"),
+      JSON.stringify({
+        name: "selected-schema-fixture",
+        type: "module",
+        exports: "./index.js",
+      }),
+      "utf8",
+    );
+    await writeFile(
+      join(dependencyDirectory, "index.js"),
+      `export const inputSchema = {
+  "~standard": {
+    version: 1,
+    vendor: "selected-dependency",
+    validate(value) {
+      return { value };
+    },
+  },
+};
+`,
+      "utf8",
+    );
+    await writeFile(
+      toolPath,
+      `import { inputSchema } from "selected-schema-fixture";
+import type { EdenToolDefinition } from "@eden/definitions";
+
+const greet: EdenToolDefinition<unknown, { readonly greeting: string }> = {
+  description: "Greet using a selected dependency.",
+  inputSchema,
+  execute() {
+    return { greeting: "hello" };
+  },
+};
+
+export default greet;
+`,
+      "utf8",
+    );
+
+    await expect(
+      runEdenCli(
+        [
+          "deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eden-selected-dependency",
+        ],
+        {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+          dryRunRunner: async () => {
+            dryRunCount += 1;
+            if (dryRunCount === 2) {
+              await writeFile(
+                join(dependencyDirectory, "index.js"),
+                `export const inputSchema = {
+  "~standard": {
+    version: 1,
+    vendor: "mutated-selected-dependency",
+    validate(value) {
+      return { value };
+    },
+  },
+};
+`,
+                "utf8",
+              );
+            }
+            return { exitCode: 0, stdout: "", stderr: "" };
+          },
+          remoteCommandRunner: async (request) => {
+            remoteCommands.push(request);
+            return {
+              exitCode: 0,
+              stdout: "https://eden-selected-dependency.example.workers.dev\n",
+              stderr: "",
+            };
+          },
+          remoteValidationRunner: async () => ({ ok: true }),
+          remoteBearerSecret: "selected-dependency-secret",
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(dryRunCount).toBe(2);
+    expect(remoteCommands).toEqual([]);
+    expect(errors.join("\n")).toMatch(/selected-schema-fixture|source|changed|stale/i);
+  });
+
+  test("rejects authored temporary-looking paths instead of trusting their names", async () => {
+    const root = await createRoot();
+    const helperDirectory = join(
+      root,
+      ".eden-build-candidate-1234-deadbeef",
+    );
+    const helperPath = join(helperDirectory, "model.ts");
+    const agentPath = join(root, "agent/agent.ts");
+    const remoteCommands: EdenCliRemoteCommandRequest[] = [];
+    const errors: string[] = [];
+    let dryRunCount = 0;
+
+    await initRoot(root);
+    await mkdir(helperDirectory, { recursive: true });
+    await writeFile(
+      helperPath,
+      'export const model = "@cf/zai-org/glm-4.7-flash";\n',
+      "utf8",
+    );
+    await writeFile(
+      agentPath,
+      `import { model } from "../.eden-build-candidate-1234-deadbeef/model.js";
+import type { EdenAgentDefinition } from "@eden/definitions";
+
+const agent: EdenAgentDefinition = {
+  model,
+  options: {
+    maxOutputTokens: 512,
+    thinking: false,
+  },
+};
+
+export default agent;
+`,
+      "utf8",
+    );
+
+    await expect(
+      runEdenCli(
+        [
+          "deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eden-authored-temporary",
+        ],
+        {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+          dryRunRunner: async () => {
+            dryRunCount += 1;
+            if (dryRunCount === 2) {
+              await writeFile(
+                helperPath,
+                'export const model = "@cf/zai-org/glm-4.7-flash-mutated";\n',
+                "utf8",
+              );
+            }
+            return { exitCode: 0, stdout: "", stderr: "" };
+          },
+          remoteCommandRunner: async (request) => {
+            remoteCommands.push(request);
+            return {
+              exitCode: 0,
+              stdout: "https://eden-authored-temporary.example.workers.dev\n",
+              stderr: "",
+            };
+          },
+          remoteValidationRunner: async () => ({ ok: true }),
+          remoteBearerSecret: "authored-temporary-secret",
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(dryRunCount).toBe(2);
+    expect(remoteCommands).toEqual([]);
+    expect(errors.join("\n")).toMatch(
+      /\.eden-build-candidate-1234-deadbeef|source|changed|stale/i,
+    );
   });
 });

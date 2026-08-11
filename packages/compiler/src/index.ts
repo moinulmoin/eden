@@ -191,6 +191,11 @@ export interface EdenNormalizedProject {
   readonly tools: readonly EdenNormalizedTool[];
 }
 
+export interface EdenImportClosure {
+  readonly files: readonly EdenSourceReference[];
+  readonly diagnostics: readonly EdenDiagnostic[];
+}
+
 export function createSourceReference(
   relativePath: string,
   sha256: string,
@@ -923,6 +928,39 @@ async function captureSourceSnapshot(
       await rm(snapshotRoot, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * Capture the exact contained source/import closure used by the compiler.
+ *
+ * The returned paths are the compiler's logical project-relative inputs,
+ * including selected-project dependency files and their package metadata.
+ * Callers that validate source identity must use this closure instead of
+ * recursively walking the project filesystem.
+ */
+export async function captureProjectImportClosure(
+  selection: EdenProjectSelection,
+): Promise<EdenImportClosure> {
+  const options =
+    typeof selection === "string" ? { projectRoot: selection } : selection;
+  const projectRoot = await resolveProjectRoot(options);
+  const snapshot = await captureSourceSnapshot(projectRoot);
+  try {
+    const files = [...snapshot.files.values()]
+      .map((file) => ({
+        relativePath: file.relativePath,
+        sha256: hashBytes(file.contents),
+      }))
+      .sort((left, right) =>
+        comparePath(left.relativePath, right.relativePath),
+      );
+    return {
+      files,
+      diagnostics: snapshot.diagnostics,
+    };
+  } finally {
+    await snapshot.cleanup();
+  }
 }
 
 function emptyDiscovery(): EdenDiscoveryResult["discovery"] {

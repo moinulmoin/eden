@@ -49,6 +49,7 @@ import {
 } from "module";
 
 import {
+  captureProjectImportClosure,
   createArtifactIdentity,
   buildProject,
   EdenCompilerError,
@@ -284,18 +285,6 @@ interface InitPublicationLockState {
 
 const INIT_STATE_FILE = ".eden-init-incomplete.json";
 const INIT_LOCK_FILE = ".eden-init.lock";
-const DEFAULT_PROJECT_INPUT_EXCLUSIONS = [
-  ".eden",
-  ".git",
-  ".wrangler",
-  "dist",
-  "node_modules",
-  INIT_STATE_FILE,
-  INIT_LOCK_FILE,
-  ".eden-dev-state.json",
-] as const;
-const CLI_OWNED_TEMPORARY_ROOT_PATTERN =
-  /^\.eden-(?:build-candidate|dev-config|dev-worker|init)-[0-9]+-[0-9a-f-]+$/u;
 const CANONICAL_ARTIFACT_NAMES = [
   "discovery.json",
   "diagnostics.json",
@@ -1491,81 +1480,49 @@ function toPosixPath(value: string): string {
   return value.split("\\").join("/");
 }
 
-async function projectInputPaths(
-  root: string,
-  configuration: ProjectConfiguration,
-  excludedRelativePaths: readonly string[] = [],
-): Promise<readonly string[]> {
-  const excluded = new Set(
-    [...DEFAULT_PROJECT_INPUT_EXCLUSIONS, ...excludedRelativePaths]
-      .map((path) => path.split("\\").join("/"))
-      .map((path) => path.replace(/\/+$/u, "")),
-  );
-  const isExcluded = (relativePath: string): boolean =>
-    [...excluded].some(
-      (excludedPath) =>
-        relativePath === excludedPath ||
-        relativePath.startsWith(`${excludedPath}/`),
-    ) ||
-    CLI_OWNED_TEMPORARY_ROOT_PATTERN.test(
-      relativePath.split("/")[0] ?? "",
-    );
-  const paths = new Set<string>([
-    relative(root, configuration.packagePath),
-    relative(root, configuration.configPath),
-  ]);
-  const visit = async (directory: string): Promise<void> => {
-    const entries = await readdir(directory, { withFileTypes: true });
-    entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
-    for (const entry of entries) {
-      const absolutePath = join(directory, entry.name);
-      const relativePath = toPosixPath(relative(root, absolutePath));
-      if (isExcluded(relativePath)) {
-        continue;
-      }
-      if (entry.isDirectory()) {
-        await visit(absolutePath);
-        continue;
-      }
-      if (entry.isFile() || entry.isSymbolicLink()) {
-        await resolveContainedProjectPath(root, relativePath);
-        paths.add(relativePath);
-      }
-    }
-  };
-  const agentDirectory = await resolveContainedProjectPath(root, "agent");
-  const details = await lstat(agentDirectory).catch(() => undefined);
-  if (details?.isDirectory() !== true || details.isSymbolicLink()) {
-    throw cliError({
-      code: "PROJECT_INPUT_INVALID",
-      message: "The selected project agent directory is unavailable during validation.",
-      source: "agent",
-    });
-  }
-  await visit(root);
-  return [...paths].sort((left, right) => left.localeCompare(right));
-}
-
 async function fingerprintProjectInputs(
   root: string,
   configuration: ProjectConfiguration,
   excludedRelativePaths: readonly string[] = [],
 ): Promise<ProjectInputFingerprint> {
-  const allExcludedRelativePaths = [
-    ...new Set(
-      [...DEFAULT_PROJECT_INPUT_EXCLUSIONS, ...excludedRelativePaths]
-        .map((path) => path.split("\\").join("/"))
-        .map((path) => path.replace(/\/+$/u, "")),
-    ),
-  ].sort((left, right) => left.localeCompare(right));
-  const files: ProjectInputFingerprint["files"][number][] = [];
-  for (const relativePath of await projectInputPaths(
-    root,
-    configuration,
-    allExcludedRelativePaths,
-  )) {
-    const path = await resolveContainedProjectPath(root, relativePath);
-    const details = await lstat(path).catch(() => undefined);
+  const exactExcludedRelativePaths = [...new Set(
+    excludedRelativePaths
+      .map((path) => toPosixPath(path))
+      .map((path) => path.replace(/^\.\/|\/+$/gu, "")),
+  )].sort((left, right) => left.localeCompare(right));
+  const excluded = new Set(exactExcludedRelativePaths);
+  const closure = await captureProjectImportClosure({ projectRoot: root });
+  if (closure.diagnostics.length > 0) {
+    const firstDiagnostic = closure.diagnostics[0];
+    throw cliError({
+      code: "PROJECT_INPUT_INVALID",
+      message:
+        firstDiagnostic?.message ??
+        "The compiler could not capture the selected project's import closure.",
+      ...(firstDiagnostic?.source === undefined
+        ? {}
+        : { source: firstDiagnostic.source }),
+      diagnostics: closure.diagnostics,
+    });
+  }
+
+  const filesByPath = new Map<string, ProjectInputFingerprint["files"][number]>();
+  for (const source of closure.files) {
+    const relativePath = toPosixPath(source.relativePath);
+    if (excluded.has(relativePath)) continue;
+    filesByPath.set(relativePath, {
+      relativePath,
+      sha256: source.sha256,
+    });
+  }
+  for (const path of [
+    configuration.packagePath,
+    configuration.configPath,
+  ]) {
+    const relativePath = toPosixPath(relative(root, path));
+    if (excluded.has(relativePath)) continue;
+    const containedPath = await resolveContainedProjectPath(root, relativePath);
+    const details = await lstat(containedPath).catch(() => undefined);
     if (
       details === undefined ||
       (!details.isFile() && !details.isSymbolicLink())
@@ -1577,7 +1534,7 @@ async function fingerprintProjectInputs(
         source: relativePath,
       });
     }
-    const contents = await readFile(path).catch(() => undefined);
+    const contents = await readFile(containedPath).catch(() => undefined);
     if (contents === undefined) {
       throw cliError({
         code: "PROJECT_INPUT_INVALID",
@@ -1585,15 +1542,18 @@ async function fingerprintProjectInputs(
         source: relativePath,
       });
     }
-    files.push({
+    filesByPath.set(relativePath, {
       relativePath,
       sha256: createHash("sha256").update(contents).digest("hex"),
     });
   }
+  const files = [...filesByPath.values()].sort((left, right) =>
+    left.relativePath.localeCompare(right.relativePath),
+  );
   return {
     files,
     digest: sha256(JSON.stringify(files)),
-    excludedRelativePaths: allExcludedRelativePaths,
+    excludedRelativePaths: exactExcludedRelativePaths,
   };
 }
 
