@@ -8,6 +8,7 @@ import {
   rm,
   writeFile,
 } from "fs/promises";
+import { statSync } from "fs";
 import {
   createServer,
 } from "net";
@@ -18,13 +19,14 @@ import {
   join,
 } from "path";
 
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
   EDEN_LOCAL_HOST,
   EDEN_LOCAL_INSPECTOR_PORT,
   EDEN_LOCAL_PORT,
   runEdenCli,
+  stopEdenDev,
   type EdenCliDryRunRequest,
   type EdenCliProcessRequest,
 } from "../src/index.js";
@@ -64,6 +66,7 @@ async function waitForDigestChange(
 }
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -80,6 +83,7 @@ describe("eden dev and deploy orchestration", () => {
         spawned.push(request);
         return {
           pid: 41_001,
+          startIdentity: "fixture-start",
           exited: Promise.resolve({ exitCode: 0, signal: null }),
           async terminate() {
             terminated = true;
@@ -128,6 +132,209 @@ describe("eden dev and deploy orchestration", () => {
     expect(terminated).toBe(false);
   });
 
+  test("keeps the local bearer out of Wrangler argv and removes restricted dev vars", async () => {
+    const root = await createRoot("eden-cli-dev-secret-");
+    await initRoot(root);
+    const secret = "local-secret-not-for-argv";
+    vi.stubEnv("EDEN_BEARER_SECRET", secret);
+    const spawned: EdenCliProcessRequest[] = [];
+    let secretFileMode: number | undefined;
+    let secretFilePath: string | undefined;
+
+    await expect(
+      runEdenCli(["dev", "--project", root], {
+        cwd: root,
+        processRunner: {
+          spawn(request: EdenCliProcessRequest) {
+            spawned.push(request);
+            const secretIndex = request.args.indexOf("--env-file");
+            const secretPath = request.args[secretIndex + 1];
+            secretFilePath = secretPath;
+            secretFileMode = statSync(secretPath).mode & 0o777;
+            return {
+              pid: 41_006,
+              startIdentity: "fixture-start",
+              exited: Promise.resolve({ exitCode: 0, signal: null }),
+              async terminate() {},
+            };
+          },
+        },
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+      }),
+    ).resolves.toBe(0);
+
+    expect(secretFileMode).toBe(0o600);
+    expect(spawned[0]?.args.join(" ")).not.toContain(secret);
+    expect(spawned[0]?.env?.EDEN_BEARER_SECRET).toBeUndefined();
+    expect(secretFilePath).toBeDefined();
+    await expect(readFile(secretFilePath as string, "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("fails closed without signaling when the child start identity is unavailable", async () => {
+    const root = await createRoot("eden-cli-dev-unverifiable-");
+    await initRoot(root);
+    let terminated = false;
+    const errors: string[] = [];
+
+    await expect(
+      runEdenCli(["dev", "--project", root], {
+        cwd: root,
+        processRunner: {
+          spawn() {
+            return {
+              pid: 41_007,
+              exited: Promise.resolve({ exitCode: 0, signal: null }),
+              async terminate() {
+                terminated = true;
+              },
+            };
+          },
+        },
+        stderr: (line) => errors.push(line),
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+      }),
+    ).resolves.toBe(1);
+
+    expect(terminated).toBe(false);
+    expect(errors.join("\n")).toMatch(/identity|verif/i);
+  });
+
+  test("removes the local secret file when startup fails after creation", async () => {
+    const root = await createRoot("eden-cli-dev-secret-failure-");
+    await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "local-secret-startup-failure");
+    let secretFilePath: string | undefined;
+
+    await expect(
+      runEdenCli(["dev", "--project", root], {
+        cwd: root,
+        processRunner: {
+          spawn(request: EdenCliProcessRequest) {
+            const secretIndex = request.args.indexOf("--env-file");
+            secretFilePath = request.args[secretIndex + 1];
+            throw new Error("spawn fixture failed");
+          },
+        },
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+      }),
+    ).resolves.toBe(1);
+
+    expect(secretFilePath).toBeDefined();
+    await expect(readFile(secretFilePath as string, "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("removes the local secret file during signal cleanup", async () => {
+    const root = await createRoot("eden-cli-dev-secret-signal-");
+    await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "local-secret-signal-cleanup");
+    let secretFilePath: string | undefined;
+    let release: ((exit: { readonly exitCode: number | null; readonly signal: null }) => void) | undefined;
+    let ready: (() => void) | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const exited = new Promise<{ readonly exitCode: number | null; readonly signal: null }>(
+      (resolve) => {
+        release = resolve;
+      },
+    );
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      processRunner: {
+        spawn(request: EdenCliProcessRequest) {
+          const secretIndex = request.args.indexOf("--env-file");
+          secretFilePath = request.args[secretIndex + 1];
+          return {
+            pid: 41_009,
+            startIdentity: "fixture-start",
+            exited,
+            async terminate() {
+              release?.({ exitCode: 0, signal: null });
+            },
+          };
+        },
+      },
+      dryRunRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      }),
+      stdout: (line) => {
+        if (line.includes("Eden dev ready")) ready?.();
+      },
+    });
+    await readyPromise;
+    process.emit("SIGTERM");
+    await expect(devPromise).resolves.toBe(0);
+    expect(secretFilePath).toBeDefined();
+    await expect(readFile(secretFilePath as string, "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("does not signal a dev PID when the persisted start identity is missing", async () => {
+    const root = await createRoot("eden-cli-dev-state-missing-");
+    await writeFile(
+      join(root, ".eden-dev-state.json"),
+      JSON.stringify({
+        pid: 41_008,
+        workerHost: EDEN_LOCAL_HOST,
+        workerPort: EDEN_LOCAL_PORT,
+        inspectorHost: EDEN_LOCAL_HOST,
+        inspectorPort: EDEN_LOCAL_INSPECTOR_PORT,
+      }),
+      "utf8",
+    );
+    const kill = vi.spyOn(process, "kill");
+    try {
+      await expect(
+        stopEdenDev({ cwd: root, projectRoot: root }),
+      ).rejects.toMatchObject({ code: "DEV_STATE_INVALID" });
+      expect(kill).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  test("does not signal a dev PID when the persisted start identity is stale", async () => {
+    const root = await createRoot("eden-cli-dev-state-stale-");
+    await writeFile(
+      join(root, ".eden-dev-state.json"),
+      JSON.stringify({
+        pid: 41_010,
+        startedAt: "stale-process-start",
+        workerHost: EDEN_LOCAL_HOST,
+        workerPort: EDEN_LOCAL_PORT,
+        inspectorHost: EDEN_LOCAL_HOST,
+        inspectorPort: EDEN_LOCAL_INSPECTOR_PORT,
+      }),
+      "utf8",
+    );
+    const kill = vi.spyOn(process, "kill");
+    try {
+      await expect(
+        stopEdenDev({ cwd: root, projectRoot: root }),
+      ).resolves.toBe(0);
+      expect(kill).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
   test("does not spawn when the initial build fails", async () => {
     const root = await createRoot("eden-cli-dev-invalid-");
     await initRoot(root);
@@ -153,6 +360,7 @@ export default {
             spawned.push(request);
             return {
               pid: 41_002,
+              startIdentity: "fixture-start",
               exited: Promise.resolve({ exitCode: 0, signal: null }),
               async terminate() {},
             };
@@ -188,6 +396,7 @@ export default {
               spawned.push(request);
               return {
                 pid: 41_003,
+                startIdentity: "fixture-start",
                 exited: Promise.resolve({ exitCode: 0, signal: null }),
                 async terminate() {},
               };
@@ -221,6 +430,7 @@ export default {
           spawn() {
             return {
               pid: 41_005,
+              startIdentity: "fixture-start",
               ready: new Promise<void>((_resolve, reject) => {
                 queueMicrotask(() => reject(new Error("readiness fixture failed")));
               }),
@@ -275,6 +485,7 @@ export default {
         spawn() {
           return {
             pid: 41_004,
+            startIdentity: "fixture-start",
             exited,
             async terminate() {
               release?.();
