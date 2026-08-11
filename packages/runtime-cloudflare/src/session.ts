@@ -11,9 +11,9 @@ import type {
   EdenVersionSet,
 } from "@eden/definitions";
 
-import { createModelAdapter } from "./model-adapter.js";
 import { readConfiguredEdenArtifact } from "./artifact-runtime.js";
 import { createWorkersAIModelAdapter } from "./model-adapter-internal.js";
+import { readConfiguredEdenTestModel } from "./test-execution.js";
 import {
   applySessionMigrations,
   readAppliedSessionSchemaVersion,
@@ -107,74 +107,6 @@ const BOUNDED_TURN_JOB_KIND = "bounded-turn";
 const BOUNDED_TURN_RECOVERY_ACTION = "run-bounded-turn";
 const BOUNDED_TURN_START_DELAY_MS = 100;
 const MAX_EVENT_LINE_BYTES = 131_072;
-
-const BOUNDED_TOOL_INPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    query: { type: "string" },
-  },
-  required: ["query"],
-  additionalProperties: false,
-} as const satisfies EdenJsonValue;
-
-const BOUNDED_TOOL_STANDARD_SCHEMA = {
-  "~standard": {
-    version: 1 as const,
-    vendor: "eden-runtime-bounded-turn",
-    validate(value: unknown) {
-      if (
-        typeof value !== "object" ||
-        value === null ||
-        Array.isArray(value) ||
-        typeof (value as { readonly query?: unknown }).query !== "string"
-      ) {
-        return {
-          issues: [{ message: "query must be a string", path: ["query"] }],
-        };
-      }
-      return {
-        value: {
-          query: (value as { readonly query: string }).query.trim(),
-        },
-      };
-    },
-  },
-} as const;
-
-const BOUNDED_TURN_TOOL: EdenToolDefinition<
-  { readonly query: string },
-  { readonly answer: string }
-> = {
-  description: "Return a bounded deterministic answer.",
-  inputSchema: BOUNDED_TOOL_STANDARD_SCHEMA,
-  execute(input) {
-    return { answer: `lookup:${input.query}` };
-  },
-};
-
-function createBoundedTurnModel(
-  toolName: string,
-  toolInput: EdenJsonValue,
-) {
-  return createModelAdapter(async (request) => {
-    if (request.messages.some((message) => message.role === "tool")) {
-      return {
-        text: "Bounded Eden turn completed: ✓",
-        finishReason: "stop",
-      };
-    }
-    return {
-      toolCalls: [
-        {
-          toolCallId: "call_lookup",
-          toolName,
-          input: toolInput,
-        },
-      ],
-      finishReason: "tool-calls",
-    };
-  });
-}
 
 interface ConfiguredTurn {
   readonly agent: EdenAgentDefinition;
@@ -1201,14 +1133,11 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     }
 
     const configured = configuredTurn();
-    const toolName = configured?.toolName ?? "lookup";
-    const toolInput = toolName === "greet"
-      ? { name: "Eden" }
-      : { query: "eden" };
+    if (configured === undefined) {
+      throw new Error("Configured agent artifact is unavailable");
+    }
     const runtimeEnvironment = this.env as EdenSessionEnvironment;
     const liveModel =
-      configured !== undefined &&
-      configured.generation.executionMode === "remote" &&
       runtimeEnvironment.AI !== undefined
         ? createWorkersAIModelAdapter({
             binding: runtimeEnvironment.AI,
@@ -1216,30 +1145,13 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
             gatewayId: "eden-dev",
           })
         : undefined;
-    if (
-      configured?.generation.executionMode === "remote" &&
-      runtimeEnvironment.AI === undefined
-    ) {
-      throw new Error("Remote model binding is unavailable");
-    }
-    if (configured !== undefined) {
-      await runBoundedTurn(this.ctx.storage, {
-        sessionId,
-        turnId: turn.turn_id,
-        messageId: turn.message_id,
-        message: turn.message,
-        model: liveModel ?? createBoundedTurnModel(toolName, toolInput),
-        modelId: configured.agent.model,
-        ...(configured.agent.options === undefined
-          ? {}
-          : { modelOptions: configured.agent.options }),
-        systemPrompt: configured.instructions,
-        toolName: configured.toolName,
-        tool: configured.tool,
-        toolInputSchema: configured.toolInputSchema,
-        bundleIdentity: configured.bundleIdentity,
-      });
-      return;
+    const testModel =
+      configured.generation.executionMode === "local"
+        ? readConfiguredEdenTestModel()
+        : undefined;
+    const model = testModel ?? liveModel;
+    if (model === undefined) {
+      throw new Error("Configured model binding is unavailable");
     }
 
     await runBoundedTurn(this.ctx.storage, {
@@ -1247,11 +1159,16 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       turnId: turn.turn_id,
       messageId: turn.message_id,
       message: turn.message,
-      model: createBoundedTurnModel(toolName, toolInput),
-      toolName,
-      tool: BOUNDED_TURN_TOOL,
-      toolInputSchema: BOUNDED_TOOL_INPUT_SCHEMA,
-      bundleIdentity: "eden-runtime-bounded-turn-v1",
+      model,
+      modelId: configured.agent.model,
+      ...(configured.agent.options === undefined
+        ? {}
+        : { modelOptions: configured.agent.options }),
+      systemPrompt: configured.instructions,
+      toolName: configured.toolName,
+      tool: configured.tool,
+      toolInputSchema: configured.toolInputSchema,
+      bundleIdentity: configured.bundleIdentity,
     });
   }
 }
