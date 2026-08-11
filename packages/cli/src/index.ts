@@ -193,6 +193,16 @@ export type EdenRuntimePublicationBoundary =
   | "after-runtime-ready"
   | "after-runtime-rollback";
 
+export type EdenDeploymentBoundary =
+  | "before-compatibility-dry-run"
+  | "after-compatibility-dry-run"
+  | "before-secret-provision"
+  | "after-secret-provision"
+  | "before-deploy"
+  | "after-deploy"
+  | "before-remote-validation"
+  | "after-remote-validation";
+
 export interface EdenCliRunOptions {
   readonly cwd?: string;
   readonly stdout?: (line: string) => void;
@@ -213,6 +223,9 @@ export interface EdenCliRunOptions {
   readonly processRunner?: EdenCliProcessRunner;
   readonly runtimePublicationHook?: (
     boundary: EdenRuntimePublicationBoundary,
+  ) => void | Promise<void>;
+  readonly deploymentBoundaryHook?: (
+    boundary: EdenDeploymentBoundary,
   ) => void | Promise<void>;
   readonly remoteCommandRunner?: (
     request: EdenCliRemoteCommandRequest,
@@ -298,6 +311,14 @@ interface ProjectInputFingerprint {
   readonly excludedRelativePaths: readonly string[];
 }
 
+interface DeploymentLockState {
+  readonly kind: "eden.deploy.lock";
+  readonly version: 1;
+  readonly pid: number;
+  readonly startedAt: string;
+  readonly token: string;
+}
+
 interface InitPublicationLockState {
   readonly kind: "eden.init.lock";
   readonly version: 1;
@@ -308,6 +329,9 @@ interface InitPublicationLockState {
 
 const INIT_STATE_FILE = ".eden-init-incomplete.json";
 const INIT_LOCK_FILE = ".eden-init.lock";
+const DEPLOY_LOCK_FILE = ".eden-deploy.lock";
+const DEPLOY_LOCK_QUARANTINE_PATTERN =
+  /^\.eden-deploy-(?:stale-lock|release-lock)-[0-9]+-[a-f0-9-]+$/u;
 const INIT_LOCK_QUARANTINE_PATTERN =
   /^\.eden-init-(?:stale-lock|release-lock|recovery)-[0-9]+-[a-f0-9-]+$/u;
 const CANONICAL_ARTIFACT_NAMES = [
@@ -1815,6 +1839,225 @@ async function assertProjectInputsUnchanged(
       ...(changedPath === undefined ? {} : { source: changedPath }),
     });
   }
+}
+
+interface DeploymentLockHandle {
+  readonly path: string;
+  readonly state: DeploymentLockState;
+  readonly release: () => Promise<boolean>;
+}
+
+function parseDeploymentLockState(value: unknown): DeploymentLockState | undefined {
+  const pid = isRecord(value) ? value.pid : undefined;
+  const startedAt = isRecord(value) ? value.startedAt : undefined;
+  const token = isRecord(value) ? value.token : undefined;
+  if (
+    !isRecord(value) ||
+    value.kind !== "eden.deploy.lock" ||
+    value.version !== 1 ||
+    typeof pid !== "number" ||
+    !Number.isSafeInteger(pid) ||
+    pid <= 0 ||
+    typeof startedAt !== "string" ||
+    startedAt.length === 0 ||
+    typeof token !== "string" ||
+    token.length === 0
+  ) {
+    return undefined;
+  }
+  return value as unknown as DeploymentLockState;
+}
+
+async function readDeploymentLockState(
+  path: string,
+): Promise<DeploymentLockState | undefined> {
+  const contents = await readFile(path, "utf8").catch(() => undefined);
+  if (contents === undefined) return undefined;
+  try {
+    return parseDeploymentLockState(JSON.parse(contents) as unknown);
+  } catch {
+    return undefined;
+  }
+}
+
+async function removeOwnedDeploymentLock(
+  root: string,
+  lock: DeploymentLockHandle,
+): Promise<boolean> {
+  const quarantinePath = join(
+    root,
+    uniqueTemporaryName("eden-deploy-release-lock"),
+  );
+  assertWithinRoot(
+    root,
+    quarantinePath,
+    "The deployment lock release quarantine path",
+  );
+  try {
+    await rename(lock.path, quarantinePath);
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return false;
+    throw error;
+  }
+  const observed = await readDeploymentLockState(quarantinePath);
+  if (
+    observed?.pid === lock.state.pid &&
+    observed.startedAt === lock.state.startedAt &&
+    observed.token === lock.state.token
+  ) {
+    await rm(quarantinePath, { force: true }).catch(() => undefined);
+    return true;
+  }
+  try {
+    await link(quarantinePath, lock.path);
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code !== "EEXIST") throw error;
+  }
+  await rm(quarantinePath, { force: true }).catch(() => undefined);
+  return false;
+}
+
+async function recoverDeploymentLockQuarantines(
+  root: string,
+): Promise<boolean> {
+  const entries = await readdir(root, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!DEPLOY_LOCK_QUARANTINE_PATTERN.test(entry.name)) continue;
+    if (!entry.isFile()) {
+      throw cliError({
+        code: "DEPLOY_BUSY",
+        message:
+          "A deployment lock recovery record is not a regular file and cannot be recovered safely.",
+        source: entry.name,
+      });
+    }
+    const quarantinePath = join(root, entry.name);
+    const state = await readDeploymentLockState(quarantinePath);
+    if (state === undefined) {
+      throw cliError({
+        code: "DEPLOY_BUSY",
+        message:
+          "A deployment lock recovery record is present but its ownership identity could not be verified.",
+        source: entry.name,
+      });
+    }
+    const observedStartedAt = await readProcessStartTime(state.pid);
+    const alive = isProcessAlive(state.pid);
+    if (observedStartedAt === state.startedAt || (observedStartedAt === undefined && alive)) {
+      return true;
+    }
+    await rm(quarantinePath, { force: true }).catch(() => undefined);
+  }
+  return false;
+}
+
+async function acquireDeploymentLock(root: string): Promise<DeploymentLockHandle> {
+  const startedAt = await readProcessStartTime(process.pid);
+  if (startedAt === undefined) {
+    throw cliError({
+      code: "DEPLOY_PROCESS_IDENTITY_UNAVAILABLE",
+      message:
+        "The Eden deploy process start identity could not be verified; remote deployment is disabled.",
+      source: DEPLOY_LOCK_FILE,
+    });
+  }
+  const path = await resolveContainedProjectPath(root, DEPLOY_LOCK_FILE);
+  if (await recoverDeploymentLockQuarantines(root)) {
+    throw cliError({
+      code: "DEPLOY_BUSY",
+      message:
+        "Another Eden deploy is releasing its ownership record; wait for it to finish before retrying.",
+      source: DEPLOY_LOCK_FILE,
+    });
+  }
+  const state: DeploymentLockState = {
+    kind: "eden.deploy.lock",
+    version: 1,
+    pid: process.pid,
+    startedAt,
+    token: randomUUID(),
+  };
+  const serialized = `${JSON.stringify(state)}\n`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await writeFile(path, serialized, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      const handle: DeploymentLockHandle = {
+        path,
+        state,
+        release: async () => removeOwnedDeploymentLock(root, handle),
+      };
+      return handle;
+    } catch (error: unknown) {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code !== "EEXIST") throw error;
+      const existing = await readDeploymentLockState(path);
+      if (existing === undefined) {
+        throw cliError({
+          code: "DEPLOY_BUSY",
+          message:
+            "Another Eden deploy owns the selected project, but its lock identity could not be verified.",
+          source: DEPLOY_LOCK_FILE,
+        });
+      }
+      const existingStartedAt = await readProcessStartTime(existing.pid);
+      const existingAlive = isProcessAlive(existing.pid);
+      if (
+        existingStartedAt === existing.startedAt ||
+        (existingStartedAt === undefined && existingAlive)
+      ) {
+        throw cliError({
+          code: "DEPLOY_BUSY",
+          message:
+            "Another Eden deploy owns the selected project; wait for it to finish before retrying.",
+          source: DEPLOY_LOCK_FILE,
+        });
+      }
+      const staleQuarantine = join(
+        root,
+        uniqueTemporaryName("eden-deploy-stale-lock"),
+      );
+      assertWithinRoot(
+        root,
+        staleQuarantine,
+        "The stale deployment lock quarantine path",
+      );
+      try {
+        await rename(path, staleQuarantine);
+      } catch (renameError: unknown) {
+        const renameCode = renameError as NodeJS.ErrnoException;
+        if (renameCode.code === "ENOENT") continue;
+        throw renameError;
+      }
+      const quarantined = await readDeploymentLockState(staleQuarantine);
+      if (
+        quarantined?.pid === existing.pid &&
+        quarantined.startedAt === existing.startedAt &&
+        quarantined.token === existing.token
+      ) {
+        await rm(staleQuarantine, { force: true }).catch(() => undefined);
+      } else {
+        try {
+          await link(staleQuarantine, path);
+        } catch (linkError: unknown) {
+          const linkCode = linkError as NodeJS.ErrnoException;
+          if (linkCode.code !== "EEXIST") throw linkError;
+        }
+        await rm(staleQuarantine, { force: true }).catch(() => undefined);
+      }
+    }
+  }
+  throw cliError({
+    code: "DEPLOY_BUSY",
+    message:
+      "The deployment lock changed while stale ownership was being recovered; retry without taking over the replacement invocation.",
+    source: DEPLOY_LOCK_FILE,
+  });
 }
 
 async function assertArtifactDirectory(
@@ -3517,7 +3760,7 @@ async function buildProjectFromCli(
   environment?: "preview" | "production",
   sourceFingerprint?: ProjectInputFingerprint,
   ownedProcesses?: OwnedProcessRegistry,
-): Promise<string> {
+): Promise<EdenArtifactGeneration> {
   const configuration = await readProjectConfiguration(root);
   const inputFingerprint =
     sourceFingerprint ?? await fingerprintProjectInputs(root, configuration);
@@ -3583,6 +3826,9 @@ async function buildProjectFromCli(
     try {
       dryRun = await runCompatibilityDryRun(options, request, ownedProcesses);
     } catch (error: unknown) {
+      if (ownedProcesses?.isStopping() === true) {
+        return candidateGeneration;
+      }
       throw cliError({
         code: "COMPATIBILITY_VALIDATION_FAILED",
         message: error instanceof Error
@@ -3602,7 +3848,10 @@ async function buildProjectFromCli(
       });
     }
     if (ownedProcesses?.isStopping() === true) {
-      return result.artifacts.buildMetadata.generationId;
+      return candidateGeneration;
+    }
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
     }
     await assertProjectInputsUnchanged(
       root,
@@ -3671,7 +3920,10 @@ async function buildProjectFromCli(
       `Built Eden project generation ${generationId}.`,
     );
     options.stdout?.("Worker compatibility dry run passed; no deployment was performed.");
-    return result.artifacts.buildMetadata.generationId;
+    return {
+      directory: canonicalGeneration,
+      artifacts: result.artifacts,
+    };
   } finally {
     await rm(candidateOutput, { recursive: true, force: true }).catch(
       () => undefined,
@@ -3974,7 +4226,7 @@ async function runDev(
     }
     rebuildInFlight = true;
     try {
-      const generationId = await buildProjectFromCli(
+      const builtGeneration = await buildProjectFromCli(
         root,
         options,
         undefined,
@@ -3983,8 +4235,7 @@ async function runDev(
       );
       if (ownedValidationProcesses.isStopping()) return;
       const resolvedConfiguration = await readProjectConfiguration(root);
-      const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
-      const nextGeneration = await readArtifactGeneration(canonicalOutput);
+      const nextGeneration = builtGeneration;
       const nextRuntimeGeneration = readRuntimeGeneration(nextGeneration);
       if (
         runtimeGeneration === undefined ||
@@ -4055,7 +4306,9 @@ async function runDev(
           );
         }
       }
-      options.stdout?.(`Eden dev generation ${generationId} is coherent.`);
+      options.stdout?.(
+        `Eden dev generation ${nextGeneration.artifacts.buildMetadata.generationId} is coherent.`,
+      );
     } catch (error: unknown) {
       for (const line of errorLines(error)) {
         options.stderr?.(`Watch rebuild unavailable: ${line}`);
@@ -4156,7 +4409,7 @@ async function runDev(
     if (stopped) return;
     await assertApprovedPortsAvailable();
     if (stopped) return;
-    await buildProjectFromCli(
+    const generation = await buildProjectFromCli(
       root,
       options,
       undefined,
@@ -4166,10 +4419,6 @@ async function runDev(
     if (stopped) return;
 
     const resolvedConfiguration = await readProjectConfiguration(root);
-    if (stopped) return;
-    const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
-    if (stopped) return;
-    const generation = await readArtifactGeneration(canonicalOutput);
     if (stopped) return;
     const runtimeFiles = await createRuntimeFiles(
       root,
@@ -4411,42 +4660,144 @@ async function runDeploy(
   environment: "preview" | "production",
   requestedWorkerName: string | undefined,
 ): Promise<void> {
-  const configuration = await readProjectConfiguration(root);
-  const deploymentInputFingerprint = await fingerprintProjectInputs(
-    root,
-    configuration,
-  );
-  await buildProjectFromCli(
-    root,
-    options,
-    environment,
-    deploymentInputFingerprint,
-  );
-  const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
-  const generation = await readArtifactGeneration(canonicalOutput);
-  const runtimeGeneration = readRuntimeGeneration(generation);
-  const runtimeFiles = await createRuntimeFiles(
-    root,
-    configuration.configPath,
-    generation,
-    "remote",
-  );
-  const temporaryConfig = runtimeFiles.configPath;
-  const configuredWorkerName = await readConfiguredWorkerName(
-    configuration.configPath,
-    environment,
-  );
-  const workerName = requestedWorkerName ?? configuredWorkerName;
-  if (workerName === undefined) {
+  const ownedValidationProcesses = createOwnedProcessRegistry();
+  let deploymentLock: DeploymentLockHandle | undefined;
+  let requestedSignal: NodeJS.Signals | undefined;
+  const stopOnSignal = (signal: NodeJS.Signals): void => {
+    requestedSignal ??= signal;
+    void ownedValidationProcesses.cleanup(signal);
+  };
+  process.on("SIGINT", stopOnSignal);
+  process.on("SIGTERM", stopOnSignal);
+  try {
+    deploymentLock = await acquireDeploymentLock(root);
+  } catch (error: unknown) {
+    process.removeListener("SIGINT", stopOnSignal);
+    process.removeListener("SIGTERM", stopOnSignal);
+    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    throw error;
+  }
+  if (deploymentLock === undefined) {
+    process.removeListener("SIGINT", stopOnSignal);
+    process.removeListener("SIGTERM", stopOnSignal);
+    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     throw cliError({
-      code: "WORKER_NAME_MISSING",
-      message:
-        "The selected deployment environment must define a Worker name or eden deploy must receive --name.",
+      code: "DEPLOY_LOCK_UNAVAILABLE",
+      message: "The Eden deployment ownership lock could not be acquired.",
+      source: DEPLOY_LOCK_FILE,
     });
   }
+  const lock: DeploymentLockHandle = deploymentLock;
+  const assertDeploymentActive = (): void => {
+    if (requestedSignal !== undefined) {
+      throw cliError({
+        code: "DEPLOY_CANCELLED",
+        message:
+          `Eden deploy was cancelled by ${requestedSignal}; no further remote action was started.`,
+      });
+    }
+  };
+  let configuration: ProjectConfiguration;
+  let generation: EdenArtifactGeneration;
+  let deploymentInputFingerprint: ProjectInputFingerprint;
+  const assertBoundGeneration = async (): Promise<void> => {
+    await assertCanonicalGenerationMatches(
+      generation.directory,
+      generation.artifacts.buildMetadata.generationId,
+      generation.artifacts,
+    );
+  };
+  try {
+    configuration = await readProjectConfiguration(root);
+    assertDeploymentActive();
+    deploymentInputFingerprint = await fingerprintProjectInputs(
+      root,
+      configuration,
+    );
+    assertDeploymentActive();
+    generation = await buildProjectFromCli(
+      root,
+      options,
+      environment,
+      deploymentInputFingerprint,
+      ownedValidationProcesses,
+    );
+    assertDeploymentActive();
+    await assertBoundGeneration();
+  } catch (error: unknown) {
+    process.removeListener("SIGINT", stopOnSignal);
+    process.removeListener("SIGTERM", stopOnSignal);
+    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await lock.release().catch(() => undefined);
+    throw error;
+  }
+  let runtimeGeneration: RuntimeGeneration;
+  let setupRuntimeFiles: RuntimeFiles | undefined;
+  let workerName: string;
+  try {
+    runtimeGeneration = readRuntimeGeneration(generation);
+    setupRuntimeFiles = await createRuntimeFiles(
+      root,
+      configuration.configPath,
+      generation,
+      "remote",
+    );
+    const configuredWorkerName = await readConfiguredWorkerName(
+      configuration.configPath,
+      environment,
+    );
+    workerName = requestedWorkerName ?? configuredWorkerName ?? "";
+    if (workerName.length === 0) {
+      throw cliError({
+        code: "WORKER_NAME_MISSING",
+        message:
+          "The selected deployment environment must define a Worker name or eden deploy must receive --name.",
+      });
+    }
+  } catch (error: unknown) {
+    if (setupRuntimeFiles !== undefined) {
+      await rm(setupRuntimeFiles.configPath, { force: true }).catch(
+        () => undefined,
+      );
+      await rm(setupRuntimeFiles.entryPath, { force: true }).catch(
+        () => undefined,
+      );
+    }
+    process.removeListener("SIGINT", stopOnSignal);
+    process.removeListener("SIGTERM", stopOnSignal);
+    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await lock.release().catch(() => undefined);
+    throw error;
+  }
+  const runtimeFiles = setupRuntimeFiles;
+  if (runtimeFiles === undefined) {
+    process.removeListener("SIGINT", stopOnSignal);
+    process.removeListener("SIGTERM", stopOnSignal);
+    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await lock.release().catch(() => undefined);
+    throw cliError({
+      code: "DEPLOY_RUNTIME_UNAVAILABLE",
+      message: "The deployment runtime files could not be created.",
+    });
+  }
+  const temporaryConfig = runtimeFiles.configPath;
+  const assertDeploymentCandidateStable = async (): Promise<void> => {
+    assertDeploymentActive();
+    await assertBoundGeneration();
+    await assertProjectInputsUnchanged(
+      root,
+      configuration,
+      deploymentInputFingerprint,
+      [
+        relative(root, temporaryConfig),
+        relative(root, runtimeFiles.entryPath),
+      ],
+    );
+    await assertBoundGeneration();
+  };
   const secret = options.remoteBearerSecret ?? process.env.EDEN_BEARER_SECRET;
   let secretProvisioned = false;
-  let workerDeployed = false;
+  let deploymentAttempted = false;
   let deploymentUrl: string | undefined;
   const remoteCommand = options.remoteCommandRunner ?? runDefaultRemoteCommand;
   const remoteValidate = options.remoteValidationRunner ??
@@ -4475,10 +4826,23 @@ async function runDeploy(
         temporaryConfig,
       ],
     };
+    await options.deploymentBoundaryHook?.("before-compatibility-dry-run");
+    assertDeploymentActive();
     let dryRun: EdenCliDryRunResult;
     try {
-      dryRun = await runCompatibilityDryRun(options, compatibilityRequest);
+      dryRun = await runCompatibilityDryRun(
+        options,
+        compatibilityRequest,
+        ownedValidationProcesses,
+      );
     } catch (error: unknown) {
+      if (ownedValidationProcesses.isStopping()) {
+        throw cliError({
+          code: "DEPLOY_CANCELLED",
+          message:
+            "Eden deploy was cancelled while validating the selected generation.",
+        });
+      }
       throw cliError({
         code: "WRANGLER_DRY_RUN_FAILED",
         message: error instanceof Error
@@ -4495,15 +4859,8 @@ async function runDeploy(
         }`,
       });
     }
-    await assertProjectInputsUnchanged(
-      root,
-      configuration,
-      deploymentInputFingerprint,
-      [
-        relative(root, temporaryConfig),
-        relative(root, runtimeFiles.entryPath),
-      ],
-    );
+    await options.deploymentBoundaryHook?.("after-compatibility-dry-run");
+    await assertDeploymentCandidateStable();
     if (secret === undefined || secret.length === 0) {
       throw cliError({
         code: "REMOTE_SECRET_REQUIRED",
@@ -4512,6 +4869,8 @@ async function runDeploy(
       });
     }
 
+    await options.deploymentBoundaryHook?.("before-secret-provision");
+    await assertDeploymentCandidateStable();
     secretProvisioned = true;
     const putSecret = await remoteCommand({
       kind: "secret-put",
@@ -4537,7 +4896,11 @@ async function runDeploy(
         }`,
       });
     }
-    workerDeployed = true;
+    await options.deploymentBoundaryHook?.("after-secret-provision");
+    await assertDeploymentCandidateStable();
+    await options.deploymentBoundaryHook?.("before-deploy");
+    await assertDeploymentCandidateStable();
+    deploymentAttempted = true;
     const deployment = await remoteCommand({
       kind: "deploy",
       cwd: root,
@@ -4561,6 +4924,8 @@ async function runDeploy(
         }`,
       });
     }
+    await options.deploymentBoundaryHook?.("after-deploy");
+    assertDeploymentActive();
     deploymentUrl = findDeploymentUrl(
       `${deployment.stdout}\n${deployment.stderr}`,
     );
@@ -4571,6 +4936,8 @@ async function runDeploy(
           "The deployment tool completed without exposing a reachable workers.dev deployment URL.",
       });
     }
+    await options.deploymentBoundaryHook?.("before-remote-validation");
+    assertDeploymentActive();
     const validation = await remoteValidate({
       cwd: root,
       environment,
@@ -4578,6 +4945,8 @@ async function runDeploy(
       url: deploymentUrl,
       expectedGeneration: runtimeGeneration,
     });
+    await options.deploymentBoundaryHook?.("after-remote-validation");
+    assertDeploymentActive();
     if (!validation.ok) {
       throw cliError({
         code: validation.code ?? "REMOTE_VALIDATION_FAILED",
@@ -4596,7 +4965,7 @@ async function runDeploy(
     if (
       deploymentFailure !== undefined &&
       requestedWorkerName !== undefined &&
-      (secretProvisioned || workerDeployed)
+      (secretProvisioned || deploymentAttempted)
     ) {
       let cleanupFailed = false;
       if (secretProvisioned) {
@@ -4610,12 +4979,12 @@ async function runDeploy(
             "--name",
             workerName,
             "--config",
-            configuration.configPath,
+            temporaryConfig,
           ],
         }).catch(() => ({ exitCode: 1 }));
         cleanupFailed ||= removed.exitCode !== 0;
       }
-      if (workerDeployed) {
+      if (deploymentAttempted) {
         const deleted = await remoteCommand({
           kind: "delete",
           cwd: root,
@@ -4625,7 +4994,7 @@ async function runDeploy(
             "--env",
             environment,
             "--config",
-            configuration.configPath,
+            temporaryConfig,
             "--force",
           ],
         }).catch(() => ({ exitCode: 1 }));
@@ -4639,6 +5008,10 @@ async function runDeploy(
     }
     await rm(temporaryConfig, { force: true }).catch(() => undefined);
     await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
+    process.removeListener("SIGINT", stopOnSignal);
+    process.removeListener("SIGTERM", stopOnSignal);
+    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await lock.release().catch(() => undefined);
   }
 }
 
