@@ -1,12 +1,14 @@
 import {
   createHash,
 } from "crypto";
+import { execFile } from "node:child_process";
 import {
   mkdtemp,
   mkdir,
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   stat,
   symlink,
@@ -326,6 +328,208 @@ describe("eden CLI project commands", () => {
     await expect(
       stat(join(root, ".eden-init.lock")),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("does not promote an incomplete same-identity generation over the prior CURRENT", async () => {
+    const root = await createRoot("eden-cli-same-identity-incomplete-");
+    const sourcePath = join(root, "agent/tools/greet.ts");
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(0);
+    const firstGeneration = await readArtifactGeneration(join(root, ".eden"));
+    const firstSource = await readFile(sourcePath, "utf8");
+    const secondSource = firstSource.replace(
+      "Greet a person by name.",
+      "Second same-identity generation.",
+    );
+    await writeFile(sourcePath, secondSource, "utf8");
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(0);
+    const secondGeneration = await readArtifactGeneration(join(root, ".eden"));
+    expect(secondGeneration.artifacts.buildMetadata.generationId).not.toBe(
+      firstGeneration.artifacts.buildMetadata.generationId,
+    );
+
+    await writeFile(sourcePath, firstSource, "utf8");
+    await rm(
+      join(
+        root,
+        ".eden/generations",
+        firstGeneration.artifacts.buildMetadata.generationId,
+        "manifest.json",
+      ),
+    );
+    const errors: string[] = [];
+
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(1);
+
+    const current = await readArtifactGeneration(join(root, ".eden"));
+    expect(current.artifacts.buildMetadata.generationId).toBe(
+      secondGeneration.artifacts.buildMetadata.generationId,
+    );
+    expect(errors.join("\n")).toMatch(/incoherent|incomplete|manifest|artifact/i);
+  });
+
+  test("does not promote a digest-mismatched same-identity generation over the prior CURRENT", async () => {
+    const root = await createRoot("eden-cli-same-identity-digest-");
+    const sourcePath = join(root, "agent/tools/greet.ts");
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(0);
+    const firstGeneration = await readArtifactGeneration(join(root, ".eden"));
+    const firstSource = await readFile(sourcePath, "utf8");
+    await writeFile(
+      sourcePath,
+      firstSource.replace(
+        "Greet a person by name.",
+        "Second digest generation.",
+      ),
+      "utf8",
+    );
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(0);
+    const secondGeneration = await readArtifactGeneration(join(root, ".eden"));
+
+    await writeFile(sourcePath, firstSource, "utf8");
+    await writeFile(
+      join(
+        root,
+        ".eden/generations",
+        firstGeneration.artifacts.buildMetadata.generationId,
+        "agent-bundle.mjs",
+      ),
+      "tampered same-identity bundle\n",
+      "utf8",
+    );
+    const errors: string[] = [];
+
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(1);
+
+    const current = await readArtifactGeneration(join(root, ".eden"));
+    expect(current.artifacts.buildMetadata.generationId).toBe(
+      secondGeneration.artifacts.buildMetadata.generationId,
+    );
+    expect(errors.join("\n")).toMatch(/digest|incoherent|artifact/i);
+  });
+
+  test("does not remove a replacement lock after observing a stale owner", async () => {
+    const root = await createRoot("eden-cli-init-lock-race-");
+    const lockPath = join(root, ".eden-init.lock");
+    const liveOwnerStartedAt = await new Promise<string>((resolve, reject) => {
+      execFile(
+        "ps",
+        ["-p", String(process.pid), "-o", "lstart="],
+        { encoding: "utf8" },
+        (error, stdout) => {
+          if (error !== null) {
+            reject(error);
+            return;
+          }
+          resolve(String(stdout).trim());
+        },
+      );
+    });
+    const replacement = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: process.pid,
+      startedAt: liveOwnerStartedAt,
+      token: "replacement-token",
+    })}\n`;
+    await writeFile(
+      lockPath,
+      `${JSON.stringify({
+        kind: "eden.init.lock",
+        version: 1,
+        pid: 99_999_999,
+        startedAt: "stale-process-start",
+        token: "stale-token",
+      })}\n`,
+      "utf8",
+    );
+
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary !== "before-stale-lock-removal") return;
+          await writeFile(lockPath, replacement, {
+            encoding: "utf8",
+            flag: "wx",
+          });
+        },
+      }),
+    ).resolves.toBe(1);
+
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(replacement);
+    await expect(stat(join(root, "package.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  test("does not remove a replacement lock during owned-lock release", async () => {
+    const root = await createRoot("eden-cli-init-release-lock-race-");
+    const lockPath = join(root, ".eden-init.lock");
+    const replacement = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: process.pid,
+      startedAt: "replacement-live-owner",
+      token: "replacement-release-token",
+    })}\n`;
+
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary !== "before-complete") return;
+          const observed = `${lockPath}.observed`;
+          await rename(lockPath, observed);
+          await writeFile(lockPath, replacement, {
+            encoding: "utf8",
+            flag: "wx",
+          });
+          await rm(observed, { force: true });
+        },
+      }),
+    ).resolves.toBe(0);
+
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(replacement);
+    await expect(stat(join(root, "package.json"))).resolves.toBeDefined();
   });
 
   test("rejects a symbolic-link project root before writing", async () => {

@@ -8,7 +8,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -115,6 +115,23 @@ async function killWithSigkill(child: ChildProcess): Promise<void> {
   const result = await waitForExit(child);
   expect(result.code).toBeNull();
   expect(result.signal).toBe("SIGKILL");
+}
+
+async function currentProcessStartIdentity(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "ps",
+      ["-p", String(process.pid), "-o", "lstart="],
+      { encoding: "utf8" },
+      (error, stdout) => {
+        if (error !== null) {
+          reject(error);
+          return;
+        }
+        resolve(String(stdout).trim());
+      },
+    );
+  });
 }
 
 async function init(root: string): Promise<void> {
@@ -237,6 +254,47 @@ describe("CLI OS-crash publication recovery", () => {
       expect(await readdir(root)).not.toContain(".eden-init.lock");
     },
   );
+
+  test("preserves a replacement live init lock after a stale-lock owner is SIGKILLed", async () => {
+    const root = await createRoot("eden-cli-init-lock-os-race-");
+    const lockPath = join(root, ".eden-init.lock");
+    const replacement = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: process.pid,
+      startedAt: await currentProcessStartIdentity(),
+      token: "replacement-live-token",
+    })}\n`;
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        kind: "eden.init.lock",
+        version: 1,
+        pid: 99_999_999,
+        startedAt: "stale-process-start",
+        token: "stale-token",
+      }),
+      "utf8",
+    );
+
+    const { child, readyPath } = startCrashChild(
+      "init",
+      root,
+      "before-stale-lock-removal",
+    );
+    await waitForFile(readyPath, child);
+    await writeFile(lockPath, replacement, "utf8");
+    await killWithSigkill(child);
+    await rm(readyPath, { force: true });
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(1);
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(replacement);
+    await expect(stat(join(root, "package.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
 
   test.each(["before-current-promotion", "after-current-promotion"] as const)(
     "recovers build artifacts after SIGKILL at %s without mixed output",

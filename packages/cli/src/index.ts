@@ -49,6 +49,7 @@ import {
 } from "module";
 
 import {
+  createArtifactIdentity,
   buildProject,
   EdenCompilerError,
   readArtifactGeneration,
@@ -205,6 +206,7 @@ export type EdenInitPublicationBoundary =
   | "after-target-validation"
   | "before-target-publish"
   | "after-target-publish"
+  | "before-stale-lock-removal"
   | "before-complete";
 
 export type EdenBuildPublicationBoundary =
@@ -759,6 +761,7 @@ function assertWithinRoot(
 
 async function acquireInitPublicationLock(
   root: string,
+  hook?: EdenCliRunOptions["initPublicationHook"],
 ): Promise<{ readonly release: () => Promise<void> }> {
   const lockPath = join(root, INIT_LOCK_FILE);
   const startedAt =
@@ -780,11 +783,42 @@ async function acquireInitPublicationLock(
       });
       return {
         release: async () => {
-          const current = await readFile(lockPath, "utf8").catch(
-            () => undefined,
+          const releaseQuarantine = join(
+            root,
+            uniqueTemporaryName("eden-init-release-lock"),
           );
-          if (current === serialized) {
-            await rm(lockPath, { force: true }).catch(() => undefined);
+          assertWithinRoot(
+            root,
+            releaseQuarantine,
+            "The init-lock release quarantine path",
+          );
+          try {
+            await rename(lockPath, releaseQuarantine);
+          } catch (error: unknown) {
+            const renameError = error as NodeJS.ErrnoException;
+            if (renameError.code === "ENOENT") return;
+            throw error;
+          }
+          let movedLock: string | undefined;
+          try {
+            movedLock = await readFile(releaseQuarantine, "utf8");
+          } catch {
+            await rm(releaseQuarantine, { force: true }).catch(() => undefined);
+            return;
+          }
+          if (movedLock === serialized) {
+            await rm(releaseQuarantine, { force: true }).catch(() => undefined);
+            return;
+          }
+          try {
+            await link(releaseQuarantine, lockPath);
+          } catch (restoreError: unknown) {
+            const restoreCode = restoreError as NodeJS.ErrnoException;
+            if (restoreCode.code !== "EEXIST") {
+              throw restoreError;
+            }
+          } finally {
+            await rm(releaseQuarantine, { force: true }).catch(() => undefined);
           }
         },
       };
@@ -853,7 +887,50 @@ async function acquireInitPublicationLock(
         () => undefined,
       );
       if (latest !== existing) continue;
-      await rm(lockPath, { force: true }).catch(() => undefined);
+      const staleLockQuarantine = join(
+        root,
+        uniqueTemporaryName("eden-init-stale-lock"),
+      );
+      assertWithinRoot(
+        root,
+        staleLockQuarantine,
+        "The stale init-lock quarantine path",
+      );
+      try {
+        await rename(lockPath, staleLockQuarantine);
+      } catch (error: unknown) {
+        const renameError = error as NodeJS.ErrnoException;
+        if (renameError.code === "ENOENT") continue;
+        throw error;
+      }
+      await hook?.("before-stale-lock-removal");
+      let movedLock: string | undefined;
+      try {
+        movedLock = await readFile(staleLockQuarantine, "utf8");
+      } catch {
+        await rm(staleLockQuarantine, { force: true }).catch(() => undefined);
+        continue;
+      }
+      if (movedLock === existing) {
+        await rm(staleLockQuarantine, { force: true }).catch(() => undefined);
+        continue;
+      }
+
+      // The lock changed after the stale observation. Restore the replacement
+      // only if the path is still free; an exclusive hard link never replaces
+      // a newer lock created by another initializer. Stop this acquisition
+      // attempt rather than parsing or removing the replacement as stale.
+      try {
+        await link(staleLockQuarantine, lockPath);
+      } catch (restoreError: unknown) {
+        const restoreCode = restoreError as NodeJS.ErrnoException;
+        if (restoreCode.code !== "EEXIST") {
+          throw restoreError;
+        }
+      } finally {
+        await rm(staleLockQuarantine, { force: true }).catch(() => undefined);
+      }
+      break;
     }
   }
   throw cliError({
@@ -868,7 +945,7 @@ async function writeScaffold(
   root: string,
   hook?: EdenCliRunOptions["initPublicationHook"],
 ): Promise<void> {
-  const lock = await acquireInitPublicationLock(root);
+  const lock = await acquireInitPublicationLock(root, hook);
   try {
     await hook?.("after-lock-acquire");
     await writeScaffoldUnlocked(root, hook);
@@ -1582,6 +1659,114 @@ async function assertArtifactDirectory(
       });
     }
     throw error;
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  }
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function assertCanonicalGenerationMatches(
+  generationDirectory: string,
+  generationId: string,
+  expected: EdenArtifactGeneration["artifacts"],
+): Promise<void> {
+  const artifactPaths = Object.fromEntries(
+    CANONICAL_ARTIFACT_NAMES.map((name) => [
+      name,
+      join(generationDirectory, name),
+    ]),
+  ) as Record<typeof CANONICAL_ARTIFACT_NAMES[number], string>;
+  try {
+    const generationDetails = await lstat(generationDirectory);
+    if (!generationDetails.isDirectory() || generationDetails.isSymbolicLink()) {
+      throw new Error("the canonical generation is not a real directory");
+    }
+    const artifactDetails = await Promise.all(
+      CANONICAL_ARTIFACT_NAMES.map((name) => lstat(artifactPaths[name])),
+    );
+    if (
+      artifactDetails.some(
+        (details) => !details.isFile() || details.isSymbolicLink(),
+      )
+    ) {
+      throw new Error("the canonical generation does not contain six regular files");
+    }
+    const [
+      discoveryText,
+      diagnosticsText,
+      manifestText,
+      moduleMapText,
+      bundle,
+      buildMetadataText,
+    ] = await Promise.all([
+      readFile(artifactPaths["discovery.json"], "utf8"),
+      readFile(artifactPaths["diagnostics.json"], "utf8"),
+      readFile(artifactPaths["manifest.json"], "utf8"),
+      readFile(artifactPaths["module-map.json"], "utf8"),
+      readFile(artifactPaths["agent-bundle.mjs"], "utf8"),
+      readFile(artifactPaths["build-metadata.json"], "utf8"),
+    ]);
+    const discovery = JSON.parse(discoveryText) as unknown;
+    const diagnostics = JSON.parse(diagnosticsText) as unknown;
+    const manifest = JSON.parse(manifestText) as unknown;
+    const moduleMap = JSON.parse(moduleMapText) as unknown;
+    const buildMetadata = JSON.parse(buildMetadataText) as unknown;
+    if (
+      !isRecord(buildMetadata) ||
+      typeof buildMetadata.generationId !== "string" ||
+      buildMetadata.generationId !== generationId ||
+      typeof buildMetadata.createdAt !== "string"
+    ) {
+      throw new Error("the canonical build metadata identity is invalid");
+    }
+    if (
+      createArtifactIdentity({
+        manifest: manifest as EdenArtifactGeneration["artifacts"]["manifest"],
+        moduleMap: moduleMap as EdenArtifactGeneration["artifacts"]["moduleMap"],
+        bundle,
+      }) !== generationId
+    ) {
+      throw new Error("the canonical generation identity is invalid");
+    }
+    if (
+      stableJson(discovery) !== stableJson(expected.discovery) ||
+      stableJson(diagnostics) !== stableJson(expected.diagnostics) ||
+      stableJson(manifest) !== stableJson(expected.manifest) ||
+      stableJson(moduleMap) !== stableJson(expected.moduleMap) ||
+      bundle !== expected.bundle
+    ) {
+      throw new Error(
+        "the canonical generation does not match the validated candidate",
+      );
+    }
+    const existingMetadata = Object.fromEntries(
+      Object.entries(buildMetadata).filter(([key]) => key !== "createdAt"),
+    );
+    const expectedMetadata = Object.fromEntries(
+      Object.entries(expected.buildMetadata).filter(([key]) => key !== "createdAt"),
+    );
+    if (stableJson(existingMetadata) !== stableJson(expectedMetadata)) {
+      throw new Error("the canonical build metadata is incoherent");
+    }
+  } catch (error: unknown) {
+    throw cliError({
+      code: "ARTIFACT_INCOHERENT",
+      message:
+        error instanceof Error
+          ? `The canonical generation "${generationId}" is incomplete or incoherent: ${error.message}.`
+          : `The canonical generation "${generationId}" is incomplete or incoherent.`,
+      source: generationId,
+    });
   }
 }
 
@@ -2798,11 +2983,20 @@ async function buildProjectFromCli(
           source: generationId,
         });
       }
-      await assertArtifactDirectory(candidateOutput);
+      await assertCanonicalGenerationMatches(
+        canonicalGeneration,
+        generationId,
+        result.artifacts,
+      );
       await rm(candidateGenerationPath, { recursive: true, force: true });
     }
     await options.buildPublicationHook?.("after-generation-publish");
     await options.buildPublicationHook?.("before-current-promotion");
+    await assertCanonicalGenerationMatches(
+      canonicalGeneration,
+      generationId,
+      result.artifacts,
+    );
     await promoteCurrentGeneration(canonicalOutput, generationId);
     await assertArtifactDirectory(canonicalOutput);
     await options.buildPublicationHook?.("after-current-promotion");
