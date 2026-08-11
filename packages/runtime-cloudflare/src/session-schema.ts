@@ -1,5 +1,3 @@
-import type { SqlStorage } from "@cloudflare/workers-types";
-
 interface SessionSchemaSql {
   exec(
     query: string,
@@ -273,7 +271,7 @@ function assertCompleteSchema(sql: SessionSchemaSql): void {
 }
 
 interface SessionStorage {
-  readonly sql: SqlStorage;
+  readonly sql: SessionSchemaSql;
   transactionSync<T>(closure: () => T): T;
 }
 

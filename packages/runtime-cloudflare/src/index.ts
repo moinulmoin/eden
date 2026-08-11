@@ -24,106 +24,6 @@ export type {
 } from "@eden/definitions";
 
 export {
-  createOpaqueSessionId,
-  createOpaqueMessageId,
-  createOpaqueTurnId,
-  createSessionObjectName,
-  isOpaqueMessageId,
-  isOpaqueSessionId,
-  isOpaqueTurnId,
-  sessionIdFromObjectName,
-} from "./session-identity.js";
-export {
-  readAppliedSessionSchemaVersion,
-  SESSION_SCHEMA_MIGRATIONS,
-  SESSION_SCHEMA_TABLES,
-  SESSION_SCHEMA_VERSION,
-} from "./session-schema.js";
-export type { SessionMigration } from "./session-schema.js";
-export {
-  commitSessionTransaction,
-  createOpaqueEventId,
-  readJournalEvents,
-  readLatestJournalCursor,
-} from "./session-journal.js";
-export type {
-  AppendJournalEventInput,
-  CompleteEffectInput,
-  EdenSessionStorage,
-  EdenJobStatus,
-  EdenSqlCursor,
-  EdenSqlStorage,
-  EdenSqlValue,
-  FailEffectInput,
-  InsertMessageInput,
-  InsertJobInput,
-  InsertStepInput,
-  InsertTurnInput,
-  JournalTransaction,
-  RecordErrorInput,
-  RequestEffectInput,
-  StartEffectInput,
-  UpdateJobInput,
-  UpdateMessageInput,
-  UpdateStepInput,
-  UpdateTurnInput,
-} from "./session-journal.js";
-export {
-  createEffectIdempotencyKey,
-  createStableEffectIdempotencyKey,
-  MAX_CHECKPOINT_ATTEMPTS,
-  markCheckpointRetryable,
-  prepareCheckpointAttempt,
-  commitCheckpointResult,
-  reenterCheckpoint,
-} from "./session-checkpoint.js";
-export type {
-  CheckpointCommitResult,
-  CheckpointPreparation,
-  CheckpointRequest,
-  PreparedCheckpoint,
-  StableEffectIdentity,
-} from "./session-checkpoint.js";
-export {
-  enqueueRecoveryJob,
-  inspectRecoveryJobs,
-  MAX_RECOVERY_JOB_ATTEMPTS,
-  MAX_RECOVERY_JOBS_PER_ALARM,
-  MAX_RECOVERY_JOBS_PER_INSPECTION_PAGE,
-  nextRecoveryJobDueAt,
-  processRecoveryJobs,
-  RECOVERY_RETRY_DELAY_MS,
-  recoverRecoveryJob,
-  sanitizeRecoveryError,
-  REGISTERED_RECOVERY_ACTIONS,
-  isRegisteredRecoveryAction,
-} from "./session-jobs.js";
-export type {
-  RecoveryAction,
-  RecoveryJobEnqueueResult,
-  RecoveryJobExecutionOptions,
-  RecoveryJobInput,
-  RecoveryJobInspection,
-  RecoveryJobInspectionOptions,
-  RecoveryJobProcessingResult,
-  RecoveryJobRecord,
-  RecoveryJobRecoveryResult,
-  RecoveryJobStorage,
-  RecoveryJobStatus,
-} from "./session-jobs.js";
-export { readSessionRehydratedState } from "./session-state.js";
-export type {
-  EdenEffectState,
-  EdenErrorState,
-  EdenJobState,
-  EdenMessageState,
-  EdenProjectionState,
-  EdenSessionMetaState,
-  EdenSessionRehydratedState,
-  EdenStepState,
-  EdenTurnState,
-} from "./session-state.js";
-export {
   createModelAdapter,
   normalizeEdenJsonValue,
   normalizeModelFailure,
@@ -151,21 +51,6 @@ export type {
   EdenModelToolResult,
   EdenModelUsage,
 } from "./model-adapter.js";
-export { executeTypedTool } from "./tool-harness.js";
-export type {
-  EdenToolFailure,
-  EdenToolFailureCode,
-  EdenToolHarnessRequest,
-  EdenToolHarnessResult,
-} from "./tool-harness.js";
-export { MAX_BOUNDED_TURN_ATTEMPTS } from "./turn-runner-types.js";
-export { runBoundedTurn } from "./turn-runner.js";
-export type {
-  EdenBoundedTurnRequest,
-  EdenBoundedTurnResult,
-  EdenTurnFailure,
-  EdenTurnFailureCode,
-} from "./turn-runner.js";
 
 export interface EdenRuntimeConfiguration {
   readonly versions: EdenVersionSet;
