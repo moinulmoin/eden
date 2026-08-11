@@ -308,6 +308,8 @@ interface InitPublicationLockState {
 
 const INIT_STATE_FILE = ".eden-init-incomplete.json";
 const INIT_LOCK_FILE = ".eden-init.lock";
+const INIT_LOCK_QUARANTINE_PATTERN =
+  /^\.eden-init-(?:stale-lock|release-lock|recovery)-[0-9]+-[a-f0-9-]+$/u;
 const CANONICAL_ARTIFACT_NAMES = [
   "discovery.json",
   "diagnostics.json",
@@ -771,13 +773,222 @@ function assertWithinRoot(
   }
 }
 
+function isContainedPath(root: string, candidate: string): boolean {
+  const normalizedRoot = root.endsWith("/") ? root.slice(0, -1) : root;
+  return (
+    candidate === normalizedRoot ||
+    candidate.startsWith(`${normalizedRoot}/`) ||
+    candidate.startsWith(`${normalizedRoot}\\`)
+  );
+}
+
+function parseInitPublicationLockState(
+  value: unknown,
+): InitPublicationLockState | undefined {
+  if (
+    !isRecord(value) ||
+    value.kind !== "eden.init.lock" ||
+    value.version !== 1 ||
+    typeof value.pid !== "number" ||
+    !Number.isSafeInteger(value.pid) ||
+    value.pid <= 0 ||
+    typeof value.startedAt !== "string" ||
+    value.startedAt.length === 0 ||
+    value.startedAt.startsWith("pid:") ||
+    typeof value.token !== "string" ||
+    value.token.length === 0
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "eden.init.lock",
+    version: 1,
+    pid: value.pid,
+    startedAt: value.startedAt,
+    token: value.token,
+  };
+}
+
+async function readInitPublicationLockState(
+  path: string,
+): Promise<{
+  readonly state: InitPublicationLockState;
+  readonly serialized: string;
+}> {
+  const details = await lstat(path).catch(() => undefined);
+  if (
+    details === undefined ||
+    !details.isFile() ||
+    details.isSymbolicLink()
+  ) {
+    throw cliError({
+      code: "INIT_BUSY",
+      message:
+        "Another Eden init owns scaffold publication; the lock state was not a regular file and was preserved.",
+      source: INIT_LOCK_FILE,
+    });
+  }
+  const serialized = await readFile(path, "utf8").catch(() => undefined);
+  if (serialized === undefined) {
+    throw cliError({
+      code: "INIT_BUSY",
+      message:
+        "Another Eden init owns scaffold publication; the lock quarantine could not be read safely.",
+      source: INIT_LOCK_FILE,
+    });
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized) as unknown;
+  } catch {
+    throw cliError({
+      code: "INIT_BUSY",
+      message:
+        "Another Eden init owns scaffold publication; the malformed lock was preserved.",
+      source: INIT_LOCK_FILE,
+    });
+  }
+  const state = parseInitPublicationLockState(value);
+  if (state === undefined) {
+    throw cliError({
+      code: "INIT_BUSY",
+      message:
+        "Another Eden init owns scaffold publication; the malformed lock was preserved.",
+      source: INIT_LOCK_FILE,
+    });
+  }
+  return { state, serialized };
+}
+
+async function initLockOwnerIsActive(
+  state: InitPublicationLockState,
+): Promise<boolean> {
+  const ownerStart = await readProcessStartTime(state.pid);
+  if (ownerStart === state.startedAt) return true;
+  if (ownerStart === undefined && isProcessAlive(state.pid)) return true;
+  return false;
+}
+
+async function restoreInitLockQuarantine(
+  quarantinePath: string,
+  lockPath: string,
+): Promise<void> {
+  try {
+    await link(quarantinePath, lockPath);
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code !== "EEXIST") throw error;
+  } finally {
+    await rm(quarantinePath, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * A stale-lock owner can be SIGKILLed after the lock has been atomically
+ * renamed out of the root name. Quarantine files are deliberately discoverable
+ * and token-checked so the next initializer can remove only the exact stale
+ * lock it observed, rather than treating every root entry as user content or
+ * deleting a replacement lock.
+ */
+async function recoverInitLockQuarantines(
+  root: string,
+): Promise<void> {
+  const entries = await readdir(root);
+  for (const entry of entries) {
+    if (!INIT_LOCK_QUARANTINE_PATTERN.test(entry)) continue;
+    const quarantinePath = join(root, entry);
+    assertWithinRoot(
+      root,
+      quarantinePath,
+      "The init-lock recovery quarantine path",
+    );
+    const details = await lstat(quarantinePath).catch(() => undefined);
+    if (
+      details === undefined ||
+      !details.isFile() ||
+      details.isSymbolicLink()
+    ) {
+      throw cliError({
+        code: "INIT_BUSY",
+        message:
+          "Another Eden init owns scaffold publication; the lock quarantine was preserved because it is not a regular file.",
+        source: entry,
+      });
+    }
+    const { state, serialized } = await readInitPublicationLockState(
+      quarantinePath,
+    );
+    if (await initLockOwnerIsActive(state)) {
+      throw cliError({
+        code: "INIT_BUSY",
+        message:
+          "Another Eden init is publishing the scaffold; retry after it completes.",
+        source: entry,
+      });
+    }
+
+    const removalPath = join(
+      root,
+      uniqueTemporaryName("eden-init-recovery"),
+    );
+    assertWithinRoot(
+      root,
+      removalPath,
+      "The init-lock recovery removal path",
+    );
+    try {
+      await rename(quarantinePath, removalPath);
+    } catch (error: unknown) {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") continue;
+      throw error;
+    }
+
+    let moved: string | undefined;
+    try {
+      moved = await readFile(removalPath, "utf8");
+    } catch {
+      await rm(removalPath, { force: true }).catch(() => undefined);
+      continue;
+    }
+    if (moved !== serialized) {
+      await restoreInitLockQuarantine(removalPath, quarantinePath);
+      throw cliError({
+        code: "INIT_BUSY",
+        message:
+          "The init-lock quarantine changed while it was being recovered; the replacement was preserved.",
+        source: entry,
+      });
+    }
+
+    if (await initLockOwnerIsActive(state)) {
+      await restoreInitLockQuarantine(removalPath, quarantinePath);
+      throw cliError({
+        code: "INIT_BUSY",
+        message:
+          "Another Eden init became active while its lock quarantine was being recovered; the lock was preserved.",
+        source: entry,
+      });
+    }
+    await rm(removalPath, { force: true }).catch(() => undefined);
+  }
+}
+
 async function acquireInitPublicationLock(
   root: string,
   hook?: EdenCliRunOptions["initPublicationHook"],
 ): Promise<{ readonly release: () => Promise<void> }> {
   const lockPath = join(root, INIT_LOCK_FILE);
-  const startedAt =
-    (await readProcessStartTime(process.pid)) ?? `pid:${process.pid}`;
+  const startedAt = await readProcessStartTime(process.pid);
+  if (startedAt === undefined) {
+    throw cliError({
+      code: "INIT_PROCESS_IDENTITY_UNAVAILABLE",
+      message:
+        "The Eden init process start identity could not be verified; scaffold lock ownership is disabled.",
+      source: INIT_LOCK_FILE,
+    });
+  }
+  await recoverInitLockQuarantines(root);
   const state: InitPublicationLockState = {
     kind: "eden.init.lock",
     version: 1,
@@ -841,40 +1052,9 @@ async function acquireInitPublicationLock(
         () => undefined,
       );
       if (existing === undefined) continue;
-      let existingState: unknown;
-      try {
-        existingState = JSON.parse(existing) as unknown;
-      } catch {
-        throw cliError({
-          code: "INIT_BUSY",
-          message:
-            "Another Eden init owns scaffold publication; the malformed lock was preserved.",
-          source: INIT_LOCK_FILE,
-        });
-      }
-      if (
-        !isRecord(existingState) ||
-        existingState.kind !== "eden.init.lock" ||
-        existingState.version !== 1 ||
-        typeof existingState.pid !== "number" ||
-        !Number.isSafeInteger(existingState.pid) ||
-        existingState.pid <= 0 ||
-        typeof existingState.startedAt !== "string" ||
-        existingState.startedAt.length === 0 ||
-        typeof existingState.token !== "string" ||
-        existingState.token.length === 0
-      ) {
-        throw cliError({
-          code: "INIT_BUSY",
-          message:
-            "Another Eden init owns scaffold publication; the malformed lock was preserved.",
-          source: INIT_LOCK_FILE,
-        });
-      }
-      const existingLock = existingState as {
-        readonly pid: number;
-        readonly startedAt: string;
-      };
+      const { state: existingLock } = await readInitPublicationLockState(
+        lockPath,
+      );
       const ownerStart = await readProcessStartTime(existingLock.pid);
       if (ownerStart === existingLock.startedAt) {
         throw cliError({
@@ -924,6 +1104,15 @@ async function acquireInitPublicationLock(
         continue;
       }
       if (movedLock === existing) {
+        if (await initLockOwnerIsActive(existingLock)) {
+          await restoreInitLockQuarantine(staleLockQuarantine, lockPath);
+          throw cliError({
+            code: "INIT_BUSY",
+            message:
+              "Another Eden init became active while its lock was being quarantined; the lock was preserved.",
+            source: INIT_LOCK_FILE,
+          });
+        }
         await rm(staleLockQuarantine, { force: true }).catch(() => undefined);
         continue;
       }
@@ -1721,6 +1910,42 @@ async function assertCanonicalGenerationMatches(
     ) {
       throw new Error("the canonical generation identity is invalid");
     }
+    const generationRoot = await realpath(generationDirectory);
+    const generationsRoot = await realpath(dirname(generationDirectory));
+    if (generationRoot !== join(generationsRoot, basename(generationDirectory))) {
+      throw new Error("the canonical generation escapes its generations root");
+    }
+    const assertDescendants = async (directory: string): Promise<void> => {
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        const child = join(directory, entry.name);
+        if (entry.isSymbolicLink()) {
+          throw new Error(
+            `the canonical generation contains symbolic-link descendant "${child}"`,
+          );
+        }
+        const childDetails = await lstat(child);
+        if (childDetails.isSymbolicLink()) {
+          throw new Error(
+            `the canonical generation contains symbolic-link descendant "${child}"`,
+          );
+        }
+        if (childDetails.isDirectory()) {
+          await assertDescendants(child);
+          continue;
+        }
+        const childRealpath = await realpath(child);
+        if (
+          childRealpath !== generationRoot &&
+          !childRealpath.startsWith(`${generationRoot}/`)
+        ) {
+          throw new Error(
+            `the canonical generation descendant "${child}" escapes its generation root`,
+          );
+        }
+      }
+    };
+    await assertDescendants(generationDirectory);
     if (
       stableJson(discovery) !== stableJson(expected.discovery) ||
       stableJson(diagnostics) !== stableJson(expected.diagnostics) ||
@@ -1806,6 +2031,7 @@ async function ensureCanonicalArtifactDirectory(
   if (currentDetails !== undefined) {
     await assertArtifactDirectory(outputDirectory);
   }
+  await assertCanonicalArtifactTree(root, outputDirectory);
 
   for (const name of CANONICAL_ARTIFACT_NAMES) {
     const alias = join(outputDirectory, name);
@@ -1850,6 +2076,133 @@ async function assertContainedPathForCli(
       source,
     });
   }
+}
+
+async function assertCanonicalArtifactTree(
+  root: string,
+  outputDirectory: string,
+): Promise<void> {
+  const outputRoot = await realpath(outputDirectory).catch(() => undefined);
+  if (outputRoot === undefined) {
+    throw cliError({
+      code: "ARTIFACT_OUTPUT_INVALID",
+      message: "The .eden artifact directory could not be resolved safely.",
+      source: ".eden",
+    });
+  }
+  const generationsDirectory = join(outputRoot, "generations");
+  const generationsRoot = await realpath(generationsDirectory).catch(
+    () => undefined,
+  );
+  const currentPath = join(outputRoot, "CURRENT");
+  const currentDetails = await lstat(currentPath).catch(() => undefined);
+  let currentGeneration: string | undefined;
+  if (currentDetails?.isSymbolicLink() === true) {
+    const currentTarget = await readlink(currentPath).catch(() => undefined);
+    if (
+      currentTarget === undefined ||
+      !/^generations\/[^/]+$/u.test(currentTarget)
+    ) {
+      throw cliError({
+        code: "ARTIFACT_OUTPUT_INVALID",
+        message:
+          "The .eden CURRENT pointer must target one contained generation.",
+        source: ".eden/CURRENT",
+      });
+    }
+    const resolvedCurrent = await realpath(currentPath).catch(() => undefined);
+    const resolvedCurrentDetails =
+      resolvedCurrent === undefined
+        ? undefined
+        : await lstat(resolvedCurrent).catch(() => undefined);
+    if (
+      generationsRoot === undefined ||
+      resolvedCurrent === undefined ||
+      resolvedCurrentDetails === undefined ||
+      !resolvedCurrentDetails.isDirectory() ||
+      resolvedCurrentDetails.isSymbolicLink() ||
+      !isContainedPath(generationsRoot, resolvedCurrent)
+    ) {
+      throw cliError({
+        code: "ARTIFACT_OUTPUT_INVALID",
+        message:
+          "The .eden CURRENT pointer must resolve to a real contained generation directory.",
+        source: ".eden/CURRENT",
+      });
+    }
+    currentGeneration = resolvedCurrent;
+  }
+
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const child = join(directory, entry.name);
+      const childRelative = toPosixPath(relative(outputRoot, child));
+      if (entry.isSymbolicLink()) {
+        const isCurrent = childRelative === "CURRENT";
+        const isCompatibilityAlias =
+          CANONICAL_ARTIFACT_NAMES.includes(
+            childRelative as typeof CANONICAL_ARTIFACT_NAMES[number],
+          );
+        if (!isCurrent && !isCompatibilityAlias) {
+          throw cliError({
+            code: "ARTIFACT_OUTPUT_INVALID",
+            message:
+              `Generated descendant "${childRelative}" must not be a symbolic link.`,
+            source: childRelative,
+          });
+        }
+        if (isCompatibilityAlias) {
+          if (currentGeneration === undefined) continue;
+          const expectedTarget = `CURRENT/${childRelative}`;
+          const target = await readlink(child).catch(() => undefined);
+          const resolved = await realpath(child).catch(() => undefined);
+          const expected = currentGeneration === undefined
+            ? undefined
+            : join(currentGeneration, childRelative);
+          const expectedDetails =
+            expected === undefined
+              ? undefined
+              : await lstat(expected).catch(() => undefined);
+          if (
+            target !== expectedTarget ||
+            resolved === undefined ||
+            expected === undefined ||
+            resolved !== expected ||
+            expectedDetails === undefined ||
+            !expectedDetails.isFile() ||
+            expectedDetails.isSymbolicLink()
+          ) {
+            throw cliError({
+              code: "ARTIFACT_OUTPUT_INVALID",
+              message:
+                `Generated compatibility alias "${childRelative}" must target the exact regular file under CURRENT.`,
+              source: childRelative,
+            });
+          }
+        }
+        continue;
+      }
+      const resolved = await realpath(child).catch(() => undefined);
+      if (
+        resolved === undefined ||
+        !isContainedPath(root, resolved) ||
+        !isContainedPath(outputRoot, resolved)
+      ) {
+        throw cliError({
+          code: "ARTIFACT_OUTPUT_INVALID",
+          message:
+            `Generated descendant "${childRelative}" escapes the selected artifact root.`,
+          source: childRelative,
+        });
+      }
+      const details = await lstat(child);
+      if (details.isDirectory()) {
+        await visit(child);
+      }
+    }
+  };
+  await visit(outputRoot);
 }
 
 async function promoteCurrentGeneration(

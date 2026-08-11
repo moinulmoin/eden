@@ -20,7 +20,7 @@ import {
 import {
   join,
 } from "path";
-import { afterAll, describe, expect, test } from "vitest";
+import { afterAll, describe, expect, test, vi } from "vitest";
 
 import { readArtifactGeneration } from "@eden/compiler";
 import {
@@ -71,6 +71,56 @@ afterAll(async () => {
 });
 
 describe("eden CLI project commands", () => {
+  test("fails closed when init cannot capture a verifiable process identity", async () => {
+    const root = await createRoot("eden-cli-init-identity-unavailable-");
+    const psShimDirectory = await createRoot("eden-cli-init-ps-shim-");
+    await writeFile(
+      join(psShimDirectory, "ps"),
+      "#!/bin/sh\nexit 1\n",
+      { encoding: "utf8", mode: 0o755 },
+    );
+    const errors: string[] = [];
+    vi.stubEnv("PATH", psShimDirectory);
+    try {
+      await expect(
+        runEdenCli(["init", "--project", root], {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+        }),
+      ).resolves.toBe(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(errors.join("\n")).toMatch(/identity|verif/i);
+    await expect(readdir(root)).resolves.toEqual([]);
+  });
+
+  test("preserves an active lock that contains only a PID fallback identity", async () => {
+    const root = await createRoot("eden-cli-init-pid-only-lock-");
+    const lockPath = join(root, ".eden-init.lock");
+    const lockContents = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: process.pid,
+      startedAt: `pid:${process.pid}`,
+      token: "pid-only-token",
+    })}\n`;
+    await writeFile(lockPath, lockContents, "utf8");
+    const errors: string[] = [];
+
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+      }),
+    ).resolves.toBe(1);
+
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(lockContents);
+    expect(errors.join("\n")).toMatch(/busy|identity|verif|lock/i);
+    await expect(readdir(root)).resolves.toEqual([".eden-init.lock"]);
+  });
+
   test("initializes a valid scaffold without a secret file", async () => {
     const root = await createRoot("eden-cli-init-");
     const output: string[] = [];
@@ -444,6 +494,62 @@ describe("eden CLI project commands", () => {
       secondGeneration.artifacts.buildMetadata.generationId,
     );
     expect(errors.join("\n")).toMatch(/digest|incoherent|artifact/i);
+  });
+
+  test("rejects an extra generated descendant symlink before same-identity promotion", async () => {
+    const root = await createRoot("eden-cli-extra-generated-symlink-");
+    const outside = await createRoot("eden-cli-extra-generated-symlink-target-");
+    const sourcePath = join(root, "agent/tools/greet.ts");
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(0);
+    const first = await readArtifactGeneration(join(root, ".eden"));
+    const firstSource = await readFile(sourcePath, "utf8");
+    await writeFile(
+      sourcePath,
+      firstSource.replace(
+        "Greet a person by name.",
+        "Second generated identity.",
+      ),
+      "utf8",
+    );
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(0);
+    const second = await readArtifactGeneration(join(root, ".eden"));
+    await writeFile(sourcePath, firstSource, "utf8");
+    await symlink(
+      outside,
+      join(
+        first.directory,
+        "extra-generated-link",
+      ),
+      "dir",
+    );
+    const errors: string[] = [];
+
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(1);
+
+    await expect(
+      realpath(join(root, ".eden/CURRENT")),
+    ).resolves.toBe(second.directory);
+    expect(errors.join("\n")).toMatch(/symlink|symbolic|unsafe|outside/i);
   });
 
   test("does not remove a replacement lock after observing a stale owner", async () => {

@@ -170,6 +170,47 @@ afterEach(async () => {
 });
 
 describe("CLI OS-crash publication recovery", () => {
+  test("recovers an owned stale-lock quarantine left after SIGKILL", async () => {
+    const root = await createRoot("eden-cli-init-quarantine-recovery-");
+    await writeFile(
+      join(root, ".eden-init.lock"),
+      `${JSON.stringify({
+        kind: "eden.init.lock",
+        version: 1,
+        pid: 99_999_999,
+        startedAt: "stale-process-start",
+        token: "stale-token",
+      })}\n`,
+      "utf8",
+    );
+
+    const { child, readyPath } = startCrashChild(
+      "init",
+      root,
+      "before-stale-lock-removal",
+    );
+    await waitForFile(readyPath, child);
+    await killWithSigkill(child);
+    await rm(readyPath, { force: true });
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      readFile(join(root, "agent/agent.ts"), "utf8"),
+    ).resolves.toContain("EdenAgentDefinition");
+    await expect(stat(join(root, ".eden-init.lock"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      readdir(root),
+    ).resolves.toEqual([
+      "agent",
+      "package.json",
+      "wrangler.jsonc",
+    ]);
+  });
+
   test.each([
     ["after-lock-acquire", ""],
     ["after-target-validation", "package.json"],
