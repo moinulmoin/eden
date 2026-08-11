@@ -5,6 +5,7 @@ import { EDEN_VERSIONS } from "@eden/definitions";
 import {
   commitSessionTransaction,
   readJournalEvents,
+  readJournalEventsPage,
 } from "../src/session-journal.js";
 import {
   createOpaqueSessionId,
@@ -32,6 +33,42 @@ async function initializeSession(
 }
 
 describe("EdenSession journal transactions", () => {
+  test("reads committed events in bounded exclusive-cursor pages", async () => {
+    const sessionId = createOpaqueSessionId();
+    const stub = sessionStub(sessionId);
+    await initializeSession(stub, sessionId);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      commitSessionTransaction(state.storage, sessionId, (journal) => {
+        for (let index = 0; index < 300; index += 1) {
+          journal.appendEvent({
+            type: "session.waiting",
+            data: { status: "waiting" },
+            committedAt: `2026-08-11T00:00:${String(index).padStart(3, "0")}Z`,
+          });
+        }
+      });
+    });
+
+    const firstPage = await runInDurableObject(stub, async (_instance, state) =>
+      readJournalEventsPage(state.storage.sql, sessionId, 0),
+    );
+    expect(firstPage).toHaveLength(256);
+    expect(firstPage[0]?.streamIndex).toBe(1);
+    expect(firstPage.at(-1)?.streamIndex).toBe(256);
+
+    const secondPage = await runInDurableObject(stub, async (_instance, state) =>
+      readJournalEventsPage(
+        state.storage.sql,
+        sessionId,
+        firstPage.at(-1)?.streamIndex ?? 0,
+      ),
+    );
+    expect(secondPage).toHaveLength(45);
+    expect(secondPage[0]?.streamIndex).toBe(257);
+    expect(secondPage.at(-1)?.streamIndex).toBe(301);
+  });
+
   test("commits lifecycle events with related rows and monotonic opaque cursors", async () => {
     const sessionId = createOpaqueSessionId();
     const stub = sessionStub(sessionId);

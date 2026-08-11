@@ -14,6 +14,7 @@ import type {
 
 const MAX_EVENT_PAYLOAD_BYTES = 131_072;
 const EVENT_ID_BYTES = 16;
+export const MAX_JOURNAL_EVENTS_PER_PAGE = 256;
 const EDEN_EVENT_TYPES: ReadonlySet<string> = new Set([
   "session.started",
   "turn.started",
@@ -807,6 +808,58 @@ function parseEvent(row: EventRow): EdenEvent {
   } as EdenEvent;
 }
 
+export interface JournalEventPageOptions {
+  readonly endIndex?: number;
+  readonly limit?: number;
+}
+
+export function readJournalEventsPage(
+  sql: EdenSqlStorage,
+  sessionId: string,
+  startIndex = 0,
+  options: JournalEventPageOptions = {},
+): readonly EdenEvent[] {
+  if (!Number.isSafeInteger(startIndex) || startIndex < 0) {
+    throw new Error("Journal start index must be a non-negative safe integer");
+  }
+  const endIndex = options.endIndex;
+  if (
+    endIndex !== undefined &&
+    (!Number.isSafeInteger(endIndex) || endIndex < 0)
+  ) {
+    throw new Error("Journal end index must be a non-negative safe integer");
+  }
+  const limit = options.limit ?? MAX_JOURNAL_EVENTS_PER_PAGE;
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > MAX_JOURNAL_EVENTS_PER_PAGE
+  ) {
+    throw new Error("Journal page limit is invalid");
+  }
+  if (endIndex !== undefined && endIndex <= startIndex) return [];
+
+  const conditions = ["session_id = ?", "stream_index > ?"];
+  const bindings: EdenSqlValue[] = [sessionId, startIndex];
+  if (endIndex !== undefined) {
+    conditions.push("stream_index <= ?");
+    bindings.push(endIndex);
+  }
+
+  const rows = sql
+    .exec<EventRow>(
+      `SELECT stream_index, event_id, type, payload_json, committed_at
+       FROM events
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY stream_index ASC
+       LIMIT ?`,
+      ...bindings,
+      limit,
+    )
+    .toArray();
+  return rows.map((row) => parseEvent(row));
+}
+
 export function readJournalEvents(
   sql: EdenSqlStorage,
   sessionId: string,
@@ -816,17 +869,18 @@ export function readJournalEvents(
     throw new Error("Journal start index must be a non-negative safe integer");
   }
 
-  return sql
-    .exec<EventRow>(
-      `SELECT stream_index, event_id, type, payload_json, committed_at
-       FROM events
-       WHERE session_id = ? AND stream_index > ?
-       ORDER BY stream_index ASC`,
-      sessionId,
-      startIndex,
-    )
-    .toArray()
-    .map((row) => parseEvent(row));
+  const highWater = readLatestJournalCursor(sql, sessionId);
+  const events: EdenEvent[] = [];
+  let cursor = startIndex;
+  while (cursor < highWater) {
+    const page = readJournalEventsPage(sql, sessionId, cursor, {
+      endIndex: highWater,
+    });
+    if (page.length === 0) break;
+    events.push(...page);
+    cursor = page[page.length - 1]?.streamIndex ?? cursor;
+  }
+  return events;
 }
 
 export function readLatestJournalCursor(

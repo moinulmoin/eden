@@ -26,7 +26,7 @@ import {
 } from "./session-identity.js";
 import {
   commitSessionTransaction,
-  readJournalEvents,
+  readJournalEventsPage,
   readLatestJournalCursor,
 } from "./session-journal.js";
 import {
@@ -586,15 +586,22 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       );
     }
 
-    const events = readJournalEvents(
+    const latestCursor = readLatestJournalCursor(this.ctx.storage.sql, sessionId);
+    const events = readJournalEventsPage(
       this.ctx.storage.sql,
       sessionId,
       startIndex,
+      { endIndex: latestCursor },
     );
     return jsonResponse({
       sessionId,
       startIndex,
-      latestCursor: readLatestJournalCursor(this.ctx.storage.sql, sessionId),
+      latestCursor,
+      nextCursor:
+        events.at(-1)?.streamIndex !== undefined &&
+        (events.at(-1)?.streamIndex ?? latestCursor) < latestCursor
+          ? events.at(-1)?.streamIndex ?? null
+          : null,
       events,
     });
   }
@@ -898,15 +905,22 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
       );
     }
 
-    const events = readJournalEvents(
+    const latestCursor = readLatestJournalCursor(this.ctx.storage.sql, sessionId);
+    const events = readJournalEventsPage(
       this.ctx.storage.sql,
       sessionId,
       body.startIndex,
+      { endIndex: latestCursor },
     );
     return jsonResponse({
       sessionId,
       startIndex: body.startIndex,
-      latestCursor: readLatestJournalCursor(this.ctx.storage.sql, sessionId),
+      latestCursor,
+      nextCursor:
+        events.at(-1)?.streamIndex !== undefined &&
+        (events.at(-1)?.streamIndex ?? latestCursor) < latestCursor
+          ? events.at(-1)?.streamIndex ?? null
+          : null,
       events,
     });
   }
@@ -934,9 +948,7 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
     }
 
     const sql = this.ctx.storage.sql;
-    const highWater = body.follow
-      ? null
-      : readLatestJournalCursor(sql, sessionId);
+    const highWater = body.follow ? null : readLatestJournalCursor(sql, sessionId);
     let cursor = body.startIndex;
     let cancelled = false;
 
@@ -945,13 +957,11 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
         const pump = async (): Promise<void> => {
           try {
             while (!cancelled) {
-              const events = readJournalEvents(sql, sessionId, cursor);
+              const events = readJournalEventsPage(sql, sessionId, cursor, {
+                ...(highWater === null ? {} : { endIndex: highWater }),
+              });
               let emitted = false;
               for (const event of events) {
-                if (highWater !== null && event.streamIndex > highWater) {
-                  break;
-                }
-                if (event.streamIndex <= cursor) continue;
                 controller.enqueue(eventLine(event));
                 cursor = event.streamIndex;
                 emitted = true;

@@ -7,7 +7,8 @@ import type {
 import type { EdenModelResult } from "./model-adapter.js";
 import {
   commitSessionTransaction,
-  readJournalEvents,
+  MAX_JOURNAL_EVENTS_PER_PAGE,
+  readJournalEventsPage,
   readLatestJournalCursor,
   type EdenSessionStorage,
   type EdenSqlStorage,
@@ -154,18 +155,29 @@ export async function deliverNewEvents(
   if (onEvent === undefined) {
     return readLatestJournalCursor(storage.sql, sessionId);
   }
-  const events = readJournalEvents(storage.sql, sessionId, cursor);
+
   let deliveredCursor = cursor;
-  for (const event of events) {
-    try {
-      await onEvent(event);
-    } catch {
-      // Delivery is best-effort transport work. Stop at the first failed
-      // callback so the next delivery attempt replays this event in order,
-      // while the canonical turn continues from its committed SQLite state.
-      break;
+  while (true) {
+    const events = readJournalEventsPage(
+      storage.sql,
+      sessionId,
+      deliveredCursor,
+    );
+    if (events.length === 0) break;
+
+    for (const event of events) {
+      try {
+        await onEvent(event);
+      } catch {
+        // Delivery is best-effort transport work. Stop at the first failed
+        // callback so the next delivery attempt replays this event in order,
+        // while the canonical turn continues from its committed SQLite state.
+        return deliveredCursor;
+      }
+      deliveredCursor = event.streamIndex;
     }
-    deliveredCursor = event.streamIndex;
+
+    if (events.length < MAX_JOURNAL_EVENTS_PER_PAGE) break;
   }
   return deliveredCursor;
 }

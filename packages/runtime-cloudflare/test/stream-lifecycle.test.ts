@@ -1,7 +1,8 @@
-import { env, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 
 import { createSessionObjectName } from "../src/session-identity.js";
+import { commitSessionTransaction } from "../src/session-journal.js";
 
 const BEARER = "eden-unit-auth";
 
@@ -55,6 +56,24 @@ async function acceptTurn(sessionId: string): Promise<void> {
   await response.arrayBuffer();
 }
 
+async function appendCommittedHistory(
+  sessionId: string,
+  count: number,
+): Promise<void> {
+  const stub = env.EDEN_SESSIONS.getByName(createSessionObjectName(sessionId));
+  await runInDurableObject(stub, async (_instance, state) => {
+    commitSessionTransaction(state.storage, sessionId, (journal) => {
+      for (let index = 0; index < count; index += 1) {
+        journal.appendEvent({
+          type: "session.waiting",
+          data: { status: "waiting" },
+          committedAt: `2026-08-11T00:00:${String(index).padStart(2, "0")}.000Z`,
+        });
+      }
+    });
+  });
+}
+
 function streamRequest(
   sessionId: string,
   query: string,
@@ -104,6 +123,37 @@ describe("Eden durable NDJSON lifecycle stream", () => {
         readonly content?: string;
       })?.content,
     ).toContain("✓");
+  }, 15_000);
+
+  test("follow mode emits backlog and waits for later committed events", async () => {
+    const sessionId = await createSession();
+    const response = await SELF.fetch(
+      streamRequest(sessionId, "startIndex=0&follow=true"),
+    );
+    expect(response.status).toBe(200);
+
+    const streamPromise = readNdjson(response);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await acceptTurn(sessionId);
+
+    const events = await streamPromise;
+    expect(events.map((event) => event.type)).toEqual([
+      "session.started",
+      "turn.started",
+      "message.received",
+      "step.started",
+      "actions.requested",
+      "action.result",
+      "step.completed",
+      "step.started",
+      "message.completed",
+      "step.completed",
+      "turn.completed",
+      "session.waiting",
+    ]);
+    expect(events.map((event) => event.streamIndex)).toEqual(
+      Array.from({ length: 12 }, (_value, index) => index + 1),
+    );
   }, 15_000);
 
   test("captures a bounded high-water range and resumes strictly after a cursor", async () => {
@@ -165,6 +215,55 @@ describe("Eden durable NDJSON lifecycle stream", () => {
     const remaining = await readNdjson(resumed);
     expect(remaining.some((event) => event.type === "session.waiting")).toBe(true);
     expect(remaining.every((event) => Number(event.streamIndex) > savedCursor)).toBe(
+      true,
+    );
+  }, 15_000);
+
+  test("streams long histories in bounded resumable pages across eviction", async () => {
+    const sessionId = await createSession();
+    await appendCommittedHistory(sessionId, 300);
+
+    const initialResponse = await SELF.fetch(
+      streamRequest(sessionId, "startIndex=0&follow=false"),
+    );
+    const initial = await readNdjson(initialResponse);
+    expect(initial).toHaveLength(301);
+    expect(initial.map((event) => event.streamIndex)).toEqual(
+      Array.from({ length: 301 }, (_value, index) => index + 1),
+    );
+
+    const resumedResponse = await SELF.fetch(
+      streamRequest(sessionId, "startIndex=127&follow=false"),
+    );
+    const resumed = await readNdjson(resumedResponse);
+    expect(resumed).toHaveLength(174);
+    expect(resumed[0]?.streamIndex).toBe(128);
+    expect(resumed.at(-1)?.streamIndex).toBe(301);
+    expect(resumed.every((event) => Number(event.streamIndex) > 127)).toBe(true);
+
+    const stub = env.EDEN_SESSIONS.getByName(createSessionObjectName(sessionId));
+    const { evictDurableObject } = await import("cloudflare:test");
+    await evictDurableObject(stub);
+
+    const afterEvictionResponse = await SELF.fetch(
+      streamRequest(sessionId, "startIndex=0&follow=false"),
+    );
+    const afterEviction = await readNdjson(afterEvictionResponse);
+    expect(afterEviction.map((event) => event.streamIndex)).toEqual(
+      initial.map((event) => event.streamIndex),
+    );
+    expect(afterEviction.map((event) => event.eventId)).toEqual(
+      initial.map((event) => event.eventId),
+    );
+
+    const resumedAfterEvictionResponse = await SELF.fetch(
+      streamRequest(sessionId, "startIndex=127&follow=false"),
+    );
+    const resumedAfterEviction = await readNdjson(resumedAfterEvictionResponse);
+    expect(resumedAfterEviction.map((event) => event.eventId)).toEqual(
+      resumed.map((event) => event.eventId),
+    );
+    expect(resumedAfterEviction.every((event) => Number(event.streamIndex) > 127)).toBe(
       true,
     );
   }, 15_000);
