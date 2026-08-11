@@ -1083,6 +1083,154 @@ describe("artifact generation", () => {
     });
   });
 
+  test("traces awaited async and function-returned global aliases", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Awaited alias fixture\n",
+      "agent/tools/awaited-alias.ts": `
+        async function getGlobal() {
+          return globalThis;
+        }
+        function getSelf() {
+          return self;
+        }
+        export default {
+          description: "Awaited and returned globals.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const runtime = await getGlobal();
+            const worker = getSelf();
+            return {
+              value: runtime.EDEN_API_KEY ?? worker.EDEN_API_KEY ?? input.name,
+            };
+          }
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/awaited-alias.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("traces awaited returns through imported helper modules", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Imported awaited alias fixture\n",
+      "agent/runtime.ts": `
+        export async function getRuntime() {
+          return globalThis;
+        }
+      `,
+      "agent/tools/imported-awaited-alias.ts": `
+        import { getRuntime } from "../runtime.js";
+        export default {
+          description: "Imported awaited global.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const runtime = await getRuntime();
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          }
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: expect.stringMatching(
+            /agent\/(?:runtime|tools\/imported-awaited-alias)\.ts/u,
+          ),
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
+      "Object.constructor",
+      `execute(input) { return { value: Object.constructor(input.name) }; }`,
+    ],
+    [
+      "globalThis Object constructor chain",
+      `execute(input) { return { value: globalThis.Object.constructor(input.name) }; }`,
+    ],
+    [
+      "aliased Object constructor chain",
+      `
+        execute(input) {
+          const object = Object;
+          const create = object.constructor;
+          return { value: create(input.name) };
+        }
+      `,
+    ],
+    [
+      "computed Object constructor chain",
+      `
+        execute(input) {
+          const create = globalThis["Object"]["constructor"];
+          return { value: create(input.name) };
+        }
+      `,
+    ],
+  ])("rejects %s dynamic code construction", async (_name, executeSource) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Constructor chain fixture\n",
+      "agent/tools/constructor-chain.ts": toolSource.replace(
+        'execute(input) {\n      return { greeting: "Hello " + input.name };\n    }',
+        executeSource,
+      ),
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+          source: "agent/tools/constructor-chain.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each(["globalThis", "self"])(
+    "rejects unknown properties on %s",
+    async (globalName) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "Unknown global property fixture\n",
+        "agent/tools/unknown-global-property.ts": toolSource.replace(
+          'return { greeting: "Hello " + input.name };',
+          `return { greeting: ${globalName}.EDEN_UNSUPPORTED_PROPERTY ?? input.name };`,
+        ),
+      });
+
+      await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            code: "MODULE_AMBIENT_BINDING",
+            source: "agent/tools/unknown-global-property.ts",
+            line: expect.any(Number),
+            column: expect.any(Number),
+          }),
+        ]),
+      });
+    },
+  );
+
   test.each([
     [
       "direct eval",
@@ -1269,4 +1417,52 @@ describe("artifact generation", () => {
       }),
     ]);
   });
+
+  test.each([
+    [
+      "ambient binding",
+      `export const read = () => globalThis.EDEN_API_KEY;\n`,
+      "MODULE_AMBIENT_BINDING",
+    ],
+    [
+      "constructor-indirected dynamic code",
+      `export const read = () => Object.constructor("return 1");\n`,
+      "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+    ],
+  ])(
+    "validates selected dependency %s with Worker semantics",
+    async (_name, dependencySource, diagnosticCode) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "Selected dependency semantic fixture\n",
+        "agent/tools/selected-semantic-dependency.ts": `
+          import { read } from "selected-semantic-fixture";
+          export default {
+            description: "Uses a selected dependency.",
+            inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+            execute(input) {
+              return { value: read() ?? input.name };
+            }
+          };
+        `,
+        "node_modules/selected-semantic-fixture/package.json": JSON.stringify({
+          name: "selected-semantic-fixture",
+          type: "module",
+          exports: "./index.js",
+        }),
+        "node_modules/selected-semantic-fixture/index.js": dependencySource,
+      });
+
+      await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            code: diagnosticCode,
+            source: "node_modules/selected-semantic-fixture/index.js",
+            line: expect.any(Number),
+            column: expect.any(Number),
+          }),
+        ]),
+      });
+    },
+  );
 });
