@@ -136,6 +136,20 @@ Successful deployment output includes the selected generation ID and reachable
 Worker URL. A deployment failure is reported separately from compatibility,
 propagation, authentication, lifecycle, model, and cleanup failures.
 
+If a validation harness provisions the secret separately instead of using
+`eden deploy`, the pinned Wrangler command must remain explicitly scoped to the
+same unique Worker:
+
+```sh
+printf '%s' "$EDEN_BEARER_SECRET" |
+  corepack pnpm exec wrangler secret put EDEN_BEARER_SECRET \
+    --name "$WORKER_NAME" --config "$PROJECT_ROOT/wrangler.jsonc"
+```
+
+Keep `--env` off these name-scoped secret commands intentionally. In Wrangler
+4.120, adding `--env` selects an environment-suffixed Worker rather than the
+exact unique Worker named by `--name`.
+
 ## Clean-room local validation
 
 The following walkthrough uses only the repository checkout and the approved
