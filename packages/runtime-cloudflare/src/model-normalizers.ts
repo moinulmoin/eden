@@ -432,7 +432,11 @@ export function normalizeModelResult(
       }
       return normalizedText;
     });
-    text = normalizedTextParts.join("");
+    const joinedText = normalizedTextParts.join("");
+    if (boundedString(joinedText) === undefined) {
+      throw new Error("Model text exceeds the bounded output limit");
+    }
+    text = joinedText;
   }
 
   const calls = uniqueCalls([

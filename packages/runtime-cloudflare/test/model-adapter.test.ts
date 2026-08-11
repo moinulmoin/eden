@@ -200,6 +200,64 @@ describe("Eden model adapter", () => {
     ]);
   });
 
+  test("rejects multipart model text whose joined UTF-8 content exceeds the bound", async () => {
+    const firstPart = "é".repeat(32 * 1024);
+    const secondPart = "b";
+    const adapter = createModelAdapter(async () => ({
+      content: [
+        { type: "text", text: firstPart },
+        { type: "text", text: secondPart },
+      ],
+      finishReason: "stop",
+    }));
+
+    await expect(
+      adapter.call({
+        ...request,
+        tools: undefined,
+        toolChoice: undefined,
+      }),
+    ).resolves.toEqual({
+      status: "error",
+      error: {
+        code: "model_result_invalid",
+        message: "Model result was invalid.",
+        retryable: false,
+        correlation,
+      },
+    });
+  });
+
+  test("normalizes in-bound multipart model text without provider metadata", async () => {
+    const adapter = createModelAdapter(async () => ({
+      content: [
+        { type: "text", text: "Hello " },
+        { type: "text", text: "from Eden." },
+      ],
+      finishReason: "stop",
+      providerMetadata: {
+        workersai: { binding: "sentinel-binding" },
+      },
+    }));
+
+    await expect(
+      adapter.call({
+        ...request,
+        tools: undefined,
+        toolChoice: undefined,
+      }),
+    ).resolves.toEqual({
+      status: "ok",
+      result: {
+        text: "Hello from Eden.",
+        calls: [],
+        results: [],
+        finishReason: "stop",
+        correlation,
+      },
+    });
+  });
+
   test("returns bounded Eden failures for provider-shaped failures and invalid results", async () => {
     const failed = normalizeModelFailure(
       {

@@ -107,6 +107,7 @@ function deterministicAdapter(
   output: EdenJsonValue,
   options: {
     readonly finalFailure?: boolean;
+    readonly finalMultipart?: boolean;
     readonly invalidInput?: boolean;
     readonly firstFailure?: boolean;
   } = {},
@@ -169,6 +170,16 @@ function deterministicAdapter(
       output,
     });
 
+    if (options.finalMultipart) {
+      return {
+        content: [
+          { type: "text", text: "é".repeat(32 * 1024) },
+          { type: "text", text: "b" },
+        ],
+        finishReason: "stop",
+      };
+    }
+
     return {
       text: `final:${JSON.stringify(output)}`,
       finishReason: "stop",
@@ -186,6 +197,7 @@ async function runFixture(
   output: EdenJsonValue,
   options: {
     readonly finalFailure?: boolean;
+    readonly finalMultipart?: boolean;
     readonly invalidInput?: boolean;
     readonly firstFailure?: boolean;
   } = {},
@@ -359,6 +371,57 @@ describe("Eden bounded turn runner", () => {
     ]);
     expect(JSON.stringify(run.events)).not.toContain("sentinel");
     expect(JSON.stringify(run.result)).not.toContain("sentinel");
+  });
+
+  test("rejects aggregate final content before committing an assistant message", async () => {
+    const run = await runFixture(
+      { answer: "aggregate" },
+      { finalMultipart: true },
+    );
+
+    expect(run.result).toMatchObject({
+      status: "failed",
+      error: {
+        code: "final_response_invalid",
+        message: "Final response was invalid.",
+        retryable: false,
+      },
+    });
+    expect(run.modelCalls()).toBe(2);
+    expect(run.toolExecutions()).toBe(1);
+    expect(run.events.map((event) => event.type)).toEqual([
+      "session.started",
+      "turn.started",
+      "message.received",
+      "step.started",
+      "actions.requested",
+      "action.result",
+      "step.completed",
+      "step.started",
+      "step.failed",
+      "turn.failed",
+      "session.failed",
+    ]);
+    expect(run.events.some((event) => event.type === "message.completed")).toBe(
+      false,
+    );
+    expect(run.events.some((event) => event.type === "turn.completed")).toBe(false);
+    expect(run.events.some((event) => event.type === "session.waiting")).toBe(false);
+
+    const assistantMessages = await runInDurableObject(
+      sessionStub(run.sessionId),
+      async (_instance, state) =>
+        state.storage.sql
+          .exec<{ readonly message_id: string }>(
+            `SELECT message_id
+             FROM messages
+             WHERE session_id = ? AND turn_id = ? AND role = 'assistant'`,
+            run.sessionId,
+            run.turnId,
+          )
+          .toArray(),
+    );
+    expect(assistantMessages).toEqual([]);
   });
 
   test("durably records invalid input without invoking the tool", async () => {
