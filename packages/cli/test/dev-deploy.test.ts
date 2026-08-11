@@ -21,6 +21,7 @@ import {
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import { readArtifactGeneration } from "@eden/compiler";
 import {
   EDEN_LOCAL_HOST,
   EDEN_LOCAL_INSPECTOR_PORT,
@@ -47,7 +48,9 @@ async function initRoot(root: string): Promise<void> {
 
 async function artifactDigest(root: string): Promise<string> {
   return createHash("sha256")
-    .update(await readFile(join(root, ".eden/agent-bundle.mjs")))
+    .update(
+      (await readArtifactGeneration(join(root, ".eden"))).artifacts.bundle,
+    )
     .digest("hex");
 }
 

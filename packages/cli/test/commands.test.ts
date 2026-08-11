@@ -20,6 +20,7 @@ import {
 } from "path";
 import { afterAll, describe, expect, test } from "vitest";
 
+import { readArtifactGeneration } from "@eden/compiler";
 import {
   EDEN_CLI_COMMANDS,
   runEdenCli,
@@ -42,17 +43,21 @@ async function sha256(path: string): Promise<string> {
 
 async function artifactHashes(root: string): Promise<Record<string, string>> {
   const output = join(root, ".eden");
-  const names = [
-    "agent-bundle.mjs",
-    "build-metadata.json",
-    "diagnostics.json",
-    "discovery.json",
-    "manifest.json",
-    "module-map.json",
-  ] as const;
+  const generation = (await readArtifactGeneration(output)).artifacts;
+  const values = {
+    "agent-bundle.mjs": generation.bundle,
+    "build-metadata.json": JSON.stringify(generation.buildMetadata),
+    "diagnostics.json": JSON.stringify(generation.diagnostics),
+    "discovery.json": JSON.stringify(generation.discovery),
+    "manifest.json": JSON.stringify(generation.manifest),
+    "module-map.json": JSON.stringify(generation.moduleMap),
+  } as const;
   return Object.fromEntries(
     await Promise.all(
-      names.map(async (name) => [name, await sha256(join(output, name))]),
+      Object.entries(values).map(async ([name, contents]) => [
+        name,
+        createHash("sha256").update(contents).digest("hex"),
+      ]),
     ),
   );
 }
@@ -282,10 +287,9 @@ describe("eden CLI project commands", () => {
       }),
     ).resolves.toBe(0);
 
-    const manifest = JSON.parse(
-      await readFile(join(root, ".eden/manifest.json"), "utf8"),
-    ) as { bundleDigest: string; tools: readonly { name: string }[] };
-    const bundle = await readFile(join(root, ".eden/agent-bundle.mjs"), "utf8");
+    const generation = (await readArtifactGeneration(join(root, ".eden"))).artifacts;
+    const manifest = generation.manifest;
+    const bundle = generation.bundle;
     expect(manifest.bundleDigest).toBe(
       createHash("sha256").update(bundle).digest("hex"),
     );

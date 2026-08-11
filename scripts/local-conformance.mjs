@@ -493,30 +493,18 @@ async function assertCleanRoomArtifacts(projectRoot) {
   }
 
   const artifactNames = (await readdir(join(projectRoot, ".eden"))).sort();
-  const expectedArtifacts = [
-    "CURRENT",
-    "agent-bundle.mjs",
-    "build-metadata.json",
-    "diagnostics.json",
-    "discovery.json",
-    "generations",
-    "manifest.json",
-    "module-map.json",
-  ];
-  if (JSON.stringify(artifactNames) !== JSON.stringify(expectedArtifacts)) {
-    throw new Error("eden build produced an incomplete artifact generation.");
+  for (const required of ["CURRENT", "generations"]) {
+    if (!artifactNames.includes(required)) {
+      throw new Error(`eden build produced no ${required} artifact root.`);
+    }
   }
-
-  const manifest = JSON.parse(
-    await readFile(join(projectRoot, ".eden", "manifest.json"), "utf8"),
+  const { readArtifactGeneration } = await import(
+    "../packages/compiler/dist/index.js"
   );
-  const metadata = JSON.parse(
-    await readFile(join(projectRoot, ".eden", "build-metadata.json"), "utf8"),
-  );
-  const bundle = await readFile(
-    join(projectRoot, ".eden", "agent-bundle.mjs"),
-    "utf8",
-  );
+  const generation = await readArtifactGeneration(join(projectRoot, ".eden"));
+  const manifest = generation.artifacts.manifest;
+  const metadata = generation.artifacts.buildMetadata;
+  const bundle = generation.artifacts.bundle;
   if (
     manifest.bundleDigest !== sha256(bundle) ||
     metadata.bundleDigest !== manifest.bundleDigest ||
@@ -526,16 +514,23 @@ async function assertCleanRoomArtifacts(projectRoot) {
   ) {
     throw new Error("Generated manifest and bundle metadata are incoherent.");
   }
+  return generation;
 }
 
-async function assertNoSecretOrPlatformLocator(projectRoot, secret) {
+async function assertNoSecretOrPlatformLocator(projectRoot, secret, generation) {
   const forbidden = [secret];
+  const generatedContents = JSON.stringify(generation.artifacts);
+  if (forbidden.some((value) => generatedContents.includes(value))) {
+    throw new Error("Generated artifact content leaked a forbidden value.");
+  }
+  const artifactRoot = join(projectRoot, ".eden");
   const pending = [projectRoot];
   while (pending.length > 0) {
     const current = pending.pop();
     const entries = await readdir(current, { withFileTypes: true });
     for (const entry of entries) {
       const path = join(current, entry.name);
+      if (path === artifactRoot) continue;
       if (entry.isDirectory()) {
         pending.push(path);
         continue;
@@ -568,8 +563,8 @@ async function runLocalFirstUse(
 ) {
   await runCli(repositoryRoot, projectRoot, ["init", "--project", projectRoot]);
   await runCli(repositoryRoot, projectRoot, ["build", "--project", projectRoot]);
-  await assertCleanRoomArtifacts(projectRoot);
-  await assertNoSecretOrPlatformLocator(projectRoot, secret);
+  const generation = await assertCleanRoomArtifacts(projectRoot);
+  await assertNoSecretOrPlatformLocator(projectRoot, secret, generation);
 
   const devProcess = startDev(repositoryRoot, projectRoot, secret);
   registerDevProcess(devProcess);
@@ -666,7 +661,7 @@ async function runLocalFirstUse(
     throw new Error("The local NDJSON lifecycle or cursor reconnect was invalid.");
   }
   assertSafePublicValue(allEvents, secret);
-  await assertNoSecretOrPlatformLocator(projectRoot, secret);
+  await assertNoSecretOrPlatformLocator(projectRoot, secret, generation);
 
   return {
     lifecycle,

@@ -106,6 +106,19 @@ export interface EdenCompiler {
   build(options: EdenCompilerOptions): Promise<EdenCompilerResult>;
 }
 
+export interface EdenArtifactGeneration {
+  readonly directory: string;
+  readonly artifacts: EdenArtifactSet;
+}
+
+export interface EdenArtifactGenerationReadOptions {
+  /**
+   * Test-only publication race hook. Production consumers should omit this
+   * callback and rely on the resolved directory returned by this reader.
+   */
+  readonly afterCurrentResolution?: () => void | Promise<void>;
+}
+
 export class EdenCompilerError extends Error {
   readonly diagnostics: readonly EdenDiagnostic[];
 
@@ -3060,10 +3073,10 @@ function assertPublishedArtifactCoherence(
   }
 }
 
-async function assertPublishedGeneration(
+async function readPublishedGeneration(
   projectRoot: string,
   directory: string,
-): Promise<void> {
+): Promise<EdenArtifactSet> {
   try {
     await assertNoGeneratedSymlinks(projectRoot, directory);
     const directoryDetails = await lstat(directory);
@@ -3129,6 +3142,14 @@ async function assertPublishedGeneration(
         ),
       ]);
     }
+    return {
+      discovery,
+      diagnostics: diagnostics as readonly EdenDiagnostic[],
+      manifest,
+      moduleMap,
+      bundle,
+      buildMetadata,
+    };
   } catch (error: unknown) {
     if (error instanceof EdenCompilerError) throw error;
     throw new EdenCompilerError("Published artifact generation is invalid", [
@@ -3138,6 +3159,108 @@ async function assertPublishedGeneration(
       ),
     ]);
   }
+}
+
+async function assertPublishedGeneration(
+  projectRoot: string,
+  directory: string,
+): Promise<void> {
+  await readPublishedGeneration(projectRoot, directory);
+}
+
+/**
+ * Resolve CURRENT exactly once, then load and validate all six artifacts from
+ * that immutable generation directory. Compatibility aliases at the output
+ * root are intentionally not consulted.
+ */
+export async function readArtifactGeneration(
+  outputDirectory: string,
+  options: EdenArtifactGenerationReadOptions = {},
+): Promise<EdenArtifactGeneration> {
+  const outputDetails = await lstat(outputDirectory).catch(() => undefined);
+  if (
+    outputDetails === undefined ||
+    !outputDetails.isDirectory() ||
+    outputDetails.isSymbolicLink()
+  ) {
+    throw new EdenCompilerError("Artifact output is invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Artifact output "${outputDirectory}" must be a real directory.`,
+        outputDirectory,
+      ),
+    ]);
+  }
+  const outputRoot = await realpath(outputDirectory).catch(() => undefined);
+  if (outputRoot === undefined) {
+    throw new EdenCompilerError("Artifact output is invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Artifact output "${outputDirectory}" could not be resolved.`,
+        outputDirectory,
+      ),
+    ]);
+  }
+  const generationsDirectory = join(outputRoot, "generations");
+  const generationsDetails = await lstat(generationsDirectory).catch(
+    () => undefined,
+  );
+  if (
+    generationsDetails === undefined ||
+    !generationsDetails.isDirectory() ||
+    generationsDetails.isSymbolicLink()
+  ) {
+    throw new EdenCompilerError("Artifact generations are invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Artifact output "${outputDirectory}" must contain a real generations directory.`,
+        "generations",
+      ),
+    ]);
+  }
+  const currentPointer = join(outputRoot, "CURRENT");
+  const currentDetails = await lstat(currentPointer).catch(() => undefined);
+  if (currentDetails === undefined || !currentDetails.isSymbolicLink()) {
+    throw new EdenCompilerError("Artifact CURRENT pointer is invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Artifact output "${outputDirectory}" CURRENT must be a symbolic link to one generation.`,
+        "CURRENT",
+      ),
+    ]);
+  }
+  const directory = await realpath(currentPointer).catch(() => undefined);
+  if (
+    directory === undefined ||
+    !isWithinRoot(generationsDirectory, directory)
+  ) {
+    throw new EdenCompilerError("Artifact CURRENT pointer is unsafe", [
+      diagnostic(
+        "OUTPUT_OUTSIDE_PROJECT",
+        `Artifact output "${outputDirectory}" CURRENT must resolve inside its generations directory.`,
+        "CURRENT",
+      ),
+    ]);
+  }
+  const directoryDetails = await lstat(directory).catch(() => undefined);
+  if (
+    directoryDetails === undefined ||
+    !directoryDetails.isDirectory() ||
+    directoryDetails.isSymbolicLink()
+  ) {
+    throw new EdenCompilerError("Artifact CURRENT pointer is invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Artifact output "${outputDirectory}" CURRENT must target a real generation directory.`,
+        "CURRENT",
+      ),
+    ]);
+  }
+  await options.afterCurrentResolution?.();
+  return {
+    directory,
+    artifacts: await readPublishedGeneration(outputRoot, directory),
+  };
 }
 
 async function outputDirectoryFor(

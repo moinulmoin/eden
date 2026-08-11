@@ -6,12 +6,13 @@ import {
   mkdir,
   readdir,
   readFile,
+  realpath,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
 
@@ -19,6 +20,7 @@ import {
   EdenCompilerError,
   buildProject,
   createArtifactIdentity,
+  readArtifactGeneration,
 } from "../src/index.js";
 
 const temporaryRoots: string[] = [];
@@ -87,31 +89,10 @@ const toolSource = `
 
 async function readGeneration(root: string) {
   const outputDirectory = join(root, ".eden");
-  const [discovery, diagnostics, manifest, moduleMap, buildMetadata, bundle] =
-    await Promise.all([
-      readFile(join(outputDirectory, "discovery.json"), "utf8"),
-      readFile(join(outputDirectory, "diagnostics.json"), "utf8"),
-      readFile(join(outputDirectory, "manifest.json"), "utf8"),
-      readFile(join(outputDirectory, "module-map.json"), "utf8"),
-      readFile(join(outputDirectory, "build-metadata.json"), "utf8"),
-      readFile(join(outputDirectory, "agent-bundle.mjs"), "utf8"),
-    ]);
+  const generation = await readArtifactGeneration(outputDirectory);
   return {
-    discovery: JSON.parse(discovery) as unknown,
-    diagnostics: JSON.parse(diagnostics) as unknown,
-    manifest: JSON.parse(manifest) as {
-      bundleDigest: string;
-      tools: readonly { name: string; module: string }[];
-    },
-    moduleMap: JSON.parse(moduleMap) as {
-      tools: readonly { name: string; module: string }[];
-    },
-    buildMetadata: JSON.parse(buildMetadata) as {
-      generationId: string;
-      createdAt: string;
-      bundleDigest: string;
-    },
-    bundle,
+    directory: generation.directory,
+    ...generation.artifacts,
   };
 }
 
@@ -148,7 +129,7 @@ describe("artifact generation", () => {
 
     await rm(join(root, "agent"), { recursive: true, force: true });
     const bundle = await import(
-      `${join(root, ".eden", "agent-bundle.mjs")}?artifact-only`
+      `${generation.directory}/agent-bundle.mjs?artifact-only`
     );
     const artifact = bundle.default as {
       toolSchemas: Record<string, unknown>;
@@ -203,6 +184,69 @@ describe("artifact generation", () => {
         ),
       ),
     ).toEqual({ greeting: "Hello Eden" });
+  });
+
+  test("keeps a resolved generation stable when CURRENT flips during reads", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Stable reader fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const first = await readArtifactGeneration(join(root, ".eden"));
+
+    await writeFile(
+      join(root, "agent/tools/greet.ts"),
+      toolSource.replace("Greet a person.", "Second generation."),
+      "utf8",
+    );
+    await buildProject({ projectRoot: root });
+    const second = await readArtifactGeneration(join(root, ".eden"));
+    expect(second.directory).not.toBe(first.directory);
+
+    const currentPointer = join(root, ".eden", "CURRENT");
+    const outputRoot = await realpath(join(root, ".eden"));
+    await rm(currentPointer, { force: true });
+    await symlink(
+      relative(outputRoot, first.directory),
+      currentPointer,
+    );
+    for (const artifactName of [
+      "discovery.json",
+      "diagnostics.json",
+      "manifest.json",
+      "module-map.json",
+      "agent-bundle.mjs",
+      "build-metadata.json",
+    ]) {
+      const alias = join(outputRoot, artifactName);
+      await rm(alias, { force: true });
+      await symlink(
+        relative(outputRoot, join(second.directory, artifactName)),
+        alias,
+      );
+    }
+
+    const resolved = await readArtifactGeneration(join(root, ".eden"), {
+      afterCurrentResolution: async () => {
+        await rm(currentPointer, { force: true });
+        await symlink(
+          relative(outputRoot, second.directory),
+          currentPointer,
+        );
+      },
+    });
+
+    expect(resolved.directory).toBe(first.directory);
+    expect(resolved.artifacts.buildMetadata.generationId).toBe(
+      first.artifacts.buildMetadata.generationId,
+    );
+    expect(resolved.artifacts.manifest.tools[0]?.description).toBe(
+      "Greet a person.",
+    );
+    expect(resolved.artifacts.bundle).toContain("Greet a person.");
+    expect(resolved.artifacts.bundle).not.toContain("Second generation.");
   });
 
   test("keeps executable identity stable while timestamps remain diagnostic", async () => {
@@ -607,8 +651,12 @@ describe("artifact generation", () => {
       ]),
     });
     await expect(
-      readFile(join(root, ".eden", "manifest.json"), "utf8"),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+      readArtifactGeneration(join(root, ".eden")),
+    ).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "OUTPUT_INVALID" }),
+      ]),
+    });
   });
 
   test("rejects undeclared identifiers with source locations", async () => {

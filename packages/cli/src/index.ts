@@ -45,15 +45,14 @@ import {
 
 import {
   buildProject,
-  createArtifactIdentity,
   EdenCompilerError,
+  readArtifactGeneration,
   resolveContainedProjectPath,
   resolveProjectRoot,
 } from "@eden/compiler";
 import type {
+  EdenArtifactGeneration,
   EdenDiagnostic,
-  EdenManifest,
-  EdenModuleMap,
 } from "@eden/compiler";
 
 const require = createRequire(import.meta.url);
@@ -1210,45 +1209,18 @@ async function assertProjectInputsUnchanged(
 
 async function assertArtifactDirectory(
   directory: string,
-): Promise<void> {
-  const manifest = JSON.parse(
-    await readFile(join(directory, "manifest.json"), "utf8"),
-  ) as {
-    readonly bundleDigest?: unknown;
-  };
-  const moduleMap = JSON.parse(
-    await readFile(join(directory, "module-map.json"), "utf8"),
-  ) as Record<string, unknown>;
-  const buildMetadata = JSON.parse(
-    await readFile(join(directory, "build-metadata.json"), "utf8"),
-  ) as {
-    readonly bundleDigest?: unknown;
-    readonly generationId?: unknown;
-  };
-  const bundle = await readFile(join(directory, "agent-bundle.mjs"), "utf8");
-  if (
-    typeof manifest.bundleDigest !== "string" ||
-    manifest.bundleDigest !== sha256(bundle) ||
-    buildMetadata.bundleDigest !== manifest.bundleDigest ||
-    typeof buildMetadata.generationId !== "string"
-  ) {
-    throw cliError({
-      code: "ARTIFACT_INCOHERENT",
-      message:
-        "The compiler produced an artifact generation whose manifest, bundle, or metadata digest does not agree.",
-    });
-  }
-  const generationId = createArtifactIdentity({
-    manifest: manifest as unknown as EdenManifest,
-    moduleMap: moduleMap as unknown as EdenModuleMap,
-    bundle,
-  });
-  if (buildMetadata.generationId !== generationId) {
-    throw cliError({
-      code: "ARTIFACT_INCOHERENT",
-      message:
-        "The compiler produced an artifact generation with a stale identity.",
-    });
+): Promise<EdenArtifactGeneration> {
+  try {
+    return await readArtifactGeneration(directory);
+  } catch (error: unknown) {
+    if (error instanceof EdenCompilerError) {
+      throw cliError({
+        code: "ARTIFACT_INCOHERENT",
+        message: error.message,
+        diagnostics: error.diagnostics,
+      });
+    }
+    throw error;
   }
 }
 
@@ -1563,17 +1535,17 @@ export async function stopEdenDev(
 async function createRuntimeFiles(
   root: string,
   configPath: string,
-  candidateDirectory: string,
+  generation: EdenArtifactGeneration,
   executionMode: "local" | "remote" = "local",
 ): Promise<RuntimeFiles> {
-  const generation = await readRuntimeGeneration(candidateDirectory);
+  const runtimeGeneration = readRuntimeGeneration(generation);
   const runtimeEntrypoint = await resolveRuntimeWorkerEntrypoint();
   const entryPath = join(
     root,
     `${uniqueTemporaryName("eden-dev-worker")}.mjs`,
   );
   assertWithinRoot(root, entryPath, "The local runtime entrypoint");
-  const bundlePath = join(candidateDirectory, "agent-bundle.mjs");
+  const bundlePath = join(generation.directory, "agent-bundle.mjs");
   const runtimeImport = relative(dirname(entryPath), runtimeEntrypoint)
     .split("\\")
     .join("/");
@@ -1592,7 +1564,7 @@ import agentArtifact from ${JSON.stringify(
   )};
 
 configureEdenArtifact(agentArtifact, ${JSON.stringify({
-  ...generation,
+  ...runtimeGeneration,
   executionMode,
 })});
 export { EdenSession };
@@ -1628,37 +1600,15 @@ export default runtimeWorker;
   }
 }
 
-async function readRuntimeGeneration(
-  directory: string,
-): Promise<RuntimeGeneration> {
-  const manifest = JSON.parse(
-    await readFile(join(directory, "manifest.json"), "utf8"),
-  ) as {
-    readonly version?: unknown;
-    readonly runtimeVersion?: unknown;
-    readonly agentBundleVersion?: unknown;
-    readonly protocolVersion?: unknown;
-    readonly schemaVersion?: unknown;
-    readonly bundleDigest?: unknown;
-    readonly tools?: readonly { readonly name?: unknown }[];
-  };
-  const metadata = JSON.parse(
-    await readFile(join(directory, "build-metadata.json"), "utf8"),
-  ) as {
-    readonly generationId?: unknown;
-    readonly bundleDigest?: unknown;
-  };
+function readRuntimeGeneration(
+  resolved: EdenArtifactGeneration,
+): RuntimeGeneration {
+  const { manifest, buildMetadata } = resolved.artifacts;
+  const toolNames = manifest.tools.map((tool) => tool.name);
   if (
-    typeof metadata.generationId !== "string" ||
-    typeof metadata.bundleDigest !== "string" ||
-    typeof manifest.version !== "string" ||
-    typeof manifest.runtimeVersion !== "string" ||
-    typeof manifest.agentBundleVersion !== "string" ||
-    typeof manifest.protocolVersion !== "string" ||
-    typeof manifest.schemaVersion !== "number" ||
-    typeof manifest.bundleDigest !== "string" ||
-    !Array.isArray(manifest.tools) ||
-    manifest.tools.some((tool) => typeof tool.name !== "string")
+    toolNames.some((name) => typeof name !== "string") ||
+    buildMetadata.generationId.length === 0 ||
+    buildMetadata.bundleDigest.length === 0
   ) {
     throw cliError({
       code: "ARTIFACT_INCOHERENT",
@@ -1667,14 +1617,14 @@ async function readRuntimeGeneration(
     });
   }
   return {
-    generationId: metadata.generationId,
-    bundleDigest: metadata.bundleDigest,
+    generationId: buildMetadata.generationId,
+    bundleDigest: buildMetadata.bundleDigest,
     manifestVersion: manifest.version,
     runtimeVersion: manifest.runtimeVersion,
     agentBundleVersion: manifest.agentBundleVersion,
     protocolVersion: manifest.protocolVersion,
     schemaVersion: manifest.schemaVersion,
-    toolNames: manifest.tools.map((tool) => tool.name as string),
+    toolNames,
   };
 }
 
@@ -2149,11 +2099,11 @@ async function buildProjectFromCli(
       }
       throw error;
     }
-    await assertArtifactDirectory(candidateOutput);
+    const candidateGeneration = await assertArtifactDirectory(candidateOutput);
     runtimeFiles = await createRuntimeFiles(
       root,
       configuration.configPath,
-      candidateOutput,
+      candidateGeneration,
     );
     temporaryConfig = runtimeFiles.configPath;
     const request: EdenCliDryRunRequest = {
@@ -2483,10 +2433,11 @@ async function runDev(
 
   const configuration = await readProjectConfiguration(root);
   const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
+  const generation = await readArtifactGeneration(canonicalOutput);
   const runtimeFiles = await createRuntimeFiles(
     root,
     configuration.configPath,
-    canonicalOutput,
+    generation,
   );
   const temporaryConfig = runtimeFiles.configPath;
   const localSecret = process.env.EDEN_BEARER_SECRET;
@@ -2754,11 +2705,12 @@ async function runDeploy(
     configuration,
   );
   const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
-  const generation = await readRuntimeGeneration(canonicalOutput);
+  const generation = await readArtifactGeneration(canonicalOutput);
+  const runtimeGeneration = readRuntimeGeneration(generation);
   const runtimeFiles = await createRuntimeFiles(
     root,
     configuration.configPath,
-    canonicalOutput,
+    generation,
     "remote",
   );
   const temporaryConfig = runtimeFiles.configPath;
@@ -2792,7 +2744,6 @@ async function runDeploy(
     });
   let deploymentFailure: unknown;
   try {
-    await assertArtifactDirectory(canonicalOutput);
     const compatibilityRequest: EdenCliDryRunRequest = {
       cwd: root,
       configPath: temporaryConfig,
@@ -2905,7 +2856,7 @@ async function runDeploy(
       environment,
       workerName,
       url: deploymentUrl,
-      expectedGeneration: generation,
+      expectedGeneration: runtimeGeneration,
     });
     if (!validation.ok) {
       throw cliError({
@@ -2916,7 +2867,7 @@ async function runDeploy(
       });
     }
     options.stdout?.(
-      `Deployment passed for ${environment}; Worker ${workerName} exposed generation ${generation.generationId} at ${deploymentUrl}.`,
+      `Deployment passed for ${environment}; Worker ${workerName} exposed generation ${runtimeGeneration.generationId} at ${deploymentUrl}.`,
     );
   } catch (error: unknown) {
     deploymentFailure = error;
