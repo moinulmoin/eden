@@ -93,10 +93,7 @@ const TEST_MODEL: EdenModelAdapter = createModelAdapter(async (request) => {
   const toolInputSchema =
     toolName === undefined
       ? undefined
-      : configured?.artifact.toolSchemas?.[toolName] ?? {
-          type: "object",
-          additionalProperties: true,
-        };
+      : configured?.artifact.toolSchemas[toolName];
 
   if (request.messages.some((message) => message.role === "tool")) {
     const toolResult = request.messages

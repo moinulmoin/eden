@@ -63,7 +63,15 @@ const toolSource = `
         }
         return { value: { name: value.name.trim() } };
       }
-    }
+    },
+    jsonSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    },
   };
 
   export default {
@@ -141,6 +149,7 @@ describe("artifact generation", () => {
       `${join(root, ".eden", "agent-bundle.mjs")}?artifact-only`
     );
     const artifact = bundle.default as {
+      toolSchemas: Record<string, unknown>;
       tools: Record<
         string,
         {
@@ -164,6 +173,14 @@ describe("artifact generation", () => {
       >;
     };
 
+    expect(artifact.toolSchemas.greet).toEqual({
+      type: "object",
+      properties: {
+        name: { type: "string" },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    });
     const tool = artifact.tools.greet;
     const validated = await tool.inputSchema["~standard"].validate({
       name: " Eden ",

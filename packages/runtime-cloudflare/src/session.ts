@@ -127,16 +127,15 @@ function configuredTurn(): ConfiguredTurn | undefined {
   if (toolName === undefined) return undefined;
   const tool = configured.artifact.tools[toolName];
   if (tool === undefined) return undefined;
+  const toolInputSchema = configured.artifact.toolSchemas[toolName];
+  if (toolInputSchema === undefined) return undefined;
   return {
     agent: configured.artifact.agent,
     instructions: configured.artifact.instructions,
     generation: configured.generation,
     toolName,
     tool,
-    toolInputSchema: configured.artifact.toolSchemas?.[toolName] ?? {
-      type: "object",
-      additionalProperties: true,
-    },
+    toolInputSchema,
     bundleIdentity: configured.generation.generationId,
   };
 }

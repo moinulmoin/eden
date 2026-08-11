@@ -483,5 +483,19 @@ describe("Eden model adapter", () => {
         signal: request.signal,
       }),
     ]);
+    const providerInputs = runs[0]?.[1] as {
+      readonly tools?: readonly {
+        readonly function?: {
+          readonly parameters?: unknown;
+        };
+      }[];
+    };
+    expect(providerInputs.tools?.[0]?.function?.parameters).toEqual(
+      request.tools?.[0]?.inputSchema,
+    );
+    expect(providerInputs.tools?.[0]?.function?.parameters).not.toEqual({
+      type: "object",
+      additionalProperties: true,
+    });
   });
 });

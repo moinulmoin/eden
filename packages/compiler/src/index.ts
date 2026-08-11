@@ -1786,7 +1786,7 @@ export const moduleMap = Object.freeze({
     ${toolModuleEntries}
   ]))
 });
-export default Object.freeze({ agent, instructions, tools, moduleMap });
+export default Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap });
 `;
 }
 

@@ -21,7 +21,7 @@ export interface EdenRuntimeAgentArtifact {
   readonly agent: EdenAgentDefinition;
   readonly instructions: string;
   readonly tools: Readonly<Record<string, EdenToolDefinition>>;
-  readonly toolSchemas?: Readonly<Record<string, EdenJsonValue>>;
+  readonly toolSchemas: Readonly<Record<string, EdenJsonValue>>;
   readonly moduleMap?: unknown;
 }
 
