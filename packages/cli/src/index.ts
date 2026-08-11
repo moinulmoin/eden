@@ -267,6 +267,7 @@ interface ProjectInputFingerprint {
     readonly relativePath: string;
     readonly sha256: string;
   }[];
+  readonly excludedRelativePaths: readonly string[];
 }
 
 interface InitPublicationLockState {
@@ -279,6 +280,18 @@ interface InitPublicationLockState {
 
 const INIT_STATE_FILE = ".eden-init-incomplete.json";
 const INIT_LOCK_FILE = ".eden-init.lock";
+const DEFAULT_PROJECT_INPUT_EXCLUSIONS = [
+  ".eden",
+  ".git",
+  ".wrangler",
+  "dist",
+  "node_modules",
+  INIT_STATE_FILE,
+  INIT_LOCK_FILE,
+  ".eden-dev-state.json",
+] as const;
+const CLI_OWNED_TEMPORARY_ROOT_PATTERN =
+  /^\.eden-(?:build-candidate|dev-config|dev-worker|init)-[0-9]+-[0-9a-f-]+$/u;
 const CANONICAL_ARTIFACT_NAMES = [
   "discovery.json",
   "diagnostics.json",
@@ -1395,31 +1408,40 @@ function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function toPosixPath(value: string): string {
+  return value.split("\\").join("/");
+}
+
 async function projectInputPaths(
   root: string,
   configuration: ProjectConfiguration,
+  excludedRelativePaths: readonly string[] = [],
 ): Promise<readonly string[]> {
+  const excluded = new Set(
+    [...DEFAULT_PROJECT_INPUT_EXCLUSIONS, ...excludedRelativePaths]
+      .map((path) => path.split("\\").join("/"))
+      .map((path) => path.replace(/\/+$/u, "")),
+  );
+  const isExcluded = (relativePath: string): boolean =>
+    [...excluded].some(
+      (excludedPath) =>
+        relativePath === excludedPath ||
+        relativePath.startsWith(`${excludedPath}/`),
+    ) ||
+    CLI_OWNED_TEMPORARY_ROOT_PATTERN.test(
+      relativePath.split("/")[0] ?? "",
+    );
   const paths = new Set<string>([
     relative(root, configuration.packagePath),
     relative(root, configuration.configPath),
-  ]);
-  const ignoredDirectories = new Set([
-    ".eden",
-    ".git",
-    ".wrangler",
-    "dist",
-    "node_modules",
   ]);
   const visit = async (directory: string): Promise<void> => {
     const entries = await readdir(directory, { withFileTypes: true });
     entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
     for (const entry of entries) {
       const absolutePath = join(directory, entry.name);
-      const relativePath = relative(root, absolutePath);
-      if (
-        ignoredDirectories.has(entry.name) ||
-        (directory === root && entry.name.startsWith(".eden-"))
-      ) {
+      const relativePath = toPosixPath(relative(root, absolutePath));
+      if (isExcluded(relativePath)) {
         continue;
       }
       if (entry.isDirectory()) {
@@ -1448,9 +1470,21 @@ async function projectInputPaths(
 async function fingerprintProjectInputs(
   root: string,
   configuration: ProjectConfiguration,
+  excludedRelativePaths: readonly string[] = [],
 ): Promise<ProjectInputFingerprint> {
+  const allExcludedRelativePaths = [
+    ...new Set(
+      [...DEFAULT_PROJECT_INPUT_EXCLUSIONS, ...excludedRelativePaths]
+        .map((path) => path.split("\\").join("/"))
+        .map((path) => path.replace(/\/+$/u, "")),
+    ),
+  ].sort((left, right) => left.localeCompare(right));
   const files: ProjectInputFingerprint["files"][number][] = [];
-  for (const relativePath of await projectInputPaths(root, configuration)) {
+  for (const relativePath of await projectInputPaths(
+    root,
+    configuration,
+    allExcludedRelativePaths,
+  )) {
     const path = await resolveContainedProjectPath(root, relativePath);
     const details = await lstat(path).catch(() => undefined);
     if (
@@ -1480,6 +1514,7 @@ async function fingerprintProjectInputs(
   return {
     files,
     digest: sha256(JSON.stringify(files)),
+    excludedRelativePaths: allExcludedRelativePaths,
   };
 }
 
@@ -1487,10 +1522,18 @@ async function assertProjectInputsUnchanged(
   root: string,
   configuration: ProjectConfiguration,
   expected: ProjectInputFingerprint,
+  additionalExcludedRelativePaths: readonly string[] = [],
 ): Promise<void> {
   let current: ProjectInputFingerprint;
   try {
-    current = await fingerprintProjectInputs(root, configuration);
+    current = await fingerprintProjectInputs(
+      root,
+      configuration,
+      [
+        ...expected.excludedRelativePaths,
+        ...additionalExcludedRelativePaths,
+      ],
+    );
   } catch (error: unknown) {
     if (error instanceof EdenCliError) {
       throw cliError({
@@ -2514,9 +2557,11 @@ async function buildProjectFromCli(
   root: string,
   options: EdenCliRunOptions,
   environment?: "preview" | "production",
+  sourceFingerprint?: ProjectInputFingerprint,
 ): Promise<string> {
   const configuration = await readProjectConfiguration(root);
-  const inputFingerprint = await fingerprintProjectInputs(root, configuration);
+  const inputFingerprint =
+    sourceFingerprint ?? await fingerprintProjectInputs(root, configuration);
   const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
   const existingOutput = await lstat(canonicalOutput).catch(() => undefined);
   if (existingOutput?.isSymbolicLink() === true) {
@@ -2597,7 +2642,18 @@ async function buildProjectFromCli(
         }`,
       });
     }
-    await assertProjectInputsUnchanged(root, configuration, inputFingerprint);
+    await assertProjectInputsUnchanged(
+      root,
+      configuration,
+      inputFingerprint,
+      [
+        relative(root, candidateOutput),
+        ...(temporaryConfig === undefined
+          ? []
+          : [relative(root, temporaryConfig)]),
+        relative(root, runtimeFiles?.entryPath ?? candidateOutput),
+      ],
+    );
     await options.buildPublicationHook?.("before-canonical-prepare");
     await ensureCanonicalArtifactDirectory(root, canonicalOutput);
     await options.buildPublicationHook?.("after-canonical-prepare");
@@ -3169,10 +3225,15 @@ async function runDeploy(
   requestedWorkerName: string | undefined,
 ): Promise<void> {
   const configuration = await readProjectConfiguration(root);
-  await buildProjectFromCli(root, options, environment);
   const deploymentInputFingerprint = await fingerprintProjectInputs(
     root,
     configuration,
+  );
+  await buildProjectFromCli(
+    root,
+    options,
+    environment,
+    deploymentInputFingerprint,
   );
   const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
   const generation = await readArtifactGeneration(canonicalOutput);
@@ -3253,6 +3314,10 @@ async function runDeploy(
       root,
       configuration,
       deploymentInputFingerprint,
+      [
+        relative(root, temporaryConfig),
+        relative(root, runtimeFiles.entryPath),
+      ],
     );
     if (secret === undefined || secret.length === 0) {
       throw cliError({
