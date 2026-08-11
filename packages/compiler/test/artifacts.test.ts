@@ -105,6 +105,116 @@ async function readGeneration(root: string) {
   };
 }
 
+type JsonPathSegment = string | number;
+
+function setJsonPath(
+  value: unknown,
+  path: readonly JsonPathSegment[],
+  replacement: unknown,
+): void {
+  if (path.length === 0) {
+    throw new Error("A JSON mutation path must not be empty.");
+  }
+  let cursor = value;
+  for (let index = 0; index < path.length; index += 1) {
+    const segment = path[index];
+    const isLast = index === path.length - 1;
+    if (typeof segment === "number") {
+      if (!Array.isArray(cursor)) {
+        throw new Error("A JSON mutation path expected an array.");
+      }
+      if (isLast) {
+        cursor[segment] = replacement;
+      } else {
+        cursor = cursor[segment];
+      }
+      continue;
+    }
+    if (
+      typeof cursor !== "object" ||
+      cursor === null ||
+      Array.isArray(cursor)
+    ) {
+      throw new Error("A JSON mutation path expected an object.");
+    }
+    const record = cursor as Record<string, unknown>;
+    if (isLast) {
+      record[segment] = replacement;
+    } else {
+      cursor = record[segment];
+    }
+  }
+}
+
+function deleteJsonPath(
+  value: unknown,
+  path: readonly JsonPathSegment[],
+): void {
+  if (path.length === 0) {
+    throw new Error("A JSON mutation path must not be empty.");
+  }
+  let cursor = value;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const segment = path[index];
+    if (typeof segment === "number") {
+      if (!Array.isArray(cursor)) {
+        throw new Error("A JSON mutation path expected an array.");
+      }
+      cursor = cursor[segment];
+    } else {
+      if (
+        typeof cursor !== "object" ||
+        cursor === null ||
+        Array.isArray(cursor)
+      ) {
+        throw new Error("A JSON mutation path expected an object.");
+      }
+      cursor = (cursor as Record<string, unknown>)[segment];
+    }
+  }
+  const finalSegment = path[path.length - 1];
+  if (typeof finalSegment === "number") {
+    if (!Array.isArray(cursor)) {
+      throw new Error("A JSON mutation path expected an array.");
+    }
+    cursor.splice(finalSegment, 1);
+  } else {
+    if (
+      typeof cursor !== "object" ||
+      cursor === null ||
+      Array.isArray(cursor)
+    ) {
+      throw new Error("A JSON mutation path expected an object.");
+    }
+    delete (cursor as Record<string, unknown>)[finalSegment];
+  }
+}
+
+function diagnosticRecordWith(
+  field: string,
+  replacement: unknown,
+): (value: unknown) => unknown {
+  return (value) => {
+    if (!Array.isArray(value)) {
+      throw new Error("Diagnostic corruption fixtures require an array.");
+    }
+    value[0] = {
+      code: "FIXTURE_DIAGNOSTIC",
+      message: "fixture diagnostic",
+      severity: "warning",
+      [field]: replacement,
+    };
+    return value;
+  };
+}
+
+function mutateJsonDocument(
+  contents: string,
+  mutate: (value: unknown) => unknown,
+): string {
+  return JSON.stringify(mutate(JSON.parse(contents)));
+}
+
 describe("artifact generation", () => {
   test("publishes one coherent generation and executes without the source tree", async () => {
     const root = await createProject({
@@ -1416,6 +1526,530 @@ describe("artifact generation", () => {
         module: "tool:selected-dependency",
       }),
     ]);
+  });
+
+  test("rejects every malformed published artifact field before reuse", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "runtime artifact schema fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const previous = await readGeneration(root);
+    await writeFile(
+      join(root, "agent/tools/greet.ts"),
+      toolSource.replace("Greet a person.", "Second generation."),
+      "utf8",
+    );
+    await expect(
+      buildProject({
+        projectRoot: root,
+        hooks: {
+          onPublicationBoundary: (boundary) => {
+            if (boundary === "before-current-promotion") {
+              throw new Error("leave schema candidate uncurrent");
+            }
+          },
+        },
+      }),
+    ).rejects.toThrow("leave schema candidate uncurrent");
+
+    const generationNames = await readdir(
+      join(root, ".eden", "generations"),
+    );
+    const candidateId = generationNames.find(
+      (name) =>
+        name.startsWith("gen_") &&
+        name !== previous.buildMetadata.generationId,
+    );
+    expect(candidateId).toBeDefined();
+    const candidateDirectory = join(
+      root,
+      ".eden",
+      "generations",
+      candidateId as string,
+    );
+    const pristine = Object.fromEntries(
+      await Promise.all(
+        artifactNames.map(async (name) => [
+          name,
+          await readFile(join(candidateDirectory, name), "utf8"),
+        ] as const),
+      ),
+    ) as Record<(typeof artifactNames)[number], string>;
+
+    const corruptions: readonly {
+      readonly name: string;
+      readonly artifact: (typeof artifactNames)[number];
+      readonly mutate: (value: unknown) => unknown;
+    }[] = [
+      {
+        name: "discovery.agent",
+        artifact: "discovery.json",
+        mutate: (value) => {
+          setJsonPath(value, ["agent"], "not a source reference");
+          return value;
+        },
+      },
+      {
+        name: "discovery.agent.relativePath",
+        artifact: "discovery.json",
+        mutate: (value) => {
+          setJsonPath(value, ["agent", "relativePath"], 42);
+          return value;
+        },
+      },
+      {
+        name: "discovery.agent.sha256",
+        artifact: "discovery.json",
+        mutate: (value) => {
+          setJsonPath(value, ["agent", "sha256"], "bad");
+          return value;
+        },
+      },
+      {
+        name: "discovery.instructions missing",
+        artifact: "discovery.json",
+        mutate: (value) => {
+          deleteJsonPath(value, ["instructions"]);
+          return value;
+        },
+      },
+      {
+        name: "discovery.tools",
+        artifact: "discovery.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools"], {});
+          return value;
+        },
+      },
+      {
+        name: "discovery.tools[0].relativePath",
+        artifact: "discovery.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools", 0, "relativePath"], null);
+          return value;
+        },
+      },
+      {
+        name: "diagnostics root",
+        artifact: "diagnostics.json",
+        mutate: () => ({}),
+      },
+      {
+        name: "diagnostics.code",
+        artifact: "diagnostics.json",
+        mutate: diagnosticRecordWith("code", 42),
+      },
+      {
+        name: "diagnostics.message",
+        artifact: "diagnostics.json",
+        mutate: diagnosticRecordWith("message", null),
+      },
+      {
+        name: "diagnostics.severity enum",
+        artifact: "diagnostics.json",
+        mutate: diagnosticRecordWith("severity", "debug"),
+      },
+      {
+        name: "diagnostics.line range",
+        artifact: "diagnostics.json",
+        mutate: diagnosticRecordWith("line", 0),
+      },
+      {
+        name: "diagnostics.column range",
+        artifact: "diagnostics.json",
+        mutate: diagnosticRecordWith("column", -1),
+      },
+      {
+        name: "manifest.kind",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["kind"], "wrong");
+          return value;
+        },
+      },
+      {
+        name: "manifest.version",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["version"], 1);
+          return value;
+        },
+      },
+      {
+        name: "manifest.runtimeVersion",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["runtimeVersion"], null);
+          return value;
+        },
+      },
+      {
+        name: "manifest.schemaVersion enum",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["schemaVersion"], 0);
+          return value;
+        },
+      },
+      {
+        name: "manifest.agent missing",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          deleteJsonPath(value, ["agent"]);
+          return value;
+        },
+      },
+      {
+        name: "manifest.agent.model",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["agent", "model"], 42);
+          return value;
+        },
+      },
+      {
+        name: "manifest.agent.options.temperature",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["agent", "options", "temperature"], "hot");
+          return value;
+        },
+      },
+      {
+        name: "manifest.instructions.content",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["instructions", "content"], 42);
+          return value;
+        },
+      },
+      {
+        name: "manifest.instructions.sha256",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["instructions", "sha256"], "bad");
+          return value;
+        },
+      },
+      {
+        name: "manifest.tools",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools"], {});
+          return value;
+        },
+      },
+      {
+        name: "manifest.tool.name",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools", 0, "name"], 42);
+          return value;
+        },
+      },
+      {
+        name: "manifest.tool.description missing",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          deleteJsonPath(value, ["tools", 0, "description"]);
+          return value;
+        },
+      },
+      {
+        name: "manifest.tool.source",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools", 0, "source"], []);
+          return value;
+        },
+      },
+      {
+        name: "manifest.tool.module",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools", 0, "module"], false);
+          return value;
+        },
+      },
+      {
+        name: "manifest.tool.schema.vendor",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools", 0, "schema", "vendor"], 42);
+          return value;
+        },
+      },
+      {
+        name: "manifest.tool.schema.version range",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools", 0, "schema", "version"], 0);
+          return value;
+        },
+      },
+      {
+        name: "manifest.bundleDigest",
+        artifact: "manifest.json",
+        mutate: (value) => {
+          setJsonPath(value, ["bundleDigest"], "bad");
+          return value;
+        },
+      },
+      {
+        name: "moduleMap.kind",
+        artifact: "module-map.json",
+        mutate: (value) => {
+          setJsonPath(value, ["kind"], "wrong");
+          return value;
+        },
+      },
+      {
+        name: "moduleMap.version",
+        artifact: "module-map.json",
+        mutate: (value) => {
+          setJsonPath(value, ["version"], 1);
+          return value;
+        },
+      },
+      {
+        name: "moduleMap.agent.name",
+        artifact: "module-map.json",
+        mutate: (value) => {
+          setJsonPath(value, ["agent", "name"], 42);
+          return value;
+        },
+      },
+      {
+        name: "moduleMap.agent.module",
+        artifact: "module-map.json",
+        mutate: (value) => {
+          setJsonPath(value, ["agent", "module"], "wrong");
+          return value;
+        },
+      },
+      {
+        name: "moduleMap.instructions missing",
+        artifact: "module-map.json",
+        mutate: (value) => {
+          deleteJsonPath(value, ["instructions"]);
+          return value;
+        },
+      },
+      {
+        name: "moduleMap.tools",
+        artifact: "module-map.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools"], {});
+          return value;
+        },
+      },
+      {
+        name: "moduleMap.tool.name",
+        artifact: "module-map.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools", 0, "name"], null);
+          return value;
+        },
+      },
+      {
+        name: "moduleMap.tool.module",
+        artifact: "module-map.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools", 0, "module"], 42);
+          return value;
+        },
+      },
+      {
+        name: "moduleMap.tool.source",
+        artifact: "module-map.json",
+        mutate: (value) => {
+          setJsonPath(value, ["tools", 0, "source"], "wrong");
+          return value;
+        },
+      },
+      {
+        name: "bundle empty",
+        artifact: "agent-bundle.mjs",
+        mutate: () => "",
+      },
+      {
+        name: "buildMetadata.generationId",
+        artifact: "build-metadata.json",
+        mutate: (value) => {
+          setJsonPath(value, ["generationId"], 42);
+          return value;
+        },
+      },
+      {
+        name: "buildMetadata.createdAt",
+        artifact: "build-metadata.json",
+        mutate: (value) => {
+          setJsonPath(value, ["createdAt"], 42);
+          return value;
+        },
+      },
+      {
+        name: "buildMetadata.bundleDigest",
+        artifact: "build-metadata.json",
+        mutate: (value) => {
+          setJsonPath(value, ["bundleDigest"], null);
+          return value;
+        },
+      },
+      {
+        name: "buildMetadata.manifestVersion missing",
+        artifact: "build-metadata.json",
+        mutate: (value) => {
+          deleteJsonPath(value, ["manifestVersion"]);
+          return value;
+        },
+      },
+      {
+        name: "buildMetadata.runtimeVersion",
+        artifact: "build-metadata.json",
+        mutate: (value) => {
+          setJsonPath(value, ["runtimeVersion"], 42);
+          return value;
+        },
+      },
+      {
+        name: "buildMetadata.agentBundleVersion",
+        artifact: "build-metadata.json",
+        mutate: (value) => {
+          setJsonPath(value, ["agentBundleVersion"], null);
+          return value;
+        },
+      },
+      {
+        name: "buildMetadata.protocolVersion",
+        artifact: "build-metadata.json",
+        mutate: (value) => {
+          setJsonPath(value, ["protocolVersion"], 42);
+          return value;
+        },
+      },
+      {
+        name: "buildMetadata.schemaVersion enum",
+        artifact: "build-metadata.json",
+        mutate: (value) => {
+          setJsonPath(value, ["schemaVersion"], -1);
+          return value;
+        },
+      },
+      {
+        name: "buildMetadata.moduleMapDigest",
+        artifact: "build-metadata.json",
+        mutate: (value) => {
+          setJsonPath(value, ["moduleMapDigest"], "bad");
+          return value;
+        },
+      },
+    ];
+
+    for (const corruption of corruptions) {
+      const original = pristine[corruption.artifact];
+      const mutated =
+        corruption.artifact === "agent-bundle.mjs"
+          ? corruption.mutate(original)
+          : mutateJsonDocument(original, corruption.mutate);
+      await writeFile(
+        join(candidateDirectory, corruption.artifact),
+        mutated,
+        "utf8",
+      );
+
+      await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+        name: "EdenCompilerError",
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            code: expect.stringMatching(
+              /^(?:OUTPUT_INVALID|ARTIFACT_|PUBLISHED_)/u,
+            ),
+          }),
+        ]),
+      } satisfies Partial<EdenCompilerError>);
+
+      const current = await readGeneration(root);
+      expect(current.buildMetadata.generationId, corruption.name).toBe(
+        previous.buildMetadata.generationId,
+      );
+      expect(current.bundle, corruption.name).toBe(previous.bundle);
+      await writeFile(
+        join(candidateDirectory, corruption.artifact),
+        original,
+        "utf8",
+      );
+    }
+  });
+
+  test("accepts valid warning and info diagnostics during migration and reuse", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "diagnostic metadata fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const previous = await readGeneration(root);
+    const warningAndInfo = [
+      {
+        code: "FIXTURE_WARNING",
+        message: "A non-fatal warning is inspectable metadata.",
+        source: "agent/tools/greet.ts",
+        line: 1,
+        column: 1,
+        severity: "warning",
+      },
+      {
+        code: "FIXTURE_INFO",
+        message: "A non-fatal info record is inspectable metadata.",
+        severity: "info",
+      },
+    ];
+    const legacyContents = await Promise.all(
+      artifactNames.map(async (name) => [
+        name,
+        name === "diagnostics.json"
+          ? JSON.stringify(warningAndInfo)
+          : await readFile(join(previous.directory, name), "utf8"),
+      ] as const),
+    );
+    await rm(join(root, ".eden"), { recursive: true, force: true });
+    await mkdir(join(root, ".eden"), { recursive: true });
+    await Promise.all(
+      legacyContents.map(([name, contents]) =>
+        writeFile(join(root, ".eden", name), contents, "utf8"),
+      ),
+    );
+
+    await expect(buildProject({ projectRoot: root })).resolves.toBeDefined();
+    const migrated = await readGeneration(root);
+    expect(migrated.diagnostics).toEqual(warningAndInfo);
+
+    await expect(buildProject({ projectRoot: root })).resolves.toBeDefined();
+    const reused = await readGeneration(root);
+    expect(reused.diagnostics).toEqual(warningAndInfo);
+
+    await writeFile(
+      join(reused.directory, "diagnostics.json"),
+      JSON.stringify([
+        {
+          code: "FIXTURE_ERROR",
+          message: "An error diagnostic blocks publication.",
+          severity: "error",
+        },
+      ]),
+      "utf8",
+    );
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      name: "EdenCompilerError",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "OUTPUT_INVALID" }),
+      ]),
+    } satisfies Partial<EdenCompilerError>);
   });
 
   test.each([

@@ -3792,6 +3792,36 @@ function sourceReferenceEqual(
   return stableJson(left) === stableJson(right);
 }
 
+function assertSortedUniqueArtifactSources(
+  sources: readonly EdenSourceReference[],
+  field: string,
+): void {
+  const seen = new Set<string>();
+  let previous: string | undefined;
+  for (const [index, source] of sources.entries()) {
+    if (seen.has(source.relativePath)) {
+      throw new EdenCompilerError("Published artifact metadata is incoherent", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          `${field}[${index}] duplicates source "${source.relativePath}".`,
+          field,
+        ),
+      ]);
+    }
+    if (previous !== undefined && comparePath(previous, source.relativePath) >= 0) {
+      throw new EdenCompilerError("Published artifact metadata is incoherent", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          `${field} must be sorted by canonical relative path.`,
+          field,
+        ),
+      ]);
+    }
+    seen.add(source.relativePath);
+    previous = source.relativePath;
+  }
+}
+
 function assertDiscoveryCoherence(
   discovery: EdenDiscoveryRecord,
   manifest: EdenManifest,
@@ -3811,6 +3841,30 @@ function assertDiscoveryCoherence(
       diagnostic(
         "OUTPUT_INVALID",
         "Published artifact kind or version metadata is not compatible with Eden.",
+      ),
+    ]);
+  }
+  if (
+    discovery.agent.relativePath !== REQUIRED_AGENT_PATH ||
+    discovery.instructions.relativePath !== REQUIRED_INSTRUCTIONS_PATH
+  ) {
+    throw new EdenCompilerError("Published discovery metadata is incoherent", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Discovery required source slots do not match the Eden authoring layout.",
+      ),
+    ]);
+  }
+  assertSortedUniqueArtifactSources(discovery.tools, "discovery.tools");
+  if (
+    manifest.instructions.sha256 !==
+      sha256(manifest.instructions.content) ||
+    manifest.instructions.source.sha256 !== manifest.instructions.sha256
+  ) {
+    throw new EdenCompilerError("Published instruction metadata is incoherent", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Instruction content, source hash, and recorded hash must agree.",
       ),
     ]);
   }
@@ -3844,6 +3898,24 @@ function assertDiscoveryCoherence(
       ),
     ]);
   }
+  for (const [index, tool] of manifest.tools.entries()) {
+    const source = discovery.tools[index];
+    if (source === undefined) continue;
+    const expectedPath = `agent/tools/${tool.name}.ts`;
+    const expectedModule = `tool:${tool.name}`;
+    if (
+      source.relativePath !== expectedPath ||
+      tool.module !== expectedModule
+    ) {
+      throw new EdenCompilerError("Published tool metadata is incoherent", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          `Tool "${tool.name}" must reference source "${expectedPath}" and module "${expectedModule}".`,
+          `manifest.tools[${index}]`,
+        ),
+      ]);
+    }
+  }
   if (
     !sourceReferenceEqual(moduleMap.agent.source, discovery.agent) ||
     moduleMap.agent.name !== "agent" ||
@@ -3871,43 +3943,593 @@ function assertDiscoveryCoherence(
   }
 }
 
-function assertDiagnosticRecords(value: unknown): asserts value is readonly EdenDiagnostic[] {
+const ARTIFACT_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const ARTIFACT_MODULE_PATTERN = /^[a-z][a-z0-9_-]*:[a-z][a-z0-9_-]*$/u;
+
+function artifactSchemaFailure(field: string, message: string): never {
+  throw new EdenCompilerError("Published artifact schema is invalid", [
+    diagnostic("OUTPUT_INVALID", `${field}: ${message}`, field),
+  ]);
+}
+
+function artifactRecord(
+  value: unknown,
+  field: string,
+): Record<string, unknown> {
+  if (!isRecord(value) || Array.isArray(value)) {
+    return artifactSchemaFailure(field, "must be an object.");
+  }
+  return value;
+}
+
+function assertArtifactKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+  field: string,
+): void {
+  const allowed = new Set([...required, ...optional]);
+  const keys = Object.keys(value);
+  const missing = required.filter((key) => !hasOwn(value, key));
+  const unknown = keys.filter((key) => !allowed.has(key));
+  if (missing.length > 0 || unknown.length > 0) {
+    const details = [
+      ...(missing.length === 0 ? [] : [`missing ${missing.join(", ")}`]),
+      ...(unknown.length === 0 ? [] : [`unknown ${unknown.join(", ")}`]),
+    ].join("; ");
+    artifactSchemaFailure(field, `has invalid fields (${details}).`);
+  }
+}
+
+function artifactString(
+  value: unknown,
+  field: string,
+  options: { readonly nonEmpty?: boolean } = {},
+): string {
   if (
-    !Array.isArray(value) ||
-    value.some(
-      (item) =>
-        !isRecord(item) ||
-        typeof item.code !== "string" ||
-        typeof item.message !== "string" ||
-        !["error", "warning", "info"].includes(String(item.severity)) ||
-        (item.source !== undefined && typeof item.source !== "string") ||
-        (item.line !== undefined && !Number.isInteger(item.line)) ||
-        (item.column !== undefined && !Number.isInteger(item.column)),
+    typeof value !== "string" ||
+    (options.nonEmpty === true && value.trim().length === 0)
+  ) {
+    return artifactSchemaFailure(
+      field,
+      options.nonEmpty === true
+        ? "must be a non-empty string."
+        : "must be a string.",
+    );
+  }
+  return value;
+}
+
+function artifactSha256(value: unknown, field: string): string {
+  const text = artifactString(value, field, { nonEmpty: true });
+  if (!ARTIFACT_SHA256_PATTERN.test(text)) {
+    return artifactSchemaFailure(
+      field,
+      "must be a lowercase SHA-256 hexadecimal digest.",
+    );
+  }
+  return text;
+}
+
+function artifactRelativePath(value: unknown, field: string): string {
+  const path = artifactString(value, field, { nonEmpty: true });
+  const segments = path.split("/");
+  if (
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    path.includes("\u0000") ||
+    segments.some(
+      (segment) => segment.length === 0 || segment === "." || segment === "..",
     )
   ) {
-    throw new EdenCompilerError("Published diagnostics are malformed", [
-      diagnostic(
-        "OUTPUT_INVALID",
-        "The generated diagnostics artifact must contain Eden diagnostic records.",
-      ),
-    ]);
+    return artifactSchemaFailure(
+      field,
+      "must be a normalized relative POSIX path.",
+    );
   }
+  return path;
+}
+
+function artifactModule(value: unknown, field: string): string {
+  const module = artifactString(value, field, { nonEmpty: true });
+  if (!ARTIFACT_MODULE_PATTERN.test(module)) {
+    return artifactSchemaFailure(
+      field,
+      "must be a valid Eden module reference.",
+    );
+  }
+  return module;
+}
+
+function artifactSafeInteger(
+  value: unknown,
+  field: string,
+  options: { readonly minimum?: number; readonly maximum?: number } = {},
+): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    (options.minimum !== undefined && value < options.minimum) ||
+    (options.maximum !== undefined && value > options.maximum)
+  ) {
+    const range =
+      options.minimum === undefined && options.maximum === undefined
+        ? "a safe integer"
+        : `a safe integer between ${String(options.minimum ?? Number.MIN_SAFE_INTEGER)} and ${String(options.maximum ?? Number.MAX_SAFE_INTEGER)}`;
+    return artifactSchemaFailure(field, `must be ${range}.`);
+  }
+  return value;
+}
+
+function artifactFiniteNumber(
+  value: unknown,
+  field: string,
+  minimum: number,
+  maximum: number,
+): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
+    return artifactSchemaFailure(
+      field,
+      `must be a finite number between ${minimum} and ${maximum}.`,
+    );
+  }
+  return value;
+}
+
+function decodeArtifactSourceReference(
+  value: unknown,
+  field: string,
+): EdenSourceReference {
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(record, ["relativePath", "sha256"], [], field);
+  return {
+    relativePath: artifactRelativePath(record.relativePath, `${field}.relativePath`),
+    sha256: artifactSha256(record.sha256, `${field}.sha256`),
+  };
+}
+
+function decodeArtifactModelOptions(
+  value: unknown,
+  field: string,
+): EdenManifest["agent"]["options"] {
+  if (value === undefined) return undefined;
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(
+    record,
+    [],
+    ["temperature", "maxOutputTokens", "thinking"],
+    field,
+  );
+  const options: {
+    temperature?: number;
+    maxOutputTokens?: number;
+    thinking?: boolean;
+  } = {};
+  if (hasOwn(record, "temperature")) {
+    options.temperature = artifactFiniteNumber(
+      record.temperature,
+      `${field}.temperature`,
+      0,
+      2,
+    );
+  }
+  if (hasOwn(record, "maxOutputTokens")) {
+    options.maxOutputTokens = artifactSafeInteger(
+      record.maxOutputTokens,
+      `${field}.maxOutputTokens`,
+      { minimum: 1, maximum: 32768 },
+    );
+  }
+  if (hasOwn(record, "thinking") && typeof record.thinking !== "boolean") {
+    artifactSchemaFailure(`${field}.thinking`, "must be a boolean.");
+  }
+  if (hasOwn(record, "thinking")) {
+    options.thinking = record.thinking as boolean;
+  }
+  return Object.keys(options).length === 0 ? {} : options;
+}
+
+function decodeArtifactAgent(
+  value: unknown,
+  field: string,
+): EdenManifest["agent"] {
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(record, ["source", "model"], ["options"], field);
+  const agent: EdenManifest["agent"] = {
+    source: decodeArtifactSourceReference(record.source, `${field}.source`),
+    model: artifactString(record.model, `${field}.model`, { nonEmpty: true }),
+  };
+  const options = decodeArtifactModelOptions(record.options, `${field}.options`);
+  if (options !== undefined) {
+    return { ...agent, options };
+  }
+  return agent;
+}
+
+function decodeArtifactInstructionManifest(
+  value: unknown,
+  field: string,
+): EdenInstructionManifest {
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(record, ["source", "content", "sha256"], [], field);
+  return {
+    source: decodeArtifactSourceReference(record.source, `${field}.source`),
+    content: artifactString(record.content, `${field}.content`),
+    sha256: artifactSha256(record.sha256, `${field}.sha256`),
+  };
+}
+
+function decodeArtifactSchemaMetadata(
+  value: unknown,
+  field: string,
+): { readonly vendor: string; readonly version: number } {
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(record, ["vendor", "version"], [], field);
+  const version = artifactSafeInteger(record.version, `${field}.version`, {
+    minimum: 1,
+    maximum: 1,
+  });
+  return {
+    vendor: artifactString(record.vendor, `${field}.vendor`, {
+      nonEmpty: true,
+    }),
+    version,
+  };
+}
+
+function decodeArtifactToolManifest(
+  value: unknown,
+  field: string,
+): EdenManifest["tools"][number] {
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(
+    record,
+    ["name", "description", "source", "module", "schema"],
+    [],
+    field,
+  );
+  const name = artifactString(record.name, `${field}.name`, { nonEmpty: true });
+  if (!TOOL_NAME_PATTERN.test(name)) {
+    artifactSchemaFailure(
+      `${field}.name`,
+      "must use the published tool-name grammar.",
+    );
+  }
+  return {
+    name,
+    description: artifactString(record.description, `${field}.description`, {
+      nonEmpty: true,
+    }),
+    source: decodeArtifactSourceReference(record.source, `${field}.source`),
+    module: artifactModule(record.module, `${field}.module`),
+    schema: decodeArtifactSchemaMetadata(record.schema, `${field}.schema`),
+  };
+}
+
+function decodeArtifactModuleReference(
+  value: unknown,
+  field: string,
+): EdenModuleMap["agent"] {
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(record, ["name", "module", "source"], [], field);
+  return {
+    name: artifactString(record.name, `${field}.name`, { nonEmpty: true }),
+    module: artifactModule(record.module, `${field}.module`),
+    source: decodeArtifactSourceReference(record.source, `${field}.source`),
+  };
+}
+
+function assertUniqueArtifactNames(
+  values: readonly { readonly name: string }[],
+  field: string,
+): void {
+  const seen = new Set<string>();
+  for (const [index, value] of values.entries()) {
+    if (seen.has(value.name)) {
+      artifactSchemaFailure(
+        `${field}[${index}].name`,
+        `duplicates "${value.name}".`,
+      );
+    }
+    seen.add(value.name);
+  }
+}
+
+function decodeArtifactDiscovery(value: unknown): EdenDiscoveryRecord {
+  const field = "discovery.json";
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(record, ["agent", "instructions", "tools"], [], field);
+  if (!Array.isArray(record.tools)) {
+    artifactSchemaFailure("discovery.json.tools", "must be an array.");
+  }
+  return {
+    agent: decodeArtifactSourceReference(record.agent, "discovery.json.agent"),
+    instructions: decodeArtifactSourceReference(
+      record.instructions,
+      "discovery.json.instructions",
+    ),
+    tools: record.tools.map((item, index) =>
+      decodeArtifactSourceReference(item, `discovery.json.tools[${index}]`),
+    ),
+  };
+}
+
+function decodeArtifactDiagnostics(value: unknown): readonly EdenDiagnostic[] {
+  const field = "diagnostics.json";
+  if (!Array.isArray(value)) {
+    artifactSchemaFailure(field, "must be an array.");
+  }
+  return value.map((item, index) => {
+    const itemField = `${field}[${index}]`;
+    const record = artifactRecord(item, itemField);
+    assertArtifactKeys(
+      record,
+      ["code", "message", "severity"],
+      ["source", "line", "column"],
+      itemField,
+    );
+    const severity = record.severity;
+    if (severity !== "error" && severity !== "warning" && severity !== "info") {
+      artifactSchemaFailure(
+        `${itemField}.severity`,
+        'must be "error", "warning", or "info".',
+      );
+    }
+    const result: EdenDiagnostic = {
+      code: artifactString(record.code, `${itemField}.code`, {
+        nonEmpty: true,
+      }),
+      message: artifactString(record.message, `${itemField}.message`, {
+        nonEmpty: true,
+      }),
+      severity,
+    };
+    if (hasOwn(record, "source")) {
+      (result as { source?: string }).source = artifactString(
+        record.source,
+        `${itemField}.source`,
+        { nonEmpty: true },
+      );
+    }
+    if (hasOwn(record, "line")) {
+      (result as { line?: number }).line = artifactSafeInteger(
+        record.line,
+        `${itemField}.line`,
+        { minimum: 1 },
+      );
+    }
+    if (hasOwn(record, "column")) {
+      (result as { column?: number }).column = artifactSafeInteger(
+        record.column,
+        `${itemField}.column`,
+        { minimum: 1 },
+      );
+    }
+    return result;
+  });
+}
+
+function decodeArtifactManifest(value: unknown): EdenManifest {
+  const field = "manifest.json";
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(
+    record,
+    [
+      "kind",
+      "version",
+      "runtimeVersion",
+      "agentBundleVersion",
+      "protocolVersion",
+      "schemaVersion",
+      "agent",
+      "instructions",
+      "tools",
+      "bundleDigest",
+    ],
+    [],
+    field,
+  );
+  if (record.kind !== "eden.manifest") {
+    artifactSchemaFailure(`${field}.kind`, 'must be "eden.manifest".');
+  }
+  if (record.version !== EDEN_MANIFEST_VERSION) {
+    artifactSchemaFailure(
+      `${field}.version`,
+      `must be "${EDEN_MANIFEST_VERSION}".`,
+    );
+  }
+  if (record.runtimeVersion !== EDEN_RUNTIME_VERSION) {
+    artifactSchemaFailure(
+      `${field}.runtimeVersion`,
+      `must be "${EDEN_RUNTIME_VERSION}".`,
+    );
+  }
+  if (record.agentBundleVersion !== EDEN_AGENT_BUNDLE_VERSION) {
+    artifactSchemaFailure(
+      `${field}.agentBundleVersion`,
+      `must be "${EDEN_AGENT_BUNDLE_VERSION}".`,
+    );
+  }
+  if (record.protocolVersion !== EDEN_PROTOCOL_VERSION) {
+    artifactSchemaFailure(
+      `${field}.protocolVersion`,
+      `must be "${EDEN_PROTOCOL_VERSION}".`,
+    );
+  }
+  if (record.schemaVersion !== EDEN_SCHEMA_VERSION) {
+    artifactSchemaFailure(
+      `${field}.schemaVersion`,
+      `must be ${EDEN_SCHEMA_VERSION}.`,
+    );
+  }
+  if (!Array.isArray(record.tools)) {
+    artifactSchemaFailure(`${field}.tools`, "must be an array.");
+  }
+  const tools = record.tools.map((item, index) =>
+    decodeArtifactToolManifest(item, `${field}.tools[${index}]`),
+  );
+  assertUniqueArtifactNames(tools, `${field}.tools`);
+  return {
+    kind: "eden.manifest",
+    version: EDEN_MANIFEST_VERSION,
+    runtimeVersion: EDEN_RUNTIME_VERSION,
+    agentBundleVersion: EDEN_AGENT_BUNDLE_VERSION,
+    protocolVersion: EDEN_PROTOCOL_VERSION,
+    schemaVersion: EDEN_SCHEMA_VERSION,
+    agent: decodeArtifactAgent(record.agent, `${field}.agent`),
+    instructions: decodeArtifactInstructionManifest(
+      record.instructions,
+      `${field}.instructions`,
+    ),
+    tools,
+    bundleDigest: artifactSha256(record.bundleDigest, `${field}.bundleDigest`),
+  };
+}
+
+function decodeArtifactModuleMap(value: unknown): EdenModuleMap {
+  const field = "module-map.json";
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(record, ["kind", "version", "agent", "instructions", "tools"], [], field);
+  if (record.kind !== "eden.module-map") {
+    artifactSchemaFailure(`${field}.kind`, 'must be "eden.module-map".');
+  }
+  if (record.version !== EDEN_AGENT_BUNDLE_VERSION) {
+    artifactSchemaFailure(
+      `${field}.version`,
+      `must be "${EDEN_AGENT_BUNDLE_VERSION}".`,
+    );
+  }
+  if (!Array.isArray(record.tools)) {
+    artifactSchemaFailure(`${field}.tools`, "must be an array.");
+  }
+  const tools = record.tools.map((item, index) =>
+    decodeArtifactModuleReference(item, `${field}.tools[${index}]`),
+  );
+  assertUniqueArtifactNames(tools, `${field}.tools`);
+  return {
+    kind: "eden.module-map",
+    version: EDEN_AGENT_BUNDLE_VERSION,
+    agent: decodeArtifactModuleReference(record.agent, `${field}.agent`),
+    instructions: decodeArtifactModuleReference(
+      record.instructions,
+      `${field}.instructions`,
+    ),
+    tools,
+  };
+}
+
+function isIsoTimestamp(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value)) {
+    return false;
+  }
+  try {
+    return new Date(value).toISOString() === value;
+  } catch {
+    return false;
+  }
+}
+
+function decodeArtifactBuildMetadata(value: unknown): EdenBuildMetadata {
+  const field = "build-metadata.json";
+  const record = artifactRecord(value, field);
+  assertArtifactKeys(
+    record,
+    [
+      "generationId",
+      "createdAt",
+      "bundleDigest",
+      "manifestVersion",
+      "runtimeVersion",
+      "agentBundleVersion",
+      "protocolVersion",
+      "schemaVersion",
+      "moduleMapDigest",
+    ],
+    [],
+    field,
+  );
+  const generationId = artifactString(record.generationId, `${field}.generationId`, {
+    nonEmpty: true,
+  });
+  if (!/^gen_[a-f0-9]{64}$/u.test(generationId)) {
+    artifactSchemaFailure(
+      `${field}.generationId`,
+      "must be a generated Eden identity.",
+    );
+  }
+  const createdAt = artifactString(record.createdAt, `${field}.createdAt`, {
+    nonEmpty: true,
+  });
+  if (!isIsoTimestamp(createdAt)) {
+    artifactSchemaFailure(
+      `${field}.createdAt`,
+      "must be a valid UTC ISO-8601 timestamp.",
+    );
+  }
+  if (record.manifestVersion !== EDEN_MANIFEST_VERSION) {
+    artifactSchemaFailure(
+      `${field}.manifestVersion`,
+      `must be "${EDEN_MANIFEST_VERSION}".`,
+    );
+  }
+  if (record.runtimeVersion !== EDEN_RUNTIME_VERSION) {
+    artifactSchemaFailure(
+      `${field}.runtimeVersion`,
+      `must be "${EDEN_RUNTIME_VERSION}".`,
+    );
+  }
+  if (record.agentBundleVersion !== EDEN_AGENT_BUNDLE_VERSION) {
+    artifactSchemaFailure(
+      `${field}.agentBundleVersion`,
+      `must be "${EDEN_AGENT_BUNDLE_VERSION}".`,
+    );
+  }
+  if (record.protocolVersion !== EDEN_PROTOCOL_VERSION) {
+    artifactSchemaFailure(
+      `${field}.protocolVersion`,
+      `must be "${EDEN_PROTOCOL_VERSION}".`,
+    );
+  }
+  if (record.schemaVersion !== EDEN_SCHEMA_VERSION) {
+    artifactSchemaFailure(
+      `${field}.schemaVersion`,
+      `must be ${EDEN_SCHEMA_VERSION}.`,
+    );
+  }
+  return {
+    generationId,
+    createdAt,
+    bundleDigest: artifactSha256(record.bundleDigest, `${field}.bundleDigest`),
+    manifestVersion: EDEN_MANIFEST_VERSION,
+    runtimeVersion: EDEN_RUNTIME_VERSION,
+    agentBundleVersion: EDEN_AGENT_BUNDLE_VERSION,
+    protocolVersion: EDEN_PROTOCOL_VERSION,
+    schemaVersion: EDEN_SCHEMA_VERSION,
+    moduleMapDigest: artifactSha256(
+      record.moduleMapDigest,
+      `${field}.moduleMapDigest`,
+    ),
+  };
 }
 
 function assertPublishedArtifactCoherence(
   discovery: EdenDiscoveryRecord,
-  diagnostics: unknown,
+  diagnostics: readonly EdenDiagnostic[],
   manifest: EdenManifest,
   moduleMap: EdenModuleMap,
   bundle: string,
   buildMetadata: EdenBuildMetadata,
 ): void {
-  assertDiagnosticRecords(diagnostics);
-  if (diagnostics.length !== 0) {
+  if (diagnostics.some((item) => item.severity === "error")) {
     throw new EdenCompilerError("Published diagnostics are not coherent", [
       diagnostic(
         "OUTPUT_INVALID",
-        "A successful generated artifact generation must contain no error diagnostics.",
+        "Error diagnostics prevent a published artifact generation from becoming authoritative.",
       ),
     ]);
   }
@@ -4012,13 +4634,30 @@ function decodePublishedArtifactSet(
   contents: PublishedArtifactContents,
   directory?: string,
 ): EdenArtifactSet {
-  const discovery = JSON.parse(contents.discovery) as EdenDiscoveryRecord;
-  const diagnostics = JSON.parse(contents.diagnostics) as unknown;
-  const manifest = JSON.parse(contents.manifest) as EdenManifest;
-  const moduleMap = JSON.parse(contents.moduleMap) as EdenModuleMap;
-  const buildMetadata = JSON.parse(
-    contents.buildMetadata,
-  ) as EdenBuildMetadata;
+  let discoveryValue: unknown;
+  let diagnosticsValue: unknown;
+  let manifestValue: unknown;
+  let moduleMapValue: unknown;
+  let buildMetadataValue: unknown;
+  try {
+    discoveryValue = JSON.parse(contents.discovery) as unknown;
+    diagnosticsValue = JSON.parse(contents.diagnostics) as unknown;
+    manifestValue = JSON.parse(contents.manifest) as unknown;
+    moduleMapValue = JSON.parse(contents.moduleMap) as unknown;
+    buildMetadataValue = JSON.parse(contents.buildMetadata) as unknown;
+  } catch {
+    throw new EdenCompilerError("Published artifact JSON is malformed", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Every JSON artifact must contain one valid JSON document.",
+      ),
+    ]);
+  }
+  const discovery = decodeArtifactDiscovery(discoveryValue);
+  const diagnostics = decodeArtifactDiagnostics(diagnosticsValue);
+  const manifest = decodeArtifactManifest(manifestValue);
+  const moduleMap = decodeArtifactModuleMap(moduleMapValue);
+  const buildMetadata = decodeArtifactBuildMetadata(buildMetadataValue);
   const bundle = contents.bundle;
   assertPublishedArtifactCoherence(
     discovery,
@@ -4681,30 +5320,30 @@ async function publishArtifacts(
     });
 
     await assertNoGeneratedSymlinks(projectRoot, stage);
-    const stagedBundle = await readFile(join(stage, ARTIFACT_FILE_NAMES.bundle), "utf8");
-    const stagedDiscovery = JSON.parse(
-      await readFile(join(stage, ARTIFACT_FILE_NAMES.discovery), "utf8"),
-    ) as EdenDiscoveryRecord;
-    const stagedDiagnostics = JSON.parse(
-      await readFile(join(stage, ARTIFACT_FILE_NAMES.diagnostics), "utf8"),
-    ) as unknown;
-    const stagedManifest = JSON.parse(
-      await readFile(join(stage, ARTIFACT_FILE_NAMES.manifest), "utf8"),
-    ) as EdenManifest;
-    const stagedModuleMap = JSON.parse(
-      await readFile(join(stage, ARTIFACT_FILE_NAMES.moduleMap), "utf8"),
-    ) as EdenModuleMap;
-    const stagedMetadata = JSON.parse(
-      await readFile(join(stage, ARTIFACT_FILE_NAMES.buildMetadata), "utf8"),
-    ) as EdenBuildMetadata;
-    assertPublishedArtifactCoherence(
-      stagedDiscovery,
-      stagedDiagnostics,
-      stagedManifest,
-      stagedModuleMap,
-      stagedBundle,
-      stagedMetadata,
-    );
+    const stagedContents = {
+      discovery: await readFile(
+        join(stage, ARTIFACT_FILE_NAMES.discovery),
+        "utf8",
+      ),
+      diagnostics: await readFile(
+        join(stage, ARTIFACT_FILE_NAMES.diagnostics),
+        "utf8",
+      ),
+      manifest: await readFile(
+        join(stage, ARTIFACT_FILE_NAMES.manifest),
+        "utf8",
+      ),
+      moduleMap: await readFile(
+        join(stage, ARTIFACT_FILE_NAMES.moduleMap),
+        "utf8",
+      ),
+      bundle: await readFile(join(stage, ARTIFACT_FILE_NAMES.bundle), "utf8"),
+      buildMetadata: await readFile(
+        join(stage, ARTIFACT_FILE_NAMES.buildMetadata),
+        "utf8",
+      ),
+    } satisfies PublishedArtifactContents;
+    decodePublishedArtifactSet(stagedContents);
     await hooks.onPublicationBoundary?.("after-stage-write");
 
     await assertNoGeneratedSymlinks(projectRoot, generationsDirectory);
