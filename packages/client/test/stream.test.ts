@@ -18,6 +18,7 @@ function event(
   streamIndex: number,
   eventId: string,
   type: "session.started" | "session.waiting",
+  sessionId = "sess_123",
 ): Record<string, unknown> {
   return {
     streamIndex,
@@ -26,7 +27,7 @@ function event(
     data:
       type === "session.started"
         ? {
-            sessionId: "sess_123",
+            sessionId,
             status: "new",
             versions: VERSIONS,
           }
@@ -157,7 +158,7 @@ describe("Eden typed client stream protocol", () => {
     );
     const conflicting = {
       ...second,
-      data: { status: "waiting", extra: true },
+      committedAt: "2026-08-10T00:00:01.000Z",
     };
     const responses = [
       ndjson(first, second, second),
@@ -189,7 +190,154 @@ describe("Eden typed client stream protocol", () => {
         // Consume until the conflicting replay is observed.
         void _receivedEvent;
       }
-    }).rejects.toBeInstanceOf(EdenProtocolError);
+    }).rejects.toMatchObject({
+      code: "event_id_conflict",
+    });
+  });
+
+  test("retains bounded replay evidence across a fresh client instance", async () => {
+    const first = event(
+      1,
+      "evt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session.started",
+    );
+    const second = event(
+      2,
+      "evt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "session.waiting",
+    );
+    const third = event(
+      3,
+      "evt_cccccccccccccccccccccccccccccccc",
+      "session.waiting",
+    );
+    const responses = [
+      ndjson(first, second),
+      ndjson(first, second, third),
+    ];
+    const store = new EdenMemoryEventStore();
+    const fetch = async () =>
+      responses.shift() ?? new Response("unexpected", { status: 500 });
+    const firstClient = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch,
+    });
+
+    const firstSession = firstClient.attach("sess_123", store);
+    const initialEvents = [];
+    for await (const receivedEvent of firstSession.events({ follow: false })) {
+      initialEvents.push(receivedEvent);
+    }
+
+    const restartedClient = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch,
+    });
+    const restartedSession = restartedClient.attach("sess_123", store);
+    const replayedEvents = [];
+    for await (const receivedEvent of restartedSession.events({ follow: false })) {
+      replayedEvents.push(receivedEvent);
+    }
+
+    expect(initialEvents.map((receivedEvent) => receivedEvent.eventId)).toEqual([
+      first.eventId,
+      second.eventId,
+    ]);
+    expect(replayedEvents.map((receivedEvent) => receivedEvent.eventId)).toEqual([
+      third.eventId,
+    ]);
+    expect(store.snapshot()).toEqual({
+      sessionId: "sess_123",
+      streamIndex: 3,
+    });
+  });
+
+  test("rejects a valid conflicting overlap after a fresh client restart", async () => {
+    const first = event(
+      1,
+      "evt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session.started",
+    );
+    const second = event(
+      2,
+      "evt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "session.waiting",
+    );
+    const conflictingSecond = event(
+      2,
+      "evt_cccccccccccccccccccccccccccccccc",
+      "session.waiting",
+    );
+    const responses = [
+      ndjson(first, second),
+      ndjson(conflictingSecond),
+    ];
+    const store = new EdenMemoryEventStore();
+    const fetch = async () =>
+      responses.shift() ?? new Response("unexpected", { status: 500 });
+    const firstClient = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch,
+    });
+
+    const firstSession = firstClient.attach("sess_123", store);
+    for await (const _receivedEvent of firstSession.events({ follow: false })) {
+      void _receivedEvent;
+    }
+
+    const restartedClient = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch,
+    });
+    const restartedSession = restartedClient.attach("sess_123", store);
+
+    await expect(async () => {
+      for await (const _receivedEvent of restartedSession.events({
+        follow: false,
+      })) {
+        void _receivedEvent;
+      }
+    }).rejects.toMatchObject({
+      code: "cursor_conflict",
+    });
+    expect(store.snapshot()).toEqual({
+      sessionId: "sess_123",
+      streamIndex: 2,
+    });
+  });
+
+  test("rejects session.started for a different attached session before persistence", async () => {
+    const responses = [
+      ndjson(
+        event(
+          1,
+          "evt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "session.started",
+          "sess_other",
+        ),
+      ),
+    ];
+    const store = new EdenMemoryEventStore();
+    const client = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch: async () =>
+        responses.shift() ?? new Response("unexpected", { status: 500 }),
+    });
+    const session = client.attach("sess_123", store);
+
+    await expect(async () => {
+      for await (const _receivedEvent of session.events({ follow: false })) {
+        void _receivedEvent;
+      }
+    }).rejects.toMatchObject({
+      code: "invalid_event",
+    });
+    expect(store.snapshot()).toBeUndefined();
   });
 
   test("rejects malformed records and cursor inconsistencies as typed failures", async () => {
