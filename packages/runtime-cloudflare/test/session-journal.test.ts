@@ -379,4 +379,110 @@ describe("EdenSession journal transactions", () => {
       step: [{ status: "completed", result_ref: "effect_result" }],
     });
   });
+
+  test("rejects cross-turn step linkage before effects, events, or errors mutate", async () => {
+    const sessionId = createOpaqueSessionId();
+    const stub = sessionStub(sessionId);
+    await initializeSession(stub, sessionId);
+
+    await runInDurableObject(stub, async (_instance, state) =>
+      commitSessionTransaction(state.storage, sessionId, (journal) => {
+        const timestamp = "2026-08-10T00:00:00.000Z";
+        journal.insertTurn({
+          turnId: "turn_link_a",
+          status: "running",
+          acceptedAt: timestamp,
+        });
+        journal.insertTurn({
+          turnId: "turn_link_b",
+          status: "running",
+          acceptedAt: timestamp,
+        });
+        journal.insertStep({
+          stepId: "step_link_b",
+          turnId: "turn_link_b",
+          logicalKey: "tool:lookup",
+          phase: "model-tool",
+          status: "running",
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+      }),
+    );
+
+    await expect(
+      runInDurableObject(stub, async (_instance, state) =>
+        commitSessionTransaction(state.storage, sessionId, (journal) =>
+          journal.requestEffect({
+            effectId: "effect_cross_turn",
+            turnId: "turn_link_a",
+            stepId: "step_link_b",
+            callId: "call_cross_turn",
+            toolName: "lookup",
+            idempotencyKey: "idem_cross_turn",
+            input: { value: "cross-turn" },
+            createdAt: "2026-08-10T00:00:01.000Z",
+          }),
+        ),
+      ),
+    ).rejects.toThrow("Journal transition referenced a missing durable row");
+
+    await expect(
+      runInDurableObject(stub, async (_instance, state) =>
+        commitSessionTransaction(state.storage, sessionId, (journal) =>
+          journal.appendEvent({
+            type: "step.started",
+            turnId: "turn_link_a",
+            stepId: "step_link_b",
+            data: { stepId: "step_link_b", phase: "model-tool" },
+            committedAt: "2026-08-10T00:00:02.000Z",
+          }),
+        ),
+      ),
+    ).rejects.toThrow("Journal transition referenced a missing durable row");
+
+    await expect(
+      runInDurableObject(stub, async (_instance, state) =>
+        commitSessionTransaction(state.storage, sessionId, (journal) =>
+          journal.recordError({
+            errorId: "error_cross_turn",
+            turnId: "turn_link_a",
+            stepId: "step_link_b",
+            code: "cross_turn",
+            message: "cross-turn linkage",
+            retryable: false,
+            createdAt: "2026-08-10T00:00:03.000Z",
+          }),
+        ),
+      ),
+    ).rejects.toThrow("Journal transition referenced a missing durable row");
+
+    const rows = await runInDurableObject(stub, async (_instance, state) => ({
+      effects: state.storage.sql
+        .exec<{ effect_id: string }>(
+          "SELECT effect_id FROM effects WHERE effect_id = ?",
+          "effect_cross_turn",
+        )
+        .toArray(),
+      events: state.storage.sql
+        .exec<{ type: string }>(
+          "SELECT type FROM events WHERE turn_id = ? OR step_id = ?",
+          "turn_link_a",
+          "step_link_b",
+        )
+        .toArray(),
+      errors: state.storage.sql
+        .exec<{ error_id: string }>(
+          "SELECT error_id FROM errors WHERE error_id = ?",
+          "error_cross_turn",
+        )
+        .toArray(),
+    }));
+
+    expect(rows).toEqual({
+      effects: [],
+      events: [],
+      errors: [],
+    });
+  });
 });

@@ -267,6 +267,54 @@ function requireRow(
   }
 }
 
+interface RelatedJournalRows {
+  readonly turnId?: string;
+  readonly stepId?: string;
+}
+
+function requireRelatedRows(
+  sql: EdenSqlStorage,
+  sessionId: string,
+  rows: RelatedJournalRows,
+): void {
+  if (rows.turnId !== undefined && rows.stepId !== undefined) {
+    requireRow(
+      sql,
+      `SELECT EXISTS (
+         SELECT 1
+         FROM turns
+         INNER JOIN steps
+           ON steps.session_id = turns.session_id
+          AND steps.turn_id = turns.turn_id
+         WHERE turns.session_id = ?
+           AND turns.turn_id = ?
+           AND steps.step_id = ?
+       ) AS present`,
+      sessionId,
+      rows.turnId,
+      rows.stepId,
+    );
+    return;
+  }
+
+  if (rows.turnId !== undefined) {
+    requireRow(
+      sql,
+      "SELECT EXISTS (SELECT 1 FROM turns WHERE turn_id = ? AND session_id = ?) AS present",
+      rows.turnId,
+      sessionId,
+    );
+  }
+  if (rows.stepId !== undefined) {
+    requireRow(
+      sql,
+      "SELECT EXISTS (SELECT 1 FROM steps WHERE step_id = ? AND session_id = ?) AS present",
+      rows.stepId,
+      sessionId,
+    );
+  }
+}
+
 function createJournal(
   sql: EdenSqlStorage,
   sessionId: string,
@@ -283,22 +331,7 @@ function createJournal(
         "SELECT EXISTS (SELECT 1 FROM session_meta WHERE session_id = ?) AS present",
         sessionId,
       );
-      if (input.turnId !== undefined) {
-        requireRow(
-          sql,
-          "SELECT EXISTS (SELECT 1 FROM turns WHERE turn_id = ? AND session_id = ?) AS present",
-          input.turnId,
-          sessionId,
-        );
-      }
-      if (input.stepId !== undefined) {
-        requireRow(
-          sql,
-          "SELECT EXISTS (SELECT 1 FROM steps WHERE step_id = ? AND session_id = ?) AS present",
-          input.stepId,
-          sessionId,
-        );
-      }
+      requireRelatedRows(sql, sessionId, input);
       const payload = json(input.data);
       assertPayloadSize(payload);
       const eventId = createOpaqueEventId();
@@ -544,18 +577,7 @@ function createJournal(
     },
 
     requestEffect(input): void {
-      requireRow(
-        sql,
-        "SELECT EXISTS (SELECT 1 FROM turns WHERE turn_id = ? AND session_id = ?) AS present",
-        input.turnId,
-        sessionId,
-      );
-      requireRow(
-        sql,
-        "SELECT EXISTS (SELECT 1 FROM steps WHERE step_id = ? AND session_id = ?) AS present",
-        input.stepId,
-        sessionId,
-      );
+      requireRelatedRows(sql, sessionId, input);
       const effectInput = json(input.input);
       sql.exec(
         `INSERT INTO effects (
@@ -682,22 +704,7 @@ function createJournal(
         "SELECT EXISTS (SELECT 1 FROM session_meta WHERE session_id = ?) AS present",
         sessionId,
       );
-      if (input.turnId !== undefined) {
-        requireRow(
-          sql,
-          "SELECT EXISTS (SELECT 1 FROM turns WHERE turn_id = ? AND session_id = ?) AS present",
-          input.turnId,
-          sessionId,
-        );
-      }
-      if (input.stepId !== undefined) {
-        requireRow(
-          sql,
-          "SELECT EXISTS (SELECT 1 FROM steps WHERE step_id = ? AND session_id = ?) AS present",
-          input.stepId,
-          sessionId,
-        );
-      }
+      requireRelatedRows(sql, sessionId, input);
       sql.exec(
         `INSERT INTO errors (
           error_id, session_id, turn_id, step_id, code, message, retryable,
