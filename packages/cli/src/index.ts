@@ -197,6 +197,7 @@ export interface EdenCliRunOptions {
 }
 
 export type EdenInitPublicationBoundary =
+  | "after-lock-acquire"
   | "after-state-write"
   | "after-stage-write"
   | "after-target-validation"
@@ -854,6 +855,7 @@ async function writeScaffold(
 ): Promise<void> {
   const lock = await acquireInitPublicationLock(root);
   try {
+    await hook?.("after-lock-acquire");
     await writeScaffoldUnlocked(root, hook);
   } finally {
     await lock.release();
