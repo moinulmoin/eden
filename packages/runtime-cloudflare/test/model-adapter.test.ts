@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   createModelAdapter,
+  normalizeEdenJsonValue,
   normalizeModelFailure,
   normalizeModelMessages,
   type EdenModelRequest,
@@ -40,6 +41,38 @@ const request: EdenModelRequest = {
 };
 
 describe("Eden model adapter", () => {
+  test("accepts shared JSON branches while rejecting true cycles", () => {
+    const shared = { value: "shared" };
+    const sharedBranches = {
+      left: shared,
+      right: [shared],
+    };
+
+    expect(normalizeEdenJsonValue(sharedBranches)).toEqual({
+      left: { value: "shared" },
+      right: [{ value: "shared" }],
+    });
+
+    const sharedArray = ["shared", { value: 2 }];
+    expect(
+      normalizeEdenJsonValue({
+        left: sharedArray,
+        right: { nested: sharedArray },
+      }),
+    ).toEqual({
+      left: ["shared", { value: 2 }],
+      right: { nested: ["shared", { value: 2 }] },
+    });
+
+    const cyclicObject: Record<string, unknown> = {};
+    cyclicObject.self = cyclicObject;
+    expect(normalizeEdenJsonValue(cyclicObject)).toBeUndefined();
+
+    const cyclicArray: unknown[] = [];
+    cyclicArray.push(cyclicArray);
+    expect(normalizeEdenJsonValue(cyclicArray)).toBeUndefined();
+  });
+
   test("normalizes provider-shaped messages, tool calls, results, and safe correlation", async () => {
     const adapter = createModelAdapter(async (providerRequest) => {
       expect(providerRequest).toEqual({

@@ -191,12 +191,18 @@ function exceedsJsonDepth(
   if (typeof value !== "object" || value === null) return false;
   if (seen.has(value)) return true;
   seen.add(value);
-  if (Array.isArray(value)) {
-    return value.some((item) => exceedsJsonDepth(item, depth + 1, seen));
+  try {
+    if (Array.isArray(value)) {
+      return value.some((item) => exceedsJsonDepth(item, depth + 1, seen));
+    }
+    return Object.values(value).some((item) =>
+      exceedsJsonDepth(item, depth + 1, seen),
+    );
+  } finally {
+    // Keep cycle tracking path-local so repeated references in separate
+    // branches remain valid JSON while true cycles still fail closed.
+    seen.delete(value);
   }
-  return Object.values(value).some((item) =>
-    exceedsJsonDepth(item, depth + 1, seen),
-  );
 }
 
 function hasOnlyKeys(

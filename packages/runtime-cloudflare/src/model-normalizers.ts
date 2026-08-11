@@ -62,7 +62,7 @@ function normalizeCorrelation(
 function normalizeJsonValue(
   value: unknown,
   depth = 0,
-  seen = new WeakSet<object>(),
+  active = new WeakSet<object>(),
 ): EdenJsonValue | undefined {
   if (depth > MAX_MODEL_JSON_DEPTH) return undefined;
   if (value === null) return null;
@@ -75,35 +75,35 @@ function normalizeJsonValue(
     return Number.isFinite(value) ? value : undefined;
   }
   if (Array.isArray(value)) {
-    if (seen.has(value)) return undefined;
-    seen.add(value);
+    if (active.has(value)) return undefined;
+    active.add(value);
     try {
       const output: EdenJsonValue[] = [];
       for (const item of value) {
-        const normalized = normalizeJsonValue(item, depth + 1, seen);
+        const normalized = normalizeJsonValue(item, depth + 1, active);
         if (normalized === undefined) return undefined;
         output.push(normalized);
       }
       return output;
     } finally {
-      seen.delete(value);
+      active.delete(value);
     }
   }
   if (!isRecord(value)) return undefined;
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return undefined;
-  if (seen.has(value)) return undefined;
-  seen.add(value);
+  if (active.has(value)) return undefined;
+  active.add(value);
   try {
     const output: Record<string, EdenJsonValue> = {};
     for (const [key, item] of Object.entries(value)) {
-      const normalized = normalizeJsonValue(item, depth + 1, seen);
+      const normalized = normalizeJsonValue(item, depth + 1, active);
       if (normalized === undefined) return undefined;
       output[key] = normalized;
     }
     return output;
   } finally {
-    seen.delete(value);
+    active.delete(value);
   }
 }
 

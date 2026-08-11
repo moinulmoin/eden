@@ -155,10 +155,19 @@ export async function deliverNewEvents(
     return readLatestJournalCursor(storage.sql, sessionId);
   }
   const events = readJournalEvents(storage.sql, sessionId, cursor);
+  let deliveredCursor = cursor;
   for (const event of events) {
-    await onEvent(event);
+    try {
+      await onEvent(event);
+    } catch {
+      // Delivery is best-effort transport work. Stop at the first failed
+      // callback so the next delivery attempt replays this event in order,
+      // while the canonical turn continues from its committed SQLite state.
+      break;
+    }
+    deliveredCursor = event.streamIndex;
   }
-  return readLatestJournalCursor(storage.sql, sessionId);
+  return deliveredCursor;
 }
 
 export function beginTurn<TInput, TOutput extends EdenJsonValue>(

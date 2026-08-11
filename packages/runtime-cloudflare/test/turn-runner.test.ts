@@ -318,6 +318,105 @@ describe("Eden bounded turn runner", () => {
     },
   );
 
+  test("isolates throwing and rejected delivery callbacks from accepted execution", async () => {
+    const sessionId = createOpaqueSessionId();
+    const turnId = `turn_${sessionId.slice(-12)}`;
+    const stub = sessionStub(sessionId);
+    await initializeSession(stub, sessionId);
+
+    const model = createModelAdapter(async (request) => {
+      if (request.messages.some((message) => message.role === "tool")) {
+        return { text: "delivery-safe completion", finishReason: "stop" };
+      }
+      return {
+        toolCalls: [
+          {
+            toolCallId: "call_lookup",
+            toolName: "lookup",
+            input: { query: "eden" },
+          },
+        ],
+        finishReason: "tool-calls",
+      };
+    });
+    const tool = fixtureTool({ answer: "delivery-safe" }, () => undefined);
+    const delivered: EdenEvent[] = [];
+    let throwOnce = true;
+
+    const result = await runInDurableObject(stub, async (_instance, state) =>
+      runBoundedTurn(state.storage, {
+        sessionId,
+        turnId,
+        messageId: `msg_${sessionId.slice(-12)}`,
+        message: "Continue after delivery failure.",
+        toolName: "lookup",
+        tool,
+        model,
+        toolInputSchema: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+          additionalProperties: false,
+        },
+        bundleIdentity: "bundle-delivery-fixture",
+        onEvent(event) {
+          if (throwOnce) {
+            throwOnce = false;
+            throw new Error("transport secret sentinel");
+          }
+          if (event.type === "session.waiting") {
+            return Promise.reject(new Error("rejected binding sentinel"));
+          }
+          delivered.push(event);
+        },
+      }),
+    );
+
+    expect(result).toEqual({
+      status: "completed",
+      sessionId,
+      turnId,
+      messageId: `msg_assistant_${turnId}`,
+      content: "delivery-safe completion",
+    });
+    expect(delivered.at(-1)?.type).toBe("turn.completed");
+
+    const durable = await runInDurableObject(stub, async (_instance, state) => ({
+      status: state.storage.sql
+        .exec<{ readonly status: string }>(
+          "SELECT status FROM session_meta WHERE session_id = ?",
+          sessionId,
+        )
+        .toArray()[0]?.status,
+      events: readJournalEvents(state.storage.sql, sessionId, 0),
+    }));
+
+    expect(durable.status).toBe("waiting");
+    expect(durable.events.map((event) => event.type)).toEqual([
+      "session.started",
+      "turn.started",
+      "message.received",
+      "step.started",
+      "actions.requested",
+      "action.result",
+      "step.completed",
+      "step.started",
+      "message.completed",
+      "step.completed",
+      "turn.completed",
+      "session.waiting",
+    ]);
+    expect(JSON.stringify(result)).not.toContain("sentinel");
+
+    const savedCursor = delivered.at(-1)?.streamIndex ?? 0;
+    const replayed = await runInDurableObject(stub, async (_instance, state) =>
+      readJournalEvents(state.storage.sql, sessionId, savedCursor),
+    );
+    expect(replayed.map((event) => event.type)).toEqual(["session.waiting"]);
+    expect(replayed[0]?.streamIndex).toBe(savedCursor + 1);
+    expect(JSON.stringify(replayed)).not.toContain("sentinel");
+  });
+
   test("rejects unsupported output before successful advancement", async () => {
     const unsupported = { answer: undefined } as unknown as EdenJsonValue;
     const run = await runFixture(unsupported);
