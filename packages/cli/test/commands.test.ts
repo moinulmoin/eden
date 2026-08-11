@@ -250,6 +250,84 @@ describe("eden CLI project commands", () => {
     expect(errors.join("\n")).toMatch(/unrelated|existing|preserved/i);
   });
 
+  test("does not replace a destination created after recovery validation", async () => {
+    const root = await createRoot("eden-cli-init-recovery-race-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("injected init interruption");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    const sentinel = "created by a competing initializer\n";
+    const recoveryOptions = {
+      cwd: root,
+      initPublicationHook: async (
+        boundary: string,
+        target?: string,
+      ) => {
+        if (boundary === "after-target-validation" && target === "package.json") {
+          await writeFile(join(root, "package.json"), sentinel, {
+            encoding: "utf8",
+            flag: "wx",
+          });
+        }
+      },
+    } as unknown as Parameters<typeof runEdenCli>[1];
+
+    await expect(
+      runEdenCli(["init", "--project", root], recoveryOptions),
+    ).resolves.toBe(1);
+    await expect(readFile(join(root, "package.json"), "utf8"))
+      .resolves.toBe(sentinel);
+    await expect(
+      readFile(join(root, ".eden-init-incomplete.json"), "utf8"),
+    ).resolves.toContain("eden.init.incomplete");
+  });
+
+  test("fails one of two concurrent init attempts without losing scaffold bytes", async () => {
+    const root = await createRoot("eden-cli-init-concurrent-");
+    const results = await Promise.all([
+      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ]);
+
+    expect(results.sort()).toEqual([0, 1]);
+    await expect(readFile(join(root, "agent/agent.ts"), "utf8"))
+      .resolves.toContain("EdenAgentDefinition");
+    await expect(readFile(join(root, "package.json"), "utf8"))
+      .resolves.toContain('"eden-basic-agent"');
+    await expect(
+      stat(join(root, ".eden-init-incomplete.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("recovers a stale init lock left by an interrupted process", async () => {
+    const root = await createRoot("eden-cli-init-stale-lock-");
+    await writeFile(
+      join(root, ".eden-init.lock"),
+      JSON.stringify({
+        kind: "eden.init.lock",
+        version: 1,
+        pid: 99_999_999,
+        startedAt: "stale-process-start",
+        token: "stale-token",
+      }),
+      "utf8",
+    );
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      stat(join(root, ".eden-init.lock")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("rejects a symbolic-link project root before writing", async () => {
     const parent = await createRoot("eden-cli-symlink-");
     const target = join(parent, "target");
@@ -470,6 +548,129 @@ export default {
     expect(await artifactHashes(root)).toEqual(before);
     expect(errors.join("\n")).toMatch(/source|configuration|changed|stale/i);
   });
+
+  test.each([
+    "before-canonical-prepare",
+    "after-canonical-prepare",
+    "before-generation-publish",
+    "after-generation-publish",
+    "before-current-promotion",
+    "after-current-promotion",
+  ] as const)(
+    "keeps a coherent canonical generation across CLI promotion interruption at %s",
+    async (boundary) => {
+      const root = await createRoot("eden-cli-build-publication-race-");
+
+      await expect(
+        runEdenCli(["init", "--project", root], { cwd: root }),
+      ).resolves.toBe(0);
+      await expect(
+        runEdenCli(["build", "--project", root], {
+          cwd: root,
+          dryRunRunner: async () => ({
+            exitCode: 0,
+            stdout: "",
+            stderr: "",
+          }),
+        }),
+      ).resolves.toBe(0);
+      const before = await readArtifactGeneration(join(root, ".eden"));
+      const beforeId = before.artifacts.buildMetadata.generationId;
+      await writeFile(
+        join(root, "agent/tools/greet.ts"),
+        (await readFile(join(root, "agent/tools/greet.ts"), "utf8"))
+          .replace("Greet a person by name.", "Second generation."),
+        "utf8",
+      );
+
+      const buildOptions = {
+        cwd: root,
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+        buildPublicationHook: async (currentBoundary: string) => {
+          if (currentBoundary === boundary) {
+            throw new Error(`injected ${boundary} interruption`);
+          }
+        },
+      } as unknown as Parameters<typeof runEdenCli>[1];
+
+      await expect(
+        runEdenCli(["build", "--project", root], buildOptions),
+      ).resolves.toBe(1);
+
+      const after = await readArtifactGeneration(join(root, ".eden"));
+      const afterId = after.artifacts.buildMetadata.generationId;
+      expect(afterId).toMatch(/^gen_[a-f0-9]{64}$/u);
+      expect(after.artifacts.manifest.bundleDigest).toBe(
+        createHash("sha256").update(after.artifacts.bundle).digest("hex"),
+      );
+      if (boundary !== "after-current-promotion") {
+        expect(afterId).toBe(beforeId);
+      } else {
+        expect(afterId).not.toBe(beforeId);
+      }
+    },
+  );
+
+  test.each([
+    "before-canonical-prepare",
+    "after-canonical-prepare",
+    "before-generation-publish",
+    "after-generation-publish",
+    "before-current-promotion",
+    "after-current-promotion",
+  ] as const)(
+    "recovers an unavailable first publication after %s interruption",
+    async (boundary) => {
+      const root = await createRoot("eden-cli-build-first-publication-");
+      await expect(
+        runEdenCli(["init", "--project", root], { cwd: root }),
+      ).resolves.toBe(0);
+
+      await expect(
+        runEdenCli(["build", "--project", root], {
+          cwd: root,
+          dryRunRunner: async () => ({
+            exitCode: 0,
+            stdout: "",
+            stderr: "",
+          }),
+          buildPublicationHook: async (currentBoundary: string) => {
+            if (currentBoundary === boundary) {
+              throw new Error(`injected ${boundary} interruption`);
+            }
+          },
+        } as unknown as Parameters<typeof runEdenCli>[1]),
+      ).resolves.toBe(1);
+
+      if (boundary === "after-current-promotion") {
+        await expect(
+          readArtifactGeneration(join(root, ".eden")),
+        ).resolves.toBeDefined();
+      } else {
+        await expect(
+          readArtifactGeneration(join(root, ".eden")),
+        ).rejects.toMatchObject({ name: "EdenCompilerError" });
+      }
+
+      await expect(
+        runEdenCli(["build", "--project", root], {
+          cwd: root,
+          dryRunRunner: async () => ({
+            exitCode: 0,
+            stdout: "",
+            stderr: "",
+          }),
+        }),
+      ).resolves.toBe(0);
+      await expect(
+        readArtifactGeneration(join(root, ".eden")),
+      ).resolves.toBeDefined();
+    },
+  );
 
   test("advertises exactly the supported command names and rejects unknown commands", async () => {
     expect(EDEN_CLI_COMMANDS).toEqual(["init", "dev", "build", "deploy"]);

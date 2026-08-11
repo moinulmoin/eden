@@ -5,12 +5,16 @@ import {
   randomUUID,
 } from "crypto";
 import {
+  link,
   lstat,
   mkdir,
   readFile,
+  readlink,
   readdir,
+  realpath,
   rename,
   rm,
+  symlink,
   writeFile,
 } from "fs/promises";
 import {
@@ -174,6 +178,10 @@ export interface EdenCliRunOptions {
   readonly stderr?: (line: string) => void;
   readonly initPublicationHook?: (
     boundary: EdenInitPublicationBoundary,
+    target?: string,
+  ) => void | Promise<void>;
+  readonly buildPublicationHook?: (
+    boundary: EdenBuildPublicationBoundary,
   ) => void | Promise<void>;
   readonly dryRunRunner?: (
     request: EdenCliDryRunRequest,
@@ -191,9 +199,18 @@ export interface EdenCliRunOptions {
 export type EdenInitPublicationBoundary =
   | "after-state-write"
   | "after-stage-write"
+  | "after-target-validation"
   | "before-target-publish"
   | "after-target-publish"
   | "before-complete";
+
+export type EdenBuildPublicationBoundary =
+  | "before-canonical-prepare"
+  | "after-canonical-prepare"
+  | "before-generation-publish"
+  | "after-generation-publish"
+  | "before-current-promotion"
+  | "after-current-promotion";
 
 interface ParsedInvocation {
   readonly command: EdenCliCommand;
@@ -251,7 +268,24 @@ interface ProjectInputFingerprint {
   }[];
 }
 
+interface InitPublicationLockState {
+  readonly kind: "eden.init.lock";
+  readonly version: 1;
+  readonly pid: number;
+  readonly startedAt: string;
+  readonly token: string;
+}
+
 const INIT_STATE_FILE = ".eden-init-incomplete.json";
+const INIT_LOCK_FILE = ".eden-init.lock";
+const CANONICAL_ARTIFACT_NAMES = [
+  "discovery.json",
+  "diagnostics.json",
+  "manifest.json",
+  "module-map.json",
+  "agent-bundle.mjs",
+  "build-metadata.json",
+] as const;
 
 const INIT_SCAFFOLD: readonly ScaffoldFile[] = [
   {
@@ -707,7 +741,126 @@ function assertWithinRoot(
   }
 }
 
+async function acquireInitPublicationLock(
+  root: string,
+): Promise<{ readonly release: () => Promise<void> }> {
+  const lockPath = join(root, INIT_LOCK_FILE);
+  const startedAt =
+    (await readProcessStartMarker(process.pid)) ?? `pid:${process.pid}`;
+  const state: InitPublicationLockState = {
+    kind: "eden.init.lock",
+    version: 1,
+    pid: process.pid,
+    startedAt,
+    token: randomUUID(),
+  };
+  const serialized = `${JSON.stringify(state)}\n`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await writeFile(lockPath, serialized, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      return {
+        release: async () => {
+          const current = await readFile(lockPath, "utf8").catch(
+            () => undefined,
+          );
+          if (current === serialized) {
+            await rm(lockPath, { force: true }).catch(() => undefined);
+          }
+        },
+      };
+    } catch (error: unknown) {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code !== "EEXIST") throw error;
+      const existing = await readFile(lockPath, "utf8").catch(
+        () => undefined,
+      );
+      if (existing === undefined) continue;
+      let existingState: unknown;
+      try {
+        existingState = JSON.parse(existing) as unknown;
+      } catch {
+        throw cliError({
+          code: "INIT_BUSY",
+          message:
+            "Another Eden init owns scaffold publication; the malformed lock was preserved.",
+          source: INIT_LOCK_FILE,
+        });
+      }
+      if (
+        !isRecord(existingState) ||
+        existingState.kind !== "eden.init.lock" ||
+        existingState.version !== 1 ||
+        typeof existingState.pid !== "number" ||
+        !Number.isSafeInteger(existingState.pid) ||
+        existingState.pid <= 0 ||
+        typeof existingState.startedAt !== "string" ||
+        existingState.startedAt.length === 0 ||
+        typeof existingState.token !== "string" ||
+        existingState.token.length === 0
+      ) {
+        throw cliError({
+          code: "INIT_BUSY",
+          message:
+            "Another Eden init owns scaffold publication; the malformed lock was preserved.",
+          source: INIT_LOCK_FILE,
+        });
+      }
+      const existingLock = existingState as {
+        readonly pid: number;
+        readonly startedAt: string;
+      };
+      const ownerStart = await readProcessStartMarker(existingLock.pid);
+      if (ownerStart === existingLock.startedAt) {
+        throw cliError({
+          code: "INIT_BUSY",
+          message:
+            "Another Eden init is publishing the scaffold; retry after it completes.",
+          source: INIT_LOCK_FILE,
+        });
+      }
+      if (
+        ownerStart === undefined &&
+        isProcessAlive(existingLock.pid)
+      ) {
+        throw cliError({
+          code: "INIT_BUSY",
+          message:
+            "Another Eden init owns scaffold publication but its start identity could not be verified.",
+          source: INIT_LOCK_FILE,
+        });
+      }
+      const latest = await readFile(lockPath, "utf8").catch(
+        () => undefined,
+      );
+      if (latest !== existing) continue;
+      await rm(lockPath, { force: true }).catch(() => undefined);
+    }
+  }
+  throw cliError({
+    code: "INIT_BUSY",
+    message:
+      "Another Eden init is publishing the scaffold; retry after it completes.",
+    source: INIT_LOCK_FILE,
+  });
+}
+
 async function writeScaffold(
+  root: string,
+  hook?: EdenCliRunOptions["initPublicationHook"],
+): Promise<void> {
+  const lock = await acquireInitPublicationLock(root);
+  try {
+    await writeScaffoldUnlocked(root, hook);
+  } finally {
+    await lock.release();
+  }
+}
+
+async function writeScaffoldUnlocked(
   root: string,
   hook?: EdenCliRunOptions["initPublicationHook"],
 ): Promise<void> {
@@ -717,7 +870,9 @@ async function writeScaffold(
     return;
   }
 
-  const entries = await readdir(root);
+  const entries = (await readdir(root)).filter(
+    (entry) => entry !== INIT_LOCK_FILE,
+  );
   if (entries.length !== 0) {
     throw cliError({
       code: "INIT_ROOT_NOT_EMPTY",
@@ -766,7 +921,14 @@ async function writeScaffold(
     await hook?.("after-state-write");
 
     const afterStage = await readdir(root);
-    if (afterStage.some((entry) => entry !== stageName && entry !== INIT_STATE_FILE)) {
+    if (
+      afterStage.some(
+        (entry) =>
+          entry !== stageName &&
+          entry !== INIT_STATE_FILE &&
+          entry !== INIT_LOCK_FILE,
+      )
+    ) {
       throw cliError({
         code: "INIT_ROOT_CHANGED",
         message:
@@ -936,6 +1098,118 @@ async function assertPublishedScaffold(
   }
 }
 
+async function publishScaffoldTargetNoReplace(
+  root: string,
+  stage: string,
+  target: "agent" | "package.json" | "wrangler.jsonc",
+  files: readonly InitState["files"][number][],
+): Promise<void> {
+  const destination = join(root, target);
+  if (target === "agent") {
+    const existingDestination = await lstat(destination).catch(
+      () => undefined,
+    );
+    if (existingDestination === undefined) {
+      await mkdir(destination);
+    } else if (
+      !existingDestination.isDirectory() ||
+      existingDestination.isSymbolicLink()
+    ) {
+      throw cliError({
+        code: "INIT_RECOVERY_CONFLICT",
+        message:
+          'The interrupted scaffold cannot recover because "agent" contains unrelated or changed bytes; no existing file was overwritten.',
+        source: "agent",
+      });
+    }
+    const toolsDirectory = join(destination, "tools");
+    const existingToolsDirectory = await lstat(toolsDirectory).catch(
+      () => undefined,
+    );
+    if (existingToolsDirectory === undefined) {
+      await mkdir(toolsDirectory);
+    } else if (
+      !existingToolsDirectory.isDirectory() ||
+      existingToolsDirectory.isSymbolicLink()
+    ) {
+      throw cliError({
+        code: "INIT_RECOVERY_CONFLICT",
+        message:
+          'The interrupted scaffold cannot recover because "agent/tools" contains unrelated or changed bytes; no existing file was overwritten.',
+        source: "agent/tools",
+      });
+    }
+    for (const file of files) {
+      const stagedPath = join(stage, file.relativePath);
+      const publishedPath = join(root, file.relativePath);
+      await link(stagedPath, publishedPath);
+      await rm(stagedPath, { force: false });
+    }
+    await rm(join(stage, target), { recursive: true, force: false });
+    return;
+  }
+
+  const stagedPath = join(stage, target);
+  await link(stagedPath, destination);
+  await rm(stagedPath, { force: false });
+}
+
+async function assertPartialAgentDestination(
+  root: string,
+  files: readonly InitState["files"][number][],
+): Promise<void> {
+  const agent = join(root, "agent");
+  const agentDetails = await lstat(agent).catch(() => undefined);
+  if (agentDetails === undefined) return;
+  if (!agentDetails.isDirectory() || agentDetails.isSymbolicLink()) {
+    throw cliError({
+      code: "INIT_RECOVERY_CONFLICT",
+      message:
+        'The interrupted scaffold cannot recover because "agent" contains unrelated or changed bytes; no existing file was overwritten.',
+      source: "agent",
+    });
+  }
+  const expectedAgentEntries = new Set([
+    "agent.ts",
+    "instructions.md",
+    "tools",
+  ]);
+  const agentEntries = await readdir(agent);
+  if (agentEntries.some((entry) => !expectedAgentEntries.has(entry))) {
+    throw cliError({
+      code: "INIT_RECOVERY_CONFLICT",
+      message:
+        'The interrupted scaffold cannot recover because "agent" contains unrelated or changed bytes; no existing file was overwritten.',
+      source: "agent",
+    });
+  }
+  const tools = join(agent, "tools");
+  const toolsDetails = await lstat(tools).catch(() => undefined);
+  if (toolsDetails === undefined) return;
+  if (!toolsDetails.isDirectory() || toolsDetails.isSymbolicLink()) {
+    throw cliError({
+      code: "INIT_RECOVERY_CONFLICT",
+      message:
+        'The interrupted scaffold cannot recover because "agent/tools" contains unrelated or changed bytes; no existing file was overwritten.',
+      source: "agent/tools",
+    });
+  }
+  const expectedToolEntries = new Set(
+    files
+      .filter((file) => file.relativePath.startsWith("agent/tools/"))
+      .map((file) => file.relativePath.slice("agent/tools/".length)),
+  );
+  const toolEntries = await readdir(tools);
+  if (toolEntries.some((entry) => !expectedToolEntries.has(entry))) {
+    throw cliError({
+      code: "INIT_RECOVERY_CONFLICT",
+      message:
+        'The interrupted scaffold cannot recover because "agent/tools" contains unrelated or changed bytes; no existing file was overwritten.',
+      source: "agent/tools",
+    });
+  }
+}
+
 async function resumeScaffold(
   root: string,
   state: InitState,
@@ -949,6 +1223,7 @@ async function resumeScaffold(
   const allowedRootEntries = new Set([
     state.stageName,
     INIT_STATE_FILE,
+    INIT_LOCK_FILE,
     "agent",
     "package.json",
     "wrangler.jsonc",
@@ -1027,7 +1302,13 @@ async function resumeScaffold(
     }
     const destination = join(root, target);
     const destinationDetails = await lstat(destination).catch(() => undefined);
-    if (destinationDetails !== undefined) {
+    const targetWasInitiallyMissing = published.every(
+      (value) => value === "missing",
+    );
+    if (
+      destinationDetails !== undefined &&
+      (target !== "agent" || targetWasInitiallyMissing)
+    ) {
       throw cliError({
         code: "INIT_RECOVERY_CONFLICT",
         message:
@@ -1035,9 +1316,18 @@ async function resumeScaffold(
         source: target,
       });
     }
-    await hook?.("before-target-publish");
-    const destinationAfterHook = await lstat(destination).catch(() => undefined);
-    if (destinationAfterHook !== undefined) {
+    if (target === "agent") {
+      await assertPartialAgentDestination(root, state.files);
+    }
+    await hook?.("after-target-validation", target);
+    await hook?.("before-target-publish", target);
+    const destinationAfterValidation = await lstat(destination).catch(
+      () => undefined,
+    );
+    if (
+      destinationAfterValidation !== undefined &&
+      (target !== "agent" || targetWasInitiallyMissing)
+    ) {
       throw cliError({
         code: "INIT_RECOVERY_CONFLICT",
         message:
@@ -1045,8 +1335,32 @@ async function resumeScaffold(
         source: target,
       });
     }
-    await rename(stagedTarget, destination);
-    await hook?.("after-target-publish");
+    if (target === "agent") {
+      await assertPartialAgentDestination(root, state.files);
+    }
+    const missingTargetFiles = targetFiles.filter(
+      (_file, index) => published[index] === "missing",
+    );
+    try {
+      await publishScaffoldTargetNoReplace(
+        root,
+        stage,
+        target,
+        missingTargetFiles,
+      );
+    } catch (error: unknown) {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "EEXIST" || code.code === "ENOTEMPTY") {
+        throw cliError({
+          code: "INIT_RECOVERY_CONFLICT",
+          message:
+            `The interrupted scaffold could not publish "${target}" because existing bytes appeared; no existing file was overwritten.`,
+          source: target,
+        });
+      }
+      throw error;
+    }
+    await hook?.("after-target-publish", target);
   }
 
   await assertPublishedScaffold(root, state);
@@ -1224,6 +1538,136 @@ async function assertArtifactDirectory(
   }
 }
 
+async function ensureCanonicalArtifactDirectory(
+  root: string,
+  outputDirectory: string,
+): Promise<void> {
+  assertWithinRoot(root, outputDirectory, "The canonical artifact directory");
+  const existing = await lstat(outputDirectory).catch(() => undefined);
+  if (existing?.isSymbolicLink() === true) {
+    throw cliError({
+      code: "ARTIFACT_OUTPUT_INVALID",
+      message: "The .eden artifact directory must not be a symbolic link.",
+      source: ".eden",
+    });
+  }
+  if (existing !== undefined && !existing.isDirectory()) {
+    throw cliError({
+      code: "ARTIFACT_OUTPUT_INVALID",
+      message: "The .eden artifact path must be a directory.",
+      source: ".eden",
+    });
+  }
+  await mkdir(outputDirectory, { recursive: true });
+  const generations = join(outputDirectory, "generations");
+  await assertContainedPathForCli(root, outputDirectory, ".eden");
+  const generationsDetails = await lstat(generations).catch(() => undefined);
+  if (generationsDetails?.isSymbolicLink() === true) {
+    throw cliError({
+      code: "ARTIFACT_OUTPUT_INVALID",
+      message: "The .eden generations directory must not be a symbolic link.",
+      source: ".eden/generations",
+    });
+  }
+  if (generationsDetails !== undefined && !generationsDetails.isDirectory()) {
+    throw cliError({
+      code: "ARTIFACT_OUTPUT_INVALID",
+      message: "The .eden generations path must be a directory.",
+      source: ".eden/generations",
+    });
+  }
+  await mkdir(generations, { recursive: true });
+  await assertContainedPathForCli(root, generations, ".eden/generations");
+
+  const current = join(outputDirectory, "CURRENT");
+  const currentDetails = await lstat(current).catch(() => undefined);
+  if (currentDetails !== undefined && !currentDetails.isSymbolicLink()) {
+    throw cliError({
+      code: "ARTIFACT_OUTPUT_INVALID",
+      message: "The .eden CURRENT pointer must be a symbolic link.",
+      source: ".eden/CURRENT",
+    });
+  }
+  if (currentDetails !== undefined) {
+    await assertArtifactDirectory(outputDirectory);
+  }
+
+  for (const name of CANONICAL_ARTIFACT_NAMES) {
+    const alias = join(outputDirectory, name);
+    const details = await lstat(alias).catch(() => undefined);
+    if (details === undefined) {
+      await symlink(join("CURRENT", name), alias);
+      continue;
+    }
+    if (!details.isSymbolicLink()) {
+      throw cliError({
+        code: "ARTIFACT_OUTPUT_INVALID",
+        message:
+          `The canonical artifact alias "${name}" must be a symbolic link to CURRENT.`,
+        source: name,
+      });
+    }
+    const target = await readlink(alias).catch(() => undefined);
+    if (target !== join("CURRENT", name)) {
+      throw cliError({
+        code: "ARTIFACT_OUTPUT_INVALID",
+        message:
+          `The canonical artifact alias "${name}" does not resolve through CURRENT.`,
+        source: name,
+      });
+    }
+  }
+}
+
+async function assertContainedPathForCli(
+  root: string,
+  path: string,
+  source: string,
+): Promise<void> {
+  const canonical = await realpath(path).catch(() => undefined);
+  if (
+    canonical === undefined ||
+    (canonical !== root && !canonical.startsWith(`${root}/`))
+  ) {
+    throw cliError({
+      code: "ARTIFACT_OUTPUT_INVALID",
+      message: `Generated artifact path "${source}" escapes the selected project root.`,
+      source,
+    });
+  }
+}
+
+async function promoteCurrentGeneration(
+  outputDirectory: string,
+  generationId: string,
+): Promise<void> {
+  const currentPointer = join(outputDirectory, "CURRENT");
+  const generationsDirectory = join(outputDirectory, "generations");
+  const generation = join(generationsDirectory, generationId);
+  const generationDetails = await lstat(generation).catch(() => undefined);
+  if (
+    generationDetails === undefined ||
+    !generationDetails.isDirectory() ||
+    generationDetails.isSymbolicLink()
+  ) {
+    throw cliError({
+      code: "ARTIFACT_OUTPUT_INVALID",
+      message: `The candidate generation "${generationId}" is unavailable.`,
+      source: generationId,
+    });
+  }
+  const pointerStage = join(
+    outputDirectory,
+    `.CURRENT-${process.pid}-${Date.now()}-${randomUUID()}`,
+  );
+  try {
+    await symlink(join("generations", generationId), pointerStage);
+    await rename(pointerStage, currentPointer);
+  } finally {
+    await rm(pointerStage, { force: true }).catch(() => undefined);
+  }
+}
+
 function replaceJsonMain(
   source: string,
   main: string,
@@ -1369,6 +1813,16 @@ function readProcessStartMarker(pid: number): Promise<string | undefined> {
       },
     );
   });
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    return code.code !== "ESRCH";
+  }
 }
 
 async function writeDevState(
@@ -2076,7 +2530,6 @@ async function buildProjectFromCli(
   assertWithinRoot(root, candidateOutput, "The artifact candidate directory");
   let temporaryConfig: string | undefined;
   let runtimeFiles: RuntimeFiles | undefined;
-  let promoted = false;
   try {
     let result;
     try {
@@ -2143,42 +2596,57 @@ async function buildProjectFromCli(
       });
     }
     await assertProjectInputsUnchanged(root, configuration, inputFingerprint);
+    await options.buildPublicationHook?.("before-canonical-prepare");
+    await ensureCanonicalArtifactDirectory(root, canonicalOutput);
+    await options.buildPublicationHook?.("after-canonical-prepare");
 
-    const backupOutput = join(root, uniqueTemporaryName("eden-build-previous"));
-    const current = await lstat(canonicalOutput).catch(() => undefined);
-    if (current !== undefined && !current.isDirectory()) {
-      throw cliError({
-        code: "ARTIFACT_OUTPUT_INVALID",
-        message: "The .eden artifact path must be a directory.",
-        source: ".eden",
-      });
-    }
-    if (current === undefined) {
-      await rename(candidateOutput, canonicalOutput);
-      promoted = true;
+    const generationId = result.artifacts.buildMetadata.generationId;
+    const candidateGenerationPath = join(
+      candidateOutput,
+      "generations",
+      generationId,
+    );
+    const canonicalGeneration = join(
+      canonicalOutput,
+      "generations",
+      generationId,
+    );
+    await options.buildPublicationHook?.("before-generation-publish");
+    const existingGeneration = await lstat(canonicalGeneration).catch(
+      () => undefined,
+    );
+    if (existingGeneration === undefined) {
+      await rename(candidateGenerationPath, canonicalGeneration);
     } else {
-      await rename(canonicalOutput, backupOutput);
-      try {
-        await rename(candidateOutput, canonicalOutput);
-        promoted = true;
-      } catch (error: unknown) {
-        await rename(backupOutput, canonicalOutput).catch(() => undefined);
-        throw error;
+      if (
+        !existingGeneration.isDirectory() ||
+        existingGeneration.isSymbolicLink()
+      ) {
+        throw cliError({
+          code: "ARTIFACT_OUTPUT_INVALID",
+          message:
+            `The canonical generation "${generationId}" is not a real directory.`,
+          source: generationId,
+        });
       }
-      await rm(backupOutput, { recursive: true, force: true });
+      await assertArtifactDirectory(candidateOutput);
+      await rm(candidateGenerationPath, { recursive: true, force: true });
     }
+    await options.buildPublicationHook?.("after-generation-publish");
+    await options.buildPublicationHook?.("before-current-promotion");
+    await promoteCurrentGeneration(canonicalOutput, generationId);
+    await assertArtifactDirectory(canonicalOutput);
+    await options.buildPublicationHook?.("after-current-promotion");
 
     options.stdout?.(
-      `Built Eden project generation ${result.artifacts.buildMetadata.generationId}.`,
+      `Built Eden project generation ${generationId}.`,
     );
     options.stdout?.("Worker compatibility dry run passed; no deployment was performed.");
     return result.artifacts.buildMetadata.generationId;
   } finally {
-    if (!promoted) {
-      await rm(candidateOutput, { recursive: true, force: true }).catch(
-        () => undefined,
-      );
-    }
+    await rm(candidateOutput, { recursive: true, force: true }).catch(
+      () => undefined,
+    );
     if (temporaryConfig !== undefined) {
       await rm(temporaryConfig, { force: true }).catch(() => undefined);
     }
