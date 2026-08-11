@@ -17,6 +17,7 @@ const MAX_JSON_DEPTH = 32;
 const EVENT_ID_PATTERN = /^evt_[A-Za-z0-9_-]+$/u;
 const SESSION_ID_PATTERN = /^sess_[A-Za-z0-9_-]+$/u;
 const OPAQUE_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]*$/u;
+const REPLAY_FINGERPRINT_PATTERN = /^fp_[0-9a-f]{32}$/u;
 
 const EVENT_TYPES: ReadonlySet<string> = new Set([
   "session.started",
@@ -111,6 +112,13 @@ export function isOpaqueSessionId(value: unknown): value is string {
 
 export function isOpaqueEventId(value: unknown): value is string {
   return typeof value === "string" && EVENT_ID_PATTERN.test(value);
+}
+
+export function isReplayEvidenceFingerprint(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    REPLAY_FINGERPRINT_PATTERN.test(value)
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -375,6 +383,26 @@ export function eventFingerprint(
     data: event.data,
     committedAt: event.committedAt,
   });
+}
+
+export function replayEvidenceFingerprint(
+  event: EdenEvent<EdenEventType>,
+): string {
+  const canonical = eventFingerprint(event);
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  let third = 0x6d2b79f5;
+  let fourth = 0x85ebca6b;
+  for (let index = 0; index < canonical.length; index += 1) {
+    const code = canonical.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ (code + index), 0x01000193);
+    third = Math.imul(third ^ (code ^ index), 0x01000193);
+    fourth = Math.imul(fourth ^ (code + (index << 1)), 0x01000193);
+  }
+  return `fp_${[first, second, third, fourth]
+    .map((part) => (part >>> 0).toString(16).padStart(8, "0"))
+    .join("")}`;
 }
 
 export function assertValidState(

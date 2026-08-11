@@ -4,6 +4,8 @@ import {
   EdenMemoryEventStore,
   EdenProtocolError,
   createEdenClient,
+  type EdenClientState,
+  type EdenEventStore,
 } from "../src/index.js";
 
 const VERSIONS = {
@@ -77,6 +79,66 @@ function acceptanceResponse(): Response {
       headers: { "content-type": "application/json; charset=utf-8" },
     },
   );
+}
+
+type ReplayEvidenceRecord = {
+  readonly eventId: string;
+  readonly streamIndex: number;
+  readonly fingerprint: string;
+};
+
+class SerializedEventStore implements EdenEventStore {
+  private readonly data: {
+    state: EdenClientState | undefined;
+    replayEvidence: Record<string, ReplayEvidenceRecord[]>;
+  };
+
+  constructor(serialized = JSON.stringify({ replayEvidence: {} })) {
+    const parsed = JSON.parse(serialized) as {
+      readonly state?: EdenClientState;
+      readonly replayEvidence?: Record<string, ReplayEvidenceRecord[]>;
+    };
+    this.data = {
+      state: parsed.state,
+      replayEvidence: Object.fromEntries(
+        Object.entries(parsed.replayEvidence ?? {}).map(
+          ([sessionId, evidence]) => [
+            sessionId,
+            evidence.map((entry) => ({ ...entry })),
+          ],
+        ),
+      ),
+    };
+  }
+
+  async load(): Promise<EdenClientState | undefined> {
+    return this.data.state === undefined ? undefined : { ...this.data.state };
+  }
+
+  async save(state: EdenClientState): Promise<void> {
+    this.data.state = { ...state };
+  }
+
+  async loadReplayEvidence(
+    sessionId: string,
+  ): Promise<readonly ReplayEvidenceRecord[]> {
+    return (this.data.replayEvidence[sessionId] ?? []).map((entry) => ({
+      ...entry,
+    }));
+  }
+
+  async saveReplayEvidence(
+    sessionId: string,
+    evidence: readonly ReplayEvidenceRecord[],
+  ): Promise<void> {
+    this.data.replayEvidence[sessionId] = evidence.map((entry) => ({
+      ...entry,
+    }));
+  }
+
+  serialize(): string {
+    return JSON.stringify(this.data);
+  }
 }
 
 describe("Eden typed client stream protocol", () => {
@@ -274,7 +336,7 @@ describe("Eden typed client stream protocol", () => {
       ndjson(first, second),
       ndjson(conflictingSecond),
     ];
-    const store = new EdenMemoryEventStore();
+    const store = new SerializedEventStore();
     const fetch = async () =>
       responses.shift() ?? new Response("unexpected", { status: 500 });
     const firstClient = createEdenClient({
@@ -288,12 +350,13 @@ describe("Eden typed client stream protocol", () => {
       void _receivedEvent;
     }
 
+    const restartedStore = new SerializedEventStore(store.serialize());
     const restartedClient = createEdenClient({
       baseUrl: "https://eden.example",
       bearerToken: "secret",
       fetch,
     });
-    const restartedSession = restartedClient.attach("sess_123", store);
+    const restartedSession = restartedClient.attach("sess_123", restartedStore);
 
     await expect(async () => {
       for await (const _receivedEvent of restartedSession.events({
@@ -304,10 +367,206 @@ describe("Eden typed client stream protocol", () => {
     }).rejects.toMatchObject({
       code: "cursor_conflict",
     });
-    expect(store.snapshot()).toEqual({
-      sessionId: "sess_123",
-      streamIndex: 2,
+    expect(JSON.parse(restartedStore.serialize())).toMatchObject({
+      state: {
+        sessionId: "sess_123",
+        streamIndex: 2,
+      },
     });
+  });
+
+  test("reconstructs a serialized store and deduplicates consistent overlap", async () => {
+    const first = event(
+      1,
+      "evt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session.started",
+    );
+    const second = event(
+      2,
+      "evt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "session.waiting",
+    );
+    const third = event(
+      3,
+      "evt_cccccccccccccccccccccccccccccccc",
+      "session.waiting",
+    );
+    const responses = [
+      ndjson(first, second),
+      ndjson(first, second, third),
+    ];
+    const fetch = async () =>
+      responses.shift() ?? new Response("unexpected", { status: 500 });
+    const firstStore = new EdenMemoryEventStore();
+    const firstClient = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch,
+    });
+
+    const firstEvents = [];
+    for await (const receivedEvent of firstClient
+      .attach("sess_123", firstStore)
+      .events({ follow: false })) {
+      firstEvents.push(receivedEvent);
+    }
+
+    const serialized = firstStore.serialize();
+    const persisted = JSON.parse(serialized) as {
+      readonly state: EdenClientState;
+      readonly replayEvidence: Record<string, readonly ReplayEvidenceRecord[]>;
+    };
+    expect(Object.keys(persisted.state).sort()).toEqual([
+      "sessionId",
+      "streamIndex",
+    ]);
+    expect(persisted.replayEvidence.sess_123).toHaveLength(2);
+    expect(serialized).not.toContain("secret");
+
+    const restartedStore = EdenMemoryEventStore.fromSerialized(serialized);
+    const restartedClient = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch,
+    });
+    const replayedEvents = [];
+    for await (const receivedEvent of restartedClient
+      .attach("sess_123", restartedStore)
+      .events({ follow: false })) {
+      replayedEvents.push(receivedEvent);
+    }
+
+    expect(firstEvents.map((receivedEvent) => receivedEvent.eventId)).toEqual([
+      first.eventId,
+      second.eventId,
+    ]);
+    expect(replayedEvents.map((receivedEvent) => receivedEvent.eventId)).toEqual([
+      third.eventId,
+    ]);
+    expect(JSON.parse(restartedStore.serialize())).toMatchObject({
+      state: { sessionId: "sess_123", streamIndex: 3 },
+    });
+  });
+
+  test("bounds serialized replay evidence to the newest committed cursors", async () => {
+    const records = Array.from({ length: 300 }, (_, offset) => {
+      const streamIndex = offset + 1;
+      return event(
+        streamIndex,
+        `evt_${streamIndex.toString(36).padStart(32, "a")}`,
+        streamIndex === 1 ? "session.started" : "session.waiting",
+      );
+    });
+    const store = new SerializedEventStore();
+    const client = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch: async () => ndjson(...records),
+    });
+
+    for await (const _receivedEvent of client
+      .attach("sess_123", store)
+      .events({ follow: false })) {
+      void _receivedEvent;
+    }
+
+    const persisted = JSON.parse(store.serialize()) as {
+      readonly replayEvidence: Record<string, readonly ReplayEvidenceRecord[]>;
+    };
+    expect(persisted.replayEvidence.sess_123).toHaveLength(256);
+    expect(persisted.replayEvidence.sess_123.at(0)?.streamIndex).toBe(45);
+    expect(persisted.replayEvidence.sess_123.at(-1)?.streamIndex).toBe(300);
+    expect(store.serialize()).not.toContain("Bearer");
+  });
+
+  test("stores only opaque replay fingerprints, never event payloads", async () => {
+    const secret = "replay-evidence-secret";
+    const records = [
+      event(
+        1,
+        "evt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "session.started",
+      ),
+      {
+        streamIndex: 2,
+        eventId: "evt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        type: "message.completed",
+        data: {
+          messageId: "msg_123",
+          role: "assistant",
+          content: secret,
+        },
+        committedAt: "2026-08-10T00:00:00.000Z",
+      },
+      event(
+        3,
+        "evt_cccccccccccccccccccccccccccccccc",
+        "session.waiting",
+      ),
+    ];
+    const store = new SerializedEventStore();
+    const client = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch: async () => ndjson(...records),
+    });
+
+    for await (const _receivedEvent of client
+      .attach("sess_123", store)
+      .events({ follow: false })) {
+      void _receivedEvent;
+    }
+
+    expect(store.serialize()).not.toContain(secret);
+    expect(store.serialize()).toMatch(/"fingerprint":"fp_[0-9a-f]{32}"/u);
+  });
+
+  test("rejects malformed or cross-session persisted replay evidence", async () => {
+    let requestCount = 0;
+    const store = new SerializedEventStore(
+      JSON.stringify({
+        state: { sessionId: "sess_123", streamIndex: 1 },
+        replayEvidence: {
+          sess_123: [
+            {
+              eventId: "evt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              streamIndex: 1,
+              fingerprint: "not-a-fingerprint",
+            },
+          ],
+          sess_other: [
+            {
+              eventId: "evt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              streamIndex: 1,
+              fingerprint: "fp_00000000000000000000000000000000",
+            },
+          ],
+        },
+      }),
+    );
+    const client = createEdenClient({
+      baseUrl: "https://eden.example",
+      bearerToken: "secret",
+      fetch: async () => {
+        requestCount += 1;
+        return ndjson(
+          event(
+            2,
+            "evt_cccccccccccccccccccccccccccccccc",
+            "session.waiting",
+          ),
+        );
+      },
+    });
+
+    await expect(async () => {
+      for await (const _receivedEvent of client
+        .attach("sess_123", store)
+        .events({ follow: false })) {
+        void _receivedEvent;
+      }
+    }).rejects.toMatchObject({ code: "invalid_state" });
+    expect(requestCount).toBe(0);
   });
 
   test("rejects session.started for a different attached session before persistence", async () => {

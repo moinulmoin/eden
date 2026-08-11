@@ -22,7 +22,9 @@ import {
   EdenHttpError,
   EdenProtocolError,
   EdenTransportError,
-  eventFingerprint,
+  replayEvidenceFingerprint,
+  isOpaqueEventId,
+  isReplayEvidenceFingerprint,
   isOpaqueSessionId,
   parseEdenEvent,
   type EdenProtocolErrorCode,
@@ -59,13 +61,30 @@ export interface EdenClientSessionState {
 
 export type EdenClientState = EdenClientSessionState;
 
+export interface EdenClientReplayEvidence {
+  readonly eventId: string;
+  readonly streamIndex: number;
+  readonly fingerprint: string;
+}
+
 export interface EdenEventStore {
   load(): Promise<EdenClientState | undefined>;
   save(state: EdenClientState): Promise<void>;
+  loadReplayEvidence(
+    sessionId: string,
+  ): Promise<readonly EdenClientReplayEvidence[]>;
+  saveReplayEvidence(
+    sessionId: string,
+    evidence: readonly EdenClientReplayEvidence[],
+  ): Promise<void>;
 }
 
 export class EdenMemoryEventStore implements EdenEventStore {
   private state: EdenClientState | undefined;
+  private readonly replayEvidenceBySession = new Map<
+    string,
+    readonly EdenClientReplayEvidence[]
+  >();
 
   constructor(initialState?: EdenClientState) {
     if (initialState !== undefined) {
@@ -95,8 +114,88 @@ export class EdenMemoryEventStore implements EdenEventStore {
     this.state = Object.freeze({ ...valid });
   }
 
+  async loadReplayEvidence(
+    sessionId: string,
+  ): Promise<readonly EdenClientReplayEvidence[]> {
+    validateSessionId(sessionId);
+    return (this.replayEvidenceBySession.get(sessionId) ?? []).map((entry) => ({
+      ...entry,
+    }));
+  }
+
+  async saveReplayEvidence(
+    sessionId: string,
+    evidence: readonly EdenClientReplayEvidence[],
+  ): Promise<void> {
+    validateSessionId(sessionId);
+    const valid = validateReplayEvidence(evidence);
+    this.replayEvidenceBySession.set(
+      sessionId,
+      valid.map((entry) => ({ ...entry })),
+    );
+  }
+
   snapshot(): EdenClientState | undefined {
     return this.state === undefined ? undefined : { ...this.state };
+  }
+
+  serialize(): string {
+    return JSON.stringify({
+      state: this.state,
+      replayEvidence: Object.fromEntries(
+        [...this.replayEvidenceBySession.entries()].map(
+          ([sessionId, evidence]) => [sessionId, evidence],
+        ),
+      ),
+    });
+  }
+
+  static fromSerialized(serialized: string): EdenMemoryEventStore {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(serialized) as unknown;
+    } catch {
+      throw new EdenProtocolError(
+        "invalid_state",
+        "Serialized Eden client state must be valid JSON.",
+      );
+    }
+    if (!isRecord(parsed)) {
+      throw new EdenProtocolError(
+        "invalid_state",
+        "Serialized Eden client state must be an object.",
+      );
+    }
+    const state = parsed.state === undefined
+      ? undefined
+      : assertValidState(parsed.state);
+    if (parsed.state !== undefined && state === undefined) {
+      throw new EdenProtocolError(
+        "invalid_state",
+        "Serialized Eden client state contains an invalid session cursor.",
+      );
+    }
+    const evidenceBySession = parsed.replayEvidence;
+    if (!isRecord(evidenceBySession)) {
+      throw new EdenProtocolError(
+        "invalid_state",
+        "Serialized Eden replay evidence must be session-scoped.",
+      );
+    }
+    const store = new EdenMemoryEventStore(state);
+    for (const [sessionId, evidence] of Object.entries(evidenceBySession)) {
+      if (!isOpaqueSessionId(sessionId) || !Array.isArray(evidence)) {
+        throw new EdenProtocolError(
+          "invalid_state",
+          "Serialized Eden replay evidence has an invalid session scope.",
+        );
+      }
+      store.replayEvidenceBySession.set(
+        sessionId,
+        validateReplayEvidence(evidence),
+      );
+    }
+    return store;
   }
 }
 
@@ -148,11 +247,7 @@ interface InternalEventRecord {
   readonly streamIndex: number;
 }
 
-interface InternalReplayEvidence {
-  readonly eventId: string;
-  readonly streamIndex: number;
-  readonly fingerprint: string;
-}
+type InternalReplayEvidence = EdenClientReplayEvidence;
 
 interface InternalSession {
   readonly sessionId: string;
@@ -169,11 +264,6 @@ const DEFAULT_FOLLOW = true;
 const ACCEPTED_JSON_CONTENT_TYPE = "application/json";
 const ACCEPTED_NDJSON_CONTENT_TYPE = "application/x-ndjson";
 const MAX_INTERNAL_REPLAY_EVIDENCE = 256;
-
-const replayEvidenceByStore = new WeakMap<
-  EdenEventStore,
-  Map<string, readonly InternalReplayEvidence[]>
->();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -237,28 +327,52 @@ function protocolError(
   return new EdenProtocolError(code, message);
 }
 
-function loadReplayEvidence(
-  store: EdenEventStore | undefined,
-  sessionId: string,
+function validateReplayEvidence(
+  value: unknown,
 ): readonly InternalReplayEvidence[] {
-  if (store === undefined) return [];
-  const evidenceBySession = replayEvidenceByStore.get(store);
-  const evidence = evidenceBySession?.get(sessionId);
-  return evidence === undefined
-    ? []
-    : evidence.map((entry) => ({ ...entry }));
+  if (!Array.isArray(value) || value.length > MAX_INTERNAL_REPLAY_EVIDENCE) {
+    throw protocolError(
+      "invalid_state",
+      "Persisted Eden replay evidence exceeds its bounded format.",
+    );
+  }
+  const seenEventIds = new Set<string>();
+  const seenCursors = new Set<number>();
+  const normalized = value.map((entry) => {
+    if (
+      !isRecord(entry) ||
+      !hasOnlyKeys(entry, ["eventId", "streamIndex", "fingerprint"]) ||
+      !isOpaqueEventId(entry.eventId) ||
+      !isReplayEvidenceFingerprint(entry.fingerprint) ||
+      typeof entry.streamIndex !== "number" ||
+      !Number.isSafeInteger(entry.streamIndex) ||
+      entry.streamIndex < 1 ||
+      seenEventIds.has(entry.eventId) ||
+      seenCursors.has(entry.streamIndex)
+    ) {
+      throw protocolError(
+        "invalid_state",
+        "Persisted Eden replay evidence is malformed or duplicated.",
+      );
+    }
+    seenEventIds.add(entry.eventId);
+    seenCursors.add(entry.streamIndex);
+    return {
+      eventId: entry.eventId,
+      streamIndex: entry.streamIndex,
+      fingerprint: entry.fingerprint,
+    };
+  });
+  return normalized.sort((left, right) => left.streamIndex - right.streamIndex);
 }
 
-function saveReplayEvidence(
-  store: EdenEventStore | undefined,
-  sessionId: string,
+function buildReplayEvidence(
   cursors: ReadonlyMap<
     number,
     { readonly eventId: string; readonly fingerprint: string }
   >,
-): void {
-  if (store === undefined) return;
-  const evidence = [...cursors.entries()]
+): readonly InternalReplayEvidence[] {
+  return [...cursors.entries()]
     .sort(([left], [right]) => left - right)
     .slice(-MAX_INTERNAL_REPLAY_EVIDENCE)
     .map(([streamIndex, value]) => ({
@@ -266,12 +380,14 @@ function saveReplayEvidence(
       streamIndex,
       fingerprint: value.fingerprint,
     }));
-  let evidenceBySession = replayEvidenceByStore.get(store);
-  if (evidenceBySession === undefined) {
-    evidenceBySession = new Map();
-    replayEvidenceByStore.set(store, evidenceBySession);
-  }
-  evidenceBySession.set(sessionId, evidence);
+}
+
+async function loadPersistedReplayEvidence(
+  store: EdenEventStore | undefined,
+  sessionId: string,
+): Promise<readonly InternalReplayEvidence[]> {
+  if (store === undefined) return [];
+  return validateReplayEvidence(await store.loadReplayEvidence(sessionId));
 }
 
 function trimReplayEvidence(
@@ -695,9 +811,8 @@ class EdenClientImplementation implements EdenClient {
     const persistedCursor = stored?.streamIndex ?? 0;
     const replayEvidence = stored === undefined
       ? []
-      : loadReplayEvidence(session.store, session.sessionId).filter(
-        (entry) => entry.streamIndex <= persistedCursor,
-      );
+      : (await loadPersistedReplayEvidence(session.store, session.sessionId))
+        .filter((entry) => entry.streamIndex <= persistedCursor);
     return {
       cursor: Math.max(requested, persistedCursor),
       persistedCursor,
@@ -776,8 +891,13 @@ class EdenClientImplementation implements EdenClient {
         fingerprint,
       });
       acceptedCursor = event.streamIndex;
+      const replayEvidence = buildReplayEvidence(cursors);
       if (session.store !== undefined) {
         try {
+          await session.store.saveReplayEvidence(
+            session.sessionId,
+            replayEvidence,
+          );
           await session.store.save({
             sessionId: session.sessionId,
             streamIndex: acceptedCursor,
@@ -793,7 +913,6 @@ class EdenClientImplementation implements EdenClient {
         }
       }
       trimReplayEvidence(known, cursors);
-      saveReplayEvidence(session.store, session.sessionId, cursors);
     };
 
     for await (const event of responseEvents(response, signal)) {
@@ -807,7 +926,7 @@ class EdenClientImplementation implements EdenClient {
           "The session.started event belongs to a different Eden session.",
         );
       }
-      const fingerprint = eventFingerprint(event);
+      const fingerprint = replayEvidenceFingerprint(event);
       const previous = known.get(event.eventId);
       if (previous !== undefined) {
         if (previous.streamIndex !== event.streamIndex) {
