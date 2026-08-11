@@ -39,7 +39,9 @@ export const PUBLIC_FAILURE_FIXTURE =
 
 export const PUBLIC_FAILURE_CASES = Object.freeze([
   "keeps invalid tool input failed after disconnect, eviction, and reconnect",
+  "keeps invalid tool invocation count at zero before and after eviction and reconnect",
   "keeps interrupted uncommitted work inspectably retryable after eviction",
+  "redacts deterministic interruption text from public events and durable state",
   "replays a completed effect after eviction without another execution",
 ]);
 

@@ -14,6 +14,7 @@ import {
   configureEdenArtifact,
   readConfiguredEdenArtifact,
 } from "./artifact-runtime.js";
+import { isOpaqueSessionId } from "./session-identity.js";
 
 export { EdenSession };
 export {
@@ -54,6 +55,74 @@ const TEST_TOOL_STANDARD_SCHEMA = {
   },
 } as const;
 
+const testToolExecutionCounts = new Map<string, number>();
+const testToolInvocationCounts = new Map<string, number>();
+const TEST_INVOCATION_PATH = "/__test/tool-invocations/";
+
+function testJsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function readTestBearer(request: Request): string | undefined {
+  const header = request.headers.get("authorization");
+  if (header === null || !header.startsWith("Bearer ")) return undefined;
+  const value = header.slice("Bearer ".length);
+  return value.length === 0 || value.includes(" ") ? undefined : value;
+}
+
+function constantTimeTestBearerEqual(left: string, right: string): boolean {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  const length = Math.max(leftBytes.length, rightBytes.length);
+  let difference = leftBytes.length ^ rightBytes.length;
+  for (let index = 0; index < length; index += 1) {
+    difference |= (leftBytes[index] ?? 0) ^ (rightBytes[index] ?? 0);
+  }
+  return difference === 0;
+}
+
+function testInvocationResponse(
+  request: Request,
+  env: EdenWorkerEnvironment,
+): Response | undefined {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith(TEST_INVOCATION_PATH)) return undefined;
+  if (request.method !== "GET") {
+    return testJsonResponse(
+      { code: "not_found", message: "Resource was not found." },
+      404,
+    );
+  }
+  const bearer = readTestBearer(request);
+  if (
+    env.EDEN_BEARER_SECRET === undefined ||
+    bearer === undefined ||
+    !constantTimeTestBearerEqual(bearer, env.EDEN_BEARER_SECRET)
+  ) {
+    return testJsonResponse(
+      { code: "unauthorized", message: "Authorization is required." },
+      401,
+    );
+  }
+  const sessionId = url.pathname.slice(TEST_INVOCATION_PATH.length);
+  if (!isOpaqueSessionId(sessionId) || sessionId.includes("/")) {
+    return testJsonResponse(
+      { code: "not_found", message: "Resource was not found." },
+      404,
+    );
+  }
+  return testJsonResponse({
+    sessionId,
+    count: testToolInvocationCounts.get(sessionId) ?? 0,
+  });
+}
+
 const TEST_TOOL: EdenToolDefinition<
   { readonly query: string },
   { readonly source: string; readonly query: string; readonly executionCount?: number }
@@ -61,8 +130,14 @@ const TEST_TOOL: EdenToolDefinition<
   description: "Return the configured test-worker artifact result.",
   inputSchema: TEST_TOOL_STANDARD_SCHEMA,
   execute(input, context) {
+    testToolInvocationCounts.set(
+      context.sessionId,
+      (testToolInvocationCounts.get(context.sessionId) ?? 0) + 1,
+    );
     if (input.query === "interrupted") {
-      throw new Error("deterministic uncommitted interruption");
+      throw new Error(
+        "deterministic uncommitted interruption: provider secret sentinel binding sentinel-binding",
+      );
     }
     const executionCount =
       input.query === "replay"
@@ -78,8 +153,6 @@ const TEST_TOOL: EdenToolDefinition<
     };
   },
 };
-
-const testToolExecutionCounts = new Map<string, number>();
 
 // This deterministic model is injected only by the Workers test entrypoint.
 // Remote generated wrappers select the Workers AI adapter instead.
@@ -203,6 +276,8 @@ export default {
     request: Request,
     env: EdenWorkerEnvironment,
   ): Promise<Response> {
+    const testInvocation = testInvocationResponse(request, env);
+    if (testInvocation !== undefined) return Promise.resolve(testInvocation);
     return handleEdenRequest(request, env);
   },
 };
