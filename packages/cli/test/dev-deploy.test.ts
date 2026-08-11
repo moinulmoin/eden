@@ -3,6 +3,7 @@ import {
 } from "crypto";
 import {
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -856,11 +857,13 @@ export default {
         release = () => resolve({ exitCode: 0, signal: null });
       },
     );
+    const spawned: EdenCliProcessRequest[] = [];
     const dryRuns: EdenCliDryRunRequest[] = [];
     const devPromise = runEdenCli(["dev", "--project", root], {
       cwd: root,
       processRunner: {
-        spawn() {
+        spawn(request: EdenCliProcessRequest) {
+          spawned.push(request);
           return {
             pid: 41_004,
             startIdentity: "fixture-start",
@@ -877,7 +880,28 @@ export default {
       },
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise<void>((resolve) => {
+      const check = (): void => {
+        if (spawned.length > 0) {
+          resolve();
+          return;
+        }
+        setTimeout(check, 10);
+      };
+      check();
+    });
+    const initialRuntimeConfigPath = spawned[0]?.args[
+      (spawned[0]?.args.indexOf("--config") ?? -1) + 1
+    ];
+    const initialRuntimeConfig = await readFile(
+      initialRuntimeConfigPath as string,
+      "utf8",
+    );
+    const initialRuntimeEntryPath = join(
+      root,
+      /"main"\s*:\s*"([^"]+)"/u.exec(initialRuntimeConfig)?.[1] as string,
+    );
+    const initialRuntimeEntry = await readFile(initialRuntimeEntryPath, "utf8");
     await writeFile(
       join(root, "agent/tools/greet.ts"),
       `import { readFile } from "node:fs/promises";
@@ -891,6 +915,12 @@ export default {
     );
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(await artifactDigest(root)).toBe(initialDigest);
+    await expect(readFile(initialRuntimeConfigPath as string, "utf8")).resolves.toBe(
+      initialRuntimeConfig,
+    );
+    await expect(readFile(initialRuntimeEntryPath, "utf8")).resolves.toBe(
+      initialRuntimeEntry,
+    );
 
     await writeFile(
       join(root, "agent/tools/greet.ts"),
@@ -922,6 +952,260 @@ export default greet;
     expect(await waitForDigestChange(root, initialDigest)).not.toBe(initialDigest);
     release?.();
     await expect(devPromise).resolves.toBe(0);
+  }, 10_000);
+
+  test("updates the running Wrangler runtime when a watch generation succeeds", async () => {
+    const root = await createRoot("eden-cli-dev-watch-runtime-swap-");
+    await initRoot(root);
+    const spawned: EdenCliProcessRequest[] = [];
+    const releases: Array<() => void> = [];
+    let resolveReady: (() => void) | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    let resolveRuntimeChange:
+      | ((observation: { readonly config: string; readonly entry: string }) => void)
+      | undefined;
+    const runtimeChanged = new Promise<{
+      readonly config: string;
+      readonly entry: string;
+    }>((resolve) => {
+      resolveRuntimeChange = resolve;
+    });
+    let baselineConfig: string | undefined;
+    let baselineEntry: string | undefined;
+    const pollers = new Set<NodeJS.Timeout>();
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      processRunner: {
+        spawn(request: EdenCliProcessRequest) {
+          spawned.push(request);
+          const configIndex = request.args.indexOf("--config");
+          const configPath = request.args[configIndex + 1] as string;
+          const poller = setInterval(() => {
+            void (async () => {
+              const config = await readFile(configPath, "utf8").catch(() => undefined);
+              if (config === undefined) return;
+              const main = /"main"\s*:\s*"([^"]+)"/u.exec(config)?.[1];
+              if (main === undefined) return;
+              const entry = await readFile(join(root, main), "utf8").catch(
+                () => undefined,
+              );
+              if (entry === undefined) return;
+              if (baselineConfig === undefined || baselineEntry === undefined) {
+                baselineConfig = config;
+                baselineEntry = entry;
+                return;
+              }
+              if (config !== baselineConfig || entry !== baselineEntry) {
+                clearInterval(poller);
+                pollers.delete(poller);
+                resolveRuntimeChange?.({ config, entry });
+              }
+            })();
+          }, 20);
+          pollers.add(poller);
+          const exited = new Promise<{
+            readonly exitCode: number;
+            readonly signal: null;
+          }>((resolve) => {
+            releases.push(() => resolve({ exitCode: 0, signal: null }));
+          });
+          return {
+            pid: 42_101 + spawned.length,
+            startIdentity: `fixture-runtime-${spawned.length}`,
+            ready: Promise.resolve(),
+            exited,
+            async terminate() {
+              releases.splice(0).forEach((release) => release());
+            },
+          };
+        },
+      },
+      dryRunRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      }),
+      stdout: (line) => {
+        if (line.includes("Eden dev ready")) resolveReady?.();
+      },
+    });
+
+    try {
+      await readyPromise;
+      const initialDigest = await artifactDigest(root);
+      await writeFile(
+        join(root, "agent/tools/greet.ts"),
+        `import type { EdenToolDefinition } from "@eden/definitions";
+const greet: EdenToolDefinition<{ readonly name: string }, { readonly greeting: string }> = {
+  description: "Updated watch greeting.",
+  inputSchema: {
+    "~standard": {
+      version: 1,
+      vendor: "eden-scaffold",
+      validate(value: unknown) {
+        if (typeof value === "object" && value !== null && !Array.isArray(value) && typeof (value as { readonly name?: unknown }).name === "string") {
+          return { value: { name: (value as { readonly name: string }).name.trim() } };
+        }
+        return { issues: [{ message: "name must be a string." }] };
+      },
+    },
+  },
+  execute(input) {
+    return { greeting: \`Updated hello, \${input.name}!\` };
+  },
+};
+export default greet;
+`,
+        "utf8",
+      );
+
+      const observed = await Promise.race([
+        runtimeChanged,
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 3_000)),
+      ]);
+      expect(observed).toBeDefined();
+      expect(await artifactDigest(root)).not.toBe(initialDigest);
+      expect(spawned.length).toBeGreaterThan(0);
+    } finally {
+      pollers.forEach((poller) => clearInterval(poller));
+      releases.splice(0).forEach((release) => release());
+      await expect(devPromise).resolves.toBe(0);
+    }
+  }, 10_000);
+
+  test("keeps the previous runtime files when runtime replacement fails", async () => {
+    const root = await createRoot("eden-cli-dev-watch-runtime-fallback-");
+    await initRoot(root);
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+      }),
+    ).resolves.toBe(0);
+    const errors: string[] = [];
+    let resolveSwapAttempt: ((value: true) => void) | undefined;
+    const swapAttempted = new Promise<true>((resolve) => {
+      resolveSwapAttempt = resolve;
+    });
+    let resolveReady: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    let release: (() => void) | undefined;
+    const exited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      release = () => resolve({ exitCode: 0, signal: null });
+    });
+    let configPath: string | undefined;
+    let entryPath: string | undefined;
+
+    const devOptions = {
+      cwd: root,
+      processRunner: {
+        spawn(request: EdenCliProcessRequest) {
+          const configIndex = request.args.indexOf("--config");
+          configPath = request.args[configIndex + 1] as string;
+          return {
+            pid: 42_102,
+            startIdentity: "fixture-runtime-fallback",
+            ready: Promise.resolve(),
+            exited,
+            async terminate() {
+              release?.();
+            },
+          };
+        },
+      },
+      dryRunRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      }),
+      stderr: (line: string) => errors.push(line),
+      stdout: (line: string) => {
+        if (line.includes("Eden dev ready")) resolveReady?.();
+      },
+      runtimePublicationHook: async (boundary: string) => {
+        if (boundary !== "after-runtime-ready") return;
+        resolveSwapAttempt?.(true);
+        throw new Error("replacement startup fixture failed");
+      },
+    } as Parameters<typeof runEdenCli>[1];
+
+    const devPromise = runEdenCli(["dev", "--project", root], devOptions);
+    try {
+      await new Promise<void>((resolve) => {
+        const check = (): void => {
+          if (configPath !== undefined) {
+            resolve();
+            return;
+          }
+          setTimeout(check, 10);
+        };
+        check();
+      });
+      const configBefore = await readFile(configPath as string, "utf8");
+      const main = /"main"\s*:\s*"([^"]+)"/u.exec(configBefore)?.[1];
+      expect(main).toBeDefined();
+      entryPath = join(root, main as string);
+      const entryBefore = await readFile(entryPath, "utf8");
+
+      await ready;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await writeFile(
+        join(root, "agent/tools/greet.ts"),
+        `import type { EdenToolDefinition } from "@eden/definitions";
+const greet: EdenToolDefinition<{ readonly name: string }, { readonly greeting: string }> = {
+  description: "Updated watch greeting before a failed replacement.",
+  inputSchema: {
+    "~standard": {
+      version: 1,
+      vendor: "eden-scaffold",
+      validate(value: unknown) {
+        if (typeof value === "object" && value !== null && !Array.isArray(value) && typeof (value as { readonly name?: unknown }).name === "string") {
+          return { value: { name: (value as { readonly name: string }).name.trim() } };
+        }
+        return { issues: [{ message: "name must be a string." }] };
+      },
+    },
+  },
+  execute(input) {
+    return { greeting: \`Replacement hello, \${input.name}!\` };
+  },
+};
+export default greet;
+`,
+        "utf8",
+      );
+      const attempted = await Promise.race([
+        swapAttempted,
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 3_000)),
+      ]);
+      expect(attempted).toBeDefined();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      await expect(readFile(configPath as string, "utf8")).resolves.toBe(
+        configBefore,
+      );
+      await expect(readFile(entryPath, "utf8")).resolves.toBe(entryBefore);
+      expect(errors.join("\n")).toMatch(/watch rebuild unavailable|replacement/i);
+    } finally {
+      release?.();
+      await expect(devPromise).resolves.toBe(0);
+      const temporaryRuntimeFiles = (await readdir(root)).filter((name) =>
+        name.includes("eden-dev-worker") || name.includes("eden-dev-config"),
+      );
+      expect(temporaryRuntimeFiles).toEqual([]);
+    }
   }, 10_000);
 
   test("distinguishes compatibility and Wrangler dry-run failures", async () => {

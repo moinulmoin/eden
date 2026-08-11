@@ -185,6 +185,14 @@ export interface EdenCliProcessRunner {
   spawn(request: EdenCliProcessRequest): EdenCliProcess;
 }
 
+export type EdenRuntimePublicationBoundary =
+  | "before-runtime-entry-publish"
+  | "after-runtime-entry-publish"
+  | "before-runtime-config-publish"
+  | "after-runtime-config-publish"
+  | "after-runtime-ready"
+  | "after-runtime-rollback";
+
 export interface EdenCliRunOptions {
   readonly cwd?: string;
   readonly stdout?: (line: string) => void;
@@ -203,6 +211,9 @@ export interface EdenCliRunOptions {
     | EdenCliDryRunHandle
     | Promise<EdenCliDryRunResult | EdenCliDryRunHandle>;
   readonly processRunner?: EdenCliProcessRunner;
+  readonly runtimePublicationHook?: (
+    boundary: EdenRuntimePublicationBoundary,
+  ) => void | Promise<void>;
   readonly remoteCommandRunner?: (
     request: EdenCliRemoteCommandRequest,
   ) => Promise<EdenCliRemoteCommandResult>;
@@ -2368,6 +2379,7 @@ async function createRuntimeFiles(
   configPath: string,
   generation: EdenArtifactGeneration,
   executionMode: "local" | "remote" = "local",
+  targetEntryPath?: string,
 ): Promise<RuntimeFiles> {
   const runtimeGeneration = readRuntimeGeneration(generation);
   const runtimeEntrypoint = await resolveRuntimeWorkerEntrypoint();
@@ -2375,12 +2387,14 @@ async function createRuntimeFiles(
     root,
     `${uniqueTemporaryName("eden-dev-worker")}.mjs`,
   );
+  const entryReferencePath = targetEntryPath ?? entryPath;
   assertWithinRoot(root, entryPath, "The local runtime entrypoint");
+  assertWithinRoot(root, entryReferencePath, "The local runtime entrypoint");
   const bundlePath = join(generation.directory, "agent-bundle.mjs");
-  const runtimeImport = relative(dirname(entryPath), runtimeEntrypoint)
+  const runtimeImport = relative(dirname(entryReferencePath), runtimeEntrypoint)
     .split("\\")
     .join("/");
-  const bundleImport = relative(dirname(entryPath), bundlePath)
+  const bundleImport = relative(dirname(entryReferencePath), bundlePath)
     .split("\\")
     .join("/");
   const moduleSpecifier = (value: string): string =>
@@ -2408,19 +2422,25 @@ export default runtimeWorker;
 
   try {
     const source = await readFile(configPath, "utf8");
-    const relativeMain = relative(root, entryPath)
+    const relativeMain = relative(root, entryReferencePath)
       .split("\\")
       .join("/");
     const extension = extname(configPath).toLowerCase();
     const contents = extension === ".toml"
       ? replaceTomlMain(source, relativeMain)
       : replaceJsonMain(source, relativeMain);
+    const marker = extension === ".toml"
+      ? `# Eden runtime generation: ${runtimeGeneration.generationId}`
+      : `// Eden runtime generation: ${runtimeGeneration.generationId}`;
+    const configContents = extension === ".json"
+      ? contents
+      : `${marker}\n${contents}`;
     const temporaryConfig = join(
       root,
       `${uniqueTemporaryName("eden-dev-config")}${extension || ".jsonc"}`,
     );
     assertWithinRoot(root, temporaryConfig, "The local runtime configuration");
-    await writeFile(temporaryConfig, contents, {
+    await writeFile(temporaryConfig, configContents, {
       encoding: "utf8",
       flag: "wx",
     });
@@ -2428,6 +2448,88 @@ export default runtimeWorker;
   } catch (error: unknown) {
     await rm(entryPath, { force: true }).catch(() => undefined);
     throw error;
+  }
+}
+
+interface RuntimeFileContents {
+  readonly config: string;
+  readonly entry: string;
+}
+
+async function readRuntimeFileContents(
+  files: RuntimeFiles,
+): Promise<RuntimeFileContents> {
+  const [config, entry] = await Promise.all([
+    readFile(files.configPath, "utf8"),
+    readFile(files.entryPath, "utf8"),
+  ]);
+  return { config, entry };
+}
+
+async function replaceRuntimeFile(
+  root: string,
+  target: string,
+  contents: string,
+): Promise<void> {
+  assertWithinRoot(root, target, "The local runtime file");
+  const stage = join(
+    root,
+    uniqueTemporaryName(`eden-runtime-file-${basename(target)}`),
+  );
+  assertWithinRoot(root, stage, "The local runtime staging file");
+  try {
+    await writeFile(stage, contents, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    await rename(stage, target);
+  } finally {
+    await rm(stage, { force: true }).catch(() => undefined);
+  }
+}
+
+async function restoreRuntimeFiles(
+  root: string,
+  files: RuntimeFiles,
+  previous: RuntimeFileContents,
+): Promise<void> {
+  await replaceRuntimeFile(root, files.entryPath, previous.entry);
+  await replaceRuntimeFile(root, files.configPath, previous.config);
+}
+
+async function publishRuntimeFiles(
+  root: string,
+  current: RuntimeFiles,
+  next: RuntimeFiles,
+  previous: RuntimeFileContents,
+  hook?: EdenCliRunOptions["runtimePublicationHook"],
+): Promise<{
+  readonly contents: RuntimeFileContents;
+}> {
+  let nextContents: RuntimeFileContents;
+  try {
+    nextContents = await readRuntimeFileContents(next);
+    await hook?.("before-runtime-entry-publish");
+    await replaceRuntimeFile(root, current.entryPath, nextContents.entry);
+    await hook?.("after-runtime-entry-publish");
+    await hook?.("before-runtime-config-publish");
+    await replaceRuntimeFile(root, current.configPath, nextContents.config);
+    await hook?.("after-runtime-config-publish");
+    return {
+      contents: nextContents,
+    };
+  } catch (error: unknown) {
+    await restoreRuntimeFiles(root, current, previous).catch(() => undefined);
+    try {
+      await hook?.("after-runtime-rollback");
+    } catch {
+      // Preserve the original publication error.
+    }
+    throw error;
+  } finally {
+    await rm(next.configPath, { force: true }).catch(() => undefined);
+    await rm(next.entryPath, { force: true }).catch(() => undefined);
   }
 }
 
@@ -3387,6 +3489,69 @@ function waitForTcpPort(
   });
 }
 
+async function waitForRuntimeGeneration(
+  child: EdenCliProcess | undefined,
+  generation: RuntimeGeneration,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const secret = process.env.EDEN_BEARER_SECRET;
+  if (secret === undefined || secret.length === 0) return;
+  const startedAt = Date.now();
+  const url =
+    `http://${EDEN_LOCAL_HOST}:${EDEN_LOCAL_PORT}/eden/v1/info`;
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${secret}`,
+        },
+      });
+      if (response.ok) {
+        const body = await response.json() as unknown;
+        const observed = isRecord(body) ? body.generation : undefined;
+        if (
+          isRecord(observed) &&
+          observed.generationId === generation.generationId &&
+          observed.bundleDigest === generation.bundleDigest &&
+          observed.manifestVersion === generation.manifestVersion &&
+          observed.runtimeVersion === generation.runtimeVersion &&
+          observed.agentBundleVersion === generation.agentBundleVersion &&
+          observed.protocolVersion === generation.protocolVersion &&
+          observed.schemaVersion === generation.schemaVersion &&
+          Array.isArray(observed.toolNames) &&
+          JSON.stringify(observed.toolNames) ===
+            JSON.stringify(generation.toolNames)
+        ) {
+          return;
+        }
+      }
+    } catch {
+      // The local process may briefly close its listener while reloading.
+    }
+    if (child !== undefined) {
+      const exited = await Promise.race([
+        child.exited.then(() => true),
+        new Promise<boolean>((resolveResult) => {
+          setTimeout(() => resolveResult(false), 0);
+        }),
+      ]);
+      if (exited) {
+        throw cliError({
+          code: "DEV_RUNTIME_RELOAD_FAILED",
+          message:
+            "The local runtime exited before the new Eden generation became ready.",
+        });
+      }
+    }
+    await new Promise((resolveResult) => setTimeout(resolveResult, 50));
+  }
+  throw cliError({
+    code: "DEV_RUNTIME_RELOAD_FAILED",
+    message:
+      `The local runtime did not expose generation ${generation.generationId} after the watch rebuild.`,
+  });
+}
+
 function defaultProcessRunner(): EdenCliProcessRunner {
   return {
     spawn(request) {
@@ -3430,6 +3595,8 @@ async function runDev(
   let stateOwner: Pick<DevState, "pid" | "startedAt" | "token"> | undefined;
   let temporaryConfig: string | undefined;
   let runtimeEntryPath: string | undefined;
+  let runtimeGeneration: RuntimeGeneration | undefined;
+  let runtimeContents: RuntimeFileContents | undefined;
   let localSecretPath: string | undefined;
   let cleanupPromise: Promise<void> | undefined;
   let cleanupRunning = false;
@@ -3442,7 +3609,9 @@ async function runDev(
   });
   const startupStopped = Symbol("eden.startup.stopped");
   const runner = options.processRunner ?? defaultProcessRunner();
+  const usingDefaultRuntimeRunner = options.processRunner === undefined;
   const ownedValidationProcesses = createOwnedProcessRegistry();
+  const runtimePublicationHook = options.runtimePublicationHook;
 
   const rebuild = async (): Promise<void> => {
     if (stopped) return;
@@ -3460,6 +3629,79 @@ async function runDev(
         ownedValidationProcesses,
       );
       if (ownedValidationProcesses.isStopping()) return;
+      const resolvedConfiguration = await readProjectConfiguration(root);
+      const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
+      const nextGeneration = await readArtifactGeneration(canonicalOutput);
+      const nextRuntimeGeneration = readRuntimeGeneration(nextGeneration);
+      if (
+        runtimeGeneration === undefined ||
+        runtimeContents === undefined ||
+        runtimeEntryPath === undefined ||
+        temporaryConfig === undefined
+      ) {
+        throw cliError({
+          code: "DEV_RUNTIME_UNAVAILABLE",
+          message:
+            "The running Eden runtime is unavailable; the coherent watch generation was not activated.",
+        });
+      }
+      const nextRuntimeFiles = await createRuntimeFiles(
+        root,
+        resolvedConfiguration.configPath,
+        nextGeneration,
+        "local",
+        runtimeEntryPath,
+      );
+      let published = false;
+      try {
+        const publishedRuntime = await publishRuntimeFiles(
+          root,
+          {
+            configPath: temporaryConfig,
+            entryPath: runtimeEntryPath,
+          },
+          nextRuntimeFiles,
+          runtimeContents,
+          runtimePublicationHook,
+        );
+        published = true;
+        const nextContents = publishedRuntime.contents;
+        try {
+          if (usingDefaultRuntimeRunner) {
+            await waitForRuntimeGeneration(
+              child,
+              nextRuntimeGeneration,
+            );
+          }
+          await runtimePublicationHook?.("after-runtime-ready");
+        } catch (error: unknown) {
+          await restoreRuntimeFiles(
+            root,
+            {
+              configPath: temporaryConfig,
+              entryPath: runtimeEntryPath,
+            },
+            runtimeContents,
+          ).catch(() => undefined);
+          try {
+            await runtimePublicationHook?.("after-runtime-rollback");
+          } catch {
+            // Preserve the runtime reload error.
+          }
+          throw error;
+        }
+        runtimeContents = nextContents;
+        runtimeGeneration = nextRuntimeGeneration;
+      } finally {
+        if (!published) {
+          await rm(nextRuntimeFiles.configPath, { force: true }).catch(
+            () => undefined,
+          );
+          await rm(nextRuntimeFiles.entryPath, { force: true }).catch(
+            () => undefined,
+          );
+        }
+      }
       options.stdout?.(`Eden dev generation ${generationId} is coherent.`);
     } catch (error: unknown) {
       for (const line of errorLines(error)) {
@@ -3583,6 +3825,8 @@ async function runDev(
     );
     temporaryConfig = runtimeFiles.configPath;
     runtimeEntryPath = runtimeFiles.entryPath;
+    runtimeGeneration = readRuntimeGeneration(generation);
+    runtimeContents = await readRuntimeFileContents(runtimeFiles);
     if (stopped) return;
 
     const localSecret = process.env.EDEN_BEARER_SECRET;
@@ -3714,13 +3958,20 @@ async function runDev(
       `(inspector ${EDEN_LOCAL_INSPECTOR_HOST}:${EDEN_LOCAL_INSPECTOR_PORT}).`,
     );
 
-    watcher = watch(join(root, "agent"), {
+    watcher = watch(
+      [
+        join(root, "agent"),
+        resolvedConfiguration.packagePath,
+        resolvedConfiguration.configPath,
+      ],
+      {
       ignoreInitial: true,
       awaitWriteFinish: {
         stabilityThreshold: 50,
         pollInterval: 10,
       },
-    });
+      },
+    );
     watcher.on("all", () => {
       if (rebuildTimer !== undefined) clearTimeout(rebuildTimer);
       rebuildTimer = setTimeout(() => {
