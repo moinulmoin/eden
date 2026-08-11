@@ -56,17 +56,30 @@ const TEST_TOOL_STANDARD_SCHEMA = {
 
 const TEST_TOOL: EdenToolDefinition<
   { readonly query: string },
-  { readonly source: string; readonly query: string }
+  { readonly source: string; readonly query: string; readonly executionCount?: number }
 > = {
   description: "Return the configured test-worker artifact result.",
   inputSchema: TEST_TOOL_STANDARD_SCHEMA,
-  execute(input) {
+  execute(input, context) {
+    if (input.query === "interrupted") {
+      throw new Error("deterministic uncommitted interruption");
+    }
+    const executionCount =
+      input.query === "replay"
+        ? (testToolExecutionCounts.get(context.idempotencyKey) ?? 0) + 1
+        : undefined;
+    if (executionCount !== undefined) {
+      testToolExecutionCounts.set(context.idempotencyKey, executionCount);
+    }
     return {
       source: "test-worker-configured-artifact",
       query: input.query,
+      ...(executionCount === undefined ? {} : { executionCount }),
     };
   },
 };
+
+const testToolExecutionCounts = new Map<string, number>();
 
 // This deterministic model is injected only by the Workers test entrypoint.
 // Remote generated wrappers select the Workers AI adapter instead.
@@ -127,9 +140,31 @@ const TEST_MODEL: EdenModelAdapter = createModelAdapter(async (request) => {
       {
         toolCallId: `call_${toolName}`,
         toolName,
-        input: toolName === "greet"
-          ? { name: " Eden " }
-          : { query: " eden " },
+        input:
+          toolName === "greet"
+            ? { name: " Eden " }
+            : request.messages.some(
+                (message) =>
+                  message.role === "user" &&
+                  typeof message.content === "string" &&
+                  message.content.includes("invalid"),
+              )
+              ? { query: 42 }
+              : request.messages.some(
+                    (message) =>
+                      message.role === "user" &&
+                      typeof message.content === "string" &&
+                      message.content.includes("interrupted"),
+                  )
+                ? { query: " interrupted " }
+                : request.messages.some(
+                      (message) =>
+                        message.role === "user" &&
+                        typeof message.content === "string" &&
+                        message.content.includes("completed-replay"),
+                    )
+                  ? { query: " replay " }
+                  : { query: " eden " },
       },
     ],
     finishReason: "tool-calls",

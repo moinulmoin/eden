@@ -206,8 +206,9 @@ curl --fail --silent \
   "http://127.0.0.1:8797/eden/v1/session/<session-id>/stream?startIndex=0&follow=false"
 ```
 
-Save the greatest committed `streamIndex` from the NDJSON response. To
-reconnect, use it as the last accepted cursor:
+Save the greatest committed `streamIndex` from the NDJSON response. A positive
+cursor is the last accepted committed event, not the next event to request. To
+reconnect, use it as that last accepted cursor:
 
 ```sh
 curl --fail --silent \
@@ -216,9 +217,12 @@ curl --fail --silent \
 ```
 
 `startIndex=0` replays from the beginning. A positive `startIndex` resumes
-strictly after that cursor. A disconnected stream does not cancel an accepted
-turn; reconnect from the saved absolute cursor and verify that committed
-events are ordered and the session reaches `session.waiting`.
+strictly after that cursor. The executable local conformance flow deliberately
+disconnects after committed cursor `5`, then reconnects with
+`startIndex=5` and verifies cursors `6` through `12`. A disconnected stream
+does not cancel an accepted turn; reconnect from the saved absolute cursor and
+verify that committed events are ordered and the session reaches
+`session.waiting`.
 
 The required successful lifecycle is visible in the journal:
 
@@ -249,14 +253,16 @@ corepack pnpm run conformance:local
 ```
 
 It creates and removes its own empty temporary root, runs the documented
-`init` → `build` → `dev` → authenticated session flow, disconnects after the
-first committed cursor and reconnects through `session.waiting`, then runs the
-deterministic Workers-pool fixtures for Durable Object eviction/replay,
-completed-effect reuse, invalid tool input, interrupted-step recovery, journal
-delivery replay, and typed-client cursor safety. The validator runs serially,
-uses only `127.0.0.1:8797` and `127.0.0.1:9297`, keeps its generated bearer
-outside the project and captured output, and verifies that its process, ports,
-and temporary root are removed.
+`init` → `build` → `dev` → authenticated session flow, disconnects after
+committed cursor `5` and reconnects through `session.waiting`, then runs one
+deterministic public failure/recovery flow through the Workers pool. That flow
+evicts and reconnects invalid tool input and interrupted-uncommitted sessions,
+checks durable failure/retry state and no false success, and verifies a
+completed effect replays with execution count `1`. The gate also runs the
+journal-delivery and typed-client cursor fixtures. The validator runs
+serially, uses only `127.0.0.1:8797` and `127.0.0.1:9297`, keeps its generated
+bearer outside the project and captured output, and verifies that its process,
+ports, and temporary root are removed.
 
 ## Deployed validation
 

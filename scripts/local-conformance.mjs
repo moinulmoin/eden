@@ -27,10 +27,20 @@ export const LOCAL_RECOVERY_FIXTURES = Object.freeze([
   "packages/runtime-cloudflare/test/turn-runner.test.ts",
   "packages/runtime-cloudflare/test/tool-harness.test.ts",
   "packages/runtime-cloudflare/test/session-recovery.test.ts",
+  "packages/runtime-cloudflare/test/failure-eviction-conformance.test.ts",
   "packages/runtime-cloudflare/test/session-journal.test.ts",
   "packages/runtime-cloudflare/test/stream-lifecycle.test.ts",
   "packages/runtime-cloudflare/test/http-host.test.ts",
   "packages/client/test/stream.test.ts",
+]);
+
+export const PUBLIC_FAILURE_FIXTURE =
+  "packages/runtime-cloudflare/test/failure-eviction-conformance.test.ts";
+
+export const PUBLIC_FAILURE_CASES = Object.freeze([
+  "keeps invalid tool input failed after disconnect, eviction, and reconnect",
+  "keeps interrupted uncommitted work inspectably retryable after eviction",
+  "replays a completed effect after eviction without another execution",
 ]);
 
 const HAPPY_PATH_LIFECYCLE = Object.freeze([
@@ -684,6 +694,7 @@ function startDev(repositoryRoot, projectRoot, secret) {
 }
 
 async function runRecoveryFixtures(repositoryRoot) {
+  const summaries = [];
   for (const fixture of LOCAL_RECOVERY_FIXTURES) {
     const isRuntimeFixture = fixture.startsWith("packages/runtime-cloudflare/");
     const args = [
@@ -697,15 +708,50 @@ async function runRecoveryFixtures(repositoryRoot) {
       fixture,
       "--maxWorkers=1",
     ];
-    const result = await runProcess("corepack", args, {
-      cwd: repositoryRoot,
-    });
-    if (result.code !== 0) {
-      throw new Error(
-        `Deterministic recovery fixture ${fixture} failed (exit code ${result.code}).`,
+    const reportRoot = await mkdtemp(join(tmpdir(), "eden-recovery-report-"));
+    const reportPath = join(reportRoot, "vitest.json");
+    try {
+      const result = await runProcess(
+        "corepack",
+        [...args, "--reporter=json", "--outputFile", reportPath],
+        { cwd: repositoryRoot },
       );
+      if (result.code !== 0) {
+        throw new Error(
+          `Deterministic recovery fixture ${fixture} failed (exit code ${result.code}).`,
+        );
+      }
+
+      const report = JSON.parse(await readFile(reportPath, "utf8"));
+      const fileReport = report.testResults?.find(
+        (entry) => typeof entry?.name === "string" && entry.name.endsWith(fixture),
+      );
+      const passedTests = fileReport?.assertionResults
+        ?.filter((entry) => entry.status === "passed")
+        .map((entry) => entry.title)
+        .filter((title) => typeof title === "string") ?? [];
+      if (
+        fixture === PUBLIC_FAILURE_FIXTURE &&
+        PUBLIC_FAILURE_CASES.some((title) => !passedTests.includes(title))
+      ) {
+        throw new Error(
+          `Public failure conformance cases were not all reported as passed: ${
+            JSON.stringify(passedTests)
+          }`,
+        );
+      }
+      summaries.push({
+        fixture,
+        passedTests,
+        ...(fixture === PUBLIC_FAILURE_FIXTURE
+          ? { publicFailureCases: PUBLIC_FAILURE_CASES }
+          : {}),
+      });
+    } finally {
+      await rm(reportRoot, { recursive: true, force: true });
     }
   }
+  return summaries;
 }
 
 export async function runLocalConformance({
@@ -716,6 +762,7 @@ export async function runLocalConformance({
   const projectRoot = await mkdtemp(join(tmpdir(), "eden-local-conformance-"));
   const secret = `eden-local-${randomUUID()}`;
   let localResult;
+  let recoveryResults = [];
   let failure;
   let devProcess;
   let localCleanup;
@@ -757,7 +804,7 @@ export async function runLocalConformance({
 
     if (failure === undefined && shouldRunRecoveryFixtures) {
       try {
-        await runRecoveryFixtures(repositoryRoot);
+        recoveryResults = await runRecoveryFixtures(repositoryRoot);
       } catch (error) {
         failure = error;
       }
@@ -798,6 +845,7 @@ export async function runLocalConformance({
     lifecycle: localResult.lifecycle,
     disconnectedCursor: localResult.disconnectedCursor,
     reconnectedCursors: localResult.reconnectedCursors,
+    recoveryResults,
     cleanup,
   };
 }
@@ -808,7 +856,7 @@ async function main() {
   process.stdout.write(
     `Local conformance passed: ${result.lifecycle.length} lifecycle events, ` +
       `reconnected after cursor ${result.disconnectedCursor}, ` +
-      `${LOCAL_RECOVERY_FIXTURES.length} deterministic recovery fixtures, ` +
+      `${result.recoveryResults.length} deterministic recovery fixtures, ` +
       "and all owned resources cleaned up.\n",
   );
 }

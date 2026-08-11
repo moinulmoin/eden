@@ -6,6 +6,8 @@ import { expect, test } from "vitest";
 
 import {
   LOCAL_RECOVERY_FIXTURES,
+  PUBLIC_FAILURE_CASES,
+  PUBLIC_FAILURE_FIXTURE,
   runLocalConformance,
 } from "../scripts/local-conformance.mjs";
 
@@ -38,6 +40,11 @@ test("completes the clean-room local first-use flow and reconnects from a saved 
     inspectorPortFree: true,
     processStopped: true,
   });
+  const publicFailure = result.recoveryResults.find(
+    (entry) => entry.fixture === PUBLIC_FAILURE_FIXTURE,
+  );
+  expect(publicFailure?.publicFailureCases).toEqual(PUBLIC_FAILURE_CASES);
+  expect(publicFailure?.passedTests).toEqual(PUBLIC_FAILURE_CASES);
 }, 30_000);
 
 test("keeps invalid-input and interrupted-step fixtures in the serial conformance gate", async () => {
@@ -45,6 +52,7 @@ test("keeps invalid-input and interrupted-step fixtures in the serial conformanc
     "packages/runtime-cloudflare/test/turn-runner.test.ts",
     "packages/runtime-cloudflare/test/tool-harness.test.ts",
     "packages/runtime-cloudflare/test/session-recovery.test.ts",
+    "packages/runtime-cloudflare/test/failure-eviction-conformance.test.ts",
     "packages/runtime-cloudflare/test/session-journal.test.ts",
     "packages/runtime-cloudflare/test/stream-lifecycle.test.ts",
     "packages/runtime-cloudflare/test/http-host.test.ts",
@@ -53,6 +61,8 @@ test("keeps invalid-input and interrupted-step fixtures in the serial conformanc
 
   const readme = await readFile(join(repositoryRoot, "README.md"), "utf8");
   expect(readme).toContain("corepack pnpm run conformance:local");
+  expect(readme).toMatch(/disconnects after committed cursor `5`/i);
+  expect(readme).toMatch(/`startIndex=5`/i);
   expect(readme).toMatch(/invalid tool input/i);
   expect(readme).toMatch(/interrupted/i);
 });
