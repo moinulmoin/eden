@@ -24,6 +24,6 @@
     "build": "tsc -b",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src --max-warnings 0",
-    "test": "vitest run --passWithNoTests --maxWorkers=1"
+    "test": "pnpm --dir ../.. exec vitest run examples/basic-agent/test --passWithNoTests --maxWorkers=1"
   }
 }
