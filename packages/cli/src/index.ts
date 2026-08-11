@@ -227,6 +227,11 @@ export interface EdenCliRunOptions {
     | EdenCliDryRunHandle
     | Promise<EdenCliDryRunResult>;
   readonly processRunner?: EdenCliProcessRunner;
+  /**
+   * Internal finite-test override for the authenticated local runtime
+   * readiness probe. Production callers use the bounded default.
+   */
+  readonly runtimeReadinessTimeoutMs?: number;
   readonly runtimePublicationHook?: (
     boundary: EdenRuntimePublicationBoundary,
   ) => void | Promise<void>;
@@ -3105,73 +3110,6 @@ async function readRuntimeFileContents(
   return { config, entry };
 }
 
-async function replaceRuntimeFile(
-  root: string,
-  target: string,
-  contents: string,
-): Promise<void> {
-  assertWithinRoot(root, target, "The local runtime file");
-  const stage = join(
-    root,
-    uniqueTemporaryName(`eden-runtime-file-${basename(target)}`),
-  );
-  assertWithinRoot(root, stage, "The local runtime staging file");
-  try {
-    await writeFile(stage, contents, {
-      encoding: "utf8",
-      mode: 0o600,
-      flag: "wx",
-    });
-    await rename(stage, target);
-  } finally {
-    await rm(stage, { force: true }).catch(() => undefined);
-  }
-}
-
-async function restoreRuntimeFiles(
-  root: string,
-  files: RuntimeFiles,
-  previous: RuntimeFileContents,
-): Promise<void> {
-  await replaceRuntimeFile(root, files.entryPath, previous.entry);
-  await replaceRuntimeFile(root, files.configPath, previous.config);
-}
-
-async function publishRuntimeFiles(
-  root: string,
-  current: RuntimeFiles,
-  next: RuntimeFiles,
-  previous: RuntimeFileContents,
-  hook?: EdenCliRunOptions["runtimePublicationHook"],
-): Promise<{
-  readonly contents: RuntimeFileContents;
-}> {
-  let nextContents: RuntimeFileContents;
-  try {
-    nextContents = await readRuntimeFileContents(next);
-    await hook?.("before-runtime-entry-publish");
-    await replaceRuntimeFile(root, current.entryPath, nextContents.entry);
-    await hook?.("after-runtime-entry-publish");
-    await hook?.("before-runtime-config-publish");
-    await replaceRuntimeFile(root, current.configPath, nextContents.config);
-    await hook?.("after-runtime-config-publish");
-    return {
-      contents: nextContents,
-    };
-  } catch (error: unknown) {
-    await restoreRuntimeFiles(root, current, previous).catch(() => undefined);
-    try {
-      await hook?.("after-runtime-rollback");
-    } catch {
-      // Preserve the original publication error.
-    }
-    throw error;
-  } finally {
-    await rm(next.configPath, { force: true }).catch(() => undefined);
-    await rm(next.entryPath, { force: true }).catch(() => undefined);
-  }
-}
-
 function readRuntimeGeneration(
   resolved: EdenArtifactGeneration,
 ): RuntimeGeneration {
@@ -4150,6 +4088,7 @@ async function waitForRuntimeGeneration(
   child: EdenCliProcess | undefined,
   generation: RuntimeGeneration,
   timeoutMs = 10_000,
+  cleanupSignal?: AbortSignal,
 ): Promise<void> {
   const secret = process.env.EDEN_BEARER_SECRET;
   if (secret === undefined || secret.length === 0) return;
@@ -4158,33 +4097,67 @@ async function waitForRuntimeGeneration(
     `http://${EDEN_LOCAL_HOST}:${EDEN_LOCAL_PORT}/eden/v1/info`;
   while (Date.now() - startedAt < timeoutMs) {
     try {
-      const response = await fetch(url, {
-        headers: {
-          Authorization: `Bearer ${secret}`,
-        },
-      });
-      if (response.ok) {
-        const body = await response.json() as unknown;
-        const observed = isRecord(body) ? body.generation : undefined;
-        if (
-          isRecord(observed) &&
-          observed.generationId === generation.generationId &&
-          observed.bundleDigest === generation.bundleDigest &&
-          observed.manifestVersion === generation.manifestVersion &&
-          observed.runtimeVersion === generation.runtimeVersion &&
-          observed.agentBundleVersion === generation.agentBundleVersion &&
-          observed.protocolVersion === generation.protocolVersion &&
-          observed.schemaVersion === generation.schemaVersion &&
-          Array.isArray(observed.toolNames) &&
-          JSON.stringify(observed.toolNames) ===
-            JSON.stringify(generation.toolNames)
-        ) {
-          return;
+      const requestController = new AbortController();
+      const requestTimeout = setTimeout(
+        () => requestController.abort(),
+        Math.min(1_000, Math.max(1, timeoutMs)),
+      );
+      const abortRequest = (): void => {
+        requestController.abort(cleanupSignal?.reason);
+      };
+      if (cleanupSignal?.aborted) return;
+      cleanupSignal?.addEventListener("abort", abortRequest, { once: true });
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          headers: {
+            Authorization: `Bearer ${secret}`,
+          },
+          signal: requestController.signal,
+        });
+        if (response.ok) {
+          const body = await response.json() as unknown;
+          const observed = isRecord(body) ? body.generation : undefined;
+          if (
+            isRecord(observed) &&
+            observed.generationId === generation.generationId &&
+            observed.bundleDigest === generation.bundleDigest &&
+            observed.manifestVersion === generation.manifestVersion &&
+            observed.runtimeVersion === generation.runtimeVersion &&
+            observed.agentBundleVersion === generation.agentBundleVersion &&
+            observed.protocolVersion === generation.protocolVersion &&
+            observed.schemaVersion === generation.schemaVersion &&
+            Array.isArray(observed.toolNames) &&
+            JSON.stringify(observed.toolNames) ===
+              JSON.stringify(generation.toolNames)
+          ) {
+            if (child !== undefined) {
+              const exited = await Promise.race([
+                child.exited.then(() => true),
+                new Promise<boolean>((resolveResult) => {
+                  setTimeout(() => resolveResult(false), 0);
+                }),
+              ]);
+              if (exited) {
+                throw cliError({
+                  code: "DEV_RUNTIME_RELOAD_FAILED",
+                  message:
+                    "The local runtime exited immediately after exposing the expected generation.",
+                });
+              }
+            }
+            return;
+          }
         }
+      } finally {
+        clearTimeout(requestTimeout);
+        cleanupSignal?.removeEventListener("abort", abortRequest);
       }
     } catch {
+      if (cleanupSignal?.aborted) return;
       // The local process may briefly close its listener while reloading.
     }
+    if (cleanupSignal?.aborted) return;
     if (child !== undefined) {
       const exited = await Promise.race([
         child.exited.then(() => true),
@@ -4200,8 +4173,24 @@ async function waitForRuntimeGeneration(
         });
       }
     }
-    await new Promise((resolveResult) => setTimeout(resolveResult, 50));
+    await new Promise<void>((resolveResult) => {
+      if (cleanupSignal?.aborted) {
+        resolveResult();
+        return;
+      }
+      const timer = setTimeout(() => {
+        cleanupSignal?.removeEventListener("abort", abortDelay);
+        resolveResult();
+      }, 50);
+      const abortDelay = (): void => {
+        clearTimeout(timer);
+        cleanupSignal?.removeEventListener("abort", abortDelay);
+        resolveResult();
+      };
+      cleanupSignal?.addEventListener("abort", abortDelay, { once: true });
+    });
   }
+  if (cleanupSignal?.aborted) return;
   throw cliError({
     code: "DEV_RUNTIME_RELOAD_FAILED",
     message:
@@ -4258,21 +4247,139 @@ async function runDev(
   let runtimeEntryPath: string | undefined;
   let runtimeGeneration: RuntimeGeneration | undefined;
   let runtimeContents: RuntimeFileContents | undefined;
+  let runtimeArtifact: EdenArtifactGeneration | undefined;
+  let replacementChild: EdenCliProcess | undefined;
+  const readinessAbortController = new AbortController();
   let localSecretPath: string | undefined;
   let cleanupPromise: Promise<void> | undefined;
   let cleanupRunning = false;
   let childCleanupRequested = false;
+  let replacingRuntime = false;
   let requestedStop = false;
   let requestedSignal: NodeJS.Signals = "SIGTERM";
   let signalResolve: (() => void) | undefined;
+  let runtimeChangeResolve: (() => void) | undefined;
+  let runtimeChange = new Promise<void>((resolve) => {
+    runtimeChangeResolve = resolve;
+  });
   const signalReceived = new Promise<void>((resolveResult) => {
     signalResolve = resolveResult;
   });
   const startupStopped = Symbol("eden.startup.stopped");
   const runner = options.processRunner ?? defaultProcessRunner();
-  const usingDefaultRuntimeRunner = options.processRunner === undefined;
   const ownedValidationProcesses = createOwnedProcessRegistry();
   const runtimePublicationHook = options.runtimePublicationHook;
+  let runtimeExecutable: DeploymentExecutable | undefined;
+  const notifyRuntimeChange = (): void => {
+    runtimeChangeResolve?.();
+    runtimeChange = new Promise<void>((resolve) => {
+      runtimeChangeResolve = resolve;
+    });
+  };
+  const markRuntimeUnavailable = (): void => {
+    replacingRuntime = false;
+    child = undefined;
+    childExited = true;
+    runtimeGeneration = undefined;
+    runtimeContents = undefined;
+    runtimeArtifact = undefined;
+    notifyRuntimeChange();
+  };
+
+  const createRuntimeProcessRequest = (
+    configPath: string,
+  ): EdenCliProcessRequest => {
+    if (runtimeExecutable === undefined) {
+      throw cliError({
+        code: "WRANGLER_UNAVAILABLE",
+        message:
+          "The local runtime executable was not resolved before child startup.",
+      });
+    }
+    return {
+      command: runtimeExecutable.command,
+      commandArgs: runtimeExecutable.commandArgs,
+      args: [
+        "dev",
+        "--local",
+        "--ip",
+        EDEN_LOCAL_HOST,
+        "--port",
+        String(EDEN_LOCAL_PORT),
+        "--inspector-port",
+        String(EDEN_LOCAL_INSPECTOR_PORT),
+        "--inspector-ip",
+        EDEN_LOCAL_INSPECTOR_HOST,
+        "--config",
+        configPath,
+        ...(localSecretPath === undefined
+          ? []
+          : ["--env-file", localSecretPath]),
+      ],
+      cwd: root,
+      processIdentity: basename(configPath),
+      env: {
+        EDEN_HOST: EDEN_LOCAL_HOST,
+        EDEN_PORT: String(EDEN_LOCAL_PORT),
+        EDEN_INSPECTOR_PORT: String(EDEN_LOCAL_INSPECTOR_PORT),
+      },
+      readiness: APPROVED_PORTS.map(({ host, port }) => ({ host, port })),
+    };
+  };
+
+  const startRuntimeChild = async (
+    configPath: string,
+  ): Promise<EdenCliProcess | typeof startupStopped> => {
+    const processHandle = runner.spawn(createRuntimeProcessRequest(configPath));
+    replacementChild = processHandle;
+    void processHandle.exited.then(
+      () => {
+        if (processHandle === child) childExited = true;
+      },
+      () => {
+        if (processHandle === child) childExited = true;
+      },
+    );
+    const startIdentityResult = await Promise.race<
+      string | undefined | typeof startupStopped
+    >([
+      Promise.resolve(processHandle.startIdentity),
+      signalReceived.then(() => startupStopped),
+    ]);
+    if (startIdentityResult === startupStopped) return startupStopped;
+    if (
+      typeof startIdentityResult !== "string" ||
+      startIdentityResult.length === 0
+    ) {
+      throw cliError({
+        code: "DEV_PROCESS_IDENTITY_UNAVAILABLE",
+        message:
+          "The Eden dev process start identity could not be verified; no PID or process group was signaled.",
+        source: DEV_STATE_FILE,
+      });
+    }
+    const readiness = processHandle.ready ?? Promise.resolve();
+    void readiness.catch(() => undefined);
+    try {
+      const readinessResult = await Promise.race<
+        void | typeof startupStopped
+      >([
+        readiness,
+        signalReceived.then(() => startupStopped),
+      ]);
+      if (readinessResult === startupStopped) return startupStopped;
+    } catch (error: unknown) {
+      throw error instanceof EdenCliError
+        ? error
+        : cliError({
+            code: "DEV_NOT_READY",
+            message: error instanceof Error
+              ? error.message
+              : "The local runtime did not become ready.",
+          });
+    }
+    return processHandle;
+  };
 
   const rebuild = async (): Promise<void> => {
     if (stopped) return;
@@ -4296,6 +4403,7 @@ async function runDev(
       if (
         runtimeGeneration === undefined ||
         runtimeContents === undefined ||
+        runtimeArtifact === undefined ||
         runtimeEntryPath === undefined ||
         temporaryConfig === undefined
       ) {
@@ -4305,55 +4413,266 @@ async function runDev(
             "The running Eden runtime is unavailable; the coherent watch generation was not activated.",
         });
       }
+      const oldArtifact = runtimeArtifact;
       const nextRuntimeFiles = await createRuntimeFiles(
         root,
         resolvedConfiguration.configPath,
         nextGeneration,
         "local",
-        runtimeEntryPath,
       );
-      let published = false;
+      let oldRuntimeStopped = false;
+      let oldConfig: string | undefined;
+      let oldEntry: string | undefined;
+      let candidateChild: EdenCliProcess | undefined;
+      let nextRuntimePromoted = false;
       try {
-        const publishedRuntime = await publishRuntimeFiles(
-          root,
-          {
-            configPath: temporaryConfig,
-            entryPath: runtimeEntryPath,
-          },
-          nextRuntimeFiles,
-          runtimeContents,
-          runtimePublicationHook,
+        if (stopped) return;
+        const oldChild = child;
+        oldConfig = temporaryConfig;
+        oldEntry = runtimeEntryPath;
+        oldRuntimeStopped = oldChild === undefined;
+        replacingRuntime = true;
+        if (oldChild !== undefined) {
+          const oldIdentity = await Promise.resolve(oldChild.startIdentity);
+          if (typeof oldIdentity !== "string" || oldIdentity.length === 0) {
+            throw cliError({
+              code: "DEV_PROCESS_IDENTITY_UNAVAILABLE",
+              message:
+                "The last good Eden runtime identity could not be verified before replacement.",
+              source: DEV_STATE_FILE,
+            });
+          }
+          await oldChild.terminate("SIGTERM");
+          oldRuntimeStopped = true;
+          await waitForApprovedPortsAvailable();
+        }
+        const replacement = await startRuntimeChild(nextRuntimeFiles.configPath);
+        if (replacement === startupStopped) {
+          replacingRuntime = false;
+          return;
+        }
+        candidateChild = replacement;
+        replacementChild = replacement;
+        const replacementIdentity = await Promise.resolve(
+          replacement.startIdentity,
         );
-        published = true;
-        const nextContents = publishedRuntime.contents;
+        if (
+          typeof replacementIdentity !== "string" ||
+          replacementIdentity.length === 0
+        ) {
+          throw cliError({
+            code: "DEV_PROCESS_IDENTITY_UNAVAILABLE",
+            message:
+              "The replacement Eden runtime identity could not be verified; the old runtime remains unavailable.",
+            source: DEV_STATE_FILE,
+          });
+        }
+        await waitForRuntimeGeneration(
+          replacement,
+          nextRuntimeGeneration,
+          options.runtimeReadinessTimeoutMs ?? 10_000,
+          readinessAbortController.signal,
+        );
+        if (stopped) {
+          replacingRuntime = false;
+          return;
+        }
+        await runtimePublicationHook?.("before-runtime-entry-publish");
+        await runtimePublicationHook?.("after-runtime-entry-publish");
+        await runtimePublicationHook?.("before-runtime-config-publish");
+        await runtimePublicationHook?.("after-runtime-config-publish");
+        await runtimePublicationHook?.("after-runtime-ready");
+
+        const nextContents = await readRuntimeFileContents(nextRuntimeFiles);
+        const previousChild = child;
+        child = replacement;
+        replacementChild = undefined;
+        childExited = false;
+        runtimeContents = nextContents;
+        runtimeGeneration = nextRuntimeGeneration;
+        runtimeArtifact = nextGeneration;
+        temporaryConfig = nextRuntimeFiles.configPath;
+        runtimeEntryPath = nextRuntimeFiles.entryPath;
+        if (stateOwner !== undefined) {
+          const writtenState = await writeDevState(
+            root,
+            replacement.pid,
+            replacementIdentity,
+          );
+          statePath = writtenState.path;
+          stateOwner = {
+            pid: replacement.pid,
+            startedAt: replacementIdentity,
+            token: writtenState.token,
+          };
+        }
+        nextRuntimePromoted = true;
+        replacingRuntime = false;
+        notifyRuntimeChange();
+        if (previousChild !== undefined && previousChild !== replacement) {
+          await previousChild.exited.catch(() => undefined);
+        }
+        if (oldConfig !== undefined) {
+          await rm(oldConfig, { force: true }).catch(() => undefined);
+        }
+        if (oldEntry !== undefined) {
+          await rm(oldEntry, { force: true }).catch(() => undefined);
+        }
+      } catch (error: unknown) {
+        const pendingCandidate =
+          candidateChild ??
+          (replacementChild !== undefined && replacementChild !== child
+            ? replacementChild
+            : undefined);
+        if (pendingCandidate !== undefined) {
+          await pendingCandidate.terminate("SIGTERM").catch(
+            () => undefined,
+          );
+          if (child === pendingCandidate) {
+            child = undefined;
+            childExited = true;
+          }
+          replacementChild = undefined;
+          if (!stopped) {
+            try {
+              await waitForApprovedPortsAvailable();
+            } catch (portError: unknown) {
+              markRuntimeUnavailable();
+              throw portError;
+            }
+          }
+        }
+        if (oldRuntimeStopped && pendingCandidate === undefined && !stopped) {
+          try {
+            await waitForApprovedPortsAvailable();
+          } catch (portError: unknown) {
+            markRuntimeUnavailable();
+            throw portError;
+          }
+        }
+        const rollbackFiles = !oldRuntimeStopped
+          ? undefined
+          : oldConfig !== undefined && oldEntry !== undefined
+            ? {
+                configPath: oldConfig,
+                entryPath: oldEntry,
+              }
+            : await createRuntimeFiles(
+                root,
+                resolvedConfiguration.configPath,
+                oldArtifact,
+                "local",
+              ).catch(() => undefined);
+        const rollbackFilesOwned =
+          rollbackFiles !== undefined &&
+          (rollbackFiles.configPath !== oldConfig ||
+            rollbackFiles.entryPath !== oldEntry);
+        let rollbackChild: EdenCliProcess | undefined;
+        let rollbackVerified = false;
         try {
-          if (usingDefaultRuntimeRunner) {
+          if (rollbackFiles !== undefined) {
+            const rollback = await startRuntimeChild(rollbackFiles.configPath);
+            if (rollback === startupStopped) {
+              if (stopped) return;
+              throw cliError({
+                code: "DEV_RUNTIME_RELOAD_FAILED",
+                message:
+                  "The last good Eden runtime rollback was interrupted before startup identity verification.",
+              });
+            }
+            rollbackChild = rollback;
+            const rollbackIdentity = await Promise.resolve(
+              rollback.startIdentity,
+            );
+            if (
+              typeof rollbackIdentity !== "string" ||
+              rollbackIdentity.length === 0
+            ) {
+              throw cliError({
+                code: "DEV_PROCESS_IDENTITY_UNAVAILABLE",
+                message:
+                  "The rollback Eden runtime identity could not be verified.",
+                source: DEV_STATE_FILE,
+              });
+            }
             await waitForRuntimeGeneration(
-              child,
-              nextRuntimeGeneration,
+              rollback,
+              runtimeGeneration,
+              options.runtimeReadinessTimeoutMs ?? 10_000,
+              readinessAbortController.signal,
+            );
+            if (stopped) return;
+            const rollbackContents = await readRuntimeFileContents(
+              rollbackFiles,
+            );
+            child = rollback;
+            replacementChild = undefined;
+            childExited = false;
+            temporaryConfig = rollbackFiles.configPath;
+            runtimeEntryPath = rollbackFiles.entryPath;
+            runtimeContents = rollbackContents;
+            if (stateOwner !== undefined) {
+              const rollbackState = await writeDevState(
+                root,
+                rollback.pid,
+                rollbackIdentity,
+              );
+              statePath = rollbackState.path;
+              stateOwner = {
+                pid: rollback.pid,
+                startedAt: rollbackIdentity,
+                token: rollbackState.token,
+              };
+            }
+            rollbackVerified = true;
+            notifyRuntimeChange();
+          }
+        } catch (rollbackError: unknown) {
+          const pendingRollback = rollbackChild ?? replacementChild;
+          if (pendingRollback !== undefined) {
+            await pendingRollback.terminate("SIGTERM").catch(
+              () => undefined,
             );
           }
-          await runtimePublicationHook?.("after-runtime-ready");
-        } catch (error: unknown) {
-          await restoreRuntimeFiles(
-            root,
-            {
-              configPath: temporaryConfig,
-              entryPath: runtimeEntryPath,
-            },
-            runtimeContents,
-          ).catch(() => undefined);
+          replacementChild = undefined;
+          if (rollbackFilesOwned && rollbackFiles !== undefined) {
+            await rm(rollbackFiles.configPath, { force: true }).catch(
+              () => undefined,
+            );
+            await rm(rollbackFiles.entryPath, { force: true }).catch(
+              () => undefined,
+            );
+          }
+          if (stopped) return;
+          markRuntimeUnavailable();
+          if (statePath !== undefined && stateOwner !== undefined) {
+            await removeOwnedDevState(root, stateOwner).catch(
+              () => undefined,
+            );
+            statePath = undefined;
+            stateOwner = undefined;
+          }
+          throw cliError({
+            code: "DEV_RUNTIME_RELOAD_FAILED",
+            message:
+              `The last good Eden runtime could not be restored after replacement failure: ${errorLines(rollbackError).join(" ")}`,
+          });
+        }
+        if (rollbackVerified) {
+          replacingRuntime = false;
+          notifyRuntimeChange();
           try {
             await runtimePublicationHook?.("after-runtime-rollback");
           } catch {
-            // Preserve the runtime reload error.
+            // Preserve the original replacement failure.
           }
-          throw error;
+        } else {
+          replacingRuntime = false;
+          notifyRuntimeChange();
         }
-        runtimeContents = nextContents;
-        runtimeGeneration = nextRuntimeGeneration;
+        throw error;
       } finally {
-        if (!published) {
+        if (!nextRuntimePromoted) {
           await rm(nextRuntimeFiles.configPath, { force: true }).catch(
             () => undefined,
           );
@@ -4383,6 +4702,7 @@ async function runDev(
     cleanupRunning = true;
     cleanupPromise = (async () => {
       stopped = true;
+      readinessAbortController.abort();
       await ownedValidationProcesses.cleanup(requestedSignal);
       if (rebuildTimer !== undefined) {
         clearTimeout(rebuildTimer);
@@ -4415,6 +4735,26 @@ async function runDev(
         if (startIdentity !== undefined) {
           childCleanupRequested = true;
           await ownedChild.terminate(requestedSignal).catch(() => undefined);
+        }
+      }
+      const pendingReplacement = replacementChild;
+      if (
+        pendingReplacement !== undefined &&
+        pendingReplacement !== ownedChild
+      ) {
+        const replacementIdentity = await Promise.race([
+          Promise.resolve(pendingReplacement.startIdentity),
+          new Promise<undefined>((resolveResult) => {
+            setTimeout(() => resolveResult(undefined), 1_000);
+          }),
+        ]).catch(() => undefined);
+        if (
+          typeof replacementIdentity === "string" &&
+          replacementIdentity.length > 0
+        ) {
+          await pendingReplacement.terminate(requestedSignal).catch(
+            () => undefined,
+          );
         }
       }
 
@@ -4485,6 +4825,7 @@ async function runDev(
     runtimeEntryPath = runtimeFiles.entryPath;
     runtimeGeneration = readRuntimeGeneration(generation);
     runtimeContents = await readRuntimeFileContents(runtimeFiles);
+    runtimeArtifact = generation;
     if (stopped) return;
 
     const localSecret = process.env.EDEN_BEARER_SECRET;
@@ -4515,40 +4856,14 @@ async function runDev(
       if (stopped) return;
     }
 
-    const executable = await resolveDeploymentExecutable(root);
+    runtimeExecutable = await resolveDeploymentExecutable(root);
     if (stopped) return;
-    const processRequest: EdenCliProcessRequest = {
-      command: executable.command,
-      commandArgs: executable.commandArgs,
-      args: [
-        "dev",
-        "--local",
-        "--ip",
-        EDEN_LOCAL_HOST,
-        "--port",
-        String(EDEN_LOCAL_PORT),
-        "--inspector-port",
-        String(EDEN_LOCAL_INSPECTOR_PORT),
-        "--inspector-ip",
-        EDEN_LOCAL_INSPECTOR_HOST,
-        "--config",
-        temporaryConfig as string,
-        ...(localSecretPath === undefined
-          ? []
-          : ["--env-file", localSecretPath]),
-      ],
-      cwd: root,
-      processIdentity: basename(temporaryConfig as string),
-      env: {
-        EDEN_HOST: EDEN_LOCAL_HOST,
-        EDEN_PORT: String(EDEN_LOCAL_PORT),
-        EDEN_INSPECTOR_PORT: String(EDEN_LOCAL_INSPECTOR_PORT),
-      },
-      readiness: APPROVED_PORTS.map(({ host, port }) => ({ host, port })),
-    };
 
     try {
-      child = runner.spawn(processRequest);
+      const started = await startRuntimeChild(temporaryConfig as string);
+      if (started === startupStopped) return;
+      child = started;
+      replacementChild = undefined;
       void child.exited.then(
         () => {
           childExited = true;
@@ -4557,14 +4872,7 @@ async function runDev(
           childExited = true;
         },
       );
-      const startIdentityResult = await Promise.race<
-        string | undefined | typeof startupStopped
-      >([
-        Promise.resolve(child.startIdentity),
-        signalReceived.then(() => startupStopped),
-      ]);
-      if (startIdentityResult === startupStopped) return;
-      const startIdentity = startIdentityResult;
+      const startIdentity = await Promise.resolve(child.startIdentity);
       if (typeof startIdentity !== "string" || startIdentity.length === 0) {
         throw cliError({
           code: "DEV_PROCESS_IDENTITY_UNAVAILABLE",
@@ -4574,8 +4882,6 @@ async function runDev(
         });
       }
       if (stopped) return;
-      const readiness = child.ready ?? Promise.resolve();
-      void readiness.catch(() => undefined);
       const writtenState = await writeDevState(root, child.pid, startIdentity);
       statePath = writtenState.path;
       stateOwner = {
@@ -4583,23 +4889,6 @@ async function runDev(
         startedAt: startIdentity,
         token: writtenState.token,
       };
-      if (stopped) return;
-      try {
-        const readinessResult = await Promise.race<void | typeof startupStopped>([
-          readiness,
-          signalReceived.then(() => startupStopped),
-        ]);
-        if (readinessResult === startupStopped) return;
-      } catch (error: unknown) {
-        throw error instanceof EdenCliError
-          ? error
-          : cliError({
-              code: "DEV_NOT_READY",
-              message: error instanceof Error
-                ? error.message
-                : "The local runtime did not become ready.",
-            });
-      }
       if (stopped) return;
       startupComplete = true;
     } catch (error: unknown) {
@@ -4644,12 +4933,43 @@ async function runDev(
       }, 75);
     });
 
-    const exitResult = await Promise.race<EdenCliProcessExit | typeof startupStopped>([
-      child.exited,
-      signalReceived.then(() => startupStopped),
-    ]);
-    if (exitResult === startupStopped) return;
-    const exit = exitResult;
+    let exit: EdenCliProcessExit;
+    while (true) {
+      const observedChild: EdenCliProcess | undefined = child;
+      const observedRuntimeChange = runtimeChange;
+      const exitResult = await Promise.race<
+        | { readonly kind: "exit"; readonly value: EdenCliProcessExit }
+        | { readonly kind: "runtime-change" }
+        | typeof startupStopped
+      >([
+        observedChild?.exited.then((value: EdenCliProcessExit) => ({
+          kind: "exit" as const,
+          value,
+        })) ?? Promise.resolve({
+          kind: "exit" as const,
+          value: { exitCode: 1, signal: null },
+        }),
+        observedRuntimeChange.then(() => ({ kind: "runtime-change" as const })),
+        signalReceived.then(() => startupStopped),
+      ]);
+      if (exitResult === startupStopped) {
+        return;
+      }
+      if (exitResult.kind === "runtime-change") continue;
+      if (observedChild !== child) continue;
+      if (replacingRuntime) {
+        const replacementResult = await Promise.race([
+          observedRuntimeChange.then(() => undefined),
+          signalReceived.then(() => startupStopped),
+        ]);
+        if (replacementResult === startupStopped) {
+          return;
+        }
+        continue;
+      }
+      exit = exitResult.value;
+      break;
+    }
     stopped = true;
     if (!requestedStop && exit.exitCode !== 0) {
       throw cliError({

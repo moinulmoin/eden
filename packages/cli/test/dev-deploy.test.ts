@@ -1098,13 +1098,7 @@ export default greet;
     const ready = new Promise<void>((resolve) => {
       resolveReady = resolve;
     });
-    let release: (() => void) | undefined;
-    const exited = new Promise<{
-      readonly exitCode: number;
-      readonly signal: null;
-    }>((resolve) => {
-      release = () => resolve({ exitCode: 0, signal: null });
-    });
+    const releases: Array<() => void> = [];
     let configPath: string | undefined;
     let entryPath: string | undefined;
 
@@ -1113,7 +1107,17 @@ export default greet;
       processRunner: {
         spawn(request: EdenCliProcessRequest) {
           const configIndex = request.args.indexOf("--config");
-          configPath = request.args[configIndex + 1] as string;
+          if (configPath === undefined) {
+            configPath = request.args[configIndex + 1] as string;
+          }
+          let release: (() => void) | undefined;
+          const exited = new Promise<{
+            readonly exitCode: number;
+            readonly signal: null;
+          }>((resolve) => {
+            release = () => resolve({ exitCode: 0, signal: null });
+          });
+          releases.push(() => release?.());
           return {
             pid: 42_102,
             startIdentity: "fixture-runtime-fallback",
@@ -1199,7 +1203,7 @@ export default greet;
       await expect(readFile(entryPath, "utf8")).resolves.toBe(entryBefore);
       expect(errors.join("\n")).toMatch(/watch rebuild unavailable|replacement/i);
     } finally {
-      release?.();
+      releases.forEach((release) => release());
       await expect(devPromise).resolves.toBe(0);
       const temporaryRuntimeFiles = (await readdir(root)).filter((name) =>
         name.includes("eden-dev-worker") || name.includes("eden-dev-config"),
