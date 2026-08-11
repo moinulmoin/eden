@@ -165,6 +165,9 @@ export interface EdenCliRunOptions {
   readonly cwd?: string;
   readonly stdout?: (line: string) => void;
   readonly stderr?: (line: string) => void;
+  readonly initPublicationHook?: (
+    boundary: EdenInitPublicationBoundary,
+  ) => void | Promise<void>;
   readonly dryRunRunner?: (
     request: EdenCliDryRunRequest,
   ) => Promise<EdenCliDryRunResult>;
@@ -177,6 +180,13 @@ export interface EdenCliRunOptions {
   ) => Promise<EdenCliRemoteValidationResult>;
   readonly remoteBearerSecret?: string;
 }
+
+export type EdenInitPublicationBoundary =
+  | "after-state-write"
+  | "after-stage-write"
+  | "before-target-publish"
+  | "after-target-publish"
+  | "before-complete";
 
 interface ParsedInvocation {
   readonly command: EdenCliCommand;
@@ -215,6 +225,26 @@ interface ProjectConfiguration {
   readonly packagePath: string;
   readonly configPath: string;
 }
+
+interface InitState {
+  readonly kind: "eden.init.incomplete";
+  readonly version: 1;
+  readonly stageName: string;
+  readonly files: readonly {
+    readonly relativePath: string;
+    readonly sha256: string;
+  }[];
+}
+
+interface ProjectInputFingerprint {
+  readonly digest: string;
+  readonly files: readonly {
+    readonly relativePath: string;
+    readonly sha256: string;
+  }[];
+}
+
+const INIT_STATE_FILE = ".eden-init-incomplete.json";
 
 const INIT_SCAFFOLD: readonly ScaffoldFile[] = [
   {
@@ -597,6 +627,15 @@ async function ensureRegularFile(
 async function readProjectConfiguration(
   root: string,
 ): Promise<ProjectConfiguration> {
+  const incompleteInit = await readInitState(root);
+  if (incompleteInit !== undefined) {
+    throw cliError({
+      code: "INIT_INCOMPLETE",
+      message:
+        "The selected project contains an interrupted Eden scaffold; rerun eden init to recover it before building.",
+      source: INIT_STATE_FILE,
+    });
+  }
   const packagePath = await ensureRegularFile(
     root,
     "package.json",
@@ -663,7 +702,14 @@ function assertWithinRoot(
 
 async function writeScaffold(
   root: string,
+  hook?: EdenCliRunOptions["initPublicationHook"],
 ): Promise<void> {
+  const interrupted = await readInitState(root);
+  if (interrupted !== undefined) {
+    await resumeScaffold(root, interrupted, hook);
+    return;
+  }
+
   const entries = await readdir(root);
   if (entries.length !== 0) {
     throw cliError({
@@ -676,49 +722,331 @@ async function writeScaffold(
   const stageName = uniqueTemporaryName("eden-init");
   const stage = join(root, stageName);
   assertWithinRoot(root, stage, "The scaffold staging directory");
-  const moved: string[] = [];
+  const statePath = join(root, INIT_STATE_FILE);
+  assertWithinRoot(root, statePath, "The scaffold state file");
+  const existingStage = await lstat(stage).catch(() => undefined);
+  if (existingStage !== undefined) {
+    throw cliError({
+      code: "INIT_STAGE_CONFLICT",
+      message: "The scaffold staging path is already occupied; no files were written.",
+      source: stageName,
+    });
+  }
+  let stageCreated = false;
+  let stateWritten = false;
   try {
     await mkdir(join(stage, "agent/tools"), { recursive: true });
+    stageCreated = true;
     for (const file of INIT_SCAFFOLD) {
       const stagedPath = join(stage, file.relativePath);
       await writeFile(stagedPath, file.content, { encoding: "utf8", flag: "wx" });
     }
 
+    const state: InitState = {
+      kind: "eden.init.incomplete",
+      version: 1,
+      stageName,
+      files: INIT_SCAFFOLD.map((file) => ({
+        relativePath: file.relativePath,
+        sha256: sha256(file.content),
+      })),
+    };
+    await writeFile(statePath, `${JSON.stringify(state)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    stateWritten = true;
+    await hook?.("after-state-write");
+
     const afterStage = await readdir(root);
-    if (
-      afterStage.length !== 1 ||
-      afterStage[0] !== stageName
-    ) {
+    if (afterStage.some((entry) => entry !== stageName && entry !== INIT_STATE_FILE)) {
       throw cliError({
         code: "INIT_ROOT_CHANGED",
         message:
-          "The selected project root changed while eden init was preparing the scaffold; no files were overwritten.",
+          "The selected project root changed while eden init was preparing the scaffold; rerun eden init to recover the explicitly incomplete scaffold.",
+      });
+    }
+    await assertStagedScaffold(root, state);
+    await hook?.("after-stage-write");
+    await resumeScaffold(root, state, hook);
+  } catch (error: unknown) {
+    if (!stateWritten) {
+      if (stageCreated) {
+        await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
+    throw error;
+  }
+}
+
+async function readInitState(
+  root: string,
+): Promise<InitState | undefined> {
+  const statePath = await resolveContainedProjectPath(root, INIT_STATE_FILE);
+  const contents = await readFile(statePath, "utf8").catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw cliError({
+      code: "INIT_STATE_INVALID",
+      message: "The Eden scaffold recovery state could not be read safely.",
+      source: INIT_STATE_FILE,
+    });
+  });
+  if (contents === undefined) return undefined;
+
+  let value: unknown;
+  try {
+    value = JSON.parse(contents) as unknown;
+  } catch {
+    throw cliError({
+      code: "INIT_STATE_INVALID",
+      message: "The Eden scaffold recovery state is not valid JSON.",
+      source: INIT_STATE_FILE,
+    });
+  }
+  if (!isRecord(value)) {
+    throw cliError({
+      code: "INIT_STATE_INVALID",
+      message: "The Eden scaffold recovery state is malformed.",
+      source: INIT_STATE_FILE,
+    });
+  }
+  const stageName = value.stageName;
+  const files = value.files;
+  if (
+    value.kind !== "eden.init.incomplete" ||
+    value.version !== 1 ||
+    typeof stageName !== "string" ||
+    !/^\.eden-init-[0-9]+-[0-9a-f-]+$/u.test(stageName) ||
+    !Array.isArray(files) ||
+    files.length !== INIT_SCAFFOLD.length ||
+    files.some(
+      (file) =>
+        !isRecord(file) ||
+        typeof file.relativePath !== "string" ||
+        typeof file.sha256 !== "string",
+    )
+  ) {
+    throw cliError({
+      code: "INIT_STATE_INVALID",
+      message: "The Eden scaffold recovery state is malformed.",
+      source: INIT_STATE_FILE,
+    });
+  }
+
+  const expectedFiles = INIT_SCAFFOLD.map((file) => ({
+    relativePath: file.relativePath,
+    sha256: sha256(file.content),
+  }));
+  const stateFiles = files as {
+    readonly relativePath: string;
+    readonly sha256: string;
+  }[];
+  if (JSON.stringify(stateFiles) !== JSON.stringify(expectedFiles)) {
+    throw cliError({
+      code: "INIT_STATE_INVALID",
+      message: "The Eden scaffold recovery state does not match the selected scaffold.",
+      source: INIT_STATE_FILE,
+    });
+  }
+  return {
+    kind: "eden.init.incomplete",
+    version: 1,
+    stageName,
+    files: stateFiles,
+  };
+}
+
+async function scaffoldPathState(
+  root: string,
+  path: string,
+  expectedSha256: string,
+): Promise<"missing" | "match" | "mismatch"> {
+  const containedPath = await resolveContainedProjectPath(
+    root,
+    relative(root, path),
+  ).catch(() => undefined);
+  if (containedPath === undefined) return "mismatch";
+  const details = await lstat(containedPath).catch(() => undefined);
+  if (details === undefined) return "missing";
+  if (!details.isFile() || details.isSymbolicLink()) return "mismatch";
+  const contents = await readFile(containedPath).catch(() => undefined);
+  if (contents === undefined) return "mismatch";
+  return sha256(contents) === expectedSha256 ? "match" : "mismatch";
+}
+
+async function assertStagedScaffold(
+  root: string,
+  state: InitState,
+  published = new Map<string, "missing" | "match" | "mismatch">(),
+): Promise<void> {
+  const stage = join(root, state.stageName);
+  assertWithinRoot(root, stage, "The scaffold staging directory");
+  for (const file of state.files) {
+    if (published.get(file.relativePath) === "match") continue;
+    const path = join(stage, file.relativePath);
+    const stateResult = await scaffoldPathState(root, path, file.sha256);
+    if (stateResult !== "match") {
+      throw cliError({
+        code: "INIT_STAGE_INVALID",
+        message:
+          `The staged scaffold file "${file.relativePath}" is missing or changed; ` +
+          "the incomplete scaffold was left untouched.",
+        source: file.relativePath,
+      });
+    }
+  }
+}
+
+async function assertPublishedScaffoldFile(
+  root: string,
+  relativePath: string,
+  expectedSha256: string,
+): Promise<"missing" | "match" | "mismatch"> {
+  const path = join(root, relativePath);
+  return scaffoldPathState(root, path, expectedSha256);
+}
+
+async function assertPublishedScaffold(
+  root: string,
+  state: InitState,
+): Promise<void> {
+  for (const file of state.files) {
+    const stateResult = await assertPublishedScaffoldFile(
+      root,
+      file.relativePath,
+      file.sha256,
+    );
+    if (stateResult !== "match") {
+      throw cliError({
+        code: "INIT_PUBLISH_INVALID",
+        message:
+          `The published scaffold file "${file.relativePath}" is missing or changed; ` +
+          "the incomplete scaffold remains explicitly unavailable.",
+        source: file.relativePath,
+      });
+    }
+  }
+}
+
+async function resumeScaffold(
+  root: string,
+  state: InitState,
+  hook?: EdenCliRunOptions["initPublicationHook"],
+): Promise<void> {
+  const stage = join(root, state.stageName);
+  assertWithinRoot(root, stage, "The scaffold staging directory");
+  const statePath = join(root, INIT_STATE_FILE);
+  assertWithinRoot(root, statePath, "The scaffold state file");
+  const targetDirectories = new Set(["agent"]);
+  const allowedRootEntries = new Set([
+    state.stageName,
+    INIT_STATE_FILE,
+    "agent",
+    "package.json",
+    "wrangler.jsonc",
+  ]);
+  const unexpectedRootEntries = (await readdir(root)).filter(
+    (entry) => !allowedRootEntries.has(entry),
+  );
+  if (unexpectedRootEntries.length > 0) {
+    throw cliError({
+      code: "INIT_RECOVERY_CONFLICT",
+      message:
+        "The interrupted scaffold cannot recover because unrelated files appeared in the selected root; existing bytes were preserved.",
+      source: unexpectedRootEntries[0] ?? ".",
+    });
+  }
+  const alreadyPublished = await Promise.all(
+    state.files.map((file) =>
+      assertPublishedScaffoldFile(root, file.relativePath, file.sha256),
+    ),
+  );
+  if (alreadyPublished.every((value) => value === "match")) {
+    await rm(stage, { recursive: true, force: true });
+    await rm(statePath, { force: true });
+    return;
+  }
+  await assertStagedScaffold(
+    root,
+    state,
+    new Map(
+      state.files.map((file, index) => [
+        file.relativePath,
+        alreadyPublished[index] ?? "missing",
+      ]),
+    ),
+  );
+
+  for (const target of ["agent", "package.json", "wrangler.jsonc"] as const) {
+    const targetFiles = state.files.filter((file) =>
+      targetDirectories.has(target)
+        ? file.relativePath === target ||
+          file.relativePath.startsWith(`${target}/`)
+        : file.relativePath === target,
+    );
+    const published = await Promise.all(
+      targetFiles.map((file) =>
+        assertPublishedScaffoldFile(root, file.relativePath, file.sha256),
+      ),
+    );
+    if (published.length > 0 && published.every((value) => value === "match")) {
+      continue;
+    }
+    if (published.some((value) => value === "mismatch")) {
+      throw cliError({
+        code: "INIT_RECOVERY_CONFLICT",
+        message:
+          `The interrupted scaffold cannot recover because "${target}" contains unrelated or changed bytes; no existing file was overwritten.`,
+        source: target,
       });
     }
 
-    const targets = ["agent", "package.json", "wrangler.jsonc"] as const;
-    for (const target of targets) {
-      const destination = join(root, target);
-      const existing = await lstat(destination).catch(() => undefined);
-      if (existing !== undefined) {
-        throw cliError({
-          code: "INIT_ROOT_CHANGED",
-          message:
-            "A file appeared during eden init; the scaffold was cancelled without overwriting it.",
-          source: target,
-        });
-      }
-      await rename(join(stage, target), destination);
-      moved.push(destination);
+    const stagedTarget = join(stage, target);
+    const stagedDetails = await lstat(stagedTarget).catch(() => undefined);
+    if (
+      stagedDetails === undefined ||
+      (targetDirectories.has(target)
+        ? !stagedDetails.isDirectory() || stagedDetails.isSymbolicLink()
+        : !stagedDetails.isFile() || stagedDetails.isSymbolicLink())
+    ) {
+      throw cliError({
+        code: "INIT_STAGE_INVALID",
+        message:
+          `The interrupted scaffold is missing its staged "${target}" target; ` +
+          "no existing file was overwritten.",
+        source: target,
+      });
     }
-  } catch (error: unknown) {
-    for (const path of moved.reverse()) {
-      await rm(path, { recursive: true, force: true }).catch(() => undefined);
+    const destination = join(root, target);
+    const destinationDetails = await lstat(destination).catch(() => undefined);
+    if (destinationDetails !== undefined) {
+      throw cliError({
+        code: "INIT_RECOVERY_CONFLICT",
+        message:
+          `The interrupted scaffold cannot publish "${target}" because existing bytes appeared; no existing file was overwritten.`,
+        source: target,
+      });
     }
-    throw error;
-  } finally {
-    await rm(stage, { recursive: true, force: true }).catch(() => undefined);
+    await hook?.("before-target-publish");
+    const destinationAfterHook = await lstat(destination).catch(() => undefined);
+    if (destinationAfterHook !== undefined) {
+      throw cliError({
+        code: "INIT_RECOVERY_CONFLICT",
+        message:
+          `The interrupted scaffold cannot publish "${target}" because existing bytes appeared; no existing file was overwritten.`,
+        source: target,
+      });
+    }
+    await rename(stagedTarget, destination);
+    await hook?.("after-target-publish");
   }
+
+  await assertPublishedScaffold(root, state);
+  await hook?.("before-complete");
+  await assertPublishedScaffold(root, state);
+  await rm(stage, { recursive: true, force: true });
+  await rm(statePath, { force: true });
 }
 
 function shortOutput(value: string): string {
@@ -740,8 +1068,136 @@ function redactOutput(value: string): string {
     );
 }
 
-function sha256(value: string): string {
+function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function projectInputPaths(
+  root: string,
+  configuration: ProjectConfiguration,
+): Promise<readonly string[]> {
+  const paths = new Set<string>([
+    relative(root, configuration.packagePath),
+    relative(root, configuration.configPath),
+  ]);
+  const ignoredDirectories = new Set([
+    ".eden",
+    ".git",
+    ".wrangler",
+    "dist",
+    "node_modules",
+  ]);
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+    for (const entry of entries) {
+      const absolutePath = join(directory, entry.name);
+      const relativePath = relative(root, absolutePath);
+      if (
+        ignoredDirectories.has(entry.name) ||
+        (directory === root && entry.name.startsWith(".eden-"))
+      ) {
+        continue;
+      }
+      if (entry.isDirectory()) {
+        await visit(absolutePath);
+        continue;
+      }
+      if (entry.isFile() || entry.isSymbolicLink()) {
+        await resolveContainedProjectPath(root, relativePath);
+        paths.add(relativePath);
+      }
+    }
+  };
+  const agentDirectory = await resolveContainedProjectPath(root, "agent");
+  const details = await lstat(agentDirectory).catch(() => undefined);
+  if (details?.isDirectory() !== true || details.isSymbolicLink()) {
+    throw cliError({
+      code: "PROJECT_INPUT_INVALID",
+      message: "The selected project agent directory is unavailable during validation.",
+      source: "agent",
+    });
+  }
+  await visit(root);
+  return [...paths].sort((left, right) => left.localeCompare(right));
+}
+
+async function fingerprintProjectInputs(
+  root: string,
+  configuration: ProjectConfiguration,
+): Promise<ProjectInputFingerprint> {
+  const files: ProjectInputFingerprint["files"][number][] = [];
+  for (const relativePath of await projectInputPaths(root, configuration)) {
+    const path = await resolveContainedProjectPath(root, relativePath);
+    const details = await lstat(path).catch(() => undefined);
+    if (
+      details === undefined ||
+      (!details.isFile() && !details.isSymbolicLink())
+    ) {
+      throw cliError({
+        code: "PROJECT_INPUT_INVALID",
+        message:
+          `Selected project input "${relativePath}" is missing or is not a regular file.`,
+        source: relativePath,
+      });
+    }
+    const contents = await readFile(path).catch(() => undefined);
+    if (contents === undefined) {
+      throw cliError({
+        code: "PROJECT_INPUT_INVALID",
+        message: `Selected project input "${relativePath}" could not be read.`,
+        source: relativePath,
+      });
+    }
+    files.push({
+      relativePath,
+      sha256: createHash("sha256").update(contents).digest("hex"),
+    });
+  }
+  return {
+    files,
+    digest: sha256(JSON.stringify(files)),
+  };
+}
+
+async function assertProjectInputsUnchanged(
+  root: string,
+  configuration: ProjectConfiguration,
+  expected: ProjectInputFingerprint,
+): Promise<void> {
+  let current: ProjectInputFingerprint;
+  try {
+    current = await fingerprintProjectInputs(root, configuration);
+  } catch (error: unknown) {
+    if (error instanceof EdenCliError) {
+      throw cliError({
+        code: "SOURCE_CHANGED_DURING_VALIDATION",
+        message:
+          `Selected source or configuration changed during Worker compatibility validation: ${error.message}`,
+        ...(error.source === undefined ? {} : { source: error.source }),
+      });
+    }
+    throw error;
+  }
+  if (
+    current.digest !== expected.digest ||
+    JSON.stringify(current.files) !== JSON.stringify(expected.files)
+  ) {
+    const changed = new Set(
+      [...expected.files, ...current.files].map((file) => file.relativePath),
+    );
+    const changedPath = [...changed].find((relativePath) => {
+      const before = expected.files.find((file) => file.relativePath === relativePath);
+      const after = current.files.find((file) => file.relativePath === relativePath);
+      return before?.sha256 !== after?.sha256;
+    });
+    throw cliError({
+      code: "SOURCE_CHANGED_DURING_VALIDATION",
+      message:
+        "Selected source or configuration changed during Worker compatibility validation; the stale candidate was not promoted.",
+      ...(changedPath === undefined ? {} : { source: changedPath }),
+    });
+  }
 }
 
 async function assertArtifactDirectory(
@@ -1648,6 +2104,7 @@ async function buildProjectFromCli(
   environment?: "preview" | "production",
 ): Promise<string> {
   const configuration = await readProjectConfiguration(root);
+  const inputFingerprint = await fingerprintProjectInputs(root, configuration);
   const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
   const existingOutput = await lstat(canonicalOutput).catch(() => undefined);
   if (existingOutput?.isSymbolicLink() === true) {
@@ -1729,6 +2186,7 @@ async function buildProjectFromCli(
         }`,
       });
     }
+    await assertProjectInputsUnchanged(root, configuration, inputFingerprint);
 
     const backupOutput = join(root, uniqueTemporaryName("eden-build-previous"));
     const current = await lstat(canonicalOutput).catch(() => undefined);
@@ -2197,6 +2655,10 @@ async function runDeploy(
 ): Promise<void> {
   const configuration = await readProjectConfiguration(root);
   await buildProjectFromCli(root, options, environment);
+  const deploymentInputFingerprint = await fingerprintProjectInputs(
+    root,
+    configuration,
+  );
   const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
   const generation = await readRuntimeGeneration(canonicalOutput);
   const runtimeFiles = await createRuntimeFiles(
@@ -2272,6 +2734,11 @@ async function runDeploy(
         }`,
       });
     }
+    await assertProjectInputsUnchanged(
+      root,
+      configuration,
+      deploymentInputFingerprint,
+    );
     if (secret === undefined || secret.length === 0) {
       throw cliError({
         code: "REMOTE_SECRET_REQUIRED",
@@ -2418,7 +2885,7 @@ async function runInvocation(
   const root = await selectedProjectRoot(invocation, cwd);
   switch (invocation.command) {
     case "init":
-      await writeScaffold(root);
+      await writeScaffold(root, options.initPublicationHook);
       options.stdout?.(`Initialized Eden project in ${root}.`);
       return;
     case "build":

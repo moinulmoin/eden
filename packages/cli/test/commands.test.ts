@@ -127,6 +127,124 @@ describe("eden CLI project commands", () => {
     expect(errors.join("")).toMatch(/empty|overwrite/i);
   });
 
+  test.each([
+    "after-state-write",
+    "after-stage-write",
+    "before-target-publish",
+    "after-target-publish",
+    "before-complete",
+  ] as const)(
+    "leaves an explicit incomplete scaffold and recovers after %s interruption",
+    async (interruption) => {
+      const root = await createRoot("eden-cli-init-interrupted-");
+      const errors: string[] = [];
+      const options = {
+        cwd: root,
+        stderr: (line: string) => errors.push(line),
+        initPublicationHook: async (boundary: string) => {
+          if (boundary === interruption) {
+            throw new Error(`injected ${interruption} interruption`);
+          }
+        },
+      };
+
+      await expect(
+        runEdenCli(["init", "--project", root], options),
+      ).resolves.toBe(1);
+
+      await expect(
+        stat(join(root, ".eden-init-incomplete.json")),
+      ).resolves.toBeDefined();
+      await expect(
+        runEdenCli(["build", "--project", root], {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+          dryRunRunner: async () => ({
+            exitCode: 0,
+            stdout: "",
+            stderr: "",
+          }),
+        }),
+      ).resolves.toBe(1);
+      expect(errors.join("\n")).toMatch(/incomplete|interrupted/i);
+
+      await expect(
+        runEdenCli(["init", "--project", root], { cwd: root }),
+      ).resolves.toBe(0);
+      await expect(stat(join(root, "agent/instructions.md"))).resolves.toBeDefined();
+      await expect(stat(join(root, "agent/agent.ts"))).resolves.toBeDefined();
+      await expect(stat(join(root, "agent/tools/greet.ts"))).resolves.toBeDefined();
+      await expect(stat(join(root, "package.json"))).resolves.toBeDefined();
+      await expect(stat(join(root, "wrangler.jsonc"))).resolves.toBeDefined();
+      await expect(
+        stat(join(root, ".eden-init-incomplete.json")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  test("refuses recovery after staged bytes are tampered", async () => {
+    const root = await createRoot("eden-cli-init-tampered-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("injected init interruption");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    const state = JSON.parse(
+      await readFile(join(root, ".eden-init-incomplete.json"), "utf8"),
+    ) as { readonly stageName: string };
+    await writeFile(
+      join(root, state.stageName, "agent/instructions.md"),
+      "tampered\n",
+      "utf8",
+    );
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+      }),
+    ).resolves.toBe(1);
+    expect(errors.join("\n")).toMatch(/staged|changed|hash/i);
+    await expect(
+      readFile(join(root, ".eden-init-incomplete.json"), "utf8"),
+    ).resolves.toContain("eden.init.incomplete");
+    expect(await readdir(root)).toContain(state.stageName);
+  });
+
+  test("preserves unrelated bytes when recovery finds a new root entry", async () => {
+    const root = await createRoot("eden-cli-init-recovery-conflict-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("injected init interruption");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+    const unrelated = join(root, "notes.txt");
+    await writeFile(unrelated, "keep this byte\n", "utf8");
+    const before = await sha256(unrelated);
+    const errors: string[] = [];
+
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+      }),
+    ).resolves.toBe(1);
+
+    expect(await sha256(unrelated)).toBe(before);
+    expect(errors.join("\n")).toMatch(/unrelated|existing|preserved/i);
+  });
+
   test("rejects a symbolic-link project root before writing", async () => {
     const parent = await createRoot("eden-cli-symlink-");
     const target = join(parent, "target");
@@ -264,6 +382,89 @@ export default {
         entry.includes("eden-build-previous"),
       ),
     ).toEqual([]);
+  });
+
+  test("rejects source mutation during Wrangler validation before promotion", async () => {
+    const root = await createRoot("eden-cli-stale-source-");
+    const sourcePath = join(root, "agent/tools/greet.ts");
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+      }),
+    ).resolves.toBe(0);
+    const before = await artifactHashes(root);
+    const originalSource = await readFile(sourcePath, "utf8");
+
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        dryRunRunner: async () => {
+          await writeFile(
+            sourcePath,
+            originalSource.replace(
+              "Greet a person by name.",
+              "Changed while Wrangler was validating.",
+            ),
+            "utf8",
+          );
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      }),
+    ).resolves.toBe(1);
+
+    expect(await artifactHashes(root)).toEqual(before);
+    expect(errors.join("\n")).toMatch(/source|configuration|changed|stale/i);
+  });
+
+  test("rejects Wrangler configuration mutation during validation before promotion", async () => {
+    const root = await createRoot("eden-cli-stale-config-");
+    const configPath = join(root, "wrangler.jsonc");
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+      }),
+    ).resolves.toBe(0);
+    const before = await artifactHashes(root);
+    const originalConfig = await readFile(configPath, "utf8");
+
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        dryRunRunner: async () => {
+          await writeFile(
+            configPath,
+            `${originalConfig}\n// changed while Wrangler was validating\n`,
+            "utf8",
+          );
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      }),
+    ).resolves.toBe(1);
+
+    expect(await artifactHashes(root)).toEqual(before);
+    expect(errors.join("\n")).toMatch(/source|configuration|changed|stale/i);
   });
 
   test("advertises exactly the supported command names and rejects unknown commands", async () => {
