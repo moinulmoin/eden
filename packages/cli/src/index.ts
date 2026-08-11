@@ -154,6 +154,12 @@ export interface EdenCliRemoteValidationResult {
 
 export interface EdenCliProcessRequest {
   readonly command: string;
+  /**
+   * Arguments needed to invoke the executable directly. The package shim is a
+   * shell script on POSIX and discards custom argv0 markers, so the default
+   * runner supplies the real Node entrypoint here.
+   */
+  readonly commandArgs?: readonly string[];
   readonly args: readonly string[];
   readonly cwd: string;
   readonly env: Readonly<Record<string, string | undefined>>;
@@ -219,7 +225,7 @@ export interface EdenCliRunOptions {
   ) =>
     | EdenCliDryRunResult
     | EdenCliDryRunHandle
-    | Promise<EdenCliDryRunResult | EdenCliDryRunHandle>;
+    | Promise<EdenCliDryRunResult>;
   readonly processRunner?: EdenCliProcessRunner;
   readonly runtimePublicationHook?: (
     boundary: EdenRuntimePublicationBoundary,
@@ -290,6 +296,11 @@ interface ScaffoldFile {
 interface ProjectConfiguration {
   readonly packagePath: string;
   readonly configPath: string;
+}
+
+interface DeploymentExecutable {
+  readonly command: string;
+  readonly commandArgs: readonly string[];
 }
 
 interface InitState {
@@ -2516,17 +2527,40 @@ function replaceTomlMain(
 
 async function resolveDeploymentExecutable(
   cwd: string,
-): Promise<string> {
+): Promise<DeploymentExecutable> {
   return resolveDeploymentExecutableSync(cwd);
 }
 
 function resolveDeploymentExecutableSync(
   cwd: string,
-): string {
+): DeploymentExecutable {
+  const packageDirectory = dirname(fileURLToPath(import.meta.url));
+  const packageDirectoryCandidates = [
+    join(packageDirectory, "../node_modules/wrangler"),
+    join(packageDirectory, "../../..", "node_modules/wrangler"),
+    join(cwd, "node_modules/wrangler"),
+    join(process.cwd(), "node_modules/wrangler"),
+  ];
+  for (const packageDirectoryCandidate of packageDirectoryCandidates) {
+    const directEntry = join(
+      packageDirectoryCandidate,
+      "wrangler-dist/cli.js",
+    );
+    if (existsSync(directEntry)) {
+      return {
+        command: process.execPath,
+        commandArgs: [directEntry],
+      };
+    }
+  }
+
+  // Keep the legacy executable lookup as a last-resort diagnostic path. The
+  // workspace install always has the direct deployment entrypoint above, while
+  // an arbitrary shell shim cannot preserve the ownership marker required for
+  // safe child cleanup.
   const executableName = process.platform === "win32"
     ? "wrangler.cmd"
     : "wrangler";
-  const packageDirectory = dirname(fileURLToPath(import.meta.url));
   const packageLocalExecutable = join(
     packageDirectory,
     "../node_modules/.bin",
@@ -2546,10 +2580,19 @@ function resolveDeploymentExecutableSync(
   ];
   for (const candidate of candidates) {
     if (existsSync(candidate)) {
-      return candidate;
+      throw cliError({
+        code: "WRANGLER_IDENTITY_UNAVAILABLE",
+        message:
+          "The installed deployment executable is only available through a shell shim; Eden refuses to start an unowned validation child.",
+        source: candidate,
+      });
     }
   }
-  return executableName;
+  throw cliError({
+    code: "WRANGLER_UNAVAILABLE",
+    message:
+      "The direct deployment CLI entrypoint could not be resolved in the selected project installation.",
+  });
 }
 
 async function resolveRuntimeWorkerEntrypoint(): Promise<string> {
@@ -3244,9 +3287,10 @@ function runDefaultDryRun(
   request: EdenCliDryRunRequest,
 ): EdenCliDryRunHandle {
   const processMarker = `${PROCESS_IDENTITY_PREFIX}dry-run-${randomUUID()}`;
+  const executable = resolveDeploymentExecutableSync(request.cwd);
   const child = spawnChild(
-    resolveDeploymentExecutableSync(request.cwd),
-    [...request.args],
+    executable.command,
+    [...executable.commandArgs, ...request.args],
     {
       argv0: processMarker,
       cwd: request.cwd,
@@ -3281,11 +3325,15 @@ function runDefaultRemoteCommand(
   return resolveDeploymentExecutable(request.cwd).then(
     (executable) =>
       new Promise((resolveResult) => {
-        const child = spawnChild(executable, [...request.args], {
-          cwd: request.cwd,
-          env: scrubChildEnvironment(),
-          stdio: ["pipe", "pipe", "pipe"],
-        });
+        const child = spawnChild(
+          executable.command,
+          [...executable.commandArgs, ...request.args],
+          {
+            cwd: request.cwd,
+            env: scrubChildEnvironment(),
+            stdio: ["pipe", "pipe", "pipe"],
+          },
+        );
         let stdout = "";
         let stderr = "";
         child.stdout?.on("data", (chunk: Buffer) => {
@@ -3744,12 +3792,16 @@ async function runCompatibilityDryRun(
   }
   const resolved = await returned;
   if (isDryRunHandle(resolved)) {
-    ownedProcesses?.register(resolved.process);
-    try {
-      return await resolved.result;
-    } finally {
-      ownedProcesses?.unregister(resolved.process);
-    }
+    // A promise-returned handle may already have spawned before this await.
+    // It cannot be registered synchronously, so this shape is unsupported.
+    // Give the returned owner one best-effort termination opportunity rather
+    // than leaving an untracked child behind.
+    await resolved.process.terminate("SIGTERM").catch(() => undefined);
+    throw cliError({
+      code: "DRY_RUN_HANDLE_UNSUPPORTED",
+      message:
+        "The compatibility runner returned a cancellable handle through a promise; return the handle synchronously so it can be registered before awaiting.",
+    });
   }
   return resolved;
 }
@@ -3802,6 +3854,9 @@ async function buildProjectFromCli(
       throw error;
     }
     const candidateGeneration = await assertArtifactDirectory(candidateOutput);
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
+    }
     runtimeFiles = await createRuntimeFiles(
       root,
       configuration.configPath,
@@ -3838,6 +3893,9 @@ async function buildProjectFromCli(
     }
     const dryRunOutput = redactOutput(dryRun.stdout);
     if (dryRunOutput.length > 0) options.stdout?.(dryRunOutput);
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
+    }
     if (dryRun.exitCode !== 0) {
       const dryRunError = redactOutput(dryRun.stderr);
       throw cliError({
@@ -3846,12 +3904,6 @@ async function buildProjectFromCli(
           dryRunError.length === 0 ? "" : ` ${dryRunError}`
         }`,
       });
-    }
-    if (ownedProcesses?.isStopping() === true) {
-      return candidateGeneration;
-    }
-    if (ownedProcesses?.isStopping() === true) {
-      return candidateGeneration;
     }
     await assertProjectInputsUnchanged(
       root,
@@ -4162,13 +4214,17 @@ function defaultProcessRunner(): EdenCliProcessRunner {
     spawn(request) {
       const processMarker =
         request.processIdentity ?? `${PROCESS_IDENTITY_PREFIX}${randomUUID()}`;
-      const child = spawnChild(request.command, [...request.args], {
-        argv0: processMarker,
-        cwd: request.cwd,
-        env: scrubChildEnvironment(request.env),
-        detached: process.platform !== "win32",
-        stdio: "inherit",
-      });
+      const child = spawnChild(
+        request.command,
+        [...(request.commandArgs ?? []), ...request.args],
+        {
+          argv0: processMarker,
+          cwd: request.cwd,
+          env: scrubChildEnvironment(request.env),
+          detached: process.platform !== "win32",
+          stdio: "inherit",
+        },
+      );
       return createDefaultProcessHandle(
         child,
         processMarker,
@@ -4462,7 +4518,8 @@ async function runDev(
     const executable = await resolveDeploymentExecutable(root);
     if (stopped) return;
     const processRequest: EdenCliProcessRequest = {
-      command: executable,
+      command: executable.command,
+      commandArgs: executable.commandArgs,
       args: [
         "dev",
         "--local",
@@ -4663,23 +4720,25 @@ async function runDeploy(
   const ownedValidationProcesses = createOwnedProcessRegistry();
   let deploymentLock: DeploymentLockHandle | undefined;
   let requestedSignal: NodeJS.Signals | undefined;
-  const stopOnSignal = (signal: NodeJS.Signals): void => {
+  const requestStop = (signal: NodeJS.Signals): void => {
     requestedSignal ??= signal;
     void ownedValidationProcesses.cleanup(signal);
   };
-  process.on("SIGINT", stopOnSignal);
-  process.on("SIGTERM", stopOnSignal);
+  const stopOnSigint = (): void => requestStop("SIGINT");
+  const stopOnSigterm = (): void => requestStop("SIGTERM");
+  process.on("SIGINT", stopOnSigint);
+  process.on("SIGTERM", stopOnSigterm);
   try {
     deploymentLock = await acquireDeploymentLock(root);
   } catch (error: unknown) {
-    process.removeListener("SIGINT", stopOnSignal);
-    process.removeListener("SIGTERM", stopOnSignal);
+    process.removeListener("SIGINT", stopOnSigint);
+    process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     throw error;
   }
   if (deploymentLock === undefined) {
-    process.removeListener("SIGINT", stopOnSignal);
-    process.removeListener("SIGTERM", stopOnSignal);
+    process.removeListener("SIGINT", stopOnSigint);
+    process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     throw cliError({
       code: "DEPLOY_LOCK_UNAVAILABLE",
@@ -4725,8 +4784,8 @@ async function runDeploy(
     assertDeploymentActive();
     await assertBoundGeneration();
   } catch (error: unknown) {
-    process.removeListener("SIGINT", stopOnSignal);
-    process.removeListener("SIGTERM", stopOnSignal);
+    process.removeListener("SIGINT", stopOnSigint);
+    process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     await lock.release().catch(() => undefined);
     throw error;
@@ -4763,16 +4822,16 @@ async function runDeploy(
         () => undefined,
       );
     }
-    process.removeListener("SIGINT", stopOnSignal);
-    process.removeListener("SIGTERM", stopOnSignal);
+    process.removeListener("SIGINT", stopOnSigint);
+    process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     await lock.release().catch(() => undefined);
     throw error;
   }
   const runtimeFiles = setupRuntimeFiles;
   if (runtimeFiles === undefined) {
-    process.removeListener("SIGINT", stopOnSignal);
-    process.removeListener("SIGTERM", stopOnSignal);
+    process.removeListener("SIGINT", stopOnSigint);
+    process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     await lock.release().catch(() => undefined);
     throw cliError({
@@ -4848,6 +4907,13 @@ async function runDeploy(
         message: error instanceof Error
           ? `Deployment dry-run could not be started: ${error.message}`
           : "Deployment dry-run could not be started.",
+      });
+    }
+    if (ownedValidationProcesses.isStopping()) {
+      throw cliError({
+        code: "DEPLOY_CANCELLED",
+        message:
+          "Eden deploy was cancelled while validating the selected generation.",
       });
     }
     if (dryRun.exitCode !== 0) {
@@ -5008,10 +5074,39 @@ async function runDeploy(
     }
     await rm(temporaryConfig, { force: true }).catch(() => undefined);
     await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
-    process.removeListener("SIGINT", stopOnSignal);
-    process.removeListener("SIGTERM", stopOnSignal);
+    process.removeListener("SIGINT", stopOnSigint);
+    process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     await lock.release().catch(() => undefined);
+  }
+}
+
+async function runBuild(
+  root: string,
+  options: EdenCliRunOptions,
+): Promise<void> {
+  const ownedValidationProcesses = createOwnedProcessRegistry();
+  let requestedSignal: NodeJS.Signals = "SIGTERM";
+  const requestStop = (signal: NodeJS.Signals): void => {
+    requestedSignal = signal;
+    void ownedValidationProcesses.cleanup(signal);
+  };
+  const stopOnSigint = (): void => requestStop("SIGINT");
+  const stopOnSigterm = (): void => requestStop("SIGTERM");
+  process.on("SIGINT", stopOnSigint);
+  process.on("SIGTERM", stopOnSigterm);
+  try {
+    await buildProjectFromCli(
+      root,
+      options,
+      undefined,
+      undefined,
+      ownedValidationProcesses,
+    );
+  } finally {
+    process.removeListener("SIGINT", stopOnSigint);
+    process.removeListener("SIGTERM", stopOnSigterm);
+    await ownedValidationProcesses.cleanup(requestedSignal);
   }
 }
 
@@ -5027,7 +5122,7 @@ async function runInvocation(
       options.stdout?.(`Initialized Eden project in ${root}.`);
       return;
     case "build":
-      await buildProjectFromCli(root, options);
+      await runBuild(root, options);
       return;
     case "dev":
       await runDev(root, options);
