@@ -13,6 +13,9 @@ const workspacePackageDirectories = [
   "packages/cli",
   "examples/basic-agent",
 ];
+// Six package-local processes run serially; keep the larger budget scoped to
+// this portability regression instead of masking unrelated hangs globally.
+const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS = 120_000;
 
 function runPnpm(args, cwd) {
   return new Promise((resolve) => {
@@ -43,7 +46,7 @@ test.sequential(
       expect(exitCode, `${directory} test script failed`).toBe(0);
     }
   },
-  60_000,
+  PACKAGE_TEST_SCRIPTS_TIMEOUT_MS,
 );
 
 test.sequential(
