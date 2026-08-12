@@ -251,6 +251,11 @@ export interface EdenCliRunOptions {
    * readiness probe. Production callers use the bounded default.
    */
   readonly runtimeReadinessTimeoutMs?: number;
+  /**
+   * Internal lifecycle injection for finite callers that need to stop dev
+   * without emitting a process-global signal.
+   */
+  readonly stopSignal?: AbortSignal;
   readonly runtimePublicationHook?: (
     boundary: EdenRuntimePublicationBoundary,
   ) => void | Promise<void>;
@@ -5582,6 +5587,12 @@ async function runDev(
   let watcher: FSWatcher | undefined;
   let stopped = false;
   let rebuildTimer: NodeJS.Timeout | undefined;
+  type ScheduledRebuild = {
+    readonly task: Promise<void>;
+    readonly cancel: () => void;
+  };
+  let scheduledRebuild: ScheduledRebuild | undefined;
+  const scheduledRebuilds = new Set<ScheduledRebuild>();
   let rebuildInFlight = false;
   let rebuildPending = false;
   const rebuildTasks = new Set<Promise<void>>();
@@ -6207,6 +6218,7 @@ async function runDev(
         `Eden dev generation ${nextGeneration.artifacts.buildMetadata.generationId} is coherent.`,
       );
     } catch (error: unknown) {
+      if (stopped) return;
       for (const line of errorLines(error)) {
         options.stderr?.(`Watch rebuild unavailable: ${line}`);
       }
@@ -6230,13 +6242,18 @@ async function runDev(
         clearTimeout(rebuildTimer);
         rebuildTimer = undefined;
       }
+      const pendingScheduledRebuild = scheduledRebuild;
+      pendingScheduledRebuild?.cancel();
       await closeWatcher(watcher);
       watcher = undefined;
 
       const cleanupDeadline = Date.now() + OWNED_PROCESS_CLEANUP_TIMEOUT_MS;
       while (Date.now() < cleanupDeadline) {
         await waitForSettlements(
-          rebuildTasks,
+          [
+            ...rebuildTasks,
+            ...[...scheduledRebuilds].map((scheduled) => scheduled.task),
+          ],
           Math.min(
             OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
             Math.max(1, cleanupDeadline - Date.now()),
@@ -6309,12 +6326,25 @@ async function runDev(
         if (
           remaining.length === 0 &&
           rebuildTasks.size === 0 &&
+          scheduledRebuilds.size === 0 &&
           runtimeTemporaryFiles.size === 0 &&
           statePath === undefined
         ) break;
       }
 
-      await waitForSettlements(rebuildTasks);
+      while (
+        rebuildTasks.size > 0 ||
+        scheduledRebuilds.size > 0
+      ) {
+        await waitForSettlements([
+          ...rebuildTasks,
+          ...[...scheduledRebuilds].map((scheduled) => scheduled.task),
+        ]);
+      }
+      await waitForSettlements([
+        ...rebuildTasks,
+        ...[...scheduledRebuilds].map((scheduled) => scheduled.task),
+      ]);
       await removeRuntimeTemporaryFiles();
       if (localSecretPath !== undefined) {
         await rm(localSecretPath, { force: true }).catch(() => undefined);
@@ -6346,8 +6376,15 @@ async function runDev(
   };
   const stopOnSigint = (): void => requestStop("SIGINT");
   const stopOnSigterm = (): void => requestStop("SIGTERM");
+  const stopOnInjectedSignal = (): void => requestStop("SIGTERM");
   process.once("SIGINT", stopOnSigint);
   process.once("SIGTERM", stopOnSigterm);
+  options.stopSignal?.addEventListener("abort", stopOnInjectedSignal, {
+    once: true,
+  });
+  if (options.stopSignal?.aborted === true) {
+    requestStop("SIGTERM");
+  }
 
   try {
     await readProjectConfiguration(root);
@@ -6486,14 +6523,57 @@ async function runDev(
     watcher.on("all", () => {
       if (stopped) return;
       if (rebuildTimer !== undefined) clearTimeout(rebuildTimer);
+      scheduledRebuild?.cancel();
+      let resolveScheduled: (() => void) | undefined;
+      let started = false;
+      let settled = false;
+      const scheduledTask = new Promise<void>((resolve) => {
+        resolveScheduled = resolve;
+      });
+      const settle = (): void => {
+        if (settled) return;
+        settled = true;
+        resolveScheduled?.();
+        resolveScheduled = undefined;
+      };
+      const scheduled = {
+        task: scheduledTask,
+        cancel: (): void => {
+          if (!started) {
+            settle();
+            scheduledRebuilds.delete(scheduled);
+            if (scheduledRebuild === scheduled) {
+              scheduledRebuild = undefined;
+            }
+          }
+        },
+      };
+      scheduledRebuilds.add(scheduled);
+      scheduledRebuild = scheduled;
       rebuildTimer = setTimeout(() => {
         rebuildTimer = undefined;
-        if (stopped) return;
-        const task = rebuild();
+        started = true;
+        if (stopped) {
+          settle();
+          scheduledRebuilds.delete(scheduled);
+          if (scheduledRebuild === scheduled) scheduledRebuild = undefined;
+          return;
+        }
+        const task = Promise.resolve().then(() => rebuild());
         rebuildTasks.add(task);
         void task.then(
-          () => rebuildTasks.delete(task),
-          () => rebuildTasks.delete(task),
+          () => {
+            rebuildTasks.delete(task);
+            settle();
+            scheduledRebuilds.delete(scheduled);
+            if (scheduledRebuild === scheduled) scheduledRebuild = undefined;
+          },
+          () => {
+            rebuildTasks.delete(task);
+            settle();
+            scheduledRebuilds.delete(scheduled);
+            if (scheduledRebuild === scheduled) scheduledRebuild = undefined;
+          },
         );
       }, 75);
     });
@@ -6564,6 +6644,7 @@ async function runDev(
   } finally {
     process.removeListener("SIGINT", stopOnSigint);
     process.removeListener("SIGTERM", stopOnSigterm);
+    options.stopSignal?.removeEventListener("abort", stopOnInjectedSignal);
     await cleanup();
   }
 }

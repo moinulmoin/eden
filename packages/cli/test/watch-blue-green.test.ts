@@ -145,6 +145,7 @@ describe("eden dev watch blue-green replacement", () => {
     async (boundary) => {
       const root = await createRoot();
       await initRoot(root);
+      const stopController = new AbortController();
       vi.stubEnv("EDEN_BEARER_SECRET", `watch-stop-${boundary}`);
 
       let servedGeneration: Record<string, unknown> | undefined;
@@ -223,6 +224,7 @@ describe("eden dev watch blue-green replacement", () => {
 
       const devPromise = runEdenCli(["dev", "--project", root], {
         cwd: root,
+        stopSignal: stopController.signal,
         processRunner,
         dryRunRunner: async () => ({
           exitCode: 0,
@@ -237,7 +239,7 @@ describe("eden dev watch blue-green replacement", () => {
               releasePublicationHook = resolve;
             });
           }
-          process.emit("SIGINT");
+          stopController.abort();
         },
         stderr: (line) => errors.push(line),
         stdout: (line) => {
@@ -255,16 +257,9 @@ describe("eden dev watch blue-green replacement", () => {
         );
         await publicationReached;
         if (boundary === "after-runtime-ready") {
-          process.emit("SIGINT");
+          stopController.abort();
         }
-        await expect(
-          Promise.race([
-            devPromise,
-            new Promise<number>((resolve) => {
-              setTimeout(() => resolve(-1), 2_000);
-            }),
-          ]),
-        ).resolves.toBe(0);
+        await expect(devPromise).resolves.toBe(0);
         await expect(access(join(root, ".eden-dev-state.json")))
           .rejects.toMatchObject({ code: "ENOENT" });
         await expect(
@@ -283,11 +278,8 @@ describe("eden dev watch blue-green replacement", () => {
         expect(exitPromises.length).toBeGreaterThanOrEqual(2);
       } finally {
         releasePublicationHook?.();
-        process.emit("SIGINT");
-        await Promise.race([
-          devPromise,
-          new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
-        ]);
+        stopController.abort();
+        await expect(devPromise).resolves.toBe(0);
       }
     },
     15_000,
@@ -296,6 +288,7 @@ describe("eden dev watch blue-green replacement", () => {
   test("proves a successful replacement through authenticated live info", async () => {
     const root = await createRoot();
     await initRoot(root);
+    const stopController = new AbortController();
     vi.stubEnv("EDEN_BEARER_SECRET", "watch-live-secret");
 
     let servedGeneration: Record<string, unknown> | undefined;
@@ -377,6 +370,7 @@ describe("eden dev watch blue-green replacement", () => {
 
     const devPromise = runEdenCli(["dev", "--project", root], {
       cwd: root,
+      stopSignal: stopController.signal,
       processRunner,
       dryRunRunner: async () => ({
         exitCode: 0,
@@ -415,7 +409,7 @@ describe("eden dev watch blue-green replacement", () => {
       expect(servedGeneration?.generationId).not.toBe(initialGenerationId);
       expect(spawnCount).toBe(2);
     } finally {
-      process.emit("SIGINT");
+      stopController.abort();
       await expect(devPromise).resolves.toBe(0);
     }
   }, 30_000);
@@ -423,6 +417,7 @@ describe("eden dev watch blue-green replacement", () => {
   test("verifies the old generation after replacement readiness fails", async () => {
     const root = await createRoot();
     await initRoot(root);
+    const stopController = new AbortController();
     vi.stubEnv("EDEN_BEARER_SECRET", "watch-rollback-secret");
 
     let servedGeneration: Record<string, unknown> | undefined;
@@ -493,7 +488,6 @@ describe("eden dev watch blue-green replacement", () => {
             if (spawnIndex === 1) {
               initialGeneration = generation;
               servedGeneration = generation;
-              resolveDevReady?.();
             } else if (spawnIndex === 2) {
               replacementProbe = true;
             } else {
@@ -524,6 +518,7 @@ describe("eden dev watch blue-green replacement", () => {
 
     const devPromise = runEdenCli(["dev", "--project", root], {
       cwd: root,
+      stopSignal: stopController.signal,
       processRunner,
       dryRunRunner: async () => ({
         exitCode: 0,
@@ -547,13 +542,21 @@ describe("eden dev watch blue-green replacement", () => {
         "utf8",
       );
 
-      await waitForValue(
-        () =>
-          errors.find((line) =>
-            /watch rebuild unavailable|rollback|replacement/i.test(line),
-          ),
-        5_000,
-      );
+      try {
+        await waitForValue(
+          () =>
+            errors.find((line) =>
+              /watch rebuild unavailable|rollback|replacement/i.test(line),
+            ),
+          5_000,
+        );
+      } catch (error) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)} ` +
+          `(spawnCount=${spawnCount}, readinessTimedOut=${readinessTimedOut}, ` +
+          `requests=${requests.length}, errors=${JSON.stringify(errors)})`,
+        );
+      }
       expect(spawnCount).toBeGreaterThanOrEqual(2);
       expect(servedGeneration?.generationId).toBe(initialGenerationId);
       expect(readinessTimedOut).toBe(true);
@@ -563,7 +566,7 @@ describe("eden dev watch blue-green replacement", () => {
         ),
       ).toBe(true);
     } finally {
-      process.emit("SIGINT");
+      stopController.abort();
       await expect(devPromise).resolves.toBe(0);
       await expect(
         readdir(root).then((entries) =>
@@ -579,6 +582,7 @@ describe("eden dev watch blue-green replacement", () => {
   test("aborts a stalled readiness request when dev cleanup starts", async () => {
     const root = await createRoot();
     await initRoot(root);
+    const stopController = new AbortController();
     vi.stubEnv("EDEN_BEARER_SECRET", "watch-abort-secret");
 
     let servedGeneration: Record<string, unknown> | undefined;
@@ -587,17 +591,14 @@ describe("eden dev watch blue-green replacement", () => {
     const devReady = new Promise<void>((resolve) => {
       resolveDevReady = resolve;
     });
-    let readinessStarted: (() => void) | undefined;
-    const readinessStartedPromise = new Promise<void>((resolve) => {
-      readinessStarted = resolve;
-    });
+    let readinessStartedObserved = false;
     let readinessAborted = false;
     let replacementProbe = false;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
         if (replacementProbe) {
-          readinessStarted?.();
+          readinessStartedObserved = true;
           await new Promise<never>((_resolve, reject) => {
             const signal = init?.signal;
             if (signal?.aborted === true) {
@@ -646,7 +647,6 @@ describe("eden dev watch blue-green replacement", () => {
             if (spawnCount === 1) {
               initialGenerationId = generation.generationId;
               servedGeneration = generation;
-              resolveDevReady?.();
             } else {
               servedGeneration = generation;
               replacementProbe = true;
@@ -676,6 +676,7 @@ describe("eden dev watch blue-green replacement", () => {
 
     const devPromise = runEdenCli(["dev", "--project", root], {
       cwd: root,
+      stopSignal: stopController.signal,
       processRunner,
       dryRunRunner: async () => ({
         exitCode: 0,
@@ -696,32 +697,35 @@ describe("eden dev watch blue-green replacement", () => {
         updatedToolSource("stalled replacement"),
         "utf8",
       );
-      await readinessStartedPromise;
+      try {
+        await waitForValue(
+          () => (readinessStartedObserved ? true : undefined),
+          5_000,
+        );
+      } catch (error) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)} ` +
+          `(spawnCount=${spawnCount}, replacementProbe=${replacementProbe}, ` +
+          `initialGenerationId=${String(initialGenerationId)}, ` +
+          `servedGeneration=${JSON.stringify(servedGeneration)})`,
+        );
+      }
       const startedAt = Date.now();
-      process.emit("SIGINT");
-      await expect(
-        Promise.race([
-          devPromise,
-          new Promise<number>((resolve) => {
-            setTimeout(() => resolve(-1), 1_000);
-          }),
-        ]),
-      ).resolves.toBe(0);
+      stopController.abort();
+      await expect(devPromise).resolves.toBe(0);
       expect(Date.now() - startedAt).toBeLessThan(1_000);
       expect(readinessAborted).toBe(true);
       expect(spawnCount).toBeGreaterThanOrEqual(2);
     } finally {
-      process.emit("SIGINT");
-      await Promise.race([
-        devPromise,
-        new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
-      ]);
+      stopController.abort();
+      await expect(devPromise).resolves.toBe(0);
     }
   }, 15_000);
 
   test("does not leak a rollback child when stop races its synchronous spawn", async () => {
     const root = await createRoot();
     await initRoot(root);
+    const stopController = new AbortController();
     vi.stubEnv("EDEN_BEARER_SECRET", "watch-rollback-race-secret");
 
     let servedGeneration: Record<string, unknown> | undefined;
@@ -794,6 +798,7 @@ describe("eden dev watch blue-green replacement", () => {
 
     const devPromise = runEdenCli(["dev", "--project", root], {
       cwd: root,
+      stopSignal: stopController.signal,
       processRunner,
       dryRunRunner: async () => ({
         exitCode: 0,
@@ -807,7 +812,7 @@ describe("eden dev watch blue-green replacement", () => {
         }
         if (boundary === "before-runtime-rollback") {
           rollbackGuardReached = true;
-          process.emit("SIGINT");
+          stopController.abort();
         }
       },
       stdout: (line) => {
@@ -829,7 +834,7 @@ describe("eden dev watch blue-green replacement", () => {
       );
       expect(spawnCount).toBe(2);
     } finally {
-      process.emit("SIGINT");
+      stopController.abort();
       await expect(devPromise).resolves.toBe(0);
     }
 
@@ -838,6 +843,7 @@ describe("eden dev watch blue-green replacement", () => {
   test("keeps the old runtime after replacement termination is rejected when live proof succeeds", async () => {
     const root = await createRoot();
     await initRoot(root);
+    const stopController = new AbortController();
     vi.stubEnv("EDEN_BEARER_SECRET", "watch-termination-rejection-secret");
 
     let servedGeneration: Record<string, unknown> | undefined;
@@ -876,7 +882,6 @@ describe("eden dev watch blue-green replacement", () => {
             if (spawnCount === 1) {
               initialGeneration = generation;
               servedGeneration = generation;
-              resolveDevReady?.();
             }
           })
           .catch((error: unknown) => {
@@ -899,6 +904,7 @@ describe("eden dev watch blue-green replacement", () => {
 
     const devPromise = runEdenCli(["dev", "--project", root], {
       cwd: root,
+      stopSignal: stopController.signal,
       processRunner,
       dryRunRunner: async () => ({
         exitCode: 0,
@@ -938,8 +944,98 @@ describe("eden dev watch blue-green replacement", () => {
       ).toBe(true);
       expect(servedGeneration?.generationId).toBe(initial.generationId);
     } finally {
-      process.emit("SIGINT");
+      stopController.abort();
       await expect(devPromise).resolves.toBe(0);
     }
+  }, 15_000);
+
+  test("waits for a rebuild that races stop before task registration", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "watch-hermetic-stop-secret");
+    const stopController = new AbortController();
+    const errors: string[] = [];
+    let servedGeneration: Record<string, unknown> | undefined;
+    let resolveDevReady: (() => void) | undefined;
+    const devReady = new Promise<void>((resolve) => {
+      resolveDevReady = resolve;
+    });
+    let resolveExit: (() => void) | undefined;
+    const exited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      resolveExit = () => resolve({ exitCode: 0, signal: null });
+    });
+    let spawnCount = 0;
+    let dryRunCount = 0;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        if (servedGeneration === undefined) {
+          return new Response("not ready", { status: 503 });
+        }
+        return new Response(JSON.stringify({ generation: servedGeneration }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      stopSignal: stopController.signal,
+      processRunner: {
+        spawn(request: EdenCliProcessRequest): EdenCliProcess {
+          spawnCount += 1;
+          const ownGeneration = {
+            value: undefined as Record<string, unknown> | undefined,
+          };
+          void generationFromRequest(root, request).then((generation) => {
+            ownGeneration.value = generation;
+            servedGeneration = generation;
+          });
+          return {
+            pid: 45_600 + spawnCount,
+            startIdentity: `watch-hermetic-${spawnCount}`,
+            ready: Promise.resolve(),
+            exited,
+            async terminate() {
+              if (ownGeneration.value !== undefined &&
+                servedGeneration === ownGeneration.value) {
+                servedGeneration = undefined;
+              }
+              resolveExit?.();
+            },
+          };
+        },
+      },
+      dryRunRunner: () => {
+        dryRunCount += 1;
+        if (dryRunCount === 2) {
+          stopController.abort();
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      stderr: (line) => errors.push(line),
+      stdout: (line) => {
+        if (line.includes("Eden dev ready")) resolveDevReady?.();
+      },
+    });
+
+    await devReady;
+    await writeFile(
+      join(root, "agent/tools/greet.ts"),
+      updatedToolSource("hermetic stop race"),
+      "utf8",
+    );
+    await expect(devPromise).resolves.toBe(0);
+
+    await rm(root, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(errors.join("\n")).not.toMatch(
+      /PROJECT_ROOT_INVALID|selected project root is unavailable/i,
+    );
   }, 15_000);
 });
