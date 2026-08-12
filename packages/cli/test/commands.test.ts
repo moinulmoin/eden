@@ -149,11 +149,11 @@ describe("eden CLI project commands", () => {
     expect(wrangler.ai).toEqual({ binding: "AI" });
     expect(wrangler.env?.preview?.name).toBe("eden-basic-agent-preview");
     expect(wrangler.env?.production?.name).toBe("eden-basic-agent-production");
-    expect((await readdir(root)).sort()).toEqual([
-      "agent",
-      "package.json",
-      "wrangler.jsonc",
-    ]);
+    expect(
+      (await readdir(root))
+        .filter((entry) => !entry.startsWith(".eden-init-provenance-"))
+        .sort(),
+    ).toEqual(["agent", "package.json", "wrangler.jsonc"]);
     await expect(stat(join(root, ".env"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(stat(join(root, ".dev.vars"))).rejects.toMatchObject({ code: "ENOENT" });
     expect(output.join("")).toContain("Initialized");
@@ -341,6 +341,51 @@ describe("eden CLI project commands", () => {
     ).resolves.toContain("eden.init.incomplete");
   });
 
+  test("preserves the source when the destination changes before source removal", async () => {
+    const root = await createRoot("eden-cli-init-source-removal-race-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("injected init interruption");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    const replacement = "created during source removal\n";
+    let replaced = false;
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary, target) => {
+          if (
+            !replaced &&
+            boundary === "before-init-source-removal" &&
+            target?.endsWith("package.json")
+          ) {
+            replaced = true;
+            await rm(join(root, "package.json"), { force: true });
+            await writeFile(join(root, "package.json"), replacement, "utf8");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+    await expect(readFile(join(root, "package.json"), "utf8")).resolves.toBe(
+      replacement,
+    );
+    await expect(
+      stat(join(root, ".eden-init-incomplete.json")),
+    ).resolves.toBeDefined();
+    const stagedState = JSON.parse(
+      await readFile(join(root, ".eden-init-incomplete.json"), "utf8"),
+    ) as { readonly stageName: string };
+    await expect(
+      readFile(join(root, stagedState.stageName, "package.json"), "utf8"),
+    ).resolves.toContain('"eden-basic-agent"');
+  });
+
   test("fails one of two concurrent init attempts without losing scaffold bytes", async () => {
     const root = await createRoot("eden-cli-init-concurrent-");
     const results = await Promise.all([
@@ -358,26 +403,32 @@ describe("eden CLI project commands", () => {
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test("recovers a stale init lock left by an interrupted process", async () => {
+  test("preserves a stale init lock without original Eden provenance", async () => {
     const root = await createRoot("eden-cli-init-stale-lock-");
+    const lockContents = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: 99_999_999,
+      startedAt: "stale-process-start",
+      token: "stale-token",
+    })}\n`;
     await writeFile(
       join(root, ".eden-init.lock"),
-      JSON.stringify({
-        kind: "eden.init.lock",
-        version: 1,
-        pid: 99_999_999,
-        startedAt: "stale-process-start",
-        token: "stale-token",
-      }),
+      lockContents,
       "utf8",
     );
 
+    const errors: string[] = [];
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
-    ).resolves.toBe(0);
-    await expect(
-      stat(join(root, ".eden-init.lock")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+      }),
+    ).resolves.toBe(1);
+    await expect(readFile(join(root, ".eden-init.lock"), "utf8")).resolves.toBe(
+      lockContents,
+    );
+    expect(errors.join("\n")).toMatch(/provenance|ownership|preserved|busy/i);
   });
 
   test("does not promote an incomplete same-identity generation over the prior CURRENT", async () => {
@@ -552,7 +603,7 @@ describe("eden CLI project commands", () => {
     expect(errors.join("\n")).toMatch(/symlink|symbolic|unsafe|outside/i);
   });
 
-  test("does not remove a replacement lock after observing a stale owner", async () => {
+  test("preserves a replacement lock when an unowned stale lock is observed", async () => {
     const root = await createRoot("eden-cli-init-lock-race-");
     const lockPath = join(root, ".eden-init.lock");
     const liveOwnerStartedAt = await new Promise<string>((resolve, reject) => {
@@ -601,7 +652,7 @@ describe("eden CLI project commands", () => {
       }),
     ).resolves.toBe(1);
 
-    await expect(readFile(lockPath, "utf8")).resolves.toBe(replacement);
+    await expect(readFile(lockPath, "utf8")).resolves.toContain('"stale-token"');
     await expect(stat(join(root, "package.json"))).rejects.toMatchObject({
       code: "ENOENT",
     });
@@ -676,7 +727,7 @@ describe("eden CLI project commands", () => {
     expect(errors.join("\n")).toMatch(/destination|preserved|busy|quarantine/i);
   });
 
-  test("preserves a replacement quarantine source after stale-lock validation", async () => {
+  test("preserves an unowned stale lock instead of creating quarantine state", async () => {
     const root = await createRoot("eden-cli-init-quarantine-source-race-");
     const lockContents = `${JSON.stringify({
       kind: "eden.init.lock",
@@ -685,27 +736,6 @@ describe("eden CLI project commands", () => {
       startedAt: "stale-process-start",
       token: "stale-source-token",
     })}\n`;
-    let quarantinePath = "";
-    const replacementContents = `${JSON.stringify({
-      kind: "eden.init.lock",
-      version: 1,
-      pid: process.pid,
-      startedAt: await new Promise<string>((resolve, reject) => {
-        execFile(
-          "ps",
-          ["-p", String(process.pid), "-o", "lstart="],
-          { encoding: "utf8" },
-          (error, stdout) => {
-            if (error !== null) {
-              reject(error);
-              return;
-            }
-            resolve(String(stdout).trim());
-          },
-        );
-      }),
-      token: "replacement-source-token",
-    })}\n`;
     await writeFile(join(root, ".eden-init.lock"), lockContents, "utf8");
 
     const errors: string[] = [];
@@ -713,30 +743,18 @@ describe("eden CLI project commands", () => {
       runEdenCli(["init", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
-        initPublicationHook: async (boundary) => {
-          if (boundary !== "before-stale-lock-removal") return;
-          const entries = await readdir(root);
-          const quarantineEntry = entries.find((entry) =>
-            entry.startsWith(".eden-init-stale-lock-"),
-          );
-          if (quarantineEntry === undefined) {
-            throw new Error("stale-lock quarantine was not created");
-          }
-          quarantinePath = join(root, quarantineEntry);
-          await rm(quarantinePath, { force: false });
-          await writeFile(
-            quarantinePath,
-            replacementContents,
-            "utf8",
-          );
-        },
       }),
     ).resolves.toBe(1);
 
-    await expect(readFile(quarantinePath, "utf8")).resolves.toBe(
-      replacementContents,
+    await expect(readFile(join(root, ".eden-init.lock"), "utf8")).resolves.toBe(
+      lockContents,
     );
-    expect(errors.join("\n")).toMatch(/changed|replacement|preserved|busy/i);
+    expect(
+      (await readdir(root)).some((entry) =>
+        entry.startsWith(".eden-init-stale-lock-"),
+      ),
+    ).toBe(false);
+    expect(errors.join("\n")).toMatch(/provenance|ownership|preserved|busy/i);
   });
 
   test("preserves the prior CURRENT when canonical metadata is malformed", async () => {

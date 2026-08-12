@@ -505,7 +505,9 @@ async function stopLocalRuntime(projectRoot, devProcess) {
 }
 
 async function assertCleanRoomArtifacts(projectRoot) {
-  const initialEntries = (await readdir(projectRoot)).sort();
+  const initialEntries = (await readdir(projectRoot))
+    .filter((entry) => !entry.startsWith(".eden-init-provenance-"))
+    .sort();
   if (
     JSON.stringify(initialEntries) !==
     JSON.stringify([".eden", ".wrangler", "agent", "package.json", "wrangler.jsonc"])

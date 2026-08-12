@@ -163,8 +163,11 @@ eden build --project "$PROJECT_ROOT"
 ```
 
 Check that the generated root contains the five scaffold entries and `.eden/`
-after the build. There must be no `.env`, `.dev.vars`, bearer value, raw
-Durable Object identifier, or secret file.
+after the build. Eden may retain its hidden, root-contained
+`.eden-init-provenance-*` ownership directory; it contains only internal
+recovery state and is not a secret-bearing project file. There must be no
+`.env`, `.dev.vars`, bearer value, raw Durable Object identifier, or secret
+file.
 
 In one terminal, set `EDEN_BEARER_SECRET` to a local value held outside the
 project and start development:
