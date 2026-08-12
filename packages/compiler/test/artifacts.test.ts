@@ -1521,6 +1521,248 @@ describe("artifact generation", () => {
     });
   });
 
+  test("rejects computed and destructured callable returns before publication", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Computed callable return fixture\n",
+      "agent/tools/computed-callable-return.ts": `
+        const methodName = "getRuntime";
+        const methods = {
+          [methodName]() {
+            return globalThis;
+          },
+        };
+        const { [methodName]: getRuntime } = methods;
+        const runtime = getRuntime();
+        export default {
+          description: "Computed callable returns must remain conservative.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/computed-callable-return.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("rejects unresolved computed object-method returns conservatively", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Unknown computed callable fixture\n",
+      "agent/tools/unknown-computed-callable.ts": `
+        const helpers = {
+          async getRuntime() {
+            return globalThis;
+          },
+        };
+        export default {
+          description: "Unknown computed methods must not hide ambient returns.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const runtime = await helpers[input.name]();
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/unknown-computed-callable.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("rejects computed callable aliases before their ambient return is used", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Computed callable alias fixture\n",
+      "agent/tools/computed-callable-alias.ts": `
+        const helpers = {
+          getRuntime() {
+            return globalThis;
+          },
+        };
+        export default {
+          description: "Computed callable aliases must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const getRuntime = helpers[input.name];
+            const runtime = getRuntime();
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/computed-callable-alias.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
+      "globalThis Reflect alias",
+      `
+        const reflect = globalThis.Reflect;
+        const read = reflect.get(globalThis, "EDEN_API_KEY");
+        export default {
+          description: "Reflect aliases must preserve ambient identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: read ?? input.name }; },
+        };
+      `,
+      "MODULE_AMBIENT_BINDING",
+    ],
+    [
+      "destructured Reflect alias",
+      `
+        const { Reflect: reflect } = self;
+        const read = reflect["get"](self, "EDEN_API_KEY");
+        export default {
+          description: "Destructured Reflect aliases must preserve ambient identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: read ?? input.name }; },
+        };
+      `,
+      "MODULE_AMBIENT_BINDING",
+    ],
+    [
+      "chained Reflect alias",
+      `
+        const get = globalThis["Reflect"]["get"];
+        const create = get(globalThis, "Function");
+        export default {
+          description: "Chained Reflect aliases must preserve dynamic-code identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: create(input.name) }; },
+        };
+      `,
+      "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+    ],
+    [
+      "computed Reflect alias",
+      `
+        const key = "Reflect";
+        const reflect = globalThis[key];
+        const read = reflect.get(globalThis, "EDEN_API_KEY");
+        export default {
+          description: "Computed Reflect aliases must preserve ambient identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: read ?? input.name }; },
+        };
+      `,
+      "MODULE_AMBIENT_BINDING",
+    ],
+    [
+      "chained Reflect call alias",
+      `
+        const reflect = Reflect.get(globalThis, "Reflect");
+        const read = reflect.get(globalThis, "EDEN_API_KEY");
+        export default {
+          description: "Chained Reflect calls must preserve ambient identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: read ?? input.name }; },
+        };
+      `,
+      "MODULE_AMBIENT_BINDING",
+    ],
+    [
+      "Reflect get alias from destructured global",
+      `
+        const { Reflect: reflect } = globalThis;
+        const { get } = reflect;
+        const read = get(globalThis, "EDEN_API_KEY");
+        export default {
+          description: "Reflect get aliases from global destructuring stay reflective.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: read ?? input.name }; },
+        };
+      `,
+      "MODULE_AMBIENT_BINDING",
+    ],
+    [
+      "globalThis Reflect constructor chain",
+      `
+        const reflect = globalThis.Reflect;
+        const create = reflect.get(Object, "constructor");
+        export default {
+          description: "Reflective constructor retrieval must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: create(input.name) }; },
+        };
+      `,
+      "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+    ],
+    [
+      "self Reflect constructor chain",
+      `
+        const reflect = self["Reflect"];
+        const create = reflect["get"](Object, "constructor");
+        export default {
+          description: "Reflective constructor retrieval must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: create(input.name) }; },
+        };
+      `,
+      "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+    ],
+    [
+      "destructured Reflect constructor chain",
+      `
+        const { Reflect: reflect } = self;
+        const { get } = reflect;
+        const create = get(Object, "constructor");
+        export default {
+          description: "Destructured reflective constructor retrieval must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) { return { value: create(input.name) }; },
+        };
+      `,
+      "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+    ],
+  ])("rejects %s reflective identity bypasses", async (_name, source, code) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Reflect alias fixture\n",
+      "agent/tools/reflect-alias.ts": source,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code,
+          source: "agent/tools/reflect-alias.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
   test("rejects computed and reflective dynamic Function constructor retrieval", async () => {
     const root = await createProject({
       "agent/agent.ts": agentSource,

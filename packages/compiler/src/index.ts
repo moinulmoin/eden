@@ -2637,7 +2637,14 @@ function semanticWorkerBindingDiagnostics(
         readonly kind: "dynamic-property";
         readonly root: "globalThis" | "self";
       }
-    | { readonly kind: "dynamic-code"; readonly name: "eval" | "Function" };
+    | { readonly kind: "dynamic-code"; readonly name: "eval" | "Function" }
+    | { readonly kind: "reflect" }
+    | { readonly kind: "reflect-get" }
+    | {
+        readonly kind: "callable";
+        readonly returns: readonly AmbientValue[];
+      }
+    | { readonly kind: "unknown-callable" };
 
   const ambientValues = new Map<ts.Symbol, AmbientValue>();
   const variableDeclarations: ts.VariableDeclaration[] = [];
@@ -2783,7 +2790,11 @@ function semanticWorkerBindingDiagnostics(
     if (direct !== undefined) return direct;
     if (ts.isIdentifier(current)) {
       const symbol = checker.getSymbolAtLocation(current);
-      if (symbol === undefined || seenSymbols.has(symbol)) return undefined;
+      if (symbol === undefined) return undefined;
+      const known = ambientValues.get(symbol);
+      if (known?.kind === "reflect") return "Reflect";
+      if (known?.kind === "reflect-get") return "Reflect.get";
+      if (seenSymbols.has(symbol)) return undefined;
       seenSymbols.add(symbol);
       const symbols = [symbol];
       if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
@@ -2791,6 +2802,9 @@ function semanticWorkerBindingDiagnostics(
         if (aliased !== symbol) symbols.push(aliased);
       }
       for (const candidate of symbols) {
+        const knownCandidate = ambientValues.get(candidate);
+        if (knownCandidate?.kind === "reflect") return "Reflect";
+        if (knownCandidate?.kind === "reflect-get") return "Reflect.get";
         for (const declaration of candidate.declarations ?? []) {
           if (
             ts.isVariableDeclaration(declaration) &&
@@ -2817,6 +2831,12 @@ function semanticWorkerBindingDiagnostics(
       const propertyName = ts.isPropertyAccessExpression(current)
         ? current.name.text
         : propertyNameExpression(current.argumentExpression);
+      if (
+        (base === "globalThis" || base === "self") &&
+        propertyName === "Reflect"
+      ) {
+        return "Reflect";
+      }
       if (base === "Reflect" && propertyName === "get") {
         return "Reflect.get";
       }
@@ -2825,6 +2845,123 @@ function semanticWorkerBindingDiagnostics(
       }
     }
     return undefined;
+  }
+
+  function isReflectIdentityExpression(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (resolveSupportedGlobalName(current) === "Reflect") return true;
+    if (
+      (ts.isPropertyAccessExpression(current) ||
+        ts.isElementAccessExpression(current)) &&
+      propertyNameExpression(
+        ts.isPropertyAccessExpression(current)
+          ? current.name
+          : current.argumentExpression,
+      ) === "Reflect"
+    ) {
+      return ambientRootName(current.expression) !== undefined;
+    }
+    if (!ts.isIdentifier(current)) return false;
+    if (current.text === "Reflect" && !hasAuthoredBinding(current)) {
+      return true;
+    }
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    seenSymbols.add(symbol);
+    const symbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) symbols.push(aliased);
+    }
+    for (const candidate of symbols) {
+      if (ambientValues.get(candidate)?.kind === "reflect") return true;
+      for (const declaration of candidate.declarations ?? []) {
+        if (
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          isReflectIdentityExpression(
+            declaration.initializer,
+            new Set(seenSymbols),
+          )
+        ) {
+          return true;
+        }
+        if (ts.isBindingElement(declaration)) {
+          const bindingPattern = declaration.parent;
+          const variableDeclaration = bindingPattern.parent;
+          if (
+            ts.isObjectBindingPattern(bindingPattern) &&
+            bindingPropertyName(declaration) === "Reflect" &&
+            ts.isVariableDeclaration(variableDeclaration) &&
+            variableDeclaration.initializer !== undefined &&
+            ambientRootName(variableDeclaration.initializer) !== undefined
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function isReflectGetAliasExpression(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (
+      (ts.isPropertyAccessExpression(current) ||
+        ts.isElementAccessExpression(current)) &&
+      propertyNameExpression(
+        ts.isPropertyAccessExpression(current)
+          ? current.name
+          : current.argumentExpression,
+      ) === "get"
+    ) {
+      return isReflectIdentityExpression(current.expression);
+    }
+    if (!ts.isIdentifier(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    seenSymbols.add(symbol);
+    const symbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) symbols.push(aliased);
+    }
+    for (const candidate of symbols) {
+      const known = ambientValues.get(candidate);
+      if (known?.kind === "reflect-get") return true;
+      for (const declaration of candidate.declarations ?? []) {
+        if (
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          isReflectGetAliasExpression(
+            declaration.initializer,
+            new Set(seenSymbols),
+          )
+        ) {
+          return true;
+        }
+        if (ts.isBindingElement(declaration)) {
+          const bindingPattern = declaration.parent;
+          const variableDeclaration = bindingPattern.parent;
+          if (
+            ts.isObjectBindingPattern(bindingPattern) &&
+            bindingPropertyName(declaration) === "get" &&
+            ts.isVariableDeclaration(variableDeclaration) &&
+            variableDeclaration.initializer !== undefined &&
+            isReflectIdentityExpression(variableDeclaration.initializer)
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
   }
 
   function isReflectGetExpression(expression: ts.Expression): boolean {
@@ -2840,14 +2977,19 @@ function semanticWorkerBindingDiagnostics(
       : propertyNameExpression(current.argumentExpression);
     return (
       propertyName === "get" &&
-      resolveSupportedGlobalName(current.expression) === "Reflect"
+      isReflectIdentityExpression(current.expression)
     );
   }
 
   function isPotentialConstructorBase(expression: ts.Expression): boolean {
     const globalName = resolveSupportedGlobalName(expression);
     if (globalName !== undefined) {
-      return globalName !== "globalThis" && globalName !== "self";
+      return (
+        globalName !== "globalThis" &&
+        globalName !== "self" &&
+        globalName !== "Reflect" &&
+        globalName !== "Reflect.get"
+      );
     }
     const value = resolveAmbientValue(expression);
     return (
@@ -2876,6 +3018,57 @@ function semanticWorkerBindingDiagnostics(
       : ts.isStringLiteralLike(name) || ts.isIdentifier(name)
         ? name.text
         : undefined;
+  }
+
+  function objectPropertyDeclarations(
+    expression: ts.Expression,
+    propertyName: string | undefined,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): ts.Declaration[] {
+    const current = unwrapExpression(expression);
+    if (ts.isObjectLiteralExpression(current)) {
+      return current.properties.filter((property) => {
+        if (
+          !ts.isMethodDeclaration(property) &&
+          !ts.isGetAccessorDeclaration(property) &&
+          !ts.isSetAccessorDeclaration(property) &&
+          !ts.isPropertyAssignment(property)
+        ) {
+          return false;
+        }
+        return (
+          propertyName === undefined ||
+          objectPropertyName(property) === propertyName
+        );
+      });
+    }
+    if (!ts.isIdentifier(current)) return [];
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return [];
+    seenSymbols.add(symbol);
+    const declarations = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) declarations.push(aliased);
+    }
+    const results: ts.Declaration[] = [];
+    for (const candidate of declarations) {
+      for (const declaration of candidate.declarations ?? []) {
+        if (
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined
+        ) {
+          results.push(
+            ...objectPropertyDeclarations(
+              declaration.initializer,
+              propertyName,
+              new Set(seenSymbols),
+            ),
+          );
+        }
+      }
+    }
+    return results;
   }
 
   function callableDeclarations(
@@ -2918,32 +3111,32 @@ function semanticWorkerBindingDiagnostics(
       }
       if (declarations.length > 0) return declarations;
       const propertyName = current.name.text;
-      const object = unwrapExpression(current.expression);
-      if (ts.isObjectLiteralExpression(object)) {
-        for (const property of object.properties) {
-          const name = objectPropertyName(property);
-          if (name === propertyName) declarations.push(property);
-        }
-      }
+      declarations.push(
+        ...objectPropertyDeclarations(current.expression, propertyName),
+      );
       return declarations;
     }
 
     if (ts.isElementAccessExpression(current)) {
       const propertyName = propertyNameExpression(current.argumentExpression);
-      if (propertyName === undefined) return declarations;
-      addSymbolDeclarations(
-        checker.getPropertyOfType(
-          checker.getTypeAtLocation(current.expression),
-          propertyName,
-        ),
-      );
+      if (propertyName !== undefined) {
+        addSymbolDeclarations(
+          checker.getPropertyOfType(
+            checker.getTypeAtLocation(current.expression),
+            propertyName,
+          ),
+        );
+      }
       if (declarations.length > 0) return declarations;
-      const object = unwrapExpression(current.expression);
-      if (ts.isObjectLiteralExpression(object)) {
-        for (const property of object.properties) {
-          const name = objectPropertyName(property);
-          if (name === propertyName) declarations.push(property);
-        }
+      if (declarations.length === 0) {
+        declarations.push(
+          ...objectPropertyDeclarations(current.expression, propertyName),
+        );
+      }
+      if (declarations.length === 0 && propertyName === undefined) {
+        declarations.push(
+          ...objectPropertyDeclarations(current.expression, undefined),
+        );
       }
       return declarations;
     }
@@ -3024,8 +3217,157 @@ function semanticWorkerBindingDiagnostics(
           ),
         );
       }
+    } else if (ts.isBindingElement(declaration)) {
+      const bindingPattern = declaration.parent;
+      const variableDeclaration = bindingPattern.parent;
+      if (
+        (ts.isObjectBindingPattern(bindingPattern) ||
+          ts.isArrayBindingPattern(bindingPattern)) &&
+        ts.isVariableDeclaration(variableDeclaration) &&
+        variableDeclaration.initializer !== undefined
+      ) {
+        const propertyName = ts.isObjectBindingPattern(bindingPattern)
+          ? bindingPropertyName(declaration)
+          : undefined;
+        const properties = objectPropertyDeclarations(
+          variableDeclaration.initializer,
+          propertyName,
+        );
+        for (const property of properties) {
+          returns.push(
+            ...callableBodies(
+              property,
+              new Set(seenSymbols),
+              seenDeclarations,
+            ),
+          );
+        }
+        if (properties.length === 0) {
+          returns.push({ kind: "unknown-callable" });
+        }
+      }
     }
     return returns;
+  }
+
+  function callableAmbientValue(
+    declarations: readonly ts.Declaration[],
+  ): AmbientValue | undefined {
+    const returns: AmbientValue[] = [];
+    const seenDeclarations = new Set<ts.Declaration>();
+    for (const declaration of declarations) {
+      returns.push(
+        ...callableBodies(
+          declaration,
+          new Set<ts.Symbol>(),
+          seenDeclarations,
+        ),
+      );
+    }
+    if (returns.length === 0) return undefined;
+    return { kind: "callable", returns };
+  }
+
+  function ambientObjectPropertyValue(
+    source: ts.Expression,
+    propertyName: string | undefined,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): AmbientValue | undefined {
+    const current = unwrapExpression(source);
+    if (ts.isObjectLiteralExpression(current)) {
+      const properties = current.properties.filter(
+        (property) =>
+          propertyName === undefined ||
+          objectPropertyName(property) === propertyName,
+      );
+      for (const property of properties) {
+        if (
+          ts.isMethodDeclaration(property) ||
+          ts.isGetAccessorDeclaration(property) ||
+          ts.isSetAccessorDeclaration(property)
+        ) {
+          return callableAmbientValue([property]);
+        }
+        if (ts.isPropertyAssignment(property)) {
+          return (
+            resolveAmbientValue(property.initializer, new Set(seenSymbols)) ??
+            callableAmbientValue([property])
+          );
+        }
+        if (ts.isShorthandPropertyAssignment(property)) {
+          return resolveAmbientValue(property.name, new Set(seenSymbols));
+        }
+        if (ts.isSpreadAssignment(property)) {
+          const spread = ambientObjectPropertyValue(
+            property.expression,
+            propertyName,
+            new Set(seenSymbols),
+          );
+          if (spread !== undefined) return spread;
+        }
+      }
+      return undefined;
+    }
+    if (ts.isIdentifier(current)) {
+      const symbol = checker.getSymbolAtLocation(current);
+      if (symbol === undefined || seenSymbols.has(symbol)) return undefined;
+      seenSymbols.add(symbol);
+      const symbols = [symbol];
+      if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        const aliased = checker.getAliasedSymbol(symbol);
+        if (aliased !== symbol) symbols.push(aliased);
+      }
+      for (const candidate of symbols) {
+        for (const declaration of candidate.declarations ?? []) {
+          if (
+            ts.isVariableDeclaration(declaration) &&
+            declaration.initializer !== undefined
+          ) {
+            const value = ambientObjectPropertyValue(
+              declaration.initializer,
+              propertyName,
+              new Set(seenSymbols),
+            );
+            if (value !== undefined) return value;
+          }
+        }
+      }
+    }
+    const value = resolveAmbientValue(current, new Set(seenSymbols));
+    return value === undefined
+      ? undefined
+      : ambientPropertyValue(value, propertyName);
+  }
+
+  function assignBindingPatternFromSource(
+    pattern: ts.BindingName,
+    source: ts.Expression,
+  ): void {
+    if (ts.isIdentifier(pattern)) {
+      const value = resolveAmbientValue(source);
+      if (value !== undefined) {
+        const symbol = checker.getSymbolAtLocation(pattern);
+        if (symbol !== undefined) addAmbientValue(symbol, value);
+      }
+      return;
+    }
+    if (ts.isObjectBindingPattern(pattern)) {
+      for (const element of pattern.elements) {
+        const propertyName = bindingPropertyName(element);
+        const value = ambientObjectPropertyValue(source, propertyName);
+        if (value !== undefined) {
+          assignBindingPattern(element.name, value);
+        }
+      }
+      return;
+    }
+    for (const element of pattern.elements) {
+      if (!ts.isBindingElement(element)) continue;
+      const value = ambientObjectPropertyValue(source, undefined);
+      if (value !== undefined) {
+        assignBindingPattern(element.name, value);
+      }
+    }
   }
 
   function resolveCallableReturns(
@@ -3040,6 +3382,13 @@ function semanticWorkerBindingDiagnostics(
       returns.push(
         ...callableBodies(declaration, seenSymbols, seenDeclarations),
       );
+    }
+    if (
+      returns.length === 0 &&
+      ts.isElementAccessExpression(current) &&
+      propertyNameExpression(current.argumentExpression) === undefined
+    ) {
+      returns.push({ kind: "unknown-callable" });
     }
     return returns;
   }
@@ -3059,6 +3408,7 @@ function semanticWorkerBindingDiagnostics(
     const root = ambientRootName(target);
     if (root !== undefined) {
       if (key === undefined) return { kind: "dynamic-property", root };
+      if (key === "Reflect") return { kind: "reflect" };
       if (DYNAMIC_CODE_GLOBALS.has(key)) {
         return {
           kind: "dynamic-code",
@@ -3083,18 +3433,46 @@ function semanticWorkerBindingDiagnostics(
     return resolveAmbientValue(target, new Set(seenSymbols));
   }
 
+  function resolveReflectGetCallResult(
+    expression: ts.CallExpression,
+    seenSymbols: Set<ts.Symbol>,
+  ): AmbientValue | undefined {
+    const result = resolveReflectGet(expression, seenSymbols);
+    if (result !== undefined) return result;
+    const callee = unwrapExpression(expression.expression);
+    if (
+      (ts.isPropertyAccessExpression(callee) ||
+        ts.isElementAccessExpression(callee)) &&
+      propertyNameExpression(
+        ts.isPropertyAccessExpression(callee)
+          ? callee.name
+          : callee.argumentExpression,
+      ) === "get" &&
+      isReflectGetAliasExpression(callee.expression)
+    ) {
+      return resolveReflectGetValue(
+        expression.arguments[0],
+        propertyNameExpression(expression.arguments[1]),
+        seenSymbols,
+      );
+    }
+    return undefined;
+  }
+
   function resolveReflectGet(
     expression: ts.CallExpression,
     seenSymbols: Set<ts.Symbol>,
   ): AmbientValue | undefined {
     const callee = unwrapExpression(expression.expression);
-    if (!ts.isPropertyAccessExpression(callee)) return undefined;
-    const reflectTarget = unwrapExpression(callee.expression);
     if (
-      !ts.isIdentifier(reflectTarget) ||
-      reflectTarget.text !== "Reflect" ||
-      hasAuthoredBinding(reflectTarget) ||
-      callee.name.text !== "get"
+      (!ts.isPropertyAccessExpression(callee) &&
+        !ts.isElementAccessExpression(callee)) ||
+      propertyNameExpression(
+        ts.isPropertyAccessExpression(callee)
+          ? callee.name
+          : callee.argumentExpression,
+      ) !== "get" ||
+      !isReflectIdentityExpression(callee.expression)
     ) {
       return undefined;
     }
@@ -3146,6 +3524,24 @@ function semanticWorkerBindingDiagnostics(
     ) {
       return left;
     }
+    if (left.kind === "reflect" && right.kind === "reflect") {
+      return left;
+    }
+    if (left.kind === "reflect-get" && right.kind === "reflect-get") {
+      return left;
+    }
+    if (
+      left.kind === "callable" &&
+      right.kind === "callable"
+    ) {
+      return {
+        kind: "callable",
+        returns: [...left.returns, ...right.returns],
+      };
+    }
+    if (left.kind === "unknown-callable" || right.kind === "unknown-callable") {
+      return { kind: "unknown-callable" };
+    }
     if (left.kind === "dynamic-code" || right.kind === "dynamic-code") {
       return {
         kind: "dynamic-code",
@@ -3174,12 +3570,89 @@ function semanticWorkerBindingDiagnostics(
     ambientValues.set(symbol, mergeAmbientValues(ambientValues.get(symbol), value));
   }
 
+  function ambientPropertyValue(
+    value: AmbientValue,
+    propertyName: string | undefined,
+  ): AmbientValue {
+    if (propertyName === "constructor") {
+      return {
+        kind: "dynamic-code",
+        name: "Function",
+      };
+    }
+    if (propertyName === undefined) {
+      return {
+        kind: "dynamic-property",
+        root:
+          value.kind === "root" ||
+          value.kind === "property" ||
+          value.kind === "dynamic-property"
+            ? value.root
+            : "globalThis",
+      };
+    }
+    if (value.kind === "root") {
+      if (propertyName === "Reflect") return { kind: "reflect" };
+      if (DYNAMIC_CODE_GLOBALS.has(propertyName)) {
+        return {
+          kind: "dynamic-code",
+          name: propertyName as "eval" | "Function",
+        };
+      }
+      return {
+        kind: "property",
+        root: value.root,
+        name: propertyName,
+      };
+    }
+    if (value.kind === "reflect" && propertyName === "get") {
+      return { kind: "reflect-get" };
+    }
+    if (
+      value.kind === "global" &&
+      value.name === "Reflect" &&
+      propertyName === "get"
+    ) {
+      return { kind: "reflect-get" };
+    }
+    if (
+      value.kind === "property" &&
+      value.root === "globalThis" &&
+      value.name === "Reflect" &&
+      propertyName === "get"
+    ) {
+      return { kind: "reflect-get" };
+    }
+    if (value.kind === "property") {
+      return {
+        kind: "property",
+        root: value.root,
+        name: `${value.name}.${propertyName}`,
+      };
+    }
+    if (value.kind === "global") {
+      return {
+        kind: "global",
+        name: `${value.name}.${propertyName}`,
+      };
+    }
+    if (value.kind === "dynamic-code") return value;
+    return {
+      kind: "dynamic-property",
+      root:
+        value.kind === "dynamic-property" ? value.root : "globalThis",
+    };
+  }
+
   function resolveAmbientValue(
     expression: ts.Expression,
     seenSymbols: Set<ts.Symbol> = new Set(),
   ): AmbientValue | undefined {
     const current = unwrapExpression(expression);
     if (isConstructorIndirection(current)) {
+      return { kind: "dynamic-code", name: "Function" };
+    }
+    if (ts.isIdentifier(current) && current.text === "Function") {
       return { kind: "dynamic-code", name: "Function" };
     }
     const root = ambientRootName(current);
@@ -3199,7 +3672,8 @@ function semanticWorkerBindingDiagnostics(
         return { kind: "global", name: globalName };
       }
       const symbol = checker.getSymbolAtLocation(current);
-      if (symbol === undefined || seenSymbols.has(symbol)) return undefined;
+      if (symbol === undefined) return undefined;
+      if (seenSymbols.has(symbol)) return undefined;
       seenSymbols.add(symbol);
       const symbols = [symbol];
       if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
@@ -3210,6 +3684,21 @@ function semanticWorkerBindingDiagnostics(
         const known = ambientValues.get(candidate);
         if (known !== undefined) return known;
         for (const declaration of candidate.declarations ?? []) {
+          if (ts.isBindingElement(declaration)) {
+            const bindingPattern = declaration.parent;
+            const variableDeclaration = bindingPattern.parent;
+            if (
+              ts.isVariableDeclaration(variableDeclaration) &&
+              variableDeclaration.initializer !== undefined &&
+              ts.isObjectBindingPattern(bindingPattern)
+            ) {
+              const value = ambientObjectPropertyValue(
+                variableDeclaration.initializer,
+                bindingPropertyName(declaration),
+              );
+              if (value !== undefined) return value;
+            }
+          }
           if (
             ts.isVariableDeclaration(declaration) &&
             declaration.initializer !== undefined
@@ -3233,11 +3722,38 @@ function semanticWorkerBindingDiagnostics(
             name: current.name.text as "eval" | "Function",
           };
         }
+        if (current.name.text === "Reflect") {
+          return { kind: "reflect" };
+        }
         return {
           kind: "property",
           root: base.root,
           name: current.name.text,
         };
+      }
+      if (base?.kind === "reflect") {
+        if (current.name.text === "get") {
+          return { kind: "reflect-get" };
+        }
+        return {
+          kind: "property",
+          root: "globalThis",
+          name: `Reflect.${current.name.text}`,
+        };
+      }
+      if (base?.kind === "reflect-get") {
+        return {
+          kind: "property",
+          root: "globalThis",
+          name: `Reflect.get.${current.name.text}`,
+        };
+      }
+      if (base?.kind === "unknown-callable") return base;
+      if (base?.kind === "callable") {
+        return base.returns.reduce<AmbientValue | undefined>(
+          (resolved, value) => mergeAmbientValues(resolved, value),
+          undefined,
+        ) ?? { kind: "unknown-callable" };
       }
       if (base?.kind === "dynamic-code") return base;
       if (base?.kind === "property") {
@@ -3256,27 +3772,18 @@ function semanticWorkerBindingDiagnostics(
       if (base?.kind === "global") {
         const name = `${base.name}.${current.name.text}`;
         if (name === "Reflect.get") {
-          return {
-            kind: "dynamic-code",
-            name: "Function",
-          };
+          return { kind: "reflect-get" };
         }
         return { kind: "global", name };
       }
       if (isReflectGetExpression(current)) {
-        return {
-          kind: "dynamic-code",
-          name: "Function",
-        };
+        return { kind: "reflect-get" };
       }
       return undefined;
     }
     if (ts.isElementAccessExpression(current)) {
       if (isReflectGetExpression(current)) {
-        return {
-          kind: "dynamic-code",
-          name: "Function",
-        };
+        return { kind: "reflect-get" };
       }
       if (isPotentialConstructorBase(current.expression)) {
         return {
@@ -3286,6 +3793,37 @@ function semanticWorkerBindingDiagnostics(
       }
       const base = resolveAmbientValue(current.expression, seenSymbols);
       if (base?.kind === "dynamic-code") return base;
+      if (base?.kind === "reflect") {
+        const name =
+          current.argumentExpression === undefined
+            ? undefined
+            : constantStringExpression(current.argumentExpression);
+        if (name === "get") return { kind: "reflect-get" };
+        return {
+          kind: "property",
+          root: "globalThis",
+          name: name === undefined ? "Reflect" : `Reflect.${name}`,
+        };
+      }
+      if (base?.kind === "reflect-get") {
+        const name =
+          current.argumentExpression === undefined
+            ? undefined
+            : constantStringExpression(current.argumentExpression);
+        return {
+          kind: "property",
+          root: "globalThis",
+          name:
+            name === undefined ? "Reflect.get" : `Reflect.get.${name}`,
+        };
+      }
+      if (base?.kind === "unknown-callable") return base;
+      if (base?.kind === "callable") {
+        return base.returns.reduce<AmbientValue | undefined>(
+          (resolved, value) => mergeAmbientValues(resolved, value),
+          undefined,
+        ) ?? { kind: "unknown-callable" };
+      }
       if (base?.kind === "global") {
         const name =
           current.argumentExpression === undefined
@@ -3296,6 +3834,9 @@ function semanticWorkerBindingDiagnostics(
             kind: "dynamic-code",
             name: "Function",
           };
+        }
+        if (base.name === "Reflect" && name === "get") {
+          return { kind: "reflect-get" };
         }
         return name === undefined
           ? {
@@ -3337,6 +3878,7 @@ function semanticWorkerBindingDiagnostics(
       if (name === undefined) {
         return { kind: "dynamic-property", root: base.root };
       }
+      if (name === "Reflect") return { kind: "reflect" };
       if (DYNAMIC_CODE_GLOBALS.has(name)) {
         return {
           kind: "dynamic-code",
@@ -3427,7 +3969,7 @@ function semanticWorkerBindingDiagnostics(
       );
     }
     if (ts.isCallExpression(current)) {
-      const reflective = resolveReflectGet(current, seenSymbols);
+      const reflective = resolveReflectGetCallResult(current, seenSymbols);
       if (reflective !== undefined) return reflective;
       const callee = resolveAmbientValue(
         current.expression,
@@ -3435,6 +3977,31 @@ function semanticWorkerBindingDiagnostics(
       );
       if (callee?.kind === "dynamic-code") return callee;
       if (callee?.kind === "dynamic-property") return callee;
+      if (callee?.kind === "unknown-callable") return callee;
+      if (callee?.kind === "callable") {
+        return callee.returns.reduce<AmbientValue | undefined>(
+          (resolved, value) => mergeAmbientValues(resolved, value),
+          undefined,
+        ) ?? { kind: "unknown-callable" };
+      }
+      if (callee?.kind === "reflect-get") {
+        const reflective = resolveReflectGetValue(
+          current.arguments[0],
+          propertyNameExpression(current.arguments[1]),
+          seenSymbols,
+        );
+        if (reflective !== undefined) return reflective;
+        return { kind: "unknown-callable" };
+      }
+      if (isReflectGetAliasExpression(current.expression)) {
+        const reflective = resolveReflectGetValue(
+          current.arguments[0],
+          propertyNameExpression(current.arguments[1]),
+          seenSymbols,
+        );
+        if (reflective !== undefined) return reflective;
+        return { kind: "unknown-callable" };
+      }
       if (callee?.kind === "global" && callee.name === "Reflect.get") {
         const reflective = resolveReflectGetValue(
           current.arguments[0],
@@ -3462,6 +4029,14 @@ function semanticWorkerBindingDiagnostics(
         current.expression,
         new Set(seenSymbols),
       );
+      if (
+        returns.length === 0 &&
+        ts.isElementAccessExpression(current.expression) &&
+        propertyNameExpression(current.expression.argumentExpression) ===
+          undefined
+      ) {
+        return { kind: "unknown-callable" };
+      }
       if (returns.length === 0) return undefined;
       return returns.slice(1).reduce(
         (currentValue, value) => mergeAmbientValues(currentValue, value),
@@ -3472,6 +4047,7 @@ function semanticWorkerBindingDiagnostics(
       const callee = resolveAmbientValue(current.expression, seenSymbols);
       if (callee?.kind === "dynamic-code") return callee;
       if (callee?.kind === "dynamic-property") return callee;
+      if (callee?.kind === "unknown-callable") return callee;
       for (const argument of current.arguments ?? []) {
         const value = resolveAmbientValue(argument, seenSymbols);
         if (value?.kind === "dynamic-code") return value;
@@ -3520,27 +4096,7 @@ function semanticWorkerBindingDiagnostics(
     if (ts.isObjectBindingPattern(pattern)) {
       for (const element of pattern.elements) {
         const propertyName = bindingPropertyName(element);
-        const elementValue =
-          propertyName === "constructor"
-            ? ({
-                kind: "dynamic-code",
-                name: "Function",
-              } as const)
-            : value.kind === "root" && propertyName !== undefined
-            ? DYNAMIC_CODE_GLOBALS.has(propertyName)
-              ? {
-                  kind: "dynamic-code" as const,
-                  name: propertyName as "eval" | "Function",
-                }
-              : {
-                  kind: "property" as const,
-                  root: value.root,
-                  name: propertyName,
-                }
-            : {
-                kind: "dynamic-property" as const,
-                root: value.kind === "root" ? value.root : "globalThis",
-              };
+        const elementValue = ambientPropertyValue(value, propertyName);
         assignBindingPattern(element.name, elementValue);
       }
       return;
@@ -3570,31 +4126,7 @@ function semanticWorkerBindingDiagnostics(
           const symbol = checker.getSymbolAtLocation(property.name);
           if (symbol !== undefined) {
             const name = property.name.text;
-            const propertyValue =
-              name === "constructor"
-                ? ({
-                    kind: "dynamic-code",
-                    name: "Function",
-                  } as const)
-                : value.kind === "root"
-                ? DYNAMIC_CODE_GLOBALS.has(name)
-                  ? {
-                      kind: "dynamic-code" as const,
-                      name: name as "eval" | "Function",
-                    }
-                  : {
-                      kind: "property" as const,
-                      root: value.root,
-                      name,
-                    }
-                : {
-                    kind: "dynamic-property" as const,
-                    root:
-                      value.kind === "property" ||
-                      value.kind === "dynamic-property"
-                        ? value.root
-                        : "globalThis",
-                  };
+            const propertyValue = ambientPropertyValue(value, name);
             addAmbientValue(symbol, propertyValue);
           }
           continue;
@@ -3625,31 +4157,7 @@ function semanticWorkerBindingDiagnostics(
           });
           continue;
         }
-        const propertyValue =
-          name === "constructor"
-            ? ({
-                kind: "dynamic-code",
-                name: "Function",
-              } as const)
-            : value.kind === "root"
-            ? DYNAMIC_CODE_GLOBALS.has(name)
-              ? {
-                  kind: "dynamic-code" as const,
-                  name: name as "eval" | "Function",
-                }
-              : {
-                  kind: "property" as const,
-                  root: value.root,
-                  name,
-                }
-            : {
-                kind: "dynamic-property" as const,
-                root:
-                  value.kind === "property" ||
-                  value.kind === "dynamic-property"
-                    ? value.root
-                    : "globalThis",
-              };
+        const propertyValue = ambientPropertyValue(value, name);
         assignExpressionPattern(property.initializer, propertyValue);
       }
       return;
@@ -3670,19 +4178,48 @@ function semanticWorkerBindingDiagnostics(
     }
   }
 
+  function assignExpressionPatternFromSource(
+    pattern: ts.Expression,
+    source: ts.Expression,
+  ): void {
+    const current = unwrapExpression(pattern);
+    if (ts.isIdentifier(current)) {
+      const value = resolveAmbientValue(source);
+      if (value !== undefined) {
+        const symbol = checker.getSymbolAtLocation(current);
+        if (symbol !== undefined) addAmbientValue(symbol, value);
+      }
+      return;
+    }
+    if (ts.isObjectLiteralExpression(current)) {
+      for (const property of current.properties) {
+        const propertyName = objectPropertyName(property);
+        if (propertyName === undefined) continue;
+        const target =
+          ts.isShorthandPropertyAssignment(property)
+            ? property.name
+            : ts.isPropertyAssignment(property)
+              ? property.initializer
+              : undefined;
+        if (target === undefined) continue;
+        const value = ambientObjectPropertyValue(source, propertyName);
+        if (value !== undefined) {
+          assignExpressionPattern(target, value);
+        }
+      }
+    }
+  }
+
   for (let iteration = 0; iteration < variableDeclarations.length + assignments.length + 2; iteration += 1) {
     for (const declaration of variableDeclarations) {
       if (declaration.initializer === undefined) continue;
-      const value = resolveAmbientValue(declaration.initializer);
-      if (value !== undefined) {
-        assignBindingPattern(declaration.name, value);
-      }
+      assignBindingPatternFromSource(
+        declaration.name,
+        declaration.initializer,
+      );
     }
     for (const assignment of assignments) {
-      const value = resolveAmbientValue(assignment.right);
-      if (value !== undefined) {
-        assignExpressionPattern(assignment.left, value);
-      }
+      assignExpressionPatternFromSource(assignment.left, assignment.right);
     }
   }
 
@@ -3715,6 +4252,20 @@ function semanticWorkerBindingDiagnostics(
       return;
     }
     if (
+      value.kind === "unknown-callable" ||
+      value.kind === "callable"
+    ) {
+      diagnostics.push(
+        diagnostic(
+          "MODULE_AMBIENT_BINDING",
+          "Unresolved callable return paths are not allowed because they may carry an ambient binding or dynamic-code capability; return a statically analyzable value.",
+          relativePath,
+          location,
+        ),
+      );
+      return;
+    }
+    if (
       value.kind === "property" &&
       (isSecretLikeAmbientName(value.name) ||
         FORBIDDEN_AMBIENT_GLOBALS.has(value.name) ||
@@ -3732,11 +4283,38 @@ function semanticWorkerBindingDiagnostics(
   }
 
   function visit(node: ts.Node): void {
-    if (ts.isBindingElement(node) && bindingPropertyName(node) === "constructor") {
-      reportResolvedAmbient(node, {
-        kind: "dynamic-code",
-        name: "Function",
-      });
+    if (ts.isBindingElement(node)) {
+      const propertyName = bindingPropertyName(node);
+      if (propertyName === "constructor") {
+        reportResolvedAmbient(node, {
+          kind: "dynamic-code",
+          name: "Function",
+        });
+      }
+      const bindingPattern = node.parent;
+      const variableDeclaration = bindingPattern.parent;
+      if (
+        ts.isObjectBindingPattern(bindingPattern) &&
+        ts.isVariableDeclaration(variableDeclaration) &&
+        variableDeclaration.initializer !== undefined
+      ) {
+        const sourceValue = resolveAmbientValue(
+          variableDeclaration.initializer,
+        );
+        if (sourceValue !== undefined) {
+          reportResolvedAmbient(
+            node,
+            ambientPropertyValue(sourceValue, propertyName),
+          );
+        }
+        reportResolvedAmbient(
+          node,
+          ambientObjectPropertyValue(
+            variableDeclaration.initializer,
+            propertyName,
+          ),
+        );
+      }
     }
     if (
       ts.isPropertyAssignment(node) &&
@@ -3766,7 +4344,19 @@ function semanticWorkerBindingDiagnostics(
     }
     if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
       const calleeValue = resolveAmbientValue(node.expression);
-      if (calleeValue === undefined) {
+      reportResolvedAmbient(node, calleeValue);
+      if (calleeValue?.kind === "reflect-get") {
+        reportResolvedAmbient(node, {
+          kind: "dynamic-code",
+          name: "Function",
+        });
+      }
+      if (
+        calleeValue === undefined ||
+        calleeValue.kind === "reflect-get" ||
+        calleeValue.kind === "unknown-callable" ||
+        calleeValue.kind === "callable"
+      ) {
         reportResolvedAmbient(node, resolveAmbientValue(node));
       }
     }
