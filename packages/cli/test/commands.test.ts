@@ -638,6 +638,107 @@ describe("eden CLI project commands", () => {
     await expect(stat(join(root, "package.json"))).resolves.toBeDefined();
   });
 
+  test("does not overwrite a destination collision during stale-lock quarantine", async () => {
+    const root = await createRoot("eden-cli-init-quarantine-destination-race-");
+    const lockContents = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: 99_999_999,
+      startedAt: "stale-process-start",
+      token: "stale-destination-token",
+    })}\n`;
+    const quarantinePath = join(
+      root,
+      `.eden-init-stale-lock-999999999-stale-destination-token-${createHash(
+        "sha256",
+      )
+        .update(lockContents)
+        .digest("hex")}`,
+    );
+    const destinationContents = "created by a competing initializer\n";
+    await writeFile(join(root, ".eden-init.lock"), lockContents, "utf8");
+    await writeFile(quarantinePath, destinationContents, "utf8");
+
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+      }),
+    ).resolves.toBe(1);
+
+    await expect(readFile(join(root, ".eden-init.lock"), "utf8")).resolves.toBe(
+      lockContents,
+    );
+    await expect(readFile(quarantinePath, "utf8")).resolves.toBe(
+      destinationContents,
+    );
+    expect(errors.join("\n")).toMatch(/destination|preserved|busy|quarantine/i);
+  });
+
+  test("preserves a replacement quarantine source after stale-lock validation", async () => {
+    const root = await createRoot("eden-cli-init-quarantine-source-race-");
+    const lockContents = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: 99_999_999,
+      startedAt: "stale-process-start",
+      token: "stale-source-token",
+    })}\n`;
+    let quarantinePath = "";
+    const replacementContents = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: process.pid,
+      startedAt: await new Promise<string>((resolve, reject) => {
+        execFile(
+          "ps",
+          ["-p", String(process.pid), "-o", "lstart="],
+          { encoding: "utf8" },
+          (error, stdout) => {
+            if (error !== null) {
+              reject(error);
+              return;
+            }
+            resolve(String(stdout).trim());
+          },
+        );
+      }),
+      token: "replacement-source-token",
+    })}\n`;
+    await writeFile(join(root, ".eden-init.lock"), lockContents, "utf8");
+
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        initPublicationHook: async (boundary) => {
+          if (boundary !== "before-stale-lock-removal") return;
+          const entries = await readdir(root);
+          const quarantineEntry = entries.find((entry) =>
+            entry.startsWith(".eden-init-stale-lock-"),
+          );
+          if (quarantineEntry === undefined) {
+            throw new Error("stale-lock quarantine was not created");
+          }
+          quarantinePath = join(root, quarantineEntry);
+          await rm(quarantinePath, { force: false });
+          await writeFile(
+            quarantinePath,
+            replacementContents,
+            "utf8",
+          );
+        },
+      }),
+    ).resolves.toBe(1);
+
+    await expect(readFile(quarantinePath, "utf8")).resolves.toBe(
+      replacementContents,
+    );
+    expect(errors.join("\n")).toMatch(/changed|replacement|preserved|busy/i);
+  });
+
   test("preserves the prior CURRENT when canonical metadata is malformed", async () => {
     const root = await createRoot("eden-cli-malformed-canonical-metadata-");
     const sourcePath = join(root, "agent/tools/greet.ts");
@@ -719,6 +820,36 @@ describe("eden CLI project commands", () => {
       startedAt: "stale-process-start",
       token,
     })}\n`;
+    await writeFile(userFile, userContents, "utf8");
+
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+      }),
+    ).resolves.toBe(1);
+
+    await expect(readFile(userFile, "utf8")).resolves.toBe(userContents);
+    expect(errors.join("\n")).toMatch(/lock|quarantine|ownership|preserved|busy/i);
+  });
+
+  test("does not delete a self-consistent user-created quarantine filename", async () => {
+    const root = await createRoot("eden-cli-forged-init-quarantine-");
+    const token = "user-created-self-consistent-token";
+    const userContents = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: 99_999_999,
+      startedAt: "stale-process-start",
+      token,
+    })}\n`;
+    const userFile = join(
+      root,
+      `.eden-init-recovery-999999999-${token}-${createHash("sha256")
+        .update(userContents)
+        .digest("hex")}`,
+    );
     await writeFile(userFile, userContents, "utf8");
 
     const errors: string[] = [];

@@ -2,7 +2,10 @@
 
 import {
   createHash,
+  createHmac,
+  randomBytes,
   randomUUID,
+  timingSafeEqual,
 } from "crypto";
 import {
   existsSync,
@@ -38,6 +41,7 @@ import {
   fileURLToPath,
 } from "url";
 import {
+  homedir,
   tmpdir,
 } from "os";
 import {
@@ -367,6 +371,16 @@ const INIT_LOCK_QUARANTINE_PATTERN =
     `^\\.eden-init-(?:stale-lock|release-lock|recovery)-[0-9]+-(${INIT_QUARANTINE_TOKEN_PATTERN.source})-([a-f0-9]{64})$`,
     "u",
   );
+const INIT_PROVENANCE_DIRECTORY = join(
+  homedir(),
+  `.eden-init-provenance-${process.getuid?.() ?? "user"}`,
+);
+const INIT_PROVENANCE_KEY_PATH = join(
+  INIT_PROVENANCE_DIRECTORY,
+  "key",
+);
+const INIT_PROVENANCE_RECORD_PATTERN =
+  /^[a-f0-9]{64}-[0-9a-f-]{36}\.json$/u;
 const CANONICAL_ARTIFACT_NAMES = [
   "discovery.json",
   "diagnostics.json",
@@ -870,6 +884,275 @@ function initQuarantineAuthToken(serialized: string): string {
   return sha256(serialized);
 }
 
+interface InitFileIdentity {
+  readonly dev: number;
+  readonly ino: number;
+}
+
+interface InitFileObservation {
+  readonly identity: InitFileIdentity;
+  readonly serialized: string;
+}
+
+interface InitQuarantineProvenance {
+  readonly recordPath: string;
+  readonly recordObservation: InitFileObservation;
+  readonly record: InitProvenanceRecord;
+  readonly expectedObservation: InitFileObservation;
+}
+
+interface InitProvenanceRecord {
+  readonly kind: "eden.init.provenance";
+  readonly version: 1;
+  readonly root: string;
+  readonly operation: "stale-lock" | "release-lock" | "recovery";
+  readonly sourceName: string;
+  readonly quarantineName: string;
+  readonly recoveryName: string;
+  readonly lockDigest: string;
+  readonly sourceDev: number;
+  readonly sourceIno: number;
+  readonly mac: string;
+}
+
+function sameInitFileIdentity(
+  left: InitFileIdentity,
+  right: InitFileIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameInitFileObservation(
+  left: InitFileObservation,
+  right: InitFileObservation,
+): boolean {
+  return sameInitFileIdentity(left.identity, right.identity) &&
+    left.serialized === right.serialized;
+}
+
+function initProvenanceMessage(
+  root: string,
+  record: Omit<InitProvenanceRecord, "mac">,
+): string {
+  return [
+    sha256(root),
+    record.operation,
+    record.sourceName,
+    record.quarantineName,
+    record.recoveryName,
+    record.lockDigest,
+    String(record.sourceDev),
+    String(record.sourceIno),
+  ].join("\n");
+}
+
+function initProvenanceMac(
+  key: Uint8Array,
+  root: string,
+  record: Omit<InitProvenanceRecord, "mac">,
+): string {
+  return createHmac("sha256", key)
+    .update(initProvenanceMessage(root, record))
+    .digest("hex");
+}
+
+async function initProvenanceKey(): Promise<Buffer> {
+  try {
+    await mkdir(INIT_PROVENANCE_DIRECTORY, { recursive: true, mode: 0o700 });
+  } catch {
+    throw initBusy(
+      "The Eden init provenance directory could not be created safely; ownership state was preserved.",
+      INIT_PROVENANCE_DIRECTORY,
+    );
+  }
+  const directoryDetails = await lstat(INIT_PROVENANCE_DIRECTORY).catch(
+    (error: unknown) => {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") return undefined;
+      throw initBusy(
+        "The Eden init provenance directory could not be inspected safely; ownership state was preserved.",
+        INIT_PROVENANCE_DIRECTORY,
+      );
+    },
+  );
+  if (
+    directoryDetails === undefined ||
+    !directoryDetails.isDirectory() ||
+    directoryDetails.isSymbolicLink()
+  ) {
+    throw initBusy(
+      "The Eden init provenance directory was not a regular directory; ownership state was preserved.",
+      INIT_PROVENANCE_DIRECTORY,
+    );
+  }
+  const existing = await readFile(INIT_PROVENANCE_KEY_PATH).catch(
+    (error: unknown) => {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") return undefined;
+      throw initBusy(
+        "The Eden init provenance key could not be read safely; ownership state was preserved.",
+        INIT_PROVENANCE_KEY_PATH,
+      );
+    },
+  );
+  if (existing !== undefined) {
+    const details = await lstat(INIT_PROVENANCE_KEY_PATH).catch(
+      (error: unknown) => {
+        const code = error as NodeJS.ErrnoException;
+        if (code.code === "ENOENT") return undefined;
+        throw initBusy(
+          "The Eden init provenance key could not be inspected safely; ownership state was preserved.",
+          INIT_PROVENANCE_KEY_PATH,
+        );
+      },
+    );
+    if (
+      details === undefined ||
+      !details.isFile() ||
+      details.isSymbolicLink()
+    ) {
+      throw initBusy(
+        "The Eden init provenance key was not a regular file; ownership state was preserved.",
+        INIT_PROVENANCE_KEY_PATH,
+      );
+    }
+    if (existing.length !== 32) {
+      throw initBusy(
+        "The Eden init provenance key was malformed; ownership state was preserved.",
+        INIT_PROVENANCE_KEY_PATH,
+      );
+    }
+    return existing;
+  }
+  const key = randomBytes(32);
+  try {
+    await writeFile(INIT_PROVENANCE_KEY_PATH, key, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    return key;
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code !== "EEXIST") {
+      throw initBusy(
+        "The Eden init provenance key could not be created safely; ownership state was preserved.",
+        INIT_PROVENANCE_KEY_PATH,
+      );
+    }
+    const raced = await readFile(INIT_PROVENANCE_KEY_PATH).catch(
+      (readError: unknown) => {
+        const readCode = readError as NodeJS.ErrnoException;
+        if (readCode.code === "ENOENT") return undefined;
+        throw initBusy(
+          "The Eden init provenance key could not be read safely; ownership state was preserved.",
+          INIT_PROVENANCE_KEY_PATH,
+        );
+      },
+    );
+    if (raced === undefined || raced.length !== 32) {
+      throw initBusy(
+        "The Eden init provenance key was unavailable after concurrent creation; ownership state was preserved.",
+        INIT_PROVENANCE_KEY_PATH,
+      );
+    }
+    const racedDetails = await lstat(INIT_PROVENANCE_KEY_PATH).catch(
+      (readError: unknown) => {
+        const readCode = readError as NodeJS.ErrnoException;
+        if (readCode.code === "ENOENT") return undefined;
+        throw initBusy(
+          "The Eden init provenance key could not be inspected safely; ownership state was preserved.",
+          INIT_PROVENANCE_KEY_PATH,
+        );
+      },
+    );
+    if (
+      racedDetails === undefined ||
+      !racedDetails.isFile() ||
+      racedDetails.isSymbolicLink()
+    ) {
+      throw initBusy(
+        "The Eden init provenance key was not a regular file; ownership state was preserved.",
+        INIT_PROVENANCE_KEY_PATH,
+      );
+    }
+    return raced;
+  }
+}
+
+async function readInitFileObservation(
+  path: string,
+  source: string,
+): Promise<InitFileObservation | undefined> {
+  const before = await lstat(path).catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw initBusy(
+      "The init ownership record could not be inspected safely and was preserved.",
+      source,
+    );
+  });
+  if (before === undefined) return undefined;
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw initBusy(
+      "The init ownership record was not a regular file and was preserved.",
+      source,
+    );
+  }
+  const serialized = await readFile(path, "utf8").catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw initBusy(
+      "The init ownership record could not be read safely and was preserved.",
+      source,
+    );
+  });
+  if (serialized === undefined) return undefined;
+  const after = await lstat(path).catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw initBusy(
+      "The init ownership record changed while it was being read and was preserved.",
+      source,
+    );
+  });
+  if (after === undefined) return undefined;
+  const reread = await readFile(path, "utf8").catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw initBusy(
+      "The init ownership record changed while it was being read and was preserved.",
+      source,
+    );
+  });
+  if (reread === undefined) return undefined;
+  const final = await lstat(path).catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw initBusy(
+      "The init ownership record changed while it was being read and was preserved.",
+      source,
+    );
+  });
+  if (final === undefined) return undefined;
+  if (
+    !sameInitFileIdentity(
+      { dev: before.dev, ino: before.ino },
+      { dev: final.dev, ino: final.ino },
+    ) ||
+    before.size !== final.size ||
+    serialized !== reread
+  ) {
+    throw initBusy(
+      "The init ownership record changed while it was being read and was preserved.",
+      source,
+    );
+  }
+  return {
+    identity: { dev: before.dev, ino: before.ino },
+    serialized,
+  };
+}
+
 function initQuarantinePath(
   root: string,
   kind: "stale-lock" | "release-lock" | "recovery",
@@ -885,10 +1168,20 @@ function initQuarantinePath(
 
 function quarantineNameAuth(
   entry: string,
-): { readonly token: string; readonly digest: string } | undefined {
+): {
+  readonly kind: "stale-lock" | "release-lock" | "recovery";
+  readonly token: string;
+  readonly digest: string;
+} | undefined {
   const match = INIT_LOCK_QUARANTINE_PATTERN.exec(entry);
   if (match === null) return undefined;
+  const kind = entry.startsWith(".eden-init-stale-lock-")
+    ? "stale-lock"
+    : entry.startsWith(".eden-init-release-lock-")
+      ? "release-lock"
+      : "recovery";
   return {
+    kind,
     token: match[1] as string,
     digest: match[2] as string,
   };
@@ -910,35 +1203,11 @@ async function readInitPublicationLockState(
 ): Promise<{
   readonly state: InitPublicationLockState;
   readonly serialized: string;
+  readonly observation: InitFileObservation;
 } | undefined> {
-  const details = await lstat(path).catch((error: unknown) => {
-    const code = error as NodeJS.ErrnoException;
-    if (code.code === "ENOENT") return undefined;
-    throw initBusy(
-      "Another Eden init owns scaffold publication; the lock state could not be inspected safely and was preserved.",
-      basename(path),
-    );
-  });
-  if (details === undefined) return undefined;
-  if (
-    details === undefined ||
-    !details.isFile() ||
-    details.isSymbolicLink()
-  ) {
-    throw initBusy(
-      "Another Eden init owns scaffold publication; the lock state was not a regular file and was preserved.",
-      basename(path),
-    );
-  }
-  const serialized = await readFile(path, "utf8").catch((error: unknown) => {
-    const code = error as NodeJS.ErrnoException;
-    if (code.code === "ENOENT") return undefined;
-    throw initBusy(
-      "Another Eden init owns scaffold publication; the lock quarantine could not be read safely and was preserved.",
-      basename(path),
-    );
-  });
-  if (serialized === undefined) return undefined;
+  const observation = await readInitFileObservation(path, basename(path));
+  if (observation === undefined) return undefined;
+  const { serialized } = observation;
   let value: unknown;
   try {
     value = JSON.parse(serialized) as unknown;
@@ -955,7 +1224,7 @@ async function readInitPublicationLockState(
       basename(path),
     );
   }
-  return { state, serialized };
+  return { state, serialized, observation };
 }
 
 async function initLockOwnerIsActive(
@@ -967,32 +1236,440 @@ async function initLockOwnerIsActive(
   return false;
 }
 
+function parseInitProvenanceRecord(
+  value: unknown,
+): InitProvenanceRecord | undefined {
+  if (
+    !isRecord(value) ||
+    value.kind !== "eden.init.provenance" ||
+    value.version !== 1 ||
+    typeof value.root !== "string" ||
+    (value.operation !== "stale-lock" &&
+      value.operation !== "release-lock" &&
+      value.operation !== "recovery") ||
+    typeof value.sourceName !== "string" ||
+    typeof value.quarantineName !== "string" ||
+    typeof value.recoveryName !== "string" ||
+    typeof value.lockDigest !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(value.lockDigest) ||
+    typeof value.sourceDev !== "number" ||
+    !Number.isSafeInteger(value.sourceDev) ||
+    value.sourceDev < 0 ||
+    typeof value.sourceIno !== "number" ||
+    !Number.isSafeInteger(value.sourceIno) ||
+    value.sourceIno < 0 ||
+    typeof value.mac !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(value.mac)
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "eden.init.provenance",
+    version: 1,
+    root: value.root,
+    operation: value.operation,
+    sourceName: value.sourceName,
+    quarantineName: value.quarantineName,
+    recoveryName: value.recoveryName,
+    lockDigest: value.lockDigest,
+    sourceDev: value.sourceDev,
+    sourceIno: value.sourceIno,
+    mac: value.mac,
+  };
+}
+
+async function readInitProvenance(
+  path: string,
+  root: string,
+  expected: InitFileObservation,
+): Promise<InitQuarantineProvenance | undefined> {
+  const recordObservation = await readInitFileObservation(path, basename(path));
+  if (recordObservation === undefined) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(recordObservation.serialized) as unknown;
+  } catch {
+    throw initBusy(
+      "The Eden init provenance record was malformed and was preserved.",
+      basename(path),
+    );
+  }
+  const record = parseInitProvenanceRecord(value);
+  if (record === undefined) {
+    throw initBusy(
+      "The Eden init provenance record was malformed and was preserved.",
+      basename(path),
+    );
+  }
+  if (record.root !== root) return undefined;
+  if (
+    record.lockDigest !== sha256(expected.serialized) ||
+    record.sourceDev !== expected.identity.dev ||
+    record.sourceIno !== expected.identity.ino
+  ) {
+    return undefined;
+  }
+  const expectedMac = initProvenanceMac(
+    await initProvenanceKey(),
+    root,
+    record,
+  );
+  const actualMac = Buffer.from(record.mac, "hex");
+  if (
+    actualMac.length !== 32 ||
+    !timingSafeEqual(Buffer.from(expectedMac, "hex"), actualMac)
+  ) {
+    throw initBusy(
+      "The Eden init provenance record was not authenticated by Eden and was preserved.",
+      basename(path),
+    );
+  }
+  return {
+    recordPath: path,
+    recordObservation,
+    record,
+    expectedObservation: expected,
+  };
+}
+
+async function createInitProvenance(
+  root: string,
+  operation: InitProvenanceRecord["operation"],
+  sourceName: string,
+  quarantineName: string,
+  recoveryName: string,
+  expected: InitFileObservation,
+): Promise<InitQuarantineProvenance> {
+  const sourceEntry = basename(sourceName);
+  const quarantineEntry = basename(quarantineName);
+  const recoveryEntry = basename(recoveryName);
+  const recordWithoutMac: Omit<InitProvenanceRecord, "mac"> = {
+    kind: "eden.init.provenance",
+    version: 1,
+    root,
+    operation,
+    sourceName: sourceEntry,
+    quarantineName: quarantineEntry,
+    recoveryName: recoveryEntry,
+    lockDigest: sha256(expected.serialized),
+    sourceDev: expected.identity.dev,
+    sourceIno: expected.identity.ino,
+  };
+  const record: InitProvenanceRecord = {
+    ...recordWithoutMac,
+    mac: initProvenanceMac(
+      await initProvenanceKey(),
+      root,
+      recordWithoutMac,
+    ),
+  };
+  const recordPath = join(
+    INIT_PROVENANCE_DIRECTORY,
+    `${sha256(root)}-${randomUUID()}.json`,
+  );
+  const serialized = `${JSON.stringify(record)}\n`;
+  try {
+    await writeFile(recordPath, serialized, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+  } catch {
+    throw initBusy(
+      "The Eden init provenance record could not be created safely; ownership state was preserved.",
+      basename(recordPath),
+    );
+  }
+  const observed = await readInitProvenance(recordPath, root, expected);
+  if (observed === undefined) {
+    throw initBusy(
+      "The Eden init provenance record disappeared before verification; ownership state was preserved.",
+      basename(recordPath),
+    );
+  }
+  return observed;
+}
+
+async function findInitProvenance(
+  root: string,
+  expected: InitFileObservation,
+  quarantineName: string,
+): Promise<InitQuarantineProvenance> {
+  const entries = await readdir(INIT_PROVENANCE_DIRECTORY).catch(
+    (error: unknown) => {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") return [];
+      throw initBusy(
+        "The init provenance records could not be inspected safely; ownership state was preserved.",
+        quarantineName,
+      );
+    },
+  );
+  const matches: InitQuarantineProvenance[] = [];
+  const rootPrefix = `${sha256(root)}-`;
+  for (const entry of entries) {
+    if (
+      !INIT_PROVENANCE_RECORD_PATTERN.test(entry) ||
+      !entry.startsWith(rootPrefix)
+    ) {
+      continue;
+    }
+    const provenance = await readInitProvenance(
+      join(INIT_PROVENANCE_DIRECTORY, entry),
+      root,
+      expected,
+    );
+    if (
+      provenance !== undefined &&
+      (provenance.record.quarantineName === basename(quarantineName) ||
+        provenance.record.recoveryName === basename(quarantineName))
+    ) {
+      matches.push(provenance);
+    }
+  }
+  if (matches.length !== 1) {
+    throw initBusy(
+      "The init-lock quarantine has no unique Eden-authenticated provenance record; its state was preserved.",
+      quarantineName,
+    );
+  }
+  return matches[0] as InitQuarantineProvenance;
+}
+
+async function ensureInitProvenance(
+  root: string,
+  operation: InitProvenanceRecord["operation"],
+  sourceName: string,
+  quarantineName: string,
+  recoveryName: string,
+  expected: InitFileObservation,
+): Promise<InitQuarantineProvenance> {
+  const entries = await readdir(INIT_PROVENANCE_DIRECTORY).catch(
+    (error: unknown) => {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") return [];
+      throw initBusy(
+        "The init provenance records could not be inspected safely; ownership state was preserved.",
+        quarantineName,
+      );
+    },
+  );
+  const rootPrefix = `${sha256(root)}-`;
+  const matches: InitQuarantineProvenance[] = [];
+  for (const entry of entries) {
+    if (
+      !INIT_PROVENANCE_RECORD_PATTERN.test(entry) ||
+      !entry.startsWith(rootPrefix)
+    ) {
+      continue;
+    }
+    const provenance = await readInitProvenance(
+      join(INIT_PROVENANCE_DIRECTORY, entry),
+      root,
+      expected,
+    );
+    if (
+      provenance !== undefined &&
+      provenance.record.operation === operation &&
+      provenance.record.sourceName === basename(sourceName) &&
+      (provenance.record.quarantineName === basename(quarantineName) ||
+        provenance.record.recoveryName === basename(recoveryName))
+    ) {
+      matches.push(provenance);
+    }
+  }
+  if (matches.length > 1) {
+    throw initBusy(
+      "The init ownership record has ambiguous Eden provenance; its state was preserved.",
+      basename(quarantineName),
+    );
+  }
+  if (matches.length === 1) return matches[0] as InitQuarantineProvenance;
+  return createInitProvenance(
+    root,
+    operation,
+    sourceName,
+    quarantineName,
+    recoveryName,
+    expected,
+  );
+}
+
+async function removeInitFileExact(
+  path: string,
+  expected: InitFileObservation,
+  source: string,
+): Promise<boolean> {
+  const observed = await readInitFileObservation(path, source);
+  if (observed === undefined) return false;
+  if (!sameInitFileObservation(observed, expected)) {
+    throw initBusy(
+      "The init ownership record changed before removal; the replacement was preserved.",
+      source,
+    );
+  }
+  try {
+    await rm(path, { force: false });
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return false;
+    throw initBusy(
+      "The init ownership record could not be removed safely; its state was preserved.",
+      source,
+    );
+  }
+  const after = await readInitFileObservation(path, source);
+  if (after !== undefined) {
+    throw initBusy(
+      "The init ownership record remained present after removal; its state was preserved.",
+      source,
+    );
+  }
+  return true;
+}
+
+async function removeInitFileAfterExactRecheck(
+  path: string,
+  expected: InitFileObservation,
+  source: string,
+): Promise<boolean> {
+  const current = await readInitFileObservation(path, source);
+  if (current === undefined) return false;
+  if (!sameInitFileObservation(current, expected)) {
+    throw initBusy(
+      "The init ownership record changed before removal; the replacement was preserved.",
+      source,
+    );
+  }
+  return removeInitFileExact(path, current, source);
+}
+
+async function removeInitProvenanceRecord(
+  provenance: InitQuarantineProvenance,
+): Promise<void> {
+  await removeInitFileAfterExactRecheck(
+    provenance.recordPath,
+    provenance.recordObservation,
+    basename(provenance.recordPath),
+  );
+}
+
+async function linkInitFileNoReplace(
+  sourcePath: string,
+  destinationPath: string,
+  expected: InitFileObservation,
+  source: string,
+): Promise<boolean> {
+  const sourceObservation = await readInitFileObservation(sourcePath, source);
+  if (sourceObservation === undefined) {
+    return false;
+  }
+  if (!sameInitFileObservation(sourceObservation, expected)) {
+    throw initBusy(
+      "The init ownership record changed before its transition; the replacement was preserved.",
+      source,
+    );
+  }
+  try {
+    await link(sourcePath, destinationPath);
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return false;
+    if (code.code === "EEXIST") {
+      throw initBusy(
+        "The init ownership transition destination already exists; its state was preserved.",
+        basename(destinationPath),
+      );
+    }
+    throw initBusy(
+      "The init ownership transition could not be created safely; its state was preserved.",
+      source,
+    );
+  }
+  const destinationObservation = await readInitFileObservation(
+    destinationPath,
+    basename(destinationPath),
+  );
+  if (
+    destinationObservation === undefined ||
+    !sameInitFileObservation(destinationObservation, expected)
+  ) {
+    if (destinationObservation === undefined) {
+      return false;
+    }
+    throw initBusy(
+      "The init ownership transition changed before it could be committed; its state was preserved.",
+      basename(destinationPath),
+    );
+  }
+  return true;
+}
+
+async function moveInitFileNoReplace(
+  sourcePath: string,
+  destinationPath: string,
+  expected: InitFileObservation,
+  source: string,
+): Promise<boolean> {
+  const linked = await linkInitFileNoReplace(
+    sourcePath,
+    destinationPath,
+    expected,
+    source,
+  );
+  if (!linked) return false;
+  const sourceObservation = await readInitFileObservation(sourcePath, source);
+  if (sourceObservation === undefined) {
+    const destinationObservation = await readInitFileObservation(
+      destinationPath,
+      basename(destinationPath),
+    );
+    if (destinationObservation !== undefined) {
+      throw initBusy(
+        "The init ownership transition source disappeared before removal; its destination was preserved.",
+        basename(destinationPath),
+      );
+    }
+    return false;
+  }
+  if (!sameInitFileObservation(sourceObservation, expected)) {
+    throw initBusy(
+      "The init ownership transition source changed before removal; the replacement was preserved.",
+      source,
+    );
+  }
+  await removeInitFileAfterExactRecheck(sourcePath, expected, source);
+  return true;
+}
+
 async function restoreInitLockQuarantine(
   quarantinePath: string,
   lockPath: string,
+  expected: InitFileObservation,
+  provenance: InitQuarantineProvenance,
 ): Promise<void> {
-  let restored = false;
-  try {
-    await link(quarantinePath, lockPath);
-    restored = true;
-  } catch (error: unknown) {
-    const code = error as NodeJS.ErrnoException;
-    if (code.code === "ENOENT") return;
-    if (code.code === "EEXIST") return;
+  const observed = await readInitFileObservation(
+    quarantinePath,
+    basename(quarantinePath),
+  );
+  if (observed === undefined) return;
+  if (!sameInitFileObservation(observed, expected)) {
     throw initBusy(
-      "The init-lock quarantine could not be restored safely; its state was preserved.",
+      "The init-lock quarantine changed during restoration; its state was preserved.",
       basename(quarantinePath),
     );
   }
-  if (!restored) return;
-  try {
-    await rm(quarantinePath, { force: false });
-  } catch (error: unknown) {
-    const code = error as NodeJS.ErrnoException;
-    if (code.code === "ENOENT") return;
-    throw initBusy(
-      "The init-lock quarantine could not be removed safely after restoration; its state was preserved.",
-      basename(quarantinePath),
+  const restored = await moveInitFileNoReplace(
+    quarantinePath,
+    lockPath,
+    expected,
+    basename(quarantinePath),
+  );
+  if (restored) {
+    await removeInitFileAfterExactRecheck(
+      provenance.recordPath,
+      provenance.recordObservation,
+      basename(provenance.recordPath),
     );
   }
 }
@@ -1025,7 +1702,7 @@ async function recoverInitLockQuarantines(
     }
     const parsed = await readInitPublicationLockState(quarantinePath);
     if (parsed === undefined) continue;
-    const { state, serialized } = parsed;
+    const { state, serialized, observation } = parsed;
     if (
       state.token !== nameAuth.token ||
       initQuarantineAuthToken(serialized) !== nameAuth.digest
@@ -1035,72 +1712,23 @@ async function recoverInitLockQuarantines(
         entry,
       );
     }
+    const provenance = await findInitProvenance(root, observation, entry);
     if (await initLockOwnerIsActive(state)) {
       throw initBusy(
         "Another Eden init is publishing the scaffold; retry after it completes.",
         entry,
       );
     }
-
-    const removalPath = initQuarantinePath(
-      root,
-      "recovery",
-      state.pid,
-      state.token,
-      serialized,
+    await removeInitFileAfterExactRecheck(
+      quarantinePath,
+      observation,
+      entry,
     );
-    assertWithinRoot(
-      root,
-      removalPath,
-      "The init-lock recovery removal path",
+    await removeInitFileAfterExactRecheck(
+      provenance.recordPath,
+      provenance.recordObservation,
+      basename(provenance.recordPath),
     );
-    try {
-      await rename(quarantinePath, removalPath);
-    } catch (error: unknown) {
-      const code = error as NodeJS.ErrnoException;
-      if (code.code === "ENOENT") continue;
-      throw initBusy(
-        "The init-lock quarantine could not be moved safely; its state was preserved.",
-        entry,
-      );
-    }
-
-    const moved = await readFile(removalPath, "utf8").catch(
-      (error: unknown) => {
-        const code = error as NodeJS.ErrnoException;
-        if (code.code === "ENOENT") return undefined;
-        throw initBusy(
-          "The init-lock quarantine could not be read safely after recovery; its state was preserved.",
-          entry,
-        );
-      },
-    );
-    if (moved === undefined) continue;
-    if (moved !== serialized) {
-      await restoreInitLockQuarantine(removalPath, quarantinePath);
-      throw initBusy(
-        "The init-lock quarantine changed while it was being recovered; the replacement was preserved.",
-        entry,
-      );
-    }
-
-    if (await initLockOwnerIsActive(state)) {
-      await restoreInitLockQuarantine(removalPath, quarantinePath);
-      throw initBusy(
-        "Another Eden init became active while its lock quarantine was being recovered; the lock was preserved.",
-        entry,
-      );
-    }
-    try {
-      await rm(removalPath, { force: false });
-    } catch (error: unknown) {
-      const code = error as NodeJS.ErrnoException;
-      if (code.code === "ENOENT") continue;
-      throw initBusy(
-        "The init-lock quarantine could not be removed safely; its state was preserved.",
-        entry,
-      );
-    }
   }
 }
 
@@ -1134,6 +1762,13 @@ async function acquireInitPublicationLock(
         mode: 0o600,
         flag: "wx",
       });
+      const owned = await readInitPublicationLockState(lockPath);
+      if (owned === undefined) {
+        throw initBusy(
+          "The init lock disappeared before ownership could be recorded; its state was preserved.",
+          INIT_LOCK_FILE,
+        );
+      }
       return {
         release: async () => {
           const releaseQuarantine = initQuarantinePath(
@@ -1158,57 +1793,56 @@ async function acquireInitPublicationLock(
           ) {
             return;
           }
-          try {
-            await rename(lockPath, releaseQuarantine);
-          } catch (error: unknown) {
-            const renameError = error as NodeJS.ErrnoException;
-            if (renameError.code === "ENOENT") return;
-            throw initBusy(
-              "The init lock could not be quarantined safely for release; its state was preserved.",
-              INIT_LOCK_FILE,
-            );
-          }
-          const moved = await readInitPublicationLockState(releaseQuarantine);
-          if (moved === undefined) return;
+          const provenance = await ensureInitProvenance(
+            root,
+            "release-lock",
+            INIT_LOCK_FILE,
+            releaseQuarantine,
+            releaseQuarantine,
+            owned.observation,
+          );
+          const moved = await moveInitFileNoReplace(
+            lockPath,
+            releaseQuarantine,
+            owned.observation,
+            INIT_LOCK_FILE,
+          );
+          if (!moved) return;
+          const movedObservation = await readInitFileObservation(
+            releaseQuarantine,
+            basename(releaseQuarantine),
+          );
           if (
-            moved.serialized === serialized &&
-            moved.state.pid === state.pid &&
-            moved.state.startedAt === state.startedAt &&
-            moved.state.token === state.token
+            movedObservation === undefined ||
+            !sameInitFileObservation(movedObservation, owned.observation)
           ) {
-            try {
-              await rm(releaseQuarantine, { force: false });
-            } catch (error: unknown) {
-              const removeError = error as NodeJS.ErrnoException;
-              if (removeError.code === "ENOENT") return;
-              throw initBusy(
-                "The init-lock release quarantine could not be removed safely; its state was preserved.",
-                basename(releaseQuarantine),
-              );
-            }
+            await restoreInitLockQuarantine(
+              releaseQuarantine,
+              lockPath,
+              owned.observation,
+              provenance,
+            );
             return;
           }
-          await restoreInitLockQuarantine(releaseQuarantine, lockPath);
+          await removeInitFileAfterExactRecheck(
+            releaseQuarantine,
+            movedObservation,
+            basename(releaseQuarantine),
+          );
+          await removeInitProvenanceRecord(provenance);
           return;
         },
       };
     } catch (error: unknown) {
       const code = error as NodeJS.ErrnoException;
       if (code.code !== "EEXIST") throw error;
-      const existing = await readFile(lockPath, "utf8").catch(
-        (readError: unknown) => {
-          const readCode = readError as NodeJS.ErrnoException;
-          if (readCode.code === "ENOENT") return undefined;
-          throw initBusy(
-            "Another Eden init owns scaffold publication; its lock could not be read safely and was preserved.",
-            INIT_LOCK_FILE,
-          );
-        },
-      );
-      if (existing === undefined) continue;
       const parsedExisting = await readInitPublicationLockState(lockPath);
       if (parsedExisting === undefined) continue;
-      const { state: existingLock } = parsedExisting;
+      const {
+        state: existingLock,
+        serialized: existing,
+        observation,
+      } = parsedExisting;
       const ownerStart = await readProcessStartTime(existingLock.pid);
       if (ownerStart === existingLock.startedAt) {
         throw initBusy(
@@ -1225,17 +1859,12 @@ async function acquireInitPublicationLock(
           INIT_LOCK_FILE,
         );
       }
-      const latest = await readFile(lockPath, "utf8").catch(
-        (readError: unknown) => {
-          const readCode = readError as NodeJS.ErrnoException;
-          if (readCode.code === "ENOENT") return undefined;
-          throw initBusy(
-            "Another Eden init owns scaffold publication; its lock could not be rechecked safely and was preserved.",
-            INIT_LOCK_FILE,
-          );
-        },
-      );
-      if (latest !== existing) continue;
+      const latest = await readInitPublicationLockState(lockPath);
+      if (
+        latest === undefined ||
+        latest.serialized !== existing ||
+        !sameInitFileObservation(latest.observation, observation)
+      ) continue;
       const staleLockQuarantine = initQuarantinePath(
         root,
         "stale-lock",
@@ -1248,48 +1877,78 @@ async function acquireInitPublicationLock(
         staleLockQuarantine,
         "The stale init-lock quarantine path",
       );
-      try {
-        await rename(lockPath, staleLockQuarantine);
-      } catch (error: unknown) {
-        const renameError = error as NodeJS.ErrnoException;
-        if (renameError.code === "ENOENT") continue;
-        throw initBusy(
-          "The stale init lock could not be quarantined safely; its state was preserved.",
-          INIT_LOCK_FILE,
-        );
-      }
+      const provenance = await ensureInitProvenance(
+        root,
+        "stale-lock",
+        INIT_LOCK_FILE,
+        staleLockQuarantine,
+        initQuarantinePath(
+          root,
+          "recovery",
+          existingLock.pid,
+          existingLock.token,
+          existing,
+        ),
+        observation,
+      );
+      const quarantined = await moveInitFileNoReplace(
+        lockPath,
+        staleLockQuarantine,
+        observation,
+        INIT_LOCK_FILE,
+      );
+      if (!quarantined) continue;
       await hook?.("before-stale-lock-removal");
       const moved = await readInitPublicationLockState(staleLockQuarantine);
-      if (moved === undefined) continue;
+      if (moved === undefined) {
+        const replacement = await readInitFileObservation(
+          staleLockQuarantine,
+          basename(staleLockQuarantine),
+        );
+        if (replacement !== undefined) {
+          throw initBusy(
+            "The init-lock quarantine changed before removal; its replacement was preserved.",
+            basename(staleLockQuarantine),
+          );
+        }
+        continue;
+      }
       if (
         moved.serialized !== existing ||
         moved.state.pid !== existingLock.pid ||
         moved.state.startedAt !== existingLock.startedAt ||
-        moved.state.token !== existingLock.token
+        moved.state.token !== existingLock.token ||
+        !sameInitFileObservation(moved.observation, observation)
       ) {
-        await restoreInitLockQuarantine(staleLockQuarantine, lockPath);
+        await restoreInitLockQuarantine(
+          staleLockQuarantine,
+          lockPath,
+          observation,
+          provenance,
+        );
         throw initBusy(
           "The stale init lock changed while it was being quarantined; the replacement was preserved.",
           INIT_LOCK_FILE,
         );
       }
       if (await initLockOwnerIsActive(existingLock)) {
-        await restoreInitLockQuarantine(staleLockQuarantine, lockPath);
+        await restoreInitLockQuarantine(
+          staleLockQuarantine,
+          lockPath,
+          observation,
+          provenance,
+        );
         throw initBusy(
           "Another Eden init became active while its lock was being quarantined; the lock was preserved.",
           INIT_LOCK_FILE,
         );
       }
-      try {
-        await rm(staleLockQuarantine, { force: false });
-      } catch (error: unknown) {
-        const removeError = error as NodeJS.ErrnoException;
-        if (removeError.code === "ENOENT") continue;
-        throw initBusy(
-          "The stale init-lock quarantine could not be removed safely; its state was preserved.",
-          basename(staleLockQuarantine),
-        );
-      }
+      await removeInitFileAfterExactRecheck(
+        staleLockQuarantine,
+        moved.observation,
+        basename(staleLockQuarantine),
+      );
+      await removeInitProvenanceRecord(provenance);
       continue;
     }
   }
