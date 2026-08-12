@@ -8,6 +8,7 @@ import {
   existsSync,
 } from "fs";
 import {
+  cp,
   link,
   lstat,
   mkdir,
@@ -129,6 +130,16 @@ export interface EdenCliRemoteCommandResult {
   readonly stderr: string;
 }
 
+export interface EdenCliRemoteCommandHandle {
+  readonly process: EdenCliProcess;
+  readonly result: Promise<EdenCliRemoteCommandResult>;
+}
+
+export type EdenCliRemoteCommandReturn =
+  | EdenCliRemoteCommandResult
+  | EdenCliRemoteCommandHandle
+  | Promise<EdenCliRemoteCommandResult | EdenCliRemoteCommandHandle>;
+
 export interface EdenCliRemoteValidationRequest {
   readonly cwd: string;
   readonly environment: "preview" | "production";
@@ -240,7 +251,7 @@ export interface EdenCliRunOptions {
   ) => void | Promise<void>;
   readonly remoteCommandRunner?: (
     request: EdenCliRemoteCommandRequest,
-  ) => Promise<EdenCliRemoteCommandResult>;
+  ) => EdenCliRemoteCommandReturn;
   readonly remoteValidationRunner?: (
     request: EdenCliRemoteValidationRequest,
   ) => Promise<EdenCliRemoteValidationResult>;
@@ -1964,6 +1975,110 @@ async function assertProjectInputsUnchanged(
   }
 }
 
+interface DeploymentSourceSnapshot {
+  readonly fingerprint: ProjectInputFingerprint;
+  readonly configurationContents: string;
+}
+
+interface DeploymentArtifactSnapshot {
+  readonly root: string;
+  readonly generation: EdenArtifactGeneration;
+}
+
+async function captureDeploymentSourceSnapshot(
+  root: string,
+  configuration: ProjectConfiguration,
+): Promise<DeploymentSourceSnapshot> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const configurationContents = await readFile(
+      configuration.configPath,
+      "utf8",
+    ).catch((error: unknown) => {
+      throw cliError({
+        code: "PROJECT_INPUT_INVALID",
+        message:
+          error instanceof Error
+            ? `The selected Worker configuration could not be read: ${error.message}`
+            : "The selected Worker configuration could not be read.",
+        source: relative(root, configuration.configPath),
+      });
+    });
+    const fingerprint = await fingerprintProjectInputs(root, configuration);
+    const configurationRelativePath = toPosixPath(
+      relative(root, configuration.configPath),
+    );
+    const fingerprintedConfiguration = fingerprint.files.find(
+      (file) => file.relativePath === configurationRelativePath,
+    );
+    if (
+      fingerprintedConfiguration !== undefined &&
+      fingerprintedConfiguration.sha256 === sha256(configurationContents)
+    ) {
+      return {
+        fingerprint,
+        configurationContents,
+      };
+    }
+  }
+  throw cliError({
+    code: "SOURCE_CHANGED_DURING_SNAPSHOT",
+    message:
+      "Selected source or configuration changed while the immutable deployment snapshot was being captured; no remote action was started.",
+    source: relative(root, configuration.configPath),
+  });
+}
+
+async function copyDeploymentGenerationSnapshot(
+  root: string,
+  generation: EdenArtifactGeneration,
+): Promise<DeploymentArtifactSnapshot> {
+  const snapshotRoot = join(
+    root,
+    uniqueTemporaryName("eden-deploy-snapshot"),
+  );
+  const snapshotGeneration = join(
+    snapshotRoot,
+    generation.artifacts.buildMetadata.generationId,
+  );
+  assertWithinRoot(
+    root,
+    snapshotRoot,
+    "The immutable deployment snapshot",
+  );
+  await mkdir(snapshotRoot, { recursive: true });
+  try {
+    await cp(generation.directory, snapshotGeneration, {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+    });
+    const validated = await readArtifactGenerationAt(
+      root,
+      snapshotGeneration,
+    );
+    if (stableJson(validated.artifacts) !== stableJson(generation.artifacts)) {
+      throw cliError({
+        code: "ARTIFACT_INCOHERENT",
+        message:
+          "The immutable deployment snapshot changed while it was being copied; no remote action was started.",
+        source: generation.artifacts.buildMetadata.generationId,
+      });
+    }
+    return {
+      root: snapshotRoot,
+      generation: {
+        directory: snapshotGeneration,
+        artifacts: validated.artifacts,
+      },
+    };
+  } catch (error: unknown) {
+    await rm(snapshotRoot, { recursive: true, force: true }).catch(
+      () => undefined,
+    );
+    throw error;
+  }
+}
+
 interface DeploymentLockHandle {
   readonly path: string;
   readonly state: DeploymentLockState;
@@ -2000,6 +2115,24 @@ async function readDeploymentLockState(
     return parseDeploymentLockState(JSON.parse(contents) as unknown);
   } catch {
     return undefined;
+  }
+}
+
+async function assertDeploymentLockOwned(
+  lock: DeploymentLockHandle,
+): Promise<void> {
+  const observed = await readDeploymentLockState(lock.path);
+  if (
+    observed?.pid !== lock.state.pid ||
+    observed.startedAt !== lock.state.startedAt ||
+    observed.token !== lock.state.token
+  ) {
+    throw cliError({
+      code: "DEPLOY_OWNERSHIP_LOST",
+      message:
+        "The Eden deployment ownership lock changed or disappeared; no stale remote mutation was started.",
+      source: DEPLOY_LOCK_FILE,
+    });
   }
 }
 
@@ -3052,6 +3185,7 @@ async function createRuntimeFiles(
   generation: EdenArtifactGeneration,
   executionMode: "local" | "remote" = "local",
   targetEntryPath?: string,
+  configurationContents?: string,
 ): Promise<RuntimeFiles> {
   const runtimeGeneration = readRuntimeGeneration(generation);
   const runtimeEntrypoint = await resolveRuntimeWorkerEntrypoint();
@@ -3093,7 +3227,7 @@ export default runtimeWorker;
   });
 
   try {
-    const source = await readFile(configPath, "utf8");
+    const source = configurationContents ?? await readFile(configPath, "utf8");
     const relativeMain = relative(root, entryReferencePath)
       .split("\\")
       .join("/");
@@ -3287,44 +3421,43 @@ function runDefaultDryRun(
 
 function runDefaultRemoteCommand(
   request: EdenCliRemoteCommandRequest,
-): Promise<EdenCliRemoteCommandResult> {
-  return resolveDeploymentExecutable(request.cwd).then(
-    (executable) =>
-      new Promise((resolveResult) => {
-        const child = spawnChild(
-          executable.command,
-          [...executable.commandArgs, ...request.args],
-          {
-            cwd: request.cwd,
-            env: scrubChildEnvironment(),
-            stdio: ["pipe", "pipe", "pipe"],
-          },
-        );
-        let stdout = "";
-        let stderr = "";
-        child.stdout?.on("data", (chunk: Buffer) => {
-          stdout += chunk.toString();
-        });
-        child.stderr?.on("data", (chunk: Buffer) => {
-          stderr += chunk.toString();
-        });
-        if (request.stdin === undefined) {
-          child.stdin?.end();
-        } else {
-          child.stdin?.end(request.stdin);
-        }
-        child.once("error", () => {
-          resolveResult({ exitCode: 1, stdout, stderr });
-        });
-        child.once("exit", (exitCode) => {
-          resolveResult({
-            exitCode: exitCode ?? 1,
-            stdout,
-            stderr,
-          });
-        });
-      }),
+): EdenCliRemoteCommandHandle {
+  const processMarker = `${PROCESS_IDENTITY_PREFIX}remote-${randomUUID()}`;
+  const executable = resolveDeploymentExecutableSync(request.cwd);
+  const child = spawnChild(
+    executable.command,
+    [...executable.commandArgs, ...request.args],
+    {
+      argv0: processMarker,
+      cwd: request.cwd,
+      env: scrubChildEnvironment(),
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+    },
   );
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  if (request.stdin === undefined) {
+    child.stdin?.end();
+  } else {
+    child.stdin?.end(request.stdin);
+  }
+  const processHandle = createDefaultProcessHandle(child, processMarker);
+  const result = processHandle.exited.then((exit) => ({
+    exitCode: exit.exitCode ?? 1,
+    stdout,
+    stderr,
+  }));
+  return {
+    process: processHandle,
+    result,
+  };
 }
 
 function findDeploymentUrl(output: string): string | undefined {
@@ -3687,9 +3820,37 @@ async function runDefaultRemoteValidation(
 
 interface OwnedProcessRegistry {
   readonly isStopping: () => boolean;
+  readonly stopped: Promise<NodeJS.Signals>;
   readonly register: (process: EdenCliProcess) => void;
   readonly unregister: (process: EdenCliProcess) => void;
   readonly cleanup: (signal: NodeJS.Signals) => Promise<void>;
+}
+
+const OWNED_PROCESS_TERMINATION_TIMEOUT_MS = 2_000;
+
+async function terminateOwnedProcess(
+  process: EdenCliProcess,
+  signal: NodeJS.Signals,
+): Promise<void> {
+  const attempt = async (requestedSignal: NodeJS.Signals): Promise<boolean> => {
+    let termination: Promise<void>;
+    try {
+      termination = Promise.resolve(process.terminate(requestedSignal));
+    } catch {
+      return true;
+    }
+    return Promise.race([
+      termination.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        setTimeout(() => resolve(false), OWNED_PROCESS_TERMINATION_TIMEOUT_MS);
+      }),
+    ]);
+  };
+  if (await attempt(signal)) return;
+  await attempt("SIGKILL");
 }
 
 function createOwnedProcessRegistry(): OwnedProcessRegistry {
@@ -3697,14 +3858,20 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
   let stopping = false;
   let cleanupPromise: Promise<void> | undefined;
   let cleanupSignal: NodeJS.Signals = "SIGTERM";
+  let resolveStopped: ((signal: NodeJS.Signals) => void) | undefined;
+  const stopped = new Promise<NodeJS.Signals>((resolve) => {
+    resolveStopped = resolve;
+  });
   const cleanup = (signal: NodeJS.Signals): Promise<void> => {
     cleanupSignal = signal;
     stopping = true;
+    resolveStopped?.(signal);
+    resolveStopped = undefined;
     if (cleanupPromise !== undefined) return cleanupPromise;
     cleanupPromise = (async () => {
       await Promise.all(
         [...processes].map((process) =>
-          process.terminate(cleanupSignal).catch(() => undefined),
+          terminateOwnedProcess(process, cleanupSignal),
         ),
       );
     })();
@@ -3712,10 +3879,11 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
   };
   return {
     isStopping: () => stopping,
+    stopped,
     register: (process) => {
       processes.add(process);
       if (stopping) {
-        void process.terminate(cleanupSignal).catch(() => undefined);
+        void terminateOwnedProcess(process, cleanupSignal);
       }
     },
     unregister: (process) => {
@@ -3728,6 +3896,22 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
 function isDryRunHandle(
   value: unknown,
 ): value is EdenCliDryRunHandle {
+  const result = isRecord(value) ? value.result : undefined;
+  const processValue = isRecord(value) ? value.process : undefined;
+  return (
+    isRecord(value) &&
+    isRecord(processValue) &&
+    typeof result === "object" &&
+    result !== null &&
+    "then" in result &&
+    typeof processValue.pid === "number" &&
+    typeof processValue.terminate === "function"
+  );
+}
+
+function isRemoteCommandHandle(
+  value: unknown,
+): value is EdenCliRemoteCommandHandle {
   const result = isRecord(value) ? value.result : undefined;
   const processValue = isRecord(value) ? value.process : undefined;
   return (
@@ -3762,11 +3946,98 @@ async function runCompatibilityDryRun(
     // It cannot be registered synchronously, so this shape is unsupported.
     // Give the returned owner one best-effort termination opportunity rather
     // than leaving an untracked child behind.
-    await resolved.process.terminate("SIGTERM").catch(() => undefined);
+    await terminateOwnedProcess(resolved.process, "SIGTERM");
     throw cliError({
       code: "DRY_RUN_HANDLE_UNSUPPORTED",
       message:
         "The compatibility runner returned a cancellable handle through a promise; return the handle synchronously so it can be registered before awaiting.",
+    });
+  }
+  return resolved;
+}
+
+async function runRemoteCommand(
+  options: EdenCliRunOptions,
+  request: EdenCliRemoteCommandRequest,
+  ownedProcesses: OwnedProcessRegistry,
+  allowWhenStopping = false,
+  onStarted?: () => void,
+): Promise<EdenCliRemoteCommandResult> {
+  if (!allowWhenStopping && ownedProcesses.isStopping()) {
+    throw cliError({
+      code: "DEPLOY_CANCELLED",
+      message:
+        "Eden deploy was cancelled before the remote command could start.",
+    });
+  }
+  const runner = options.remoteCommandRunner ?? runDefaultRemoteCommand;
+  const returned = runner(request);
+  onStarted?.();
+  if (isRemoteCommandHandle(returned)) {
+    ownedProcesses.register(returned.process);
+    try {
+      if (allowWhenStopping) {
+        return await Promise.race([
+          returned.result,
+          new Promise<EdenCliRemoteCommandResult>((resolve) => {
+            setTimeout(
+              () =>
+                resolve({
+                  exitCode: 1,
+                  stdout: "",
+                  stderr: "Remote cleanup command did not settle.",
+                }),
+              OWNED_PROCESS_TERMINATION_TIMEOUT_MS,
+            );
+          }),
+        ]);
+      }
+      return await Promise.race([
+        returned.result,
+        ownedProcesses.stopped.then((signal) => {
+          throw cliError({
+            code: "DEPLOY_CANCELLED",
+            message:
+              `Eden deploy was cancelled by ${signal}; the owned remote command was terminated.`,
+          });
+        }),
+      ]);
+    } finally {
+      ownedProcesses.unregister(returned.process);
+    }
+  }
+  let resolved: EdenCliRemoteCommandResult | EdenCliRemoteCommandHandle;
+  try {
+    resolved = await Promise.race([
+      Promise.resolve(returned),
+      ...(allowWhenStopping
+        ? []
+        : [
+            ownedProcesses.stopped.then((signal) => {
+              throw cliError({
+                code: "DEPLOY_CANCELLED",
+                message:
+                  `Eden deploy was cancelled by ${signal} before a remote command handle was registered.`,
+              });
+            }),
+          ]),
+    ]);
+  } catch (error: unknown) {
+    void Promise.resolve(returned)
+      .then((late) => {
+        if (isRemoteCommandHandle(late)) {
+          void terminateOwnedProcess(late.process, "SIGTERM");
+        }
+      })
+      .catch(() => undefined);
+    throw error;
+  }
+  if (isRemoteCommandHandle(resolved)) {
+    await terminateOwnedProcess(resolved.process, "SIGTERM");
+    throw cliError({
+      code: "REMOTE_COMMAND_HANDLE_UNSUPPORTED",
+      message:
+        "The remote command runner returned a cancellable handle through a promise; return the handle synchronously so it can be registered before awaiting.",
     });
   }
   return resolved;
@@ -5021,8 +5292,9 @@ async function runDev(
 async function readConfiguredWorkerName(
   configPath: string,
   environment: "preview" | "production",
+  sourceContents?: string,
 ): Promise<string | undefined> {
-  const source = await readFile(configPath, "utf8");
+  const source = sourceContents ?? await readFile(configPath, "utf8");
   const extension = extname(configPath).toLowerCase();
   if (extension !== ".toml") {
     const withoutComments = source
@@ -5108,7 +5380,9 @@ async function runDeploy(
   };
   let configuration: ProjectConfiguration;
   let generation: EdenArtifactGeneration;
-  let deploymentInputFingerprint: ProjectInputFingerprint;
+  let deploymentSnapshot: DeploymentSourceSnapshot;
+  let deploymentArtifactSnapshotRoot: string | undefined;
+  let deploymentRuntimeContents: RuntimeFileContents | undefined;
   const assertBoundGeneration = async (): Promise<void> => {
     await assertCanonicalGenerationMatches(
       root,
@@ -5120,7 +5394,7 @@ async function runDeploy(
   try {
     configuration = await readProjectConfiguration(root);
     assertDeploymentActive();
-    deploymentInputFingerprint = await fingerprintProjectInputs(
+    deploymentSnapshot = await captureDeploymentSourceSnapshot(
       root,
       configuration,
     );
@@ -5129,16 +5403,26 @@ async function runDeploy(
       root,
       options,
       environment,
-      deploymentInputFingerprint,
+      deploymentSnapshot.fingerprint,
       ownedValidationProcesses,
     );
     assertDeploymentActive();
     await assertBoundGeneration();
+    const deploymentArtifactSnapshot =
+      await copyDeploymentGenerationSnapshot(root, generation);
+    deploymentArtifactSnapshotRoot = deploymentArtifactSnapshot.root;
+    generation = deploymentArtifactSnapshot.generation;
   } catch (error: unknown) {
     process.removeListener("SIGINT", stopOnSigint);
     process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     await lock.release().catch(() => undefined);
+    if (deploymentArtifactSnapshotRoot !== undefined) {
+      await rm(deploymentArtifactSnapshotRoot, {
+        recursive: true,
+        force: true,
+      }).catch(() => undefined);
+    }
     throw error;
   }
   let runtimeGeneration: RuntimeGeneration;
@@ -5151,10 +5435,14 @@ async function runDeploy(
       configuration.configPath,
       generation,
       "remote",
+      undefined,
+      deploymentSnapshot.configurationContents,
     );
+    deploymentRuntimeContents = await readRuntimeFileContents(setupRuntimeFiles);
     const configuredWorkerName = await readConfiguredWorkerName(
       configuration.configPath,
       environment,
+      deploymentSnapshot.configurationContents,
     );
     workerName = requestedWorkerName ?? configuredWorkerName ?? "";
     if (workerName.length === 0) {
@@ -5177,6 +5465,12 @@ async function runDeploy(
     process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     await lock.release().catch(() => undefined);
+    if (deploymentArtifactSnapshotRoot !== undefined) {
+      await rm(deploymentArtifactSnapshotRoot, {
+        recursive: true,
+        force: true,
+      }).catch(() => undefined);
+    }
     throw error;
   }
   const runtimeFiles = setupRuntimeFiles;
@@ -5185,31 +5479,66 @@ async function runDeploy(
     process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     await lock.release().catch(() => undefined);
+    if (deploymentArtifactSnapshotRoot !== undefined) {
+      await rm(deploymentArtifactSnapshotRoot, {
+        recursive: true,
+        force: true,
+      }).catch(() => undefined);
+    }
     throw cliError({
       code: "DEPLOY_RUNTIME_UNAVAILABLE",
       message: "The deployment runtime files could not be created.",
     });
   }
   const temporaryConfig = runtimeFiles.configPath;
+  if (deploymentRuntimeContents === undefined) {
+    process.removeListener("SIGINT", stopOnSigint);
+    process.removeListener("SIGTERM", stopOnSigterm);
+    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await lock.release().catch(() => undefined);
+    if (deploymentArtifactSnapshotRoot !== undefined) {
+      await rm(deploymentArtifactSnapshotRoot, {
+        recursive: true,
+        force: true,
+      }).catch(() => undefined);
+    }
+    throw cliError({
+      code: "DEPLOY_RUNTIME_UNAVAILABLE",
+      message: "The deployment runtime snapshot could not be read.",
+    });
+  }
   const assertDeploymentCandidateStable = async (): Promise<void> => {
     assertDeploymentActive();
+    await assertDeploymentLockOwned(lock);
     await assertBoundGeneration();
     await assertProjectInputsUnchanged(
       root,
       configuration,
-      deploymentInputFingerprint,
+      deploymentSnapshot.fingerprint,
       [
         relative(root, temporaryConfig),
         relative(root, runtimeFiles.entryPath),
       ],
     );
     await assertBoundGeneration();
+    const currentRuntimeContents = await readRuntimeFileContents(runtimeFiles);
+    if (
+      currentRuntimeContents.config !== deploymentRuntimeContents.config ||
+      currentRuntimeContents.entry !== deploymentRuntimeContents.entry
+    ) {
+      throw cliError({
+        code: "DEPLOYMENT_SNAPSHOT_CHANGED",
+        message:
+          "The immutable deployment runtime snapshot changed; no stale remote mutation may continue.",
+        source: relative(root, temporaryConfig),
+      });
+    }
+    await assertDeploymentLockOwned(lock);
   };
   const secret = options.remoteBearerSecret ?? process.env.EDEN_BEARER_SECRET;
   let secretProvisioned = false;
   let deploymentAttempted = false;
   let deploymentUrl: string | undefined;
-  const remoteCommand = options.remoteCommandRunner ?? runDefaultRemoteCommand;
   const remoteValidate = options.remoteValidationRunner ??
     ((request: EdenCliRemoteValidationRequest) => {
       if (secret === undefined || secret.length === 0) {
@@ -5222,6 +5551,36 @@ async function runDeploy(
       return runDefaultRemoteValidation(request, secret);
     });
   let deploymentFailure: unknown;
+  const runOwnedRemoteMutation = async (
+    request: EdenCliRemoteCommandRequest,
+    markStarted?: () => void,
+  ): Promise<EdenCliRemoteCommandResult> => {
+    await assertDeploymentCandidateStable();
+    const result = await runRemoteCommand(
+      options,
+      request,
+      ownedValidationProcesses,
+      false,
+      markStarted,
+    );
+    await assertDeploymentCandidateStable();
+    return result;
+  };
+  const runOwnedRemoteCleanup = async (
+    request: EdenCliRemoteCommandRequest,
+  ): Promise<EdenCliRemoteCommandResult> => {
+    await assertDeploymentLockOwned(lock);
+    const result = await runRemoteCommand(
+      options,
+      request,
+      ownedValidationProcesses,
+      true,
+    );
+    if (!ownedValidationProcesses.isStopping()) {
+      await assertDeploymentLockOwned(lock);
+    }
+    return result;
+  };
   try {
     const compatibilityRequest: EdenCliDryRunRequest = {
       cwd: root,
@@ -5287,22 +5646,25 @@ async function runDeploy(
     }
 
     await options.deploymentBoundaryHook?.("before-secret-provision");
-    await assertDeploymentCandidateStable();
-    secretProvisioned = true;
-    const putSecret = await remoteCommand({
-      kind: "secret-put",
-      cwd: root,
-      args: [
-        "secret",
-        "put",
-        "EDEN_BEARER_SECRET",
-        "--name",
-        workerName,
-        "--config",
-        temporaryConfig,
-      ],
-      stdin: `${secret}\n`,
-    });
+    const putSecret = await runOwnedRemoteMutation(
+      {
+        kind: "secret-put",
+        cwd: root,
+        args: [
+          "secret",
+          "put",
+          "EDEN_BEARER_SECRET",
+          "--name",
+          workerName,
+          "--config",
+          temporaryConfig,
+        ],
+        stdin: `${secret}\n`,
+      },
+      () => {
+        secretProvisioned = true;
+      },
+    );
     if (putSecret.exitCode !== 0) {
       throw cliError({
         code: "REMOTE_SECRET_FAILED",
@@ -5316,21 +5678,24 @@ async function runDeploy(
     await options.deploymentBoundaryHook?.("after-secret-provision");
     await assertDeploymentCandidateStable();
     await options.deploymentBoundaryHook?.("before-deploy");
-    await assertDeploymentCandidateStable();
-    deploymentAttempted = true;
-    const deployment = await remoteCommand({
-      kind: "deploy",
-      cwd: root,
-      args: [
-        "deploy",
-        "--env",
-        environment,
-        "--name",
-        workerName,
-        "--config",
-        temporaryConfig,
-      ],
-    });
+    const deployment = await runOwnedRemoteMutation(
+      {
+        kind: "deploy",
+        cwd: root,
+        args: [
+          "deploy",
+          "--env",
+          environment,
+          "--name",
+          workerName,
+          "--config",
+          temporaryConfig,
+        ],
+      },
+      () => {
+        deploymentAttempted = true;
+      },
+    );
     if (deployment.exitCode !== 0) {
       throw cliError({
         code: "REMOTE_DEPLOY_FAILED",
@@ -5386,7 +5751,7 @@ async function runDeploy(
     ) {
       let cleanupFailed = false;
       if (secretProvisioned) {
-        const removed = await remoteCommand({
+        const removed = await runOwnedRemoteCleanup({
           kind: "secret-delete",
           cwd: root,
           args: [
@@ -5402,7 +5767,7 @@ async function runDeploy(
         cleanupFailed ||= removed.exitCode !== 0;
       }
       if (deploymentAttempted) {
-        const deleted = await remoteCommand({
+        const deleted = await runOwnedRemoteCleanup({
           kind: "delete",
           cwd: root,
           args: [
@@ -5425,6 +5790,13 @@ async function runDeploy(
     }
     await rm(temporaryConfig, { force: true }).catch(() => undefined);
     await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
+    if (deploymentArtifactSnapshotRoot !== undefined) {
+      await rm(deploymentArtifactSnapshotRoot, {
+        recursive: true,
+        force: true,
+      }).catch(() => undefined);
+      deploymentArtifactSnapshotRoot = undefined;
+    }
     process.removeListener("SIGINT", stopOnSigint);
     process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
