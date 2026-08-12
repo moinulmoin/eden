@@ -112,6 +112,57 @@ export interface EdenArtifactGeneration {
   readonly artifacts: EdenArtifactSet;
 }
 
+/**
+ * Read and validate one immutable generation directory without consulting
+ * CURRENT. CLI publication uses this to validate an existing same-identity
+ * generation before changing the pointer, while the compiler remains the
+ * single owner of artifact schemas, runtime shape, coherence, and descendant
+ * tree safety.
+ */
+export async function readArtifactGenerationAt(
+  projectRoot: string,
+  generationDirectory: string,
+): Promise<EdenArtifactGeneration> {
+  const resolvedProjectRoot = await resolveProjectRoot({ projectRoot });
+  const candidate = isAbsolute(generationDirectory)
+    ? normalize(generationDirectory)
+    : resolve(resolvedProjectRoot, generationDirectory);
+  const details = await lstat(candidate).catch(() => undefined);
+  if (
+    details === undefined ||
+    !details.isDirectory() ||
+    details.isSymbolicLink()
+  ) {
+    throw new EdenCompilerError("Artifact generation is invalid", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        `Artifact generation "${generationDirectory}" must be a real directory.`,
+        generationDirectory,
+      ),
+    ]);
+  }
+  const resolvedDirectory = await realpath(candidate).catch(() => undefined);
+  if (
+    resolvedDirectory === undefined ||
+    !isWithinRoot(resolvedProjectRoot, resolvedDirectory)
+  ) {
+    throw new EdenCompilerError("Artifact generation is unsafe", [
+      diagnostic(
+        "OUTPUT_OUTSIDE_PROJECT",
+        `Artifact generation "${generationDirectory}" must resolve inside the selected project root.`,
+        generationDirectory,
+      ),
+    ]);
+  }
+  return {
+    directory: resolvedDirectory,
+    artifacts: await readPublishedGeneration(
+      resolvedProjectRoot,
+      candidate,
+    ),
+  };
+}
+
 export interface EdenArtifactGenerationReadOptions {
   /**
    * Test-only publication race hook. Production consumers should omit this

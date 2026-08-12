@@ -54,10 +54,10 @@ import {
 
 import {
   captureProjectImportClosure,
-  createArtifactIdentity,
   buildProject,
   EdenCompilerError,
   readArtifactGeneration,
+  readArtifactGenerationAt,
   resolveContainedProjectPath,
   resolveProjectRoot,
 } from "@eden/compiler";
@@ -348,8 +348,13 @@ const INIT_LOCK_FILE = ".eden-init.lock";
 const DEPLOY_LOCK_FILE = ".eden-deploy.lock";
 const DEPLOY_LOCK_QUARANTINE_PATTERN =
   /^\.eden-deploy-(?:stale-lock|release-lock)-[0-9]+-[a-f0-9-]+$/u;
+const INIT_QUARANTINE_TOKEN_PATTERN =
+  /[A-Za-z0-9][A-Za-z0-9._-]*/u;
 const INIT_LOCK_QUARANTINE_PATTERN =
-  /^\.eden-init-(?:stale-lock|release-lock|recovery)-[0-9]+-[a-f0-9-]+$/u;
+  new RegExp(
+    `^\\.eden-init-(?:stale-lock|release-lock|recovery)-[0-9]+-(${INIT_QUARANTINE_TOKEN_PATTERN.source})-([a-f0-9]{64})$`,
+    "u",
+  );
 const CANONICAL_ARTIFACT_NAMES = [
   "discovery.json",
   "diagnostics.json",
@@ -836,7 +841,7 @@ function parseInitPublicationLockState(
     value.startedAt.length === 0 ||
     value.startedAt.startsWith("pid:") ||
     typeof value.token !== "string" ||
-    value.token.length === 0
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value.token)
   ) {
     return undefined;
   }
@@ -849,53 +854,94 @@ function parseInitPublicationLockState(
   };
 }
 
+function initQuarantineAuthToken(serialized: string): string {
+  return sha256(serialized);
+}
+
+function initQuarantinePath(
+  root: string,
+  kind: "stale-lock" | "release-lock" | "recovery",
+  pid: number,
+  token: string,
+  serialized: string,
+): string {
+  return join(
+    root,
+    `.eden-init-${kind}-${pid}-${token}-${initQuarantineAuthToken(serialized)}`,
+  );
+}
+
+function quarantineNameAuth(
+  entry: string,
+): { readonly token: string; readonly digest: string } | undefined {
+  const match = INIT_LOCK_QUARANTINE_PATTERN.exec(entry);
+  if (match === null) return undefined;
+  return {
+    token: match[1] as string,
+    digest: match[2] as string,
+  };
+}
+
+function initBusy(
+  message: string,
+  source: string,
+): EdenCliError {
+  return cliError({
+    code: "INIT_BUSY",
+    message,
+    source,
+  });
+}
+
 async function readInitPublicationLockState(
   path: string,
 ): Promise<{
   readonly state: InitPublicationLockState;
   readonly serialized: string;
-}> {
-  const details = await lstat(path).catch(() => undefined);
+} | undefined> {
+  const details = await lstat(path).catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw initBusy(
+      "Another Eden init owns scaffold publication; the lock state could not be inspected safely and was preserved.",
+      basename(path),
+    );
+  });
+  if (details === undefined) return undefined;
   if (
     details === undefined ||
     !details.isFile() ||
     details.isSymbolicLink()
   ) {
-    throw cliError({
-      code: "INIT_BUSY",
-      message:
-        "Another Eden init owns scaffold publication; the lock state was not a regular file and was preserved.",
-      source: INIT_LOCK_FILE,
-    });
+    throw initBusy(
+      "Another Eden init owns scaffold publication; the lock state was not a regular file and was preserved.",
+      basename(path),
+    );
   }
-  const serialized = await readFile(path, "utf8").catch(() => undefined);
-  if (serialized === undefined) {
-    throw cliError({
-      code: "INIT_BUSY",
-      message:
-        "Another Eden init owns scaffold publication; the lock quarantine could not be read safely.",
-      source: INIT_LOCK_FILE,
-    });
-  }
+  const serialized = await readFile(path, "utf8").catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw initBusy(
+      "Another Eden init owns scaffold publication; the lock quarantine could not be read safely and was preserved.",
+      basename(path),
+    );
+  });
+  if (serialized === undefined) return undefined;
   let value: unknown;
   try {
     value = JSON.parse(serialized) as unknown;
   } catch {
-    throw cliError({
-      code: "INIT_BUSY",
-      message:
-        "Another Eden init owns scaffold publication; the malformed lock was preserved.",
-      source: INIT_LOCK_FILE,
-    });
+    throw initBusy(
+      "Another Eden init owns scaffold publication; the malformed lock was preserved.",
+      basename(path),
+    );
   }
   const state = parseInitPublicationLockState(value);
   if (state === undefined) {
-    throw cliError({
-      code: "INIT_BUSY",
-      message:
-        "Another Eden init owns scaffold publication; the malformed lock was preserved.",
-      source: INIT_LOCK_FILE,
-    });
+    throw initBusy(
+      "Another Eden init owns scaffold publication; the malformed lock was preserved.",
+      basename(path),
+    );
   }
   return { state, serialized };
 }
@@ -913,13 +959,29 @@ async function restoreInitLockQuarantine(
   quarantinePath: string,
   lockPath: string,
 ): Promise<void> {
+  let restored = false;
   try {
     await link(quarantinePath, lockPath);
+    restored = true;
   } catch (error: unknown) {
     const code = error as NodeJS.ErrnoException;
-    if (code.code !== "EEXIST") throw error;
-  } finally {
-    await rm(quarantinePath, { force: true }).catch(() => undefined);
+    if (code.code === "ENOENT") return;
+    if (code.code === "EEXIST") return;
+    throw initBusy(
+      "The init-lock quarantine could not be restored safely; its state was preserved.",
+      basename(quarantinePath),
+    );
+  }
+  if (!restored) return;
+  try {
+    await rm(quarantinePath, { force: false });
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return;
+    throw initBusy(
+      "The init-lock quarantine could not be removed safely after restoration; its state was preserved.",
+      basename(quarantinePath),
+    );
   }
 }
 
@@ -942,34 +1004,38 @@ async function recoverInitLockQuarantines(
       quarantinePath,
       "The init-lock recovery quarantine path",
     );
-    const details = await lstat(quarantinePath).catch(() => undefined);
-    if (
-      details === undefined ||
-      !details.isFile() ||
-      details.isSymbolicLink()
-    ) {
-      throw cliError({
-        code: "INIT_BUSY",
-        message:
-          "Another Eden init owns scaffold publication; the lock quarantine was preserved because it is not a regular file.",
-        source: entry,
-      });
+    const nameAuth = quarantineNameAuth(entry);
+    if (nameAuth === undefined) {
+      throw initBusy(
+        "The init-lock quarantine filename could not be authenticated; it was preserved.",
+        entry,
+      );
     }
-    const { state, serialized } = await readInitPublicationLockState(
-      quarantinePath,
-    );
+    const parsed = await readInitPublicationLockState(quarantinePath);
+    if (parsed === undefined) continue;
+    const { state, serialized } = parsed;
+    if (
+      state.token !== nameAuth.token ||
+      initQuarantineAuthToken(serialized) !== nameAuth.digest
+    ) {
+      throw initBusy(
+        "The init-lock quarantine ownership token did not match its authenticated filename; it was preserved.",
+        entry,
+      );
+    }
     if (await initLockOwnerIsActive(state)) {
-      throw cliError({
-        code: "INIT_BUSY",
-        message:
-          "Another Eden init is publishing the scaffold; retry after it completes.",
-        source: entry,
-      });
+      throw initBusy(
+        "Another Eden init is publishing the scaffold; retry after it completes.",
+        entry,
+      );
     }
 
-    const removalPath = join(
+    const removalPath = initQuarantinePath(
       root,
-      uniqueTemporaryName("eden-init-recovery"),
+      "recovery",
+      state.pid,
+      state.token,
+      serialized,
     );
     assertWithinRoot(
       root,
@@ -981,36 +1047,48 @@ async function recoverInitLockQuarantines(
     } catch (error: unknown) {
       const code = error as NodeJS.ErrnoException;
       if (code.code === "ENOENT") continue;
-      throw error;
+      throw initBusy(
+        "The init-lock quarantine could not be moved safely; its state was preserved.",
+        entry,
+      );
     }
 
-    let moved: string | undefined;
-    try {
-      moved = await readFile(removalPath, "utf8");
-    } catch {
-      await rm(removalPath, { force: true }).catch(() => undefined);
-      continue;
-    }
+    const moved = await readFile(removalPath, "utf8").catch(
+      (error: unknown) => {
+        const code = error as NodeJS.ErrnoException;
+        if (code.code === "ENOENT") return undefined;
+        throw initBusy(
+          "The init-lock quarantine could not be read safely after recovery; its state was preserved.",
+          entry,
+        );
+      },
+    );
+    if (moved === undefined) continue;
     if (moved !== serialized) {
       await restoreInitLockQuarantine(removalPath, quarantinePath);
-      throw cliError({
-        code: "INIT_BUSY",
-        message:
-          "The init-lock quarantine changed while it was being recovered; the replacement was preserved.",
-        source: entry,
-      });
+      throw initBusy(
+        "The init-lock quarantine changed while it was being recovered; the replacement was preserved.",
+        entry,
+      );
     }
 
     if (await initLockOwnerIsActive(state)) {
       await restoreInitLockQuarantine(removalPath, quarantinePath);
-      throw cliError({
-        code: "INIT_BUSY",
-        message:
-          "Another Eden init became active while its lock quarantine was being recovered; the lock was preserved.",
-        source: entry,
-      });
+      throw initBusy(
+        "Another Eden init became active while its lock quarantine was being recovered; the lock was preserved.",
+        entry,
+      );
     }
-    await rm(removalPath, { force: true }).catch(() => undefined);
+    try {
+      await rm(removalPath, { force: false });
+    } catch (error: unknown) {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") continue;
+      throw initBusy(
+        "The init-lock quarantine could not be removed safely; its state was preserved.",
+        entry,
+      );
+    }
   }
 }
 
@@ -1046,82 +1124,112 @@ async function acquireInitPublicationLock(
       });
       return {
         release: async () => {
-          const releaseQuarantine = join(
+          const releaseQuarantine = initQuarantinePath(
             root,
-            uniqueTemporaryName("eden-init-release-lock"),
+            "release-lock",
+            state.pid,
+            state.token,
+            serialized,
           );
           assertWithinRoot(
             root,
             releaseQuarantine,
             "The init-lock release quarantine path",
           );
+          const currentLock = await readInitPublicationLockState(lockPath);
+          if (currentLock === undefined) return;
+          if (
+            currentLock.serialized !== serialized ||
+            currentLock.state.pid !== state.pid ||
+            currentLock.state.startedAt !== state.startedAt ||
+            currentLock.state.token !== state.token
+          ) {
+            return;
+          }
           try {
             await rename(lockPath, releaseQuarantine);
           } catch (error: unknown) {
             const renameError = error as NodeJS.ErrnoException;
             if (renameError.code === "ENOENT") return;
-            throw error;
+            throw initBusy(
+              "The init lock could not be quarantined safely for release; its state was preserved.",
+              INIT_LOCK_FILE,
+            );
           }
-          let movedLock: string | undefined;
-          try {
-            movedLock = await readFile(releaseQuarantine, "utf8");
-          } catch {
-            await rm(releaseQuarantine, { force: true }).catch(() => undefined);
-            return;
-          }
-          if (movedLock === serialized) {
-            await rm(releaseQuarantine, { force: true }).catch(() => undefined);
-            return;
-          }
-          try {
-            await link(releaseQuarantine, lockPath);
-          } catch (restoreError: unknown) {
-            const restoreCode = restoreError as NodeJS.ErrnoException;
-            if (restoreCode.code !== "EEXIST") {
-              throw restoreError;
+          const moved = await readInitPublicationLockState(releaseQuarantine);
+          if (moved === undefined) return;
+          if (
+            moved.serialized === serialized &&
+            moved.state.pid === state.pid &&
+            moved.state.startedAt === state.startedAt &&
+            moved.state.token === state.token
+          ) {
+            try {
+              await rm(releaseQuarantine, { force: false });
+            } catch (error: unknown) {
+              const removeError = error as NodeJS.ErrnoException;
+              if (removeError.code === "ENOENT") return;
+              throw initBusy(
+                "The init-lock release quarantine could not be removed safely; its state was preserved.",
+                basename(releaseQuarantine),
+              );
             }
-          } finally {
-            await rm(releaseQuarantine, { force: true }).catch(() => undefined);
+            return;
           }
+          await restoreInitLockQuarantine(releaseQuarantine, lockPath);
+          return;
         },
       };
     } catch (error: unknown) {
       const code = error as NodeJS.ErrnoException;
       if (code.code !== "EEXIST") throw error;
       const existing = await readFile(lockPath, "utf8").catch(
-        () => undefined,
+        (readError: unknown) => {
+          const readCode = readError as NodeJS.ErrnoException;
+          if (readCode.code === "ENOENT") return undefined;
+          throw initBusy(
+            "Another Eden init owns scaffold publication; its lock could not be read safely and was preserved.",
+            INIT_LOCK_FILE,
+          );
+        },
       );
       if (existing === undefined) continue;
-      const { state: existingLock } = await readInitPublicationLockState(
-        lockPath,
-      );
+      const parsedExisting = await readInitPublicationLockState(lockPath);
+      if (parsedExisting === undefined) continue;
+      const { state: existingLock } = parsedExisting;
       const ownerStart = await readProcessStartTime(existingLock.pid);
       if (ownerStart === existingLock.startedAt) {
-        throw cliError({
-          code: "INIT_BUSY",
-          message:
-            "Another Eden init is publishing the scaffold; retry after it completes.",
-          source: INIT_LOCK_FILE,
-        });
+        throw initBusy(
+          "Another Eden init is publishing the scaffold; retry after it completes.",
+          INIT_LOCK_FILE,
+        );
       }
       if (
         ownerStart === undefined &&
         isProcessAlive(existingLock.pid)
       ) {
-        throw cliError({
-          code: "INIT_BUSY",
-          message:
-            "Another Eden init owns scaffold publication but its start identity could not be verified.",
-          source: INIT_LOCK_FILE,
-        });
+        throw initBusy(
+          "Another Eden init owns scaffold publication but its start identity could not be verified.",
+          INIT_LOCK_FILE,
+        );
       }
       const latest = await readFile(lockPath, "utf8").catch(
-        () => undefined,
+        (readError: unknown) => {
+          const readCode = readError as NodeJS.ErrnoException;
+          if (readCode.code === "ENOENT") return undefined;
+          throw initBusy(
+            "Another Eden init owns scaffold publication; its lock could not be rechecked safely and was preserved.",
+            INIT_LOCK_FILE,
+          );
+        },
       );
       if (latest !== existing) continue;
-      const staleLockQuarantine = join(
+      const staleLockQuarantine = initQuarantinePath(
         root,
-        uniqueTemporaryName("eden-init-stale-lock"),
+        "stale-lock",
+        existingLock.pid,
+        existingLock.token,
+        existing,
       );
       assertWithinRoot(
         root,
@@ -1133,45 +1241,44 @@ async function acquireInitPublicationLock(
       } catch (error: unknown) {
         const renameError = error as NodeJS.ErrnoException;
         if (renameError.code === "ENOENT") continue;
-        throw error;
+        throw initBusy(
+          "The stale init lock could not be quarantined safely; its state was preserved.",
+          INIT_LOCK_FILE,
+        );
       }
       await hook?.("before-stale-lock-removal");
-      let movedLock: string | undefined;
+      const moved = await readInitPublicationLockState(staleLockQuarantine);
+      if (moved === undefined) continue;
+      if (
+        moved.serialized !== existing ||
+        moved.state.pid !== existingLock.pid ||
+        moved.state.startedAt !== existingLock.startedAt ||
+        moved.state.token !== existingLock.token
+      ) {
+        await restoreInitLockQuarantine(staleLockQuarantine, lockPath);
+        throw initBusy(
+          "The stale init lock changed while it was being quarantined; the replacement was preserved.",
+          INIT_LOCK_FILE,
+        );
+      }
+      if (await initLockOwnerIsActive(existingLock)) {
+        await restoreInitLockQuarantine(staleLockQuarantine, lockPath);
+        throw initBusy(
+          "Another Eden init became active while its lock was being quarantined; the lock was preserved.",
+          INIT_LOCK_FILE,
+        );
+      }
       try {
-        movedLock = await readFile(staleLockQuarantine, "utf8");
-      } catch {
-        await rm(staleLockQuarantine, { force: true }).catch(() => undefined);
-        continue;
+        await rm(staleLockQuarantine, { force: false });
+      } catch (error: unknown) {
+        const removeError = error as NodeJS.ErrnoException;
+        if (removeError.code === "ENOENT") continue;
+        throw initBusy(
+          "The stale init-lock quarantine could not be removed safely; its state was preserved.",
+          basename(staleLockQuarantine),
+        );
       }
-      if (movedLock === existing) {
-        if (await initLockOwnerIsActive(existingLock)) {
-          await restoreInitLockQuarantine(staleLockQuarantine, lockPath);
-          throw cliError({
-            code: "INIT_BUSY",
-            message:
-              "Another Eden init became active while its lock was being quarantined; the lock was preserved.",
-            source: INIT_LOCK_FILE,
-          });
-        }
-        await rm(staleLockQuarantine, { force: true }).catch(() => undefined);
-        continue;
-      }
-
-      // The lock changed after the stale observation. Restore the replacement
-      // only if the path is still free; an exclusive hard link never replaces
-      // a newer lock created by another initializer. Stop this acquisition
-      // attempt rather than parsing or removing the replacement as stale.
-      try {
-        await link(staleLockQuarantine, lockPath);
-      } catch (restoreError: unknown) {
-        const restoreCode = restoreError as NodeJS.ErrnoException;
-        if (restoreCode.code !== "EEXIST") {
-          throw restoreError;
-        }
-      } finally {
-        await rm(staleLockQuarantine, { force: true }).catch(() => undefined);
-      }
-      break;
+      continue;
     }
   }
   throw cliError({
@@ -2107,110 +2214,29 @@ function stableJson(value: unknown): string {
 }
 
 async function assertCanonicalGenerationMatches(
+  projectRoot: string,
   generationDirectory: string,
   generationId: string,
   expected: EdenArtifactGeneration["artifacts"],
 ): Promise<void> {
-  const artifactPaths = Object.fromEntries(
-    CANONICAL_ARTIFACT_NAMES.map((name) => [
-      name,
-      join(generationDirectory, name),
-    ]),
-  ) as Record<typeof CANONICAL_ARTIFACT_NAMES[number], string>;
   try {
-    const generationDetails = await lstat(generationDirectory);
-    if (!generationDetails.isDirectory() || generationDetails.isSymbolicLink()) {
-      throw new Error("the canonical generation is not a real directory");
-    }
-    const artifactDetails = await Promise.all(
-      CANONICAL_ARTIFACT_NAMES.map((name) => lstat(artifactPaths[name])),
+    const canonical = await readArtifactGenerationAt(
+      projectRoot,
+      generationDirectory,
     );
-    if (
-      artifactDetails.some(
-        (details) => !details.isFile() || details.isSymbolicLink(),
-      )
-    ) {
-      throw new Error("the canonical generation does not contain six regular files");
-    }
-    const [
-      discoveryText,
-      diagnosticsText,
-      manifestText,
-      moduleMapText,
-      bundle,
-      buildMetadataText,
-    ] = await Promise.all([
-      readFile(artifactPaths["discovery.json"], "utf8"),
-      readFile(artifactPaths["diagnostics.json"], "utf8"),
-      readFile(artifactPaths["manifest.json"], "utf8"),
-      readFile(artifactPaths["module-map.json"], "utf8"),
-      readFile(artifactPaths["agent-bundle.mjs"], "utf8"),
-      readFile(artifactPaths["build-metadata.json"], "utf8"),
-    ]);
-    const discovery = JSON.parse(discoveryText) as unknown;
-    const diagnostics = JSON.parse(diagnosticsText) as unknown;
-    const manifest = JSON.parse(manifestText) as unknown;
-    const moduleMap = JSON.parse(moduleMapText) as unknown;
-    const buildMetadata = JSON.parse(buildMetadataText) as unknown;
-    if (
-      !isRecord(buildMetadata) ||
-      typeof buildMetadata.generationId !== "string" ||
-      buildMetadata.generationId !== generationId ||
-      typeof buildMetadata.createdAt !== "string"
-    ) {
-      throw new Error("the canonical build metadata identity is invalid");
-    }
-    if (
-      createArtifactIdentity({
-        manifest: manifest as EdenArtifactGeneration["artifacts"]["manifest"],
-        moduleMap: moduleMap as EdenArtifactGeneration["artifacts"]["moduleMap"],
-        bundle,
-      }) !== generationId
-    ) {
+    if (canonical.artifacts.buildMetadata.generationId !== generationId) {
       throw new Error("the canonical generation identity is invalid");
     }
-    const generationRoot = await realpath(generationDirectory);
-    const generationsRoot = await realpath(dirname(generationDirectory));
-    if (generationRoot !== join(generationsRoot, basename(generationDirectory))) {
-      throw new Error("the canonical generation escapes its generations root");
-    }
-    const assertDescendants = async (directory: string): Promise<void> => {
-      const entries = await readdir(directory, { withFileTypes: true });
-      for (const entry of entries) {
-        const child = join(directory, entry.name);
-        if (entry.isSymbolicLink()) {
-          throw new Error(
-            `the canonical generation contains symbolic-link descendant "${child}"`,
-          );
-        }
-        const childDetails = await lstat(child);
-        if (childDetails.isSymbolicLink()) {
-          throw new Error(
-            `the canonical generation contains symbolic-link descendant "${child}"`,
-          );
-        }
-        if (childDetails.isDirectory()) {
-          await assertDescendants(child);
-          continue;
-        }
-        const childRealpath = await realpath(child);
-        if (
-          childRealpath !== generationRoot &&
-          !childRealpath.startsWith(`${generationRoot}/`)
-        ) {
-          throw new Error(
-            `the canonical generation descendant "${child}" escapes its generation root`,
-          );
-        }
-      }
-    };
-    await assertDescendants(generationDirectory);
+    const { buildMetadata, ...canonicalWithoutMetadata } =
+      canonical.artifacts;
+    const {
+      buildMetadata: expectedBuildMetadata,
+      ...expectedWithoutMetadata
+    } =
+      expected;
     if (
-      stableJson(discovery) !== stableJson(expected.discovery) ||
-      stableJson(diagnostics) !== stableJson(expected.diagnostics) ||
-      stableJson(manifest) !== stableJson(expected.manifest) ||
-      stableJson(moduleMap) !== stableJson(expected.moduleMap) ||
-      bundle !== expected.bundle
+      stableJson(canonicalWithoutMetadata) !==
+      stableJson(expectedWithoutMetadata)
     ) {
       throw new Error(
         "the canonical generation does not match the validated candidate",
@@ -2220,7 +2246,9 @@ async function assertCanonicalGenerationMatches(
       Object.entries(buildMetadata).filter(([key]) => key !== "createdAt"),
     );
     const expectedMetadata = Object.fromEntries(
-      Object.entries(expected.buildMetadata).filter(([key]) => key !== "createdAt"),
+      Object.entries(expectedBuildMetadata).filter(
+        ([key]) => key !== "createdAt",
+      ),
     );
     if (stableJson(existingMetadata) !== stableJson(expectedMetadata)) {
       throw new Error("the canonical build metadata is incoherent");
@@ -3889,6 +3917,7 @@ async function buildProjectFromCli(
         });
       }
       await assertCanonicalGenerationMatches(
+        root,
         canonicalGeneration,
         generationId,
         result.artifacts,
@@ -3898,6 +3927,7 @@ async function buildProjectFromCli(
     await options.buildPublicationHook?.("after-generation-publish");
     await options.buildPublicationHook?.("before-current-promotion");
     await assertCanonicalGenerationMatches(
+      root,
       canonicalGeneration,
       generationId,
       result.artifacts,
@@ -5081,6 +5111,7 @@ async function runDeploy(
   let deploymentInputFingerprint: ProjectInputFingerprint;
   const assertBoundGeneration = async (): Promise<void> => {
     await assertCanonicalGenerationMatches(
+      root,
       generation.directory,
       generation.artifacts.buildMetadata.generationId,
       generation.artifacts,

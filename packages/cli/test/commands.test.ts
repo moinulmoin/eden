@@ -638,6 +638,101 @@ describe("eden CLI project commands", () => {
     await expect(stat(join(root, "package.json"))).resolves.toBeDefined();
   });
 
+  test("preserves the prior CURRENT when canonical metadata is malformed", async () => {
+    const root = await createRoot("eden-cli-malformed-canonical-metadata-");
+    const sourcePath = join(root, "agent/tools/greet.ts");
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(0);
+    const first = await readArtifactGeneration(join(root, ".eden"));
+    const firstSource = await readFile(sourcePath, "utf8");
+
+    await writeFile(
+      sourcePath,
+      firstSource.replace(
+        "Greet a person by name.",
+        "Second coherent generation.",
+      ),
+      "utf8",
+    );
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(0);
+    const second = await readArtifactGeneration(join(root, ".eden"));
+
+    await writeFile(sourcePath, firstSource, "utf8");
+    const metadataPath = join(
+      root,
+      ".eden/generations",
+      first.artifacts.buildMetadata.generationId,
+      "build-metadata.json",
+    );
+    const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    metadata.createdAt = "not-a-timestamp";
+    await writeFile(metadataPath, JSON.stringify(metadata), "utf8");
+
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(1);
+
+    await expect(readArtifactGeneration(join(root, ".eden"))).resolves.toMatchObject({
+      artifacts: {
+        buildMetadata: {
+          generationId: second.artifacts.buildMetadata.generationId,
+        },
+      },
+    });
+    expect(errors.join("\n")).toMatch(/createdAt|timestamp|artifact|incoherent/i);
+  });
+
+  test("does not delete an unverified user-created quarantine filename", async () => {
+    const root = await createRoot("eden-cli-unverified-init-quarantine-");
+    const token = "user-created-token";
+    const userFile = join(
+      root,
+      `.eden-init-recovery-999999999-${token}-${createHash("sha256")
+        .update("not-the-file-contents")
+        .digest("hex")}`,
+    );
+    const userContents = `${JSON.stringify({
+      kind: "eden.init.lock",
+      version: 1,
+      pid: 99_999_999,
+      startedAt: "stale-process-start",
+      token,
+    })}\n`;
+    await writeFile(userFile, userContents, "utf8");
+
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+      }),
+    ).resolves.toBe(1);
+
+    await expect(readFile(userFile, "utf8")).resolves.toBe(userContents);
+    expect(errors.join("\n")).toMatch(/lock|quarantine|ownership|preserved|busy/i);
+  });
+
   test("rejects a symbolic-link project root before writing", async () => {
     const parent = await createRoot("eden-cli-symlink-");
     const target = join(parent, "target");
