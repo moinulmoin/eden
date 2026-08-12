@@ -358,6 +358,122 @@ const forgedTools = Object.freeze(Object.fromEntries([
       ),
   },
   {
+    name: "forged generated export helper namespace",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap: forgedModuleMap })",
+        `const __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+function forgedSchemaFactory() {
+  return {
+    "~standard": {
+      version: 1,
+      vendor: "forged",
+      validate(value) { return { value }; }
+    }
+  };
+}
+var forged_exports = {};
+__export(forged_exports, {
+  object: () => forgedSchemaFactory,
+  string: () => forgedSchemaFactory
+});
+const forgedInputSchema = forged_exports.object({});
+const forgedTools = Object.freeze(Object.fromEntries([
+  ["greet", {
+    description: "Greet a person.",
+    inputSchema: forgedInputSchema,
+    execute(input) { return input; }
+  }]
+]));
+const forgedModuleMap = moduleMap;`,
+      ),
+  },
+  {
+    name: "unresolved conditional artifact branch",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap: conditionalModuleMap })",
+        `const condition = Math.random() > 0;
+const conditionalModuleMap = condition
+  ? moduleMap
+  : { agent: null, instructions: "instructions:default", tools: { greet: "tool:greet" } };`,
+      ),
+  },
+  {
+    name: "unresolved logical artifact branch",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap: logicalModuleMap })",
+        `const maybeModuleMap = Math.random() > 0 ? moduleMap : null;
+const logicalModuleMap = maybeModuleMap && moduleMap;`,
+      ),
+  },
+  {
+    name: "aliased Object.assign mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "artifact",
+        `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+const assign = Object.assign;
+assign(artifact, { agent: null });`,
+      ),
+  },
+  {
+    name: "destructured post-construction mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "artifact",
+        `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+const { agent: agentAlias } = artifact;
+agentAlias.model = "tampered-through-destructure";`,
+      ),
+  },
+  {
+    name: "aliased Reflect.set mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "artifact",
+        `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+const reflectSet = Reflect.set;
+reflectSet(artifact, "agent", null);`,
+      ),
+  },
+  {
+    name: "moduleMap unknown descendant spread",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap: malformedModuleMap })",
+        `const unknownModuleMapOverride = globalThis["edenModuleMapOverride"];
+const malformedModuleMap = { ...moduleMap, ...unknownModuleMapOverride };`,
+      ),
+  },
+  {
+    name: "moduleMap invalid nested reference",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap: malformedModuleMap })",
+        `const malformedModuleMap = Object.freeze({
+  agent: "agent:default",
+  instructions: "instructions:default",
+  tools: Object.freeze(Object.fromEntries([
+    ["greet", null]
+  ]))
+});`,
+      ),
+  },
+  {
     name: "positive Infinity in JSON metadata",
     mutate: (bundle: string) =>
       replaceBundleDefault(
