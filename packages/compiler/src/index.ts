@@ -3268,6 +3268,117 @@ function semanticWorkerBindingDiagnostics(
     return { kind: "callable", returns };
   }
 
+  function isAnyOrUnknownType(expression: ts.Expression): boolean {
+    const flags = checker.getTypeAtLocation(expression).flags;
+    return (
+      (flags & ts.TypeFlags.Any) !== 0 ||
+      (flags & ts.TypeFlags.Unknown) !== 0
+    );
+  }
+
+  function isCallResultExpression(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isCallExpression(current) || ts.isNewExpression(current)) {
+      return true;
+    }
+    if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+      return isCallResultExpression(current.expression, seenSymbols);
+    }
+    if (!ts.isIdentifier(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    seenSymbols.add(symbol);
+    const symbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) symbols.push(aliased);
+    }
+    return symbols.some((candidate) =>
+      (candidate.declarations ?? []).some(
+        (declaration) =>
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          isCallResultExpression(declaration.initializer, new Set(seenSymbols)),
+      ),
+    );
+  }
+
+  function isKnownCallableCallResult(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isCallExpression(current)) {
+      return callableDeclarations(current.expression, new Set()).length > 0;
+    }
+    if (ts.isNewExpression(current)) return false;
+    if (
+      ts.isPropertyAccessExpression(current) ||
+      ts.isElementAccessExpression(current)
+    ) {
+      return isKnownCallableCallResult(current.expression, seenSymbols);
+    }
+    if (!ts.isIdentifier(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    seenSymbols.add(symbol);
+    return (symbol.declarations ?? []).some(
+      (declaration) =>
+        ts.isVariableDeclaration(declaration) &&
+        declaration.initializer !== undefined &&
+        isKnownCallableCallResult(
+          declaration.initializer,
+          new Set(seenSymbols),
+        ),
+    );
+  }
+
+  function isTrustedZodCall(expression: ts.Expression): boolean {
+    const current = unwrapExpression(expression);
+    const callee =
+      ts.isCallExpression(current)
+        ? unwrapExpression(current.expression)
+        : current;
+    const receiver =
+      ts.isPropertyAccessExpression(callee) ||
+      ts.isElementAccessExpression(callee)
+        ? callee.expression
+        : undefined;
+    if (receiver === undefined || !ts.isIdentifier(receiver)) return false;
+    const symbol = checker.getSymbolAtLocation(receiver);
+    return (symbol?.declarations ?? []).some((declaration) => {
+      if (!ts.isImportSpecifier(declaration)) return false;
+      const importDeclaration = declaration.parent.parent.parent;
+      return (
+        ts.isImportDeclaration(importDeclaration) &&
+        ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
+        importDeclaration.moduleSpecifier.text === "zod"
+      );
+    });
+  }
+
+  function isUnresolvedCallablePropertyAccess(
+    expression: ts.Expression,
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (
+      !ts.isPropertyAccessExpression(current) &&
+      !ts.isElementAccessExpression(current)
+    ) {
+      return false;
+    }
+    const receiver = current.expression;
+    return (
+      isAnyOrUnknownType(receiver) &&
+      isCallResultExpression(receiver) &&
+      !isTrustedZodCall(receiver) &&
+      isKnownCallableCallResult(receiver)
+    );
+  }
+
   function ambientObjectPropertyValue(
     source: ts.Expression,
     propertyName: string | undefined,
@@ -3710,6 +3821,8 @@ function semanticWorkerBindingDiagnostics(
             if (value !== undefined) return value;
           }
         }
+        const callable = callableAmbientValue(candidate.declarations ?? []);
+        if (callable !== undefined) return callable;
       }
       return undefined;
     }
@@ -3778,6 +3891,9 @@ function semanticWorkerBindingDiagnostics(
       }
       if (isReflectGetExpression(current)) {
         return { kind: "reflect-get" };
+      }
+      if (isUnresolvedCallablePropertyAccess(current)) {
+        return { kind: "unknown-callable" };
       }
       return undefined;
     }
@@ -3963,14 +4079,20 @@ function semanticWorkerBindingDiagnostics(
         new Set(seenSymbols),
       );
       if (returns.length === 0) return undefined;
-      return returns.slice(1).reduce(
-        (currentValue, value) => mergeAmbientValues(currentValue, value),
-        returns[0] as AmbientValue,
-      );
+      return { kind: "callable", returns };
     }
     if (ts.isCallExpression(current)) {
       const reflective = resolveReflectGetCallResult(current, seenSymbols);
       if (reflective !== undefined) return reflective;
+      if (isReflectGetAliasExpression(current.expression)) {
+        const reflectiveAlias = resolveReflectGetValue(
+          current.arguments[0],
+          propertyNameExpression(current.arguments[1]),
+          seenSymbols,
+        );
+        if (reflectiveAlias !== undefined) return reflectiveAlias;
+        return { kind: "unknown-callable" };
+      }
       const callee = resolveAmbientValue(
         current.expression,
         new Set(seenSymbols),
@@ -3985,15 +4107,6 @@ function semanticWorkerBindingDiagnostics(
         ) ?? { kind: "unknown-callable" };
       }
       if (callee?.kind === "reflect-get") {
-        const reflective = resolveReflectGetValue(
-          current.arguments[0],
-          propertyNameExpression(current.arguments[1]),
-          seenSymbols,
-        );
-        if (reflective !== undefined) return reflective;
-        return { kind: "unknown-callable" };
-      }
-      if (isReflectGetAliasExpression(current.expression)) {
         const reflective = resolveReflectGetValue(
           current.arguments[0],
           propertyNameExpression(current.arguments[1]),

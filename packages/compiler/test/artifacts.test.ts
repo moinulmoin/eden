@@ -1920,6 +1920,185 @@ describe("artifact generation", () => {
 
   test.each([
     [
+      "any returned object",
+      `
+        function makeHelpers(): any {
+          return {
+            getRuntime() {
+              return globalThis;
+            },
+          };
+        }
+        export default {
+          description: "Any returned objects must not hide ambient methods.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const runtime = makeHelpers().getRuntime();
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+    ],
+    [
+      "unknown returned object",
+      `
+        function makeHelpers(): unknown {
+          return {
+            getRuntime() {
+              return self;
+            },
+          };
+        }
+        export default {
+          description: "Unknown returned objects must not hide ambient methods.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const runtime = (makeHelpers() as any).getRuntime();
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+    ],
+  ])("rejects ordinary property calls on %s", async (_name, source) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Ordinary property callable fixture\n",
+      "agent/tools/ordinary-property-call.ts": source,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/ordinary-property-call.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
+      "globalThis",
+      `
+        function getRuntime() {
+          return globalThis;
+        }
+        function makeFactory() {
+          return getRuntime;
+        }
+        export default {
+          description: "Higher-order global returns must preserve capability identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const runtime = makeFactory()() ;
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+    ],
+    [
+      "self",
+      `
+        function getRuntime() {
+          return self;
+        }
+        function makeFactory() {
+          return getRuntime;
+        }
+        export default {
+          description: "Higher-order self returns must preserve capability identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const runtime = makeFactory()() ;
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+    ],
+  ])("rejects higher-order function-valued returns of %s", async (_name, source) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Higher-order callable fixture\n",
+      "agent/tools/higher-order-runtime.ts": source,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/higher-order-runtime.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
+      "Reflect",
+      `
+        function getReflect() {
+          return globalThis.Reflect;
+        }
+        function makeFactory() {
+          return getReflect;
+        }
+        export default {
+          description: "Higher-order Reflect returns must preserve capability identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const reflect = makeFactory()();
+            const read = reflect.get(globalThis, "EDEN_API_KEY");
+            return { value: read ?? input.name };
+          },
+        };
+      `,
+      "MODULE_AMBIENT_BINDING",
+    ],
+    [
+      "Function",
+      `
+        function getFunction() {
+          return Function;
+        }
+        function makeFactory() {
+          return getFunction;
+        }
+        export default {
+          description: "Higher-order dynamic-code returns must preserve capability identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const create = makeFactory()();
+            return { value: create(input.name) };
+          },
+        };
+      `,
+      "MODULE_DYNAMIC_CODE_UNSUPPORTED",
+    ],
+  ])("rejects higher-order %s capability returns", async (_name, source, code) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Higher-order capability fixture\n",
+      "agent/tools/higher-order-capability.ts": source,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code,
+          source: "agent/tools/higher-order-capability.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
       "globalThis Reflect alias",
       `
         const reflect = globalThis.Reflect;
