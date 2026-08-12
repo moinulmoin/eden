@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
+import type { EdenArtifactSet } from "@eden/definitions";
 
 import {
   EdenCompilerError,
@@ -215,6 +216,36 @@ function mutateJsonDocument(
   return JSON.stringify(mutate(JSON.parse(contents)));
 }
 
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function replaceBundleCoherently(
+  contents: Record<(typeof artifactNames)[number], string>,
+  bundle: string,
+): Record<(typeof artifactNames)[number], string> {
+  const manifest = {
+    ...(JSON.parse(contents["manifest.json"]) as Record<string, unknown>),
+    bundleDigest: sha256Text(bundle),
+  };
+  const moduleMap = JSON.parse(contents["module-map.json"]) as EdenArtifactSet["moduleMap"];
+  const buildMetadata = {
+    ...(JSON.parse(contents["build-metadata.json"]) as Record<string, unknown>),
+    bundleDigest: sha256Text(bundle),
+    generationId: createArtifactIdentity({
+      manifest: manifest as EdenArtifactSet["manifest"],
+      moduleMap,
+      bundle,
+    }),
+  };
+  return {
+    ...contents,
+    "manifest.json": JSON.stringify(manifest),
+    "agent-bundle.mjs": bundle,
+    "build-metadata.json": JSON.stringify(buildMetadata),
+  };
+}
+
 describe("artifact generation", () => {
   test("publishes one coherent generation and executes without the source tree", async () => {
     const root = await createProject({
@@ -251,12 +282,20 @@ describe("artifact generation", () => {
       `${generation.directory}/agent-bundle.mjs?artifact-only`
     );
     const artifact = bundle.default as {
+      agent: {
+        model: string;
+        options: { maxOutputTokens: number; thinking: boolean };
+      };
+      instructions: string;
       toolSchemas: Record<string, unknown>;
       tools: Record<
         string,
         {
+          description: string;
           inputSchema: {
             "~standard": {
+              version: number;
+              vendor: string;
               validate(value: unknown): unknown;
             };
           };
@@ -275,6 +314,20 @@ describe("artifact generation", () => {
       >;
     };
 
+    expect(artifact.agent).toEqual({
+      model: "@cf/zai-org/glm-4.7-flash",
+      options: { maxOutputTokens: 512, thinking: false },
+    });
+    expect(artifact.instructions).toBe("# Artifact fixture\n");
+    expect(artifact.tools.greet).toMatchObject({
+      description: "Greet a person.",
+      execute: expect.any(Function),
+    });
+    expect(artifact.tools.greet.inputSchema["~standard"]).toMatchObject({
+      version: 1,
+      vendor: "fixture",
+      validate: expect.any(Function),
+    });
     expect(artifact.toolSchemas.greet).toEqual({
       type: "object",
       properties: {
@@ -303,6 +356,157 @@ describe("artifact generation", () => {
         ),
       ),
     ).toEqual({ greeting: "Hello Eden" });
+  });
+
+  test("rejects a coherent but runtime-invalid bundle before legacy migration", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "runtime bundle legacy fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const previous = await readArtifactGeneration(join(root, ".eden"));
+    const legacyContents = Object.fromEntries(
+      await Promise.all(
+        artifactNames.map(async (name) => [
+          name,
+          await readFile(join(previous.directory, name), "utf8"),
+        ] as const),
+      ),
+    ) as Record<(typeof artifactNames)[number], string>;
+    const invalidContents = replaceBundleCoherently(
+      legacyContents,
+      "export default null; /* agent:default instructions:default tool:greet */\n",
+    );
+
+    await rm(join(root, ".eden"), { recursive: true, force: true });
+    await mkdir(join(root, ".eden"), { recursive: true });
+    await Promise.all(
+      artifactNames.map((name) =>
+        writeFile(join(root, ".eden", name), invalidContents[name], "utf8"),
+      ),
+    );
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      name: "EdenCompilerError",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "OUTPUT_INVALID" }),
+      ]),
+    } satisfies Partial<EdenCompilerError>);
+    await expect(lstat(join(root, ".eden", "CURRENT"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readdir(join(root, ".eden", "generations"))).resolves.toEqual(
+      [],
+    );
+  });
+
+  test("rejects a runtime-invalid CURRENT bundle through authoritative reads", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "runtime bundle reader fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const current = await readArtifactGeneration(join(root, ".eden"));
+    const contents = Object.fromEntries(
+      await Promise.all(
+        artifactNames.map(async (name) => [
+          name,
+          await readFile(join(current.directory, name), "utf8"),
+        ] as const),
+      ),
+    ) as Record<(typeof artifactNames)[number], string>;
+    const invalidContents = replaceBundleCoherently(
+      contents,
+      "export default { agent: null, instructions: [], tools: null, toolSchemas: null }; /* agent:default instructions:default tool:greet */\n",
+    );
+    await Promise.all(
+      artifactNames.map((name) =>
+        writeFile(join(current.directory, name), invalidContents[name], "utf8"),
+      ),
+    );
+
+    await expect(readArtifactGeneration(join(root, ".eden"))).rejects.toMatchObject({
+      name: "EdenCompilerError",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "OUTPUT_INVALID" }),
+      ]),
+    } satisfies Partial<EdenCompilerError>);
+  });
+
+  test("rejects a runtime-invalid same-identity candidate before CURRENT promotion", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "runtime bundle reuse fixture\n",
+      "agent/tools/greet.ts": toolSource,
+    });
+
+    await buildProject({ projectRoot: root });
+    const previous = await readArtifactGeneration(join(root, ".eden"));
+    await writeFile(
+      join(root, "agent/tools/greet.ts"),
+      toolSource.replace("Greet a person.", "runtime-invalid candidate"),
+      "utf8",
+    );
+    await expect(
+      buildProject({
+        projectRoot: root,
+        hooks: {
+          onPublicationBoundary: (boundary) => {
+            if (boundary === "before-current-promotion") {
+              throw new Error("leave runtime-invalid candidate uncurrent");
+            }
+          },
+        },
+      }),
+    ).rejects.toThrow("leave runtime-invalid candidate uncurrent");
+
+    const candidateId = (
+      await readdir(join(root, ".eden", "generations"))
+    ).find(
+      (name) =>
+        name.startsWith("gen_") &&
+        name !== previous.artifacts.buildMetadata.generationId,
+    );
+    expect(candidateId).toBeDefined();
+    const candidateDirectory = join(
+      root,
+      ".eden",
+      "generations",
+      candidateId as string,
+    );
+    const candidateContents = Object.fromEntries(
+      await Promise.all(
+        artifactNames.map(async (name) => [
+          name,
+          await readFile(join(candidateDirectory, name), "utf8"),
+        ] as const),
+      ),
+    ) as Record<(typeof artifactNames)[number], string>;
+    const invalidContents = replaceBundleCoherently(
+      candidateContents,
+      "export default null; /* agent:default instructions:default tool:greet */\n",
+    );
+    await Promise.all(
+      artifactNames.map((name) =>
+        writeFile(join(candidateDirectory, name), invalidContents[name], "utf8"),
+      ),
+    );
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      name: "EdenCompilerError",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "OUTPUT_INVALID" }),
+      ]),
+    } satisfies Partial<EdenCompilerError>);
+    const after = await readArtifactGeneration(join(root, ".eden"));
+    expect(after.artifacts.buildMetadata.generationId).toBe(
+      previous.artifacts.buildMetadata.generationId,
+    );
+    expect(after.artifacts.bundle).toBe(previous.artifacts.bundle);
   });
 
   test("keeps a resolved generation stable when CURRENT flips during reads", async () => {
@@ -2033,6 +2237,11 @@ describe("artifact generation", () => {
         name: "bundle empty",
         artifact: "agent-bundle.mjs",
         mutate: () => "",
+      },
+      {
+        name: "bundle syntax invalid",
+        artifact: "agent-bundle.mjs",
+        mutate: () => "export default {",
       },
       {
         name: "buildMetadata.generationId",
