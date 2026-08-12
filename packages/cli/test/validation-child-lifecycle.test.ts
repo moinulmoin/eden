@@ -1,5 +1,6 @@
 import {
   mkdtemp,
+  readFile,
   rm,
 } from "node:fs/promises";
 import {
@@ -175,4 +176,150 @@ describe("CLI validation child lifecycle", () => {
     expect(observed).toBe(1);
     expect(errors.join("\n")).toMatch(/unsupported|synchronous|handle/i);
   });
+
+  test("races a never-settling compatibility result with cancellation", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const errors: string[] = [];
+    const signals: NodeJS.Signals[] = [];
+    let releaseResult: (() => void) | undefined;
+    const result = new Promise<EdenCliDryRunResult>((resolve) => {
+      releaseResult = () => resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    const processHandle: EdenCliProcess = {
+      pid: 44_003,
+      startIdentity: "never-settling-validation-result",
+      exited: new Promise(() => {}),
+      async terminate(signal?: NodeJS.Signals) {
+        if (signal !== undefined) signals.push(signal);
+      },
+    };
+
+    const buildPromise = runEdenCli(["build", "--project", root], {
+      cwd: root,
+      stderr: (line) => errors.push(line),
+      dryRunRunner: () => {
+        queueMicrotask(() => process.emit("SIGTERM"));
+        return { process: processHandle, result };
+      },
+    });
+    const observed = await Promise.race([
+      buildPromise,
+      new Promise<number>((resolve) => {
+        setTimeout(() => resolve(-1), 3_000);
+      }),
+    ]);
+    releaseResult?.();
+
+    await expect(buildPromise).resolves.toBe(0);
+    expect(observed).toBe(0);
+    expect(signals).toContain("SIGTERM");
+    expect(errors.join("\n")).not.toMatch(/compatibility validation failed/i);
+  });
+
+  test("keeps a synchronous remote spawn reservation in the cleanup barrier", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const errors: string[] = [];
+    const signals: NodeJS.Signals[] = [];
+    let releaseTermination: (() => void) | undefined;
+    const termination = new Promise<void>((resolve) => {
+      releaseTermination = resolve;
+    });
+    const remoteResult = new Promise<{
+      readonly exitCode: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    }>(() => {});
+    const processHandle: EdenCliProcess = {
+      pid: 44_004,
+      startIdentity: "reserved-remote-spawn",
+      exited: new Promise(() => {}),
+      async terminate(signal?: NodeJS.Signals) {
+        if (signal !== undefined) signals.push(signal);
+        await termination;
+      },
+    };
+
+    const deployPromise = runEdenCli(
+      [
+        "deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-reserved-remote-spawn",
+      ],
+      {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+        remoteCommandRunner: () => {
+          process.emit("SIGTERM");
+          return { process: processHandle, result: remoteResult };
+        },
+        remoteBearerSecret: "reserved-remote-secret",
+      },
+    );
+
+    await new Promise<void>((resolve) => {
+      const check = (): void => {
+        if (signals.length > 0) {
+          resolve();
+          return;
+        }
+        setTimeout(check, 10);
+      };
+      check();
+    });
+    const settledBeforeRelease = await Promise.race([
+      deployPromise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        setTimeout(() => resolve(false), 300);
+      }),
+    ]);
+    expect(settledBeforeRelease).toBe(false);
+    releaseTermination?.();
+    await expect(deployPromise).resolves.toBe(1);
+    expect(signals).toContain("SIGTERM");
+    expect(errors.join("\n")).toMatch(/cancel|signal|remote/i);
+    await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("escalates a stubborn validation child with independent SIGKILL", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const signals: NodeJS.Signals[] = [];
+    const processHandle: EdenCliProcess = {
+      pid: 44_005,
+      startIdentity: "stubborn-validation-child",
+      exited: new Promise(() => {}),
+      async terminate(signal?: NodeJS.Signals) {
+        if (signal !== undefined) signals.push(signal);
+      },
+    };
+
+    const buildPromise = runEdenCli(["build", "--project", root], {
+      cwd: root,
+      dryRunRunner: () => {
+        queueMicrotask(() => process.emit("SIGTERM"));
+        return {
+          process: processHandle,
+          result: new Promise<EdenCliDryRunResult>(() => {}),
+        };
+      },
+    });
+
+    await expect(
+      Promise.race([
+        buildPromise,
+        new Promise<number>((resolve) => {
+          setTimeout(() => resolve(-1), 8_000);
+        }),
+      ]),
+    ).resolves.toBe(0);
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+  }, 12_000);
 });

@@ -217,6 +217,7 @@ export type EdenRuntimePublicationBoundary =
 
 export type EdenDeploymentBoundary =
   | "before-compatibility-dry-run"
+  | "before-remote-runner-invocation"
   | "after-compatibility-dry-run"
   | "before-secret-provision"
   | "after-secret-provision"
@@ -4096,11 +4097,18 @@ function createDefaultProcessHandle(
     waitForProcessIdentity(pid, processMarker),
     exited.then(() => undefined),
   ]);
-  let termination: Promise<void> | undefined;
   const signalOwnedChild = async (
     signal: NodeJS.Signals,
   ): Promise<boolean> => {
-    const expected = await startIdentity;
+    const expected = await resolveOwnedProcessIdentity(
+      {
+        pid,
+        startIdentity,
+        exited,
+        async terminate() {},
+      },
+      OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
+    );
     if (
       expected === undefined ||
       !(await verifyProcessIdentity(pid, expected))
@@ -4126,29 +4134,8 @@ function createDefaultProcessHandle(
     exited,
     ...(ready === undefined ? {} : { ready }),
     async terminate(signal = "SIGTERM") {
-      if (termination !== undefined) {
-        await termination;
-        return;
-      }
-      termination = (async () => {
-        if (pid <= 0) return;
-        await signalOwnedChild(signal);
-        const graceful = await Promise.race([
-          exited,
-          new Promise<undefined>((resolveExit) => {
-            setTimeout(() => resolveExit(undefined), 5_000);
-          }),
-        ]);
-        if (graceful !== undefined) return;
-        await signalOwnedChild("SIGKILL");
-        await Promise.race([
-          exited,
-          new Promise<undefined>((resolveExit) => {
-            setTimeout(() => resolveExit(undefined), 5_000);
-          }),
-        ]);
-      })();
-      await termination;
+      if (pid <= 0) return;
+      await signalOwnedChild(signal);
     },
   };
 }
@@ -4591,41 +4578,63 @@ async function runDefaultRemoteValidation(
 interface OwnedProcessRegistry {
   readonly isStopping: () => boolean;
   readonly stopped: Promise<NodeJS.Signals>;
+  readonly reserve: () => { readonly release: () => void };
   readonly register: (process: EdenCliProcess) => void;
   readonly unregister: (process: EdenCliProcess) => void;
+  readonly waitForQuiescence: () => Promise<void>;
   readonly cleanup: (signal: NodeJS.Signals) => Promise<void>;
 }
 
 const OWNED_PROCESS_TERMINATION_TIMEOUT_MS = 2_000;
 const OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS = 750;
+const OWNED_PROCESS_CLEANUP_TIMEOUT_MS =
+  OWNED_PROCESS_TERMINATION_TIMEOUT_MS * 2 +
+  OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS * 2 +
+  500;
 
 async function terminateOwnedProcess(
   process: EdenCliProcess,
   signal: NodeJS.Signals,
-): Promise<void> {
+): Promise<boolean> {
   const attempt = async (requestedSignal: NodeJS.Signals): Promise<boolean> => {
     let termination: Promise<void>;
     try {
       termination = Promise.resolve(process.terminate(requestedSignal));
     } catch {
-      return true;
+      return false;
     }
     return Promise.race([
       termination.then(
         () => true,
-        () => true,
+        () => false,
       ),
       new Promise<boolean>((resolve) => {
         setTimeout(() => resolve(false), OWNED_PROCESS_TERMINATION_TIMEOUT_MS);
       }),
     ]);
   };
-  if (await attempt(signal)) return;
+  const initialSignalSent = await attempt(signal);
+  if (initialSignalSent) {
+    const exited = await waitForOwnedProcessExit(
+      process,
+      OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
+    );
+    if (exited) return true;
+  }
   await attempt("SIGKILL");
+  return await waitForOwnedProcessExit(
+    process,
+    OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
+  );
 }
 
 function createOwnedProcessRegistry(): OwnedProcessRegistry {
   const processes = new Set<EdenCliProcess>();
+  const pendingTerminations = new Map<EdenCliProcess, Promise<boolean>>();
+  const reservations = new Set<{
+    readonly settled: Promise<void>;
+    readonly release: () => void;
+  }>();
   let stopping = false;
   let cleanupPromise: Promise<void> | undefined;
   let cleanupSignal: NodeJS.Signals = "SIGTERM";
@@ -4633,6 +4642,21 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
   const stopped = new Promise<NodeJS.Signals>((resolve) => {
     resolveStopped = resolve;
   });
+  const terminateTracked = (process: EdenCliProcess): Promise<boolean> => {
+    const existing = pendingTerminations.get(process);
+    if (existing !== undefined) return existing;
+    const termination = terminateOwnedProcess(process, cleanupSignal)
+      .then((settled) => {
+        processes.delete(process);
+        return settled;
+      })
+      .finally(() => {
+        pendingTerminations.delete(process);
+        void cleanup(cleanupSignal);
+      });
+    pendingTerminations.set(process, termination);
+    return termination;
+  };
   const cleanup = (signal: NodeJS.Signals): Promise<void> => {
     cleanupSignal = signal;
     stopping = true;
@@ -4640,25 +4664,86 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
     resolveStopped = undefined;
     if (cleanupPromise !== undefined) return cleanupPromise;
     cleanupPromise = (async () => {
-      await Promise.all(
-        [...processes].map((process) =>
-          terminateOwnedProcess(process, cleanupSignal),
-        ),
-      );
-    })();
+      const deadline =
+        Date.now() + OWNED_PROCESS_CLEANUP_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const processSnapshot = [...processes];
+        const reservationSnapshot = [...reservations];
+        const terminations = processSnapshot.map((process) =>
+          terminateTracked(process),
+        );
+        await Promise.all(terminations);
+        const remainingMs = Math.max(1, deadline - Date.now());
+        await Promise.all([
+          waitForSettlements(
+            processSnapshot.map((process) => process.exited),
+            Math.min(OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS, remainingMs),
+          ),
+          waitForSettlements(
+            reservationSnapshot.map((reservation) => reservation.settled),
+            Math.min(OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS, remainingMs),
+          ),
+        ]);
+        if (
+          processes.size === 0 &&
+          pendingTerminations.size === 0 &&
+          reservations.size === 0
+        ) {
+          return;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      for (const reservation of [...reservations]) {
+        reservation.release();
+      }
+    })().finally(() => {
+      cleanupPromise = undefined;
+    });
     return cleanupPromise;
   };
   return {
     isStopping: () => stopping,
     stopped,
+    reserve: () => {
+      let resolveReservation: (() => void) | undefined;
+      const settled = new Promise<void>((resolve) => {
+        resolveReservation = resolve;
+      });
+      let released = false;
+      const reservation: {
+        readonly settled: Promise<void>;
+        readonly release: () => void;
+      } = {
+        settled,
+        release: (): void => {
+          if (released) return;
+          released = true;
+          reservations.delete(reservation);
+          resolveReservation?.();
+        },
+      };
+      reservations.add(reservation);
+      return {
+        release: (): void => {
+          reservation.release();
+        },
+      };
+    },
     register: (process) => {
       processes.add(process);
       if (stopping) {
-        void terminateOwnedProcess(process, cleanupSignal);
+        void terminateTracked(process);
       }
     },
     unregister: (process) => {
-      processes.delete(process);
+      if (!stopping && !pendingTerminations.has(process)) {
+        processes.delete(process);
+      }
+    },
+    waitForQuiescence: async () => {
+      if (!stopping) return;
+      const signal = await stopped;
+      await cleanup(signal);
     },
     cleanup,
   };
@@ -4700,30 +4785,70 @@ async function runCompatibilityDryRun(
   options: EdenCliRunOptions,
   request: EdenCliDryRunRequest,
   ownedProcesses?: OwnedProcessRegistry,
+  beforeStart?: () => void | Promise<void>,
 ): Promise<EdenCliDryRunResult> {
   const runner = options.dryRunRunner ?? runDefaultDryRun;
-  const returned = runner(request);
+  const reservation = ownedProcesses?.reserve();
+  let returned: EdenCliDryRunResult | EdenCliDryRunHandle | Promise<EdenCliDryRunResult>;
+  try {
+    await beforeStart?.();
+    if (ownedProcesses?.isStopping() === true) {
+      throw cliError({
+        code: "DEPLOY_CANCELLED",
+        message: "The Eden operation was cancelled before compatibility validation started.",
+      });
+    }
+    returned = runner(request);
+  } catch (error: unknown) {
+    reservation?.release();
+    throw error;
+  }
   if (isDryRunHandle(returned)) {
     ownedProcesses?.register(returned.process);
+    reservation?.release();
     try {
-      return await returned.result;
+      return await raceOwnedResult(
+        returned.result,
+        ownedProcesses,
+        "The compatibility validation was cancelled before its result settled.",
+      );
     } finally {
       ownedProcesses?.unregister(returned.process);
     }
   }
-  const resolved = await returned;
+  let resolved: EdenCliDryRunResult | EdenCliDryRunHandle;
+  try {
+    if (isPromiseLikeValue(returned)) {
+      resolved = await raceOwnedResult(
+        returned,
+        ownedProcesses,
+        "The compatibility validation was cancelled before its result settled.",
+      );
+    } else {
+      resolved = returned;
+    }
+  } catch (error: unknown) {
+    void settleLateChildResult(
+      Promise.resolve(returned),
+      reservation,
+      isDryRunHandle,
+    );
+    throw error;
+  }
   if (isDryRunHandle(resolved)) {
     // A promise-returned handle may already have spawned before this await.
     // It cannot be registered synchronously, so this shape is unsupported.
     // Give the returned owner one best-effort termination opportunity rather
     // than leaving an untracked child behind.
     await terminateOwnedProcess(resolved.process, "SIGTERM");
+    reservation?.release();
     throw cliError({
       code: "DRY_RUN_HANDLE_UNSUPPORTED",
       message:
         "The compatibility runner returned a cancellable handle through a promise; return the handle synchronously so it can be registered before awaiting.",
     });
   }
+  reservation?.release();
   return resolved;
 }
 
@@ -4733,6 +4858,7 @@ async function runRemoteCommand(
   ownedProcesses: OwnedProcessRegistry,
   allowWhenStopping = false,
   onStarted?: () => void,
+  beforeStart?: () => void | Promise<void>,
 ): Promise<EdenCliRemoteCommandResult> {
   if (!allowWhenStopping && ownedProcesses.isStopping()) {
     throw cliError({
@@ -4742,13 +4868,29 @@ async function runRemoteCommand(
     });
   }
   const runner = options.remoteCommandRunner ?? runDefaultRemoteCommand;
-  const returned = runner(request);
+  const reservation = ownedProcesses.reserve();
+  let returned: EdenCliRemoteCommandReturn;
+  try {
+    await beforeStart?.();
+    if (!allowWhenStopping && ownedProcesses.isStopping()) {
+      throw cliError({
+        code: "DEPLOY_CANCELLED",
+        message:
+          "Eden deploy was cancelled before the remote command could start.",
+      });
+    }
+    returned = runner(request);
+  } catch (error: unknown) {
+    reservation.release();
+    throw error;
+  }
   if (isRemoteCommandHandle(returned)) {
-    onStarted?.();
     ownedProcesses.register(returned.process);
+    reservation.release();
+    onStarted?.();
     try {
       if (allowWhenStopping) {
-        return await Promise.race([
+        const result = await Promise.race([
           returned.result,
           new Promise<EdenCliRemoteCommandResult>((resolve) => {
             setTimeout(
@@ -4762,6 +4904,8 @@ async function runRemoteCommand(
             );
           }),
         ]);
+        await ownedProcesses.waitForQuiescence();
+        return result;
       }
       return await Promise.race([
         returned.result,
@@ -4779,40 +4923,102 @@ async function runRemoteCommand(
   }
   let resolved: EdenCliRemoteCommandResult | EdenCliRemoteCommandHandle;
   try {
-    resolved = await Promise.race([
-      Promise.resolve(returned),
-      ...(allowWhenStopping
-        ? []
-        : [
-            ownedProcesses.stopped.then((signal) => {
-              throw cliError({
-                code: "DEPLOY_CANCELLED",
-                message:
-                  `Eden deploy was cancelled by ${signal} before a remote command handle was registered.`,
-              });
-            }),
-          ]),
-    ]);
+    if (isPromiseLikeValue(returned)) {
+      resolved = await raceOwnedResult(
+        returned,
+        ownedProcesses,
+        "The remote command was cancelled before its result settled.",
+      );
+    } else {
+      resolved = returned;
+    }
   } catch (error: unknown) {
-    void Promise.resolve(returned)
-      .then((late) => {
-        if (isRemoteCommandHandle(late)) {
-          void terminateOwnedProcess(late.process, "SIGTERM");
-        }
-      })
-      .catch(() => undefined);
+    void settleLateChildResult(
+      Promise.resolve(returned),
+      reservation,
+      isRemoteCommandHandle,
+    );
     throw error;
   }
   if (isRemoteCommandHandle(resolved)) {
     await terminateOwnedProcess(resolved.process, "SIGTERM");
+    reservation.release();
     throw cliError({
       code: "REMOTE_COMMAND_HANDLE_UNSUPPORTED",
       message:
         "The remote command runner returned a cancellable handle through a promise; return the handle synchronously so it can be registered before awaiting.",
     });
   }
+  reservation.release();
   onStarted?.();
   return resolved;
+}
+
+async function runBoundedRemoteValidation(
+  validation: (
+    request: EdenCliRemoteValidationRequest,
+  ) => Promise<EdenCliRemoteValidationResult>,
+  request: EdenCliRemoteValidationRequest,
+  ownedProcesses: OwnedProcessRegistry,
+): Promise<EdenCliRemoteValidationResult> {
+  return await Promise.race([
+    validation(request),
+    ownedProcesses.stopped.then((signal) => {
+      throw cliError({
+        code: "DEPLOY_CANCELLED",
+        message:
+          `Eden deploy was cancelled by ${signal} before remote validation settled.`,
+      });
+    }),
+  ]);
+}
+
+async function settleLateChildResult<T>(
+  returned: PromiseLike<T>,
+  reservation: { readonly release: () => void } | undefined,
+  isHandle: (value: unknown) => value is {
+    readonly process: EdenCliProcess;
+  },
+): Promise<void> {
+  let resolved: T | undefined;
+  try {
+    resolved = await Promise.race([
+      Promise.resolve(returned),
+      new Promise<undefined>((resolve) => {
+        setTimeout(resolve, OWNED_PROCESS_TERMINATION_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    reservation?.release();
+    return;
+  }
+  if (resolved !== undefined && isHandle(resolved)) {
+    await terminateOwnedProcess(resolved.process, "SIGTERM");
+  }
+  reservation?.release();
+}
+
+function isPromiseLikeValue(value: unknown): value is PromiseLike<unknown> {
+  return typeof value === "object" && value !== null && "then" in value;
+}
+
+async function raceOwnedResult<T>(
+  result: T | PromiseLike<T>,
+  ownedProcesses: OwnedProcessRegistry | undefined,
+  cancellationMessage: string,
+): Promise<T> {
+  if (ownedProcesses === undefined) {
+    return await result;
+  }
+  return await Promise.race([
+    Promise.resolve(result),
+    ownedProcesses.stopped.then(() => {
+      throw cliError({
+        code: "DEPLOY_CANCELLED",
+        message: cancellationMessage,
+      });
+    }),
+  ]);
 }
 
 async function buildProjectFromCli(
@@ -4978,7 +5184,6 @@ async function buildProjectFromCli(
     await promoteCurrentGeneration(canonicalOutput, generationId);
     await assertArtifactDirectory(canonicalOutput);
     await options.buildPublicationHook?.("after-current-promotion");
-
     options.stdout?.(
       `Built Eden project generation ${generationId}.`,
     );
@@ -6437,6 +6642,24 @@ async function runDeploy(
     }
     await assertDeploymentLockOwned(lock);
   };
+  const assertDeploymentCompatibilityStable = async (): Promise<void> => {
+    assertDeploymentActive();
+    await assertDeploymentLockOwned(lock);
+    await assertBoundGeneration();
+    const currentRuntimeContents = await readRuntimeFileContents(runtimeFiles);
+    if (
+      currentRuntimeContents.config !== deploymentRuntimeContents.config ||
+      currentRuntimeContents.entry !== deploymentRuntimeContents.entry
+    ) {
+      throw cliError({
+        code: "DEPLOYMENT_SNAPSHOT_CHANGED",
+        message:
+          "The immutable deployment runtime snapshot changed; no stale remote mutation may continue.",
+        source: relative(root, temporaryConfig),
+      });
+    }
+    await assertDeploymentLockOwned(lock);
+  };
   const secret = options.remoteBearerSecret ?? process.env.EDEN_BEARER_SECRET;
   let secretProvisioned = false;
   let deploymentAttempted = false;
@@ -6453,17 +6676,28 @@ async function runDeploy(
       return runDefaultRemoteValidation(request, secret);
     });
   let deploymentFailure: unknown;
+  const deployBoundary = async (
+    boundary: EdenDeploymentBoundary,
+  ): Promise<void> => {
+    await options.deploymentBoundaryHook?.(boundary);
+    assertDeploymentActive();
+  };
   const runOwnedRemoteMutation = async (
     request: EdenCliRemoteCommandRequest,
     markStarted?: () => void,
   ): Promise<EdenCliRemoteCommandResult> => {
-    await assertDeploymentCandidateStable();
     const result = await runRemoteCommand(
       options,
       request,
       ownedValidationProcesses,
       false,
       markStarted,
+      async () => {
+        await options.deploymentBoundaryHook?.(
+          "before-remote-runner-invocation",
+        );
+        await assertDeploymentCandidateStable();
+      },
     );
     await assertDeploymentCandidateStable();
     return result;
@@ -6471,12 +6705,13 @@ async function runDeploy(
   const runOwnedRemoteCleanup = async (
     request: EdenCliRemoteCommandRequest,
   ): Promise<EdenCliRemoteCommandResult> => {
-    await assertDeploymentLockOwned(lock);
     const result = await runRemoteCommand(
       options,
       request,
       ownedValidationProcesses,
       true,
+      undefined,
+      () => assertDeploymentLockOwned(lock),
     );
     if (!ownedValidationProcesses.isStopping()) {
       await assertDeploymentLockOwned(lock);
@@ -6497,14 +6732,14 @@ async function runDeploy(
         temporaryConfig,
       ],
     };
-    await options.deploymentBoundaryHook?.("before-compatibility-dry-run");
-    assertDeploymentActive();
+    await deployBoundary("before-compatibility-dry-run");
     let dryRun: EdenCliDryRunResult;
     try {
       dryRun = await runCompatibilityDryRun(
         options,
         compatibilityRequest,
         ownedValidationProcesses,
+        () => assertDeploymentCompatibilityStable(),
       );
     } catch (error: unknown) {
       if (ownedValidationProcesses.isStopping()) {
@@ -6537,7 +6772,7 @@ async function runDeploy(
         }`,
       });
     }
-    await options.deploymentBoundaryHook?.("after-compatibility-dry-run");
+    await deployBoundary("after-compatibility-dry-run");
     await assertDeploymentCandidateStable();
     if (secret === undefined || secret.length === 0) {
       throw cliError({
@@ -6547,7 +6782,7 @@ async function runDeploy(
       });
     }
 
-    await options.deploymentBoundaryHook?.("before-secret-provision");
+    await deployBoundary("before-secret-provision");
     const putSecret = await runOwnedRemoteMutation(
       {
         kind: "secret-put",
@@ -6577,9 +6812,9 @@ async function runDeploy(
         }`,
       });
     }
-    await options.deploymentBoundaryHook?.("after-secret-provision");
+    await deployBoundary("after-secret-provision");
     await assertDeploymentCandidateStable();
-    await options.deploymentBoundaryHook?.("before-deploy");
+    await deployBoundary("before-deploy");
     const deployment = await runOwnedRemoteMutation(
       {
         kind: "deploy",
@@ -6608,8 +6843,7 @@ async function runDeploy(
         }`,
       });
     }
-    await options.deploymentBoundaryHook?.("after-deploy");
-    assertDeploymentActive();
+    await deployBoundary("after-deploy");
     deploymentUrl = findDeploymentUrl(
       `${deployment.stdout}\n${deployment.stderr}`,
     );
@@ -6620,17 +6854,19 @@ async function runDeploy(
           "The deployment tool completed without exposing a reachable workers.dev deployment URL.",
       });
     }
-    await options.deploymentBoundaryHook?.("before-remote-validation");
-    assertDeploymentActive();
-    const validation = await remoteValidate({
-      cwd: root,
-      environment,
-      workerName,
-      url: deploymentUrl,
-      expectedGeneration: runtimeGeneration,
-    });
-    await options.deploymentBoundaryHook?.("after-remote-validation");
-    assertDeploymentActive();
+    await deployBoundary("before-remote-validation");
+    const validation = await runBoundedRemoteValidation(
+      remoteValidate,
+      {
+        cwd: root,
+        environment,
+        workerName,
+        url: deploymentUrl,
+        expectedGeneration: runtimeGeneration,
+      },
+      ownedValidationProcesses,
+    );
+    await deployBoundary("after-remote-validation");
     if (!validation.ok) {
       throw cliError({
         code: validation.code ?? "REMOTE_VALIDATION_FAILED",

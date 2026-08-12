@@ -403,4 +403,73 @@ describe("eden remote deployment orchestration", () => {
     expect(validationCalled).toBe(false);
     expect(errors.join("\n")).toMatch(/source|configuration|changed|stale/i);
   });
+
+  test("rejects ownership mutation immediately before the remote runner starts", async () => {
+    const root = await createRoot();
+    const lockPath = join(root, ".eden-deploy.lock");
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    const errors: string[] = [];
+    let mutated = false;
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(
+        [
+          "deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eden-final-spawn-cas",
+        ],
+        {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+          dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+          deploymentBoundaryHook: async (boundary) => {
+            if (boundary !== "before-remote-runner-invocation" || mutated) {
+              return;
+            }
+            mutated = true;
+            const current = JSON.parse(await readFile(lockPath, "utf8")) as {
+              readonly kind: string;
+              readonly version: number;
+              readonly pid: number;
+              readonly startedAt: string;
+              readonly token: string;
+            };
+            await writeFile(
+              lockPath,
+              `${JSON.stringify({
+                ...current,
+                token: "final-spawn-replacement",
+              })}\n`,
+              "utf8",
+            );
+          },
+          remoteCommandRunner: async (request) => {
+            commands.push(request);
+            return {
+              exitCode: 0,
+              stdout: request.kind === "deploy"
+                ? "https://eden-final-spawn-cas.example.workers.dev\n"
+                : "",
+              stderr: "",
+            };
+          },
+          remoteValidationRunner: async () => ({ ok: true }),
+          remoteBearerSecret: "final-spawn-cas-secret",
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(commands).toEqual([]);
+    expect(errors.join("\n")).toMatch(/ownership|lock|replaced|changed/i);
+    await expect(readFile(lockPath, "utf8")).resolves.toContain(
+      "final-spawn-replacement",
+    );
+  });
 });
