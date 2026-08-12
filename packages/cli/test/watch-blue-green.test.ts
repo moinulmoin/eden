@@ -1,4 +1,5 @@
 import {
+  access,
   mkdtemp,
   readFile,
   readdir,
@@ -133,6 +134,165 @@ beforeEach(() => {
 });
 
 describe("eden dev watch blue-green replacement", () => {
+  test.each([
+    "before-runtime-entry-publish",
+    "after-runtime-entry-publish",
+    "before-runtime-config-publish",
+    "after-runtime-config-publish",
+    "after-runtime-ready",
+  ] as const)(
+    "stop guards late replacement publication at %s",
+    async (boundary) => {
+      const root = await createRoot();
+      await initRoot(root);
+      vi.stubEnv("EDEN_BEARER_SECRET", `watch-stop-${boundary}`);
+
+      let servedGeneration: Record<string, unknown> | undefined;
+      let initialGeneration: Record<string, unknown> | undefined;
+      let resolveDevReady: (() => void) | undefined;
+      const devReady = new Promise<void>((resolve) => {
+        resolveDevReady = resolve;
+      });
+      let spawnCount = 0;
+      let releaseExit: (() => void) | undefined;
+      const exitPromises: Array<Promise<{
+        readonly exitCode: number;
+        readonly signal: null;
+      }>> = [];
+      let replacementPublicationReached: (() => void) | undefined;
+      const publicationReached = new Promise<void>((resolve) => {
+        replacementPublicationReached = resolve;
+      });
+      let releasePublicationHook: (() => void) | undefined;
+      const errors: string[] = [];
+
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          if (servedGeneration === undefined) {
+            return new Response("not ready", { status: 503 });
+          }
+          return new Response(JSON.stringify({ generation: servedGeneration }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }),
+      );
+
+      const processRunner = {
+        spawn(request: EdenCliProcessRequest): EdenCliProcess {
+          spawnCount += 1;
+          const ownGeneration = {
+            value: undefined as Record<string, unknown> | undefined,
+          };
+          let resolveExit: (() => void) | undefined;
+          const exited = new Promise<{
+            readonly exitCode: number;
+            readonly signal: null;
+          }>((resolve) => {
+            resolveExit = () => resolve({ exitCode: 0, signal: null });
+          });
+          exitPromises.push(exited);
+          void generationFromRequest(root, request).then((generation) => {
+            ownGeneration.value = generation;
+            if (spawnCount === 1) {
+              initialGeneration = generation;
+              servedGeneration = generation;
+            } else {
+              servedGeneration = generation;
+            }
+          });
+          return {
+            pid: 45_500 + spawnCount,
+            startIdentity: `watch-stop-${boundary}-${spawnCount}`,
+            ready: Promise.resolve(),
+            exited,
+            async terminate() {
+              if (
+                ownGeneration.value !== undefined &&
+                servedGeneration === ownGeneration.value
+              ) {
+                servedGeneration = initialGeneration;
+              }
+              resolveExit?.();
+              releaseExit?.();
+            },
+          };
+        },
+      };
+
+      const devPromise = runEdenCli(["dev", "--project", root], {
+        cwd: root,
+        processRunner,
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+        runtimePublicationHook: async (observedBoundary) => {
+          if (observedBoundary !== boundary || spawnCount < 2) return;
+          replacementPublicationReached?.();
+          if (boundary === "after-runtime-ready") {
+            await new Promise<void>((resolve) => {
+              releasePublicationHook = resolve;
+            });
+          }
+          process.emit("SIGINT");
+        },
+        stderr: (line) => errors.push(line),
+        stdout: (line) => {
+          if (line.includes("Eden dev ready")) resolveDevReady?.();
+        },
+      });
+
+      try {
+        await devReady;
+        expect(initialGeneration?.generationId).toEqual(expect.any(String));
+        await writeFile(
+          join(root, "agent/tools/greet.ts"),
+          updatedToolSource(`stop at ${boundary}`),
+          "utf8",
+        );
+        await publicationReached;
+        if (boundary === "after-runtime-ready") {
+          process.emit("SIGINT");
+        }
+        await expect(
+          Promise.race([
+            devPromise,
+            new Promise<number>((resolve) => {
+              setTimeout(() => resolve(-1), 2_000);
+            }),
+          ]),
+        ).resolves.toBe(0);
+        await expect(access(join(root, ".eden-dev-state.json")))
+          .rejects.toMatchObject({ code: "ENOENT" });
+        await expect(
+          readdir(root).then((entries) =>
+            entries.filter((entry) =>
+              entry.includes("eden-dev-worker") ||
+              entry.includes("eden-dev-config"),
+            ),
+          ),
+        ).resolves.toEqual([]);
+        releasePublicationHook?.();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await expect(access(join(root, ".eden-dev-state.json")))
+          .rejects.toMatchObject({ code: "ENOENT" });
+        expect(errors.join("\n")).not.toMatch(/unhandled/i);
+        expect(exitPromises.length).toBeGreaterThanOrEqual(2);
+      } finally {
+        releasePublicationHook?.();
+        process.emit("SIGINT");
+        await Promise.race([
+          devPromise,
+          new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
+        ]);
+      }
+    },
+    15_000,
+  );
+
   test("proves a successful replacement through authenticated live info", async () => {
     const root = await createRoot();
     await initRoot(root);
@@ -312,6 +472,7 @@ describe("eden dev watch blue-green replacement", () => {
     const processRunner = {
       spawn(request: EdenCliProcessRequest): EdenCliProcess {
         spawnCount += 1;
+        const spawnIndex = spawnCount;
         const ownGeneration = {
           value: undefined as Record<string, unknown> | undefined,
         };
@@ -329,11 +490,11 @@ describe("eden dev watch blue-green replacement", () => {
         void generationFromRequest(root, request)
           .then((generation) => {
             ownGeneration.value = generation;
-            if (spawnCount === 1) {
+            if (spawnIndex === 1) {
               initialGeneration = generation;
               servedGeneration = generation;
               resolveDevReady?.();
-            } else if (spawnCount === 2) {
+            } else if (spawnIndex === 2) {
               replacementProbe = true;
             } else {
               replacementProbe = false;
@@ -588,6 +749,7 @@ describe("eden dev watch blue-green replacement", () => {
     const processRunner = {
       spawn(request: EdenCliProcessRequest): EdenCliProcess {
         spawnCount += 1;
+        const spawnIndex = spawnCount;
         const ownGeneration = {
           value: undefined as Record<string, unknown> | undefined,
         };
@@ -604,7 +766,6 @@ describe("eden dev watch blue-green replacement", () => {
             if (spawnCount === 1) {
               initialGeneration = generation;
               servedGeneration = generation;
-              resolveDevReady?.();
             } else {
               servedGeneration = generation;
             }
@@ -613,8 +774,8 @@ describe("eden dev watch blue-green replacement", () => {
             console.error("watch rollback-race fixture failed", error);
           });
         const processHandle: EdenCliProcess = {
-          pid: 45_300 + spawnCount,
-          startIdentity: `watch-rollback-race-${spawnCount}`,
+          pid: 45_300 + spawnIndex,
+          startIdentity: `watch-rollback-race-${spawnIndex}`,
           ready: Promise.resolve(),
           exited,
           async terminate() {

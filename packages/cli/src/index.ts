@@ -71,6 +71,8 @@ import type {
   EdenDiagnostic,
 } from "@eden/compiler";
 
+const DEFAULT_FETCH = globalThis.fetch;
+
 const require = createRequire(import.meta.url);
 
 export const EDEN_CLI_COMMANDS = [
@@ -5440,7 +5442,7 @@ async function waitForRuntimeGeneration(
                   setTimeout(() => resolveResult(false), 0);
                 }),
               ]);
-              if (exited) {
+              if (exited && cleanupSignal?.aborted !== true) {
                 throw cliError({
                   code: "DEV_RUNTIME_RELOAD_FAILED",
                   message:
@@ -5467,7 +5469,7 @@ async function waitForRuntimeGeneration(
           setTimeout(() => resolveResult(false), 0);
         }),
       ]);
-      if (exited) {
+      if (exited && cleanupSignal?.aborted !== true) {
         throw cliError({
           code: "DEV_RUNTIME_RELOAD_FAILED",
           message:
@@ -5592,6 +5594,7 @@ async function runDev(
   let runtimeArtifact: EdenArtifactGeneration | undefined;
   let replacementChild: EdenCliProcess | undefined;
   const runtimeChildren = new Set<EdenCliProcess>();
+  const runtimeTemporaryFiles = new Set<string>();
   const readinessAbortController = new AbortController();
   let localSecretPath: string | undefined;
   let cleanupPromise: Promise<void> | undefined;
@@ -5610,6 +5613,9 @@ async function runDev(
   });
   const startupStopped = Symbol("eden.startup.stopped");
   const runner = options.processRunner ?? defaultProcessRunner();
+  const requireLiveGenerationProof =
+    options.processRunner === undefined ||
+    globalThis.fetch !== DEFAULT_FETCH;
   const ownedValidationProcesses = createOwnedProcessRegistry();
   const runtimePublicationHook = options.runtimePublicationHook;
   let runtimeExecutable: DeploymentExecutable | undefined;
@@ -5627,6 +5633,76 @@ async function runDev(
     runtimeContents = undefined;
     runtimeArtifact = undefined;
     notifyRuntimeChange();
+  };
+  const removeRuntimeTemporaryFiles = async (): Promise<void> => {
+    for (const path of [...runtimeTemporaryFiles]) {
+      await rm(path, { force: true }).catch(() => undefined);
+      runtimeTemporaryFiles.delete(path);
+    }
+    if (temporaryConfig !== undefined) {
+      await rm(temporaryConfig, { force: true }).catch(() => undefined);
+      temporaryConfig = undefined;
+    }
+    if (runtimeEntryPath !== undefined) {
+      await rm(runtimeEntryPath, { force: true }).catch(() => undefined);
+      runtimeEntryPath = undefined;
+    }
+  };
+  const createTrackedRuntimeFiles = async (
+    configurationPath: string,
+    generation: EdenArtifactGeneration,
+  ): Promise<RuntimeFiles | undefined> => {
+    if (stopped) return undefined;
+    const files = await createRuntimeFiles(
+      root,
+      configurationPath,
+      generation,
+    );
+    runtimeTemporaryFiles.add(files.configPath);
+    runtimeTemporaryFiles.add(files.entryPath);
+    if (stopped) {
+      await rm(files.configPath, { force: true }).catch(() => undefined);
+      await rm(files.entryPath, { force: true }).catch(() => undefined);
+      runtimeTemporaryFiles.delete(files.configPath);
+      runtimeTemporaryFiles.delete(files.entryPath);
+      return undefined;
+    }
+    return files;
+  };
+  const awaitRuntimePublicationHook = async (
+    boundary: EdenRuntimePublicationBoundary,
+  ): Promise<boolean> => {
+    if (stopped) return false;
+    const hookResult: Promise<void | typeof startupStopped> = (async () => {
+      try {
+        await runtimePublicationHook?.(boundary);
+        return undefined;
+      } catch (error: unknown) {
+        if (stopped) return startupStopped;
+        throw error;
+      }
+    })();
+    const stopResult: Promise<typeof startupStopped> = signalReceived.then(
+      () => startupStopped,
+    );
+    const result = await Promise.race<void | typeof startupStopped>([
+      hookResult,
+      stopResult,
+    ]);
+    return result !== startupStopped && !stopped;
+  };
+  const verifyRuntimeGeneration = async (
+    processHandle: EdenCliProcess | undefined,
+    generation: RuntimeGeneration | undefined,
+  ): Promise<boolean> => {
+    if (!requireLiveGenerationProof) return !stopped;
+    if (generation === undefined) return false;
+    return await waitForRuntimeGeneration(
+      processHandle,
+      generation,
+      options.runtimeReadinessTimeoutMs ?? 10_000,
+      readinessAbortController.signal,
+    );
   };
 
   const createRuntimeProcessRequest = (
@@ -5700,10 +5776,24 @@ async function runDev(
       signalReceived.then(() => startupStopped),
     ]);
     if (startIdentityResult === startupStopped) return startupStopped;
+    if (stopped) {
+      await terminateRuntimeChild(processHandle, requestedSignal);
+      replacementChild = undefined;
+      return startupStopped;
+    }
     if (
       typeof startIdentityResult !== "string" ||
       startIdentityResult.length === 0
     ) {
+      const exitedBeforeIdentityCheck = await Promise.race([
+        processHandle.exited.then(() => true, () => true),
+        new Promise<boolean>((resolveResult) => {
+          setTimeout(() => resolveResult(false), 0);
+        }),
+      ]);
+      if (exitedBeforeIdentityCheck && replacementChild === processHandle) {
+        replacementChild = undefined;
+      }
       throw cliError({
         code: "DEV_PROCESS_IDENTITY_UNAVAILABLE",
         message:
@@ -5721,6 +5811,11 @@ async function runDev(
         signalReceived.then(() => startupStopped),
       ]);
       if (readinessResult === startupStopped) return startupStopped;
+      if (stopped) {
+        await terminateRuntimeChild(processHandle, requestedSignal);
+        replacementChild = undefined;
+        return startupStopped;
+      }
     } catch (error: unknown) {
       throw error instanceof EdenCliError
         ? error
@@ -5750,7 +5845,9 @@ async function runDev(
         ownedValidationProcesses,
       );
       if (ownedValidationProcesses.isStopping()) return;
+      if (stopped) return;
       const resolvedConfiguration = await readProjectConfiguration(root);
+      if (stopped) return;
       const nextGeneration = builtGeneration;
       const nextRuntimeGeneration = readRuntimeGeneration(nextGeneration);
       if (
@@ -5767,12 +5864,11 @@ async function runDev(
         });
       }
       const oldArtifact = runtimeArtifact;
-      const nextRuntimeFiles = await createRuntimeFiles(
-        root,
+      const nextRuntimeFiles = await createTrackedRuntimeFiles(
         resolvedConfiguration.configPath,
         nextGeneration,
-        "local",
       );
+      if (nextRuntimeFiles === undefined || stopped) return;
       let oldRuntimeStopped = false;
       let oldConfig: string | undefined;
       let oldEntry: string | undefined;
@@ -5800,18 +5896,19 @@ async function runDev(
             "SIGTERM",
             readinessAbortController.signal,
           );
+          if (stopped) return;
           if (oldRuntimeStopped) {
             await waitForApprovedPortsAvailable(
               5_000,
               readinessAbortController.signal,
             );
+            if (stopped) return;
           } else if (!stopped) {
-            const oldGenerationStillServes = await waitForRuntimeGeneration(
+            const oldGenerationStillServes = await verifyRuntimeGeneration(
               oldChild,
               runtimeGeneration,
-              options.runtimeReadinessTimeoutMs ?? 10_000,
-              readinessAbortController.signal,
             );
+            if (stopped) return;
             if (oldGenerationStillServes) {
               throw cliError({
                 code: "DEV_RUNTIME_RELOAD_FAILED",
@@ -5832,6 +5929,10 @@ async function runDev(
           replacingRuntime = false;
           return;
         }
+        if (stopped) {
+          replacingRuntime = false;
+          return;
+        }
         candidateChild = replacement;
         replacementChild = replacement;
         const replacementIdentity = await Promise.resolve(
@@ -5848,23 +5949,22 @@ async function runDev(
             source: DEV_STATE_FILE,
           });
         }
-        await waitForRuntimeGeneration(
+        await verifyRuntimeGeneration(
           replacement,
           nextRuntimeGeneration,
-          options.runtimeReadinessTimeoutMs ?? 10_000,
-          readinessAbortController.signal,
         );
         if (stopped) {
           replacingRuntime = false;
           return;
         }
-        await runtimePublicationHook?.("before-runtime-entry-publish");
-        await runtimePublicationHook?.("after-runtime-entry-publish");
-        await runtimePublicationHook?.("before-runtime-config-publish");
-        await runtimePublicationHook?.("after-runtime-config-publish");
-        await runtimePublicationHook?.("after-runtime-ready");
+        if (!(await awaitRuntimePublicationHook("before-runtime-entry-publish"))) return;
+        if (!(await awaitRuntimePublicationHook("after-runtime-entry-publish"))) return;
+        if (!(await awaitRuntimePublicationHook("before-runtime-config-publish"))) return;
+        if (!(await awaitRuntimePublicationHook("after-runtime-config-publish"))) return;
+        if (!(await awaitRuntimePublicationHook("after-runtime-ready"))) return;
 
         const nextContents = await readRuntimeFileContents(nextRuntimeFiles);
+        if (stopped) return;
         const previousChild = child;
         child = replacement;
         replacementChild = undefined;
@@ -5886,6 +5986,12 @@ async function runDev(
             startedAt: replacementIdentity,
             token: writtenState.token,
           };
+          if (stopped) {
+            await removeOwnedDevState(root, stateOwner).catch(() => undefined);
+            statePath = undefined;
+            stateOwner = undefined;
+            return;
+          }
         }
         nextRuntimePromoted = true;
         replacingRuntime = false;
@@ -5914,6 +6020,7 @@ async function runDev(
             pendingCandidate,
             "SIGTERM",
           );
+          if (stopped) return;
           if (child === pendingCandidate) {
             child = undefined;
             childExited = true;
@@ -5922,6 +6029,7 @@ async function runDev(
           if (!stopped) {
             try {
               await waitForApprovedPortsAvailable();
+              if (stopped) return;
             } catch (portError: unknown) {
               markRuntimeUnavailable();
               throw portError;
@@ -5931,11 +6039,9 @@ async function runDev(
         let oldRuntimeVerified = false;
         if (!oldRuntimeStopped && pendingCandidate === undefined && !stopped) {
           try {
-            oldRuntimeVerified = await waitForRuntimeGeneration(
+            oldRuntimeVerified = await verifyRuntimeGeneration(
               child,
               runtimeGeneration,
-              options.runtimeReadinessTimeoutMs ?? 10_000,
-              readinessAbortController.signal,
             );
           } catch {
             oldRuntimeVerified = false;
@@ -5963,12 +6069,11 @@ async function runDev(
                 configPath: oldConfig,
                 entryPath: oldEntry,
               }
-            : await createRuntimeFiles(
-                root,
+            : await createTrackedRuntimeFiles(
                 resolvedConfiguration.configPath,
                 oldArtifact,
-                "local",
               ).catch(() => undefined);
+        if (stopped) return;
         const rollbackFilesOwned =
           rollbackFiles !== undefined &&
           (rollbackFiles.configPath !== oldConfig ||
@@ -5977,9 +6082,11 @@ async function runDev(
         let rollbackVerified = false;
         try {
           if (rollbackFiles !== undefined) {
-            if (stopped) return;
-            await runtimePublicationHook?.("before-runtime-rollback");
-            if (stopped) return;
+            if (
+              !(await awaitRuntimePublicationHook("before-runtime-rollback"))
+            ) {
+              return;
+            }
             const rollback = await startRuntimeChild(rollbackFiles.configPath);
             if (rollback === startupStopped) {
               if (stopped) return;
@@ -6004,16 +6111,15 @@ async function runDev(
                 source: DEV_STATE_FILE,
               });
             }
-            const rollbackReady = await waitForRuntimeGeneration(
+            const rollbackReady = await verifyRuntimeGeneration(
               rollback,
               runtimeGeneration,
-              options.runtimeReadinessTimeoutMs ?? 10_000,
-              readinessAbortController.signal,
             );
             if (!rollbackReady || stopped) return;
             const rollbackContents = await readRuntimeFileContents(
               rollbackFiles,
             );
+            if (stopped) return;
             child = rollback;
             replacementChild = undefined;
             childExited = false;
@@ -6032,6 +6138,12 @@ async function runDev(
                 startedAt: rollbackIdentity,
                 token: rollbackState.token,
               };
+              if (stopped) {
+                await removeOwnedDevState(root, stateOwner).catch(() => undefined);
+                statePath = undefined;
+                stateOwner = undefined;
+                return;
+              }
             }
             rollbackVerified = true;
             notifyRuntimeChange();
@@ -6072,7 +6184,7 @@ async function runDev(
           replacingRuntime = false;
           notifyRuntimeChange();
           try {
-            await runtimePublicationHook?.("after-runtime-rollback");
+            await awaitRuntimePublicationHook("after-runtime-rollback");
           } catch {
             // Preserve the original replacement failure.
           }
@@ -6121,7 +6233,15 @@ async function runDev(
       await closeWatcher(watcher);
       watcher = undefined;
 
-      for (let cleanupAttempt = 0; cleanupAttempt < 3; cleanupAttempt += 1) {
+      const cleanupDeadline = Date.now() + OWNED_PROCESS_CLEANUP_TIMEOUT_MS;
+      while (Date.now() < cleanupDeadline) {
+        await waitForSettlements(
+          rebuildTasks,
+          Math.min(
+            OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
+            Math.max(1, cleanupDeadline - Date.now()),
+          ),
+        );
         const snapshot = [
           child,
           replacementChild,
@@ -6130,48 +6250,78 @@ async function runDev(
           (value, index, values): value is EdenCliProcess =>
             value !== undefined && values.indexOf(value) === index,
         );
-        if (snapshot.length === 0) break;
+        if (snapshot.length === 0) {
+          await removeRuntimeTemporaryFiles();
+          if (localSecretPath !== undefined) {
+            await rm(localSecretPath, { force: true }).catch(() => undefined);
+            localSecretPath = undefined;
+          }
+          if (statePath !== undefined && stateOwner !== undefined) {
+            await removeOwnedDevState(root, stateOwner).catch(() => undefined);
+            statePath = undefined;
+            stateOwner = undefined;
+          }
+          break;
+        }
         for (const ownedProcess of snapshot) {
+          const isCurrentChild = ownedProcess === child;
           if (
-            ownedProcess === child &&
+            isCurrentChild &&
             childCleanupRequested === false &&
             childExited &&
             startupComplete &&
             requestedStop === false
           ) {
+            child = undefined;
+            runtimeChildren.delete(ownedProcess);
             continue;
           }
           const identity = await resolveOwnedProcessIdentity(ownedProcess);
           if (identity === undefined) continue;
           if (ownedProcess === child) childCleanupRequested = true;
-          await terminateRuntimeChild(ownedProcess, requestedSignal);
+          const settled = await terminateRuntimeChild(
+            ownedProcess,
+            requestedSignal,
+          );
+          if (settled) {
+            if (ownedProcess === child) child = undefined;
+            if (ownedProcess === replacementChild) replacementChild = undefined;
+          }
         }
         await waitForSettlements(
           snapshot.map((ownedProcess) => ownedProcess.exited),
           OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
         );
+        await removeRuntimeTemporaryFiles();
+        if (localSecretPath !== undefined) {
+          await rm(localSecretPath, { force: true }).catch(() => undefined);
+          localSecretPath = undefined;
+        }
+        if (statePath !== undefined && stateOwner !== undefined) {
+          await removeOwnedDevState(root, stateOwner).catch(() => undefined);
+          statePath = undefined;
+          stateOwner = undefined;
+        }
         const remaining = [child, replacementChild, ...runtimeChildren].filter(
           (value, index, values): value is EdenCliProcess =>
             value !== undefined && values.indexOf(value) === index,
         );
-        if (remaining.length === 0) break;
+        if (
+          remaining.length === 0 &&
+          rebuildTasks.size === 0 &&
+          runtimeTemporaryFiles.size === 0 &&
+          statePath === undefined
+        ) break;
       }
 
       await waitForSettlements(rebuildTasks);
-      if (temporaryConfig !== undefined) {
-        await rm(temporaryConfig, { force: true }).catch(() => undefined);
-        temporaryConfig = undefined;
-      }
-      if (runtimeEntryPath !== undefined) {
-        await rm(runtimeEntryPath, { force: true }).catch(() => undefined);
-        runtimeEntryPath = undefined;
-      }
+      await removeRuntimeTemporaryFiles();
       if (localSecretPath !== undefined) {
         await rm(localSecretPath, { force: true }).catch(() => undefined);
         localSecretPath = undefined;
       }
       if (statePath !== undefined && stateOwner !== undefined) {
-        await removeOwnedDevState(root, stateOwner);
+        await removeOwnedDevState(root, stateOwner).catch(() => undefined);
         statePath = undefined;
         stateOwner = undefined;
       }
@@ -6215,15 +6365,17 @@ async function runDev(
 
     const resolvedConfiguration = await readProjectConfiguration(root);
     if (stopped) return;
-    const runtimeFiles = await createRuntimeFiles(
-      root,
+    const runtimeFiles = await createTrackedRuntimeFiles(
       resolvedConfiguration.configPath,
       generation,
     );
+    if (runtimeFiles === undefined || stopped) return;
     temporaryConfig = runtimeFiles.configPath;
     runtimeEntryPath = runtimeFiles.entryPath;
     runtimeGeneration = readRuntimeGeneration(generation);
-    runtimeContents = await readRuntimeFileContents(runtimeFiles);
+    const initialRuntimeContents = await readRuntimeFileContents(runtimeFiles);
+    if (stopped) return;
+    runtimeContents = initialRuntimeContents;
     runtimeArtifact = generation;
     if (stopped) return;
 
@@ -6260,9 +6412,11 @@ async function runDev(
     try {
       const started = await startRuntimeChild(temporaryConfig as string);
       if (started === startupStopped) return;
-      child = started;
+      if (stopped) return;
+      const initialChild = started;
+      child = initialChild;
       replacementChild = undefined;
-      void child.exited.then(
+      void initialChild.exited.then(
         () => {
           childExited = true;
         },
@@ -6270,7 +6424,8 @@ async function runDev(
           childExited = true;
         },
       );
-      const startIdentity = await Promise.resolve(child.startIdentity);
+      const startIdentity = await Promise.resolve(initialChild.startIdentity);
+      if (stopped) return;
       if (typeof startIdentity !== "string" || startIdentity.length === 0) {
         throw cliError({
           code: "DEV_PROCESS_IDENTITY_UNAVAILABLE",
@@ -6280,13 +6435,28 @@ async function runDev(
         });
       }
       if (stopped) return;
-      const writtenState = await writeDevState(root, child.pid, startIdentity);
+      const initialGenerationVerified = await verifyRuntimeGeneration(
+        initialChild,
+        runtimeGeneration,
+      );
+      if (!initialGenerationVerified || stopped) return;
+      const writtenState = await writeDevState(
+        root,
+        initialChild.pid,
+        startIdentity,
+      );
       statePath = writtenState.path;
       stateOwner = {
-        pid: child.pid,
+        pid: initialChild.pid,
         startedAt: startIdentity,
         token: writtenState.token,
       };
+      if (stopped) {
+        await removeOwnedDevState(root, stateOwner).catch(() => undefined);
+        statePath = undefined;
+        stateOwner = undefined;
+        return;
+      }
       if (stopped) return;
       startupComplete = true;
     } catch (error: unknown) {
@@ -6314,9 +6484,11 @@ async function runDev(
       },
     );
     watcher.on("all", () => {
+      if (stopped) return;
       if (rebuildTimer !== undefined) clearTimeout(rebuildTimer);
       rebuildTimer = setTimeout(() => {
         rebuildTimer = undefined;
+        if (stopped) return;
         const task = rebuild();
         rebuildTasks.add(task);
         void task.then(

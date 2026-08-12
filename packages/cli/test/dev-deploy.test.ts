@@ -2,6 +2,7 @@ import {
   createHash,
 } from "crypto";
 import {
+  access,
   mkdtemp,
   readdir,
   readFile,
@@ -95,6 +96,7 @@ async function waitForDigestChange(
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -106,6 +108,173 @@ beforeEach(() => {
 
 
 describe("eden dev and deploy orchestration", () => {
+  test("authenticates the exact initial generation before state and readiness publication", async () => {
+    const root = await createRoot("eden-cli-dev-initial-info-");
+    await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "initial-info-secret");
+    const statePath = join(root, ".eden-dev-state.json");
+    const observations: string[] = [];
+    let servedGeneration: Record<string, unknown> | undefined;
+    let resolveReady: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    let releaseExit: (() => void) | undefined;
+    const exited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseExit = () => resolve({ exitCode: 0, signal: null });
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const headers = new Headers(init?.headers);
+        observations.push(
+          `fetch:${String(input)}:${headers.get("authorization") ?? ""}`,
+        );
+        if (servedGeneration === undefined) {
+          return new Response("not ready", { status: 503 });
+        }
+        const statePublished = await access(statePath)
+          .then(() => true)
+          .catch(() => false);
+        observations.push(`state:${statePublished ? "present" : "absent"}`);
+        return new Response(JSON.stringify({ generation: servedGeneration }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      processRunner: {
+        spawn(request: EdenCliProcessRequest) {
+          void generationFromRequestForDevTest(root, request).then((generation) => {
+            servedGeneration = generation;
+            resolveReady?.();
+          });
+          return {
+            pid: 41_017,
+            startIdentity: "initial-info-runtime",
+            ready,
+            exited,
+            async terminate() {
+              releaseExit?.();
+            },
+          };
+        },
+      },
+      dryRunRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      }),
+    });
+
+    await new Promise<void>((resolve) => {
+      const check = (): void => {
+        if (
+          observations.some((value) => value === "state:absent") &&
+          observations.some((value) => value.startsWith("fetch:"))
+        ) {
+          resolve();
+          return;
+        }
+        setTimeout(check, 10);
+      };
+      check();
+    });
+    expect(observations).toContain(
+      "fetch:http://127.0.0.1:8797/eden/v1/info:Bearer initial-info-secret",
+    );
+    expect(observations).toContain("state:absent");
+
+    process.emit("SIGINT");
+    await expect(devPromise).resolves.toBe(0);
+  });
+
+  test("fails closed and cleans the child when the initial runtime exposes a wrong generation", async () => {
+    const root = await createRoot("eden-cli-dev-initial-wrong-generation-");
+    await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "initial-wrong-generation-secret");
+    const errors: string[] = [];
+    const signals: NodeJS.Signals[] = [];
+    let releaseExit: (() => void) | undefined;
+    const exited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseExit = () => resolve({ exitCode: 0, signal: null });
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            generation: {
+              generationId: "gen_wrong_initial_generation",
+              bundleDigest: "wrong-bundle",
+              manifestVersion: "wrong-manifest",
+              runtimeVersion: "wrong-runtime",
+              agentBundleVersion: "wrong-agent",
+              protocolVersion: "wrong-protocol",
+              schemaVersion: 999,
+              toolNames: ["wrong-tool"],
+            },
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      ),
+    );
+
+    await expect(
+      runEdenCli(["dev", "--project", root], {
+        cwd: root,
+        runtimeReadinessTimeoutMs: 100,
+        stderr: (line) => errors.push(line),
+        processRunner: {
+          spawn() {
+            return {
+              pid: 41_018,
+              startIdentity: "initial-wrong-generation-runtime",
+              ready: Promise.resolve(),
+              exited,
+              async terminate(signal?: NodeJS.Signals) {
+                if (signal !== undefined) signals.push(signal);
+                releaseExit?.();
+              },
+            };
+          },
+        },
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+      }),
+    ).resolves.toBe(1);
+
+    expect(signals).toContain("SIGTERM");
+    expect(errors.join("\n")).toMatch(/generation|ready|reload/i);
+    await expect(readFile(join(root, ".eden-dev-state.json"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      readdir(root).then((entries) =>
+        entries.filter((entry) =>
+          entry.includes("eden-dev-worker") ||
+          entry.includes("eden-dev-config"),
+        ),
+      ),
+    ).resolves.toEqual([]);
+  });
+
   test("builds before spawning only the approved local runtime and cleans the owned child", async () => {
     const root = await createRoot("eden-cli-dev-");
     await initRoot(root);
@@ -1316,13 +1485,17 @@ export default greet;
         new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 3_000)),
       ]);
       expect(attempted).toBeDefined();
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await vi.waitFor(
+        () => {
+          expect(errors.join("\n")).toMatch(/watch rebuild unavailable|replacement/i);
+        },
+        { timeout: 3_000 },
+      );
 
       await expect(readFile(configPath as string, "utf8")).resolves.toBe(
         configBefore,
       );
       await expect(readFile(entryPath, "utf8")).resolves.toBe(entryBefore);
-      expect(errors.join("\n")).toMatch(/watch rebuild unavailable|replacement/i);
     } finally {
       releases.forEach((release) => release());
       await expect(devPromise).resolves.toBe(0);
