@@ -24,7 +24,7 @@ import {
   join,
 } from "path";
 
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { readArtifactGeneration } from "@eden/compiler";
 import {
@@ -59,6 +59,26 @@ async function artifactDigest(root: string): Promise<string> {
     .digest("hex");
 }
 
+async function generationFromRequestForDevTest(
+  root: string,
+  request: EdenCliProcessRequest,
+): Promise<Record<string, unknown>> {
+  const configIndex = request.args.indexOf("--config");
+  const configPath = request.args[configIndex + 1];
+  if (configPath === undefined) throw new Error("missing dev config path");
+  const config = await readFile(configPath, "utf8");
+  const main = /"main"\s*:\s*"([^"]+)"/u.exec(config)?.[1];
+  if (main === undefined) throw new Error("missing dev runtime entry");
+  const entry = await readFile(join(root, main), "utf8");
+  const marker = "configureEdenArtifact(agentArtifact, ";
+  const start = entry.indexOf(marker);
+  const end = entry.indexOf(");\nexport", start + marker.length);
+  if (start < 0 || end < 0) throw new Error("missing dev generation marker");
+  return JSON.parse(
+    entry.slice(start + marker.length, end),
+  ) as Record<string, unknown>;
+}
+
 async function waitForDigestChange(
   root: string,
   previous: string,
@@ -79,6 +99,11 @@ afterEach(async () => {
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
 });
+
+beforeEach(() => {
+  vi.stubEnv("EDEN_BEARER_SECRET", "dev-test-secret");
+});
+
 
 describe("eden dev and deploy orchestration", () => {
   test("builds before spawning only the approved local runtime and cleans the owned child", async () => {
@@ -214,6 +239,41 @@ describe("eden dev and deploy orchestration", () => {
 
     expect(terminated).toBe(false);
     expect(errors.join("\n")).toMatch(/identity|verif/i);
+  });
+
+  test("fails closed before local readiness when no bearer can authenticate generation verification", async () => {
+    const root = await createRoot("eden-cli-dev-missing-bearer-");
+    await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "");
+    const errors: string[] = [];
+    let spawned = false;
+
+    await expect(
+      runEdenCli(["dev", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        processRunner: {
+          spawn() {
+            spawned = true;
+            return {
+              pid: 41_016,
+              startIdentity: "fixture-missing-bearer",
+              ready: Promise.resolve(),
+              exited: Promise.resolve({ exitCode: 0, signal: null }),
+              async terminate() {},
+            };
+          },
+        },
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+      }),
+    ).resolves.toBe(1);
+
+    expect(errors.join("\n")).toMatch(/bearer|authenticat|generation/i);
+    expect(spawned).toBe(false);
   });
 
   test("removes the local secret file when startup fails after creation", async () => {
@@ -838,6 +898,19 @@ export default {
   test("keeps the last coherent generation when a watch rebuild fails", async () => {
     const root = await createRoot("eden-cli-dev-watch-");
     await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "watch-last-good-secret");
+    let servedGeneration: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        servedGeneration === undefined
+          ? new Response("not ready", { status: 503 })
+          : new Response(JSON.stringify({ generation: servedGeneration }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+      ),
+    );
     const initialDigest = await (async () => {
       const result = await runEdenCli(["build", "--project", root], {
         cwd: root,
@@ -851,22 +924,32 @@ export default {
       return artifactDigest(root);
     })();
 
-    let release: (() => void) | undefined;
-    const exited = new Promise<{ readonly exitCode: number; readonly signal: null }>(
-      (resolve) => {
-        release = () => resolve({ exitCode: 0, signal: null });
-      },
-    );
     const spawned: EdenCliProcessRequest[] = [];
+    const releases: Array<() => void> = [];
     const dryRuns: EdenCliDryRunRequest[] = [];
     const devPromise = runEdenCli(["dev", "--project", root], {
       cwd: root,
       processRunner: {
         spawn(request: EdenCliProcessRequest) {
           spawned.push(request);
+          let release: (() => void) | undefined;
+          const exited = new Promise<{
+            readonly exitCode: number;
+            readonly signal: null;
+          }>((resolve) => {
+            release = () => resolve({ exitCode: 0, signal: null });
+          });
+          releases.push(() => release?.());
+          const generationReady = generationFromRequestForDevTest(
+            root,
+            request,
+          ).then((generation) => {
+            servedGeneration = generation;
+          });
           return {
-            pid: 41_004,
+            pid: 41_004 + spawned.length,
             startIdentity: "fixture-start",
+            ready: generationReady,
             exited,
             async terminate() {
               release?.();
@@ -950,13 +1033,26 @@ export default greet;
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(dryRuns.length).toBeGreaterThanOrEqual(1);
     expect(await waitForDigestChange(root, initialDigest)).not.toBe(initialDigest);
-    release?.();
+    releases.forEach((release) => release());
     await expect(devPromise).resolves.toBe(0);
   }, 10_000);
 
   test("updates the running Wrangler runtime when a watch generation succeeds", async () => {
     const root = await createRoot("eden-cli-dev-watch-runtime-swap-");
     await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "watch-runtime-swap-secret");
+    let servedGeneration: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        servedGeneration === undefined
+          ? new Response("not ready", { status: 503 })
+          : new Response(JSON.stringify({ generation: servedGeneration }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+      ),
+    );
     const spawned: EdenCliProcessRequest[] = [];
     const releases: Array<() => void> = [];
     let resolveReady: (() => void) | undefined;
@@ -1006,6 +1102,12 @@ export default greet;
             })();
           }, 20);
           pollers.add(poller);
+          const generationReady = generationFromRequestForDevTest(
+            root,
+            request,
+          ).then((generation) => {
+            servedGeneration = generation;
+          });
           const exited = new Promise<{
             readonly exitCode: number;
             readonly signal: null;
@@ -1015,7 +1117,7 @@ export default greet;
           return {
             pid: 42_101 + spawned.length,
             startIdentity: `fixture-runtime-${spawned.length}`,
-            ready: Promise.resolve(),
+            ready: generationReady,
             exited,
             async terminate() {
               releases.splice(0).forEach((release) => release());
@@ -1079,6 +1181,19 @@ export default greet;
   test("keeps the previous runtime files when runtime replacement fails", async () => {
     const root = await createRoot("eden-cli-dev-watch-runtime-fallback-");
     await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "watch-runtime-fallback-secret");
+    let servedGeneration: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        servedGeneration === undefined
+          ? new Response("not ready", { status: 503 })
+          : new Response(JSON.stringify({ generation: servedGeneration }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+      ),
+    );
     await expect(
       runEdenCli(["build", "--project", root], {
         cwd: root,
@@ -1110,6 +1225,12 @@ export default greet;
           if (configPath === undefined) {
             configPath = request.args[configIndex + 1] as string;
           }
+          const generationReady = generationFromRequestForDevTest(
+            root,
+            request,
+          ).then((generation) => {
+            servedGeneration = generation;
+          });
           let release: (() => void) | undefined;
           const exited = new Promise<{
             readonly exitCode: number;
@@ -1121,7 +1242,7 @@ export default greet;
           return {
             pid: 42_102,
             startIdentity: "fixture-runtime-fallback",
-            ready: Promise.resolve(),
+            ready: generationReady,
             exited,
             async terminate() {
               release?.();

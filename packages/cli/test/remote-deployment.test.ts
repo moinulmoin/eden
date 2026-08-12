@@ -275,6 +275,7 @@ describe("eden remote deployment orchestration", () => {
   test("rejects a promise-returned remote handle before awaiting it", async () => {
     const root = await createRoot();
     let terminateCount = 0;
+    const errors: string[] = [];
     let resolveResult: (() => void) | undefined;
     const result = new Promise<{
       readonly exitCode: number;
@@ -304,6 +305,7 @@ describe("eden remote deployment orchestration", () => {
         ],
         {
           cwd: root,
+          stderr: (line) => errors.push(line),
           dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
           remoteCommandRunner: async () => ({
             process: {
@@ -323,6 +325,8 @@ describe("eden remote deployment orchestration", () => {
     ).resolves.toBe(1);
 
     expect(terminateCount).toBeGreaterThan(0);
+    expect(errors.join("\n")).toMatch(/REMOTE_COMMAND_HANDLE_UNSUPPORTED/u);
+    expect(errors.join("\n")).not.toMatch(/REMOTE_CLEANUP_FAILED/u);
     await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
   });

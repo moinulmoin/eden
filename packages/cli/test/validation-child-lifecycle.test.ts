@@ -9,7 +9,7 @@ import {
   join,
 } from "node:path";
 
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   runEdenCli,
@@ -33,9 +33,14 @@ async function initRoot(root: string): Promise<void> {
 }
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
+});
+
+beforeEach(() => {
+  vi.stubEnv("EDEN_BEARER_SECRET", "validation-test-secret");
 });
 
 describe("CLI validation child lifecycle", () => {

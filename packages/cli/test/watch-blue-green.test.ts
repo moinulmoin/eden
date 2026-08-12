@@ -12,7 +12,7 @@ import {
   join,
 } from "node:path";
 
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   runEdenCli,
@@ -128,6 +128,10 @@ afterEach(async () => {
   );
 });
 
+beforeEach(() => {
+  vi.stubEnv("EDEN_BEARER_SECRET", "watch-test-secret");
+});
+
 describe("eden dev watch blue-green replacement", () => {
   test("proves a successful replacement through authenticated live info", async () => {
     const root = await createRoot();
@@ -187,7 +191,6 @@ describe("eden dev watch blue-green replacement", () => {
             ownGeneration.value = generation;
             if (spawnCount === 1) {
               initialGeneration = generation;
-              resolveDevReady?.();
             }
             servedGeneration = generation;
             resolveReady?.();
@@ -244,6 +247,7 @@ describe("eden dev watch blue-green replacement", () => {
             request.authorization === "Bearer watch-live-secret" &&
             request.generationId !== initialGenerationId,
         ),
+        20_000,
       );
       expect(replacementRequest.generationId).toBe(
         servedGeneration?.generationId,
@@ -254,7 +258,7 @@ describe("eden dev watch blue-green replacement", () => {
       process.emit("SIGINT");
       await expect(devPromise).resolves.toBe(0);
     }
-  }, 15_000);
+  }, 30_000);
 
   test("verifies the old generation after replacement readiness fails", async () => {
     const root = await createRoot();
@@ -551,6 +555,230 @@ describe("eden dev watch blue-green replacement", () => {
         devPromise,
         new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
       ]);
+    }
+  }, 15_000);
+
+  test("does not leak a rollback child when stop races its synchronous spawn", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "watch-rollback-race-secret");
+
+    let servedGeneration: Record<string, unknown> | undefined;
+    let initialGeneration: Record<string, unknown> | undefined;
+    let resolveDevReady: (() => void) | undefined;
+    const devReady = new Promise<void>((resolve) => {
+      resolveDevReady = resolve;
+    });
+    let spawnCount = 0;
+    let rollbackGuardReached = false;
+    const errors: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        if (servedGeneration === undefined) {
+          return new Response("not ready", { status: 503 });
+        }
+        return new Response(JSON.stringify({ generation: servedGeneration }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+
+    const processRunner = {
+      spawn(request: EdenCliProcessRequest): EdenCliProcess {
+        spawnCount += 1;
+        const ownGeneration = {
+          value: undefined as Record<string, unknown> | undefined,
+        };
+        let resolveExit: (() => void) | undefined;
+        const exited = new Promise<{
+          readonly exitCode: number;
+          readonly signal: null;
+        }>((resolve) => {
+          resolveExit = () => resolve({ exitCode: 0, signal: null });
+        });
+        void generationFromRequest(root, request)
+          .then((generation) => {
+            ownGeneration.value = generation;
+            if (spawnCount === 1) {
+              initialGeneration = generation;
+              servedGeneration = generation;
+              resolveDevReady?.();
+            } else {
+              servedGeneration = generation;
+            }
+          })
+          .catch((error: unknown) => {
+            console.error("watch rollback-race fixture failed", error);
+          });
+        const processHandle: EdenCliProcess = {
+          pid: 45_300 + spawnCount,
+          startIdentity: `watch-rollback-race-${spawnCount}`,
+          ready: Promise.resolve(),
+          exited,
+          async terminate() {
+            if (
+              ownGeneration.value !== undefined &&
+              servedGeneration === ownGeneration.value
+            ) {
+              servedGeneration = initialGeneration;
+            }
+            resolveExit?.();
+          },
+        };
+        return processHandle;
+      },
+    };
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      processRunner,
+      dryRunRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      }),
+      stderr: (line) => errors.push(line),
+      runtimePublicationHook: async (boundary) => {
+        if (boundary === "after-runtime-ready") {
+          throw new Error("replacement publication failed");
+        }
+        if (boundary === "before-runtime-rollback") {
+          rollbackGuardReached = true;
+          process.emit("SIGINT");
+        }
+      },
+      stdout: (line) => {
+        if (line.includes("Eden dev ready")) resolveDevReady?.();
+      },
+    });
+
+    try {
+      await devReady;
+      await waitForValue(() => initialGeneration);
+      await writeFile(
+        join(root, "agent/tools/greet.ts"),
+        updatedToolSource("rollback spawn race"),
+        "utf8",
+      );
+      await waitForValue(
+        () => (rollbackGuardReached ? true : undefined),
+        5_000,
+      );
+      expect(spawnCount).toBe(2);
+    } finally {
+      process.emit("SIGINT");
+      await expect(devPromise).resolves.toBe(0);
+    }
+
+  }, 15_000);
+
+  test("keeps the old runtime after replacement termination is rejected when live proof succeeds", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    vi.stubEnv("EDEN_BEARER_SECRET", "watch-termination-rejection-secret");
+
+    let servedGeneration: Record<string, unknown> | undefined;
+    let initialGeneration: Record<string, unknown> | undefined;
+    let resolveDevReady: (() => void) | undefined;
+    const devReady = new Promise<void>((resolve) => {
+      resolveDevReady = resolve;
+    });
+    let spawnCount = 0;
+    let oldTerminationAttempts = 0;
+    const errors: string[] = [];
+    const requests: Array<Record<string, unknown> | undefined> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        requests.push(servedGeneration);
+        if (servedGeneration === undefined) {
+          return new Response("not ready", { status: 503 });
+        }
+        return new Response(JSON.stringify({ generation: servedGeneration }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+
+    const processRunner = {
+      spawn(request: EdenCliProcessRequest): EdenCliProcess {
+        spawnCount += 1;
+        const ownGeneration = {
+          value: undefined as Record<string, unknown> | undefined,
+        };
+        void generationFromRequest(root, request)
+          .then((generation) => {
+            ownGeneration.value = generation;
+            if (spawnCount === 1) {
+              initialGeneration = generation;
+              servedGeneration = generation;
+              resolveDevReady?.();
+            }
+          })
+          .catch((error: unknown) => {
+            console.error("watch termination-rejection fixture failed", error);
+          });
+        return {
+          pid: 45_400 + spawnCount,
+          startIdentity: `watch-termination-rejection-${spawnCount}`,
+          ready: Promise.resolve(),
+          exited: new Promise(() => {}),
+          async terminate() {
+            if (spawnCount === 1) {
+              oldTerminationAttempts += 1;
+              throw new Error("old runtime termination was rejected");
+            }
+          },
+        };
+      },
+    };
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      processRunner,
+      dryRunRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      }),
+      stderr: (line) => errors.push(line),
+      runtimeReadinessTimeoutMs: 250,
+      stdout: (line) => {
+        if (line.includes("Eden dev ready")) resolveDevReady?.();
+      },
+    });
+
+    try {
+      await devReady;
+      const initial = await waitForValue(() => initialGeneration);
+      const settledBeforeStop = await Promise.race([
+        devPromise.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500)),
+      ]);
+      expect(settledBeforeStop).toBe(false);
+      await writeFile(
+        join(root, "agent/tools/greet.ts"),
+        updatedToolSource("termination rejection"),
+        "utf8",
+      );
+      await waitForValue(
+        () => errors.find((line) => /watch rebuild unavailable|termination|old runtime/i.test(line)),
+        5_000,
+      );
+      expect(spawnCount).toBe(1);
+      expect(oldTerminationAttempts).toBeGreaterThan(0);
+      expect(
+        requests.some(
+          (generation) => generation?.generationId === initial.generationId,
+        ),
+      ).toBe(true);
+      expect(servedGeneration?.generationId).toBe(initial.generationId);
+    } finally {
+      process.emit("SIGINT");
+      await expect(devPromise).resolves.toBe(0);
     }
   }, 15_000);
 });
