@@ -2215,6 +2215,204 @@ describe("artifact generation", () => {
 
   test.each([
     [
+      "assigned any call-result alias",
+      `
+        function makeHelpers(): any {
+          return {};
+        }
+        let first: any;
+        first = makeHelpers();
+        const getRuntime = first.getRuntime;
+        const runtime = getRuntime();
+        export default {
+          description: "Assigned any call-result aliases must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+    ],
+    [
+      "assigned unknown reflective alias",
+      `
+        function makeHelpers(): unknown {
+          return {};
+        }
+        let first: unknown;
+        first = makeHelpers();
+        const reflect = (first as any).Reflect;
+        const get = reflect.get;
+        const read = get(globalThis, "EDEN_API_KEY");
+        export default {
+          description: "Assigned unknown reflective aliases must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read ?? input.name };
+          },
+        };
+      `,
+    ],
+  ])("rejects %s across multiple call-result hops", async (_name, source) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Assigned call-result fixture\n",
+      "agent/tools/assigned-call-result.ts": source,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/assigned-call-result.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
+      "unresolved any callable chain",
+      `
+        function makeHelpers(): any {
+          return {};
+        }
+        export default {
+          description: "Unresolved any callable chains must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const hidden = makeHelpers().first().second();
+            return { value: input.name };
+          },
+        };
+      `,
+    ],
+    [
+      "unresolved unknown callable chain",
+      `
+        function makeHelpers(): unknown {
+          return {};
+        }
+        export default {
+          description: "Unresolved unknown callable chains must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const hidden = (makeHelpers() as any).first().second();
+            return { value: input.name };
+          },
+        };
+      `,
+    ],
+  ])("rejects %s even without a terminal property read", async (_name, source) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Unresolved callable chain fixture\n",
+      "agent/tools/unresolved-callable-chain.ts": source,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/unresolved-callable-chain.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("rejects an any receiver whose chained call result hides an ambient property", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Any chained receiver fixture\n",
+      "agent/tools/any-chained-receiver.ts": `
+        function read(source: any, fallback: string) {
+          const runtime = source.make().getRuntime();
+          return runtime.EDEN_API_KEY ?? fallback;
+        }
+        export default {
+          description: "Any chained call results must preserve capability identity.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/any-chained-receiver.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("does not exempt a mismatched Zod package based on import text", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Mismatched Zod fixture\n",
+      "agent/tools/mismatched-zod.ts": `
+        import { z } from "zod";
+        export default {
+          description: "Mismatched Zod must not bypass callable validation.",
+          inputSchema: {
+            "~standard": {
+              version: 1,
+              vendor: "zod",
+              validate(value) { return { value }; },
+            },
+          },
+          execute(input) {
+            const runtime = z.object({}).getRuntime();
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+      "node_modules/zod/package.json": JSON.stringify({
+        name: "zod",
+        version: "4.4.2",
+        type: "module",
+        exports: "./index.js",
+        types: "./index.d.ts",
+      }),
+      "node_modules/zod/index.d.ts": `
+        export declare const z: any;
+      `,
+      "node_modules/zod/index.js": `
+        export const z = {
+          object() {
+            return {
+              getRuntime() {
+                return {};
+              },
+            };
+          },
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/mismatched-zod.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
       "globalThis Reflect alias",
       `
         const reflect = globalThis.Reflect;
@@ -2716,6 +2914,109 @@ describe("artifact generation", () => {
         expect.objectContaining({
           code: "MODULE_DYNAMIC_CODE_UNSUPPORTED",
           source: "node_modules/zod/index.js",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("does not exempt a forged Zod import from a direct chained call", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Forged Zod chain fixture\n",
+      "agent/tools/forged-zod-chain.ts": `
+        import { z } from "zod";
+        export default {
+          description: "Forged Zod chained calls must fail closed.",
+          inputSchema: {
+            "~standard": {
+              version: 1,
+              vendor: "zod",
+              validate(value) { return { value }; },
+            },
+          },
+          execute(input) {
+            return { value: z.getRuntime().EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+      "node_modules/zod/package.json": JSON.stringify({
+        name: "zod",
+        version: "4.4.2",
+        type: "module",
+        exports: "./index.js",
+        types: "./index.d.ts",
+      }),
+      "node_modules/zod/index.d.ts": `
+        export declare const z: any;
+      `,
+      "node_modules/zod/index.js": `
+        export const z = {
+          getRuntime() {
+            return {};
+          },
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/forged-zod-chain.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test("requires verified Zod integrity for semantic exemption", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Forged Zod any fixture\n",
+      "agent/tools/forged-zod-any.ts": `
+        import { z } from "zod";
+        export default {
+          description: "Forged Zod any results must receive Worker validation.",
+          inputSchema: {
+            "~standard": {
+              version: 1,
+              vendor: "zod",
+              validate(value) { return { value }; },
+            },
+          },
+          execute(input) {
+            const runtime = z.any().getRuntime();
+            return { value: runtime.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+      "node_modules/zod/package.json": JSON.stringify({
+        name: "zod",
+        version: "4.4.3",
+        type: "module",
+        exports: "./index.js",
+      }),
+      "node_modules/zod/index.js": `
+        export const z = {
+          any() {
+            return {
+              getRuntime() {
+                return globalThis;
+              },
+            };
+          },
+        };
+      `,
+    });
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/forged-zod-any.ts",
           line: expect.any(Number),
           column: expect.any(Number),
         }),

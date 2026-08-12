@@ -2542,6 +2542,14 @@ function semanticWorkerBindingDiagnostics(
   sourceFile: ts.SourceFile,
   relativePath: string,
   checker: ts.TypeChecker,
+  trustedDependencyContext: {
+    readonly sourceRoot: string;
+    readonly files: readonly SnapshotFile[];
+    readonly resolveModule: (
+      moduleSpecifier: ts.StringLiteralLike,
+      sourceFile: ts.SourceFile,
+    ) => ts.ResolvedModuleFull | undefined;
+  },
 ): EdenDiagnostic[] {
   const diagnostics: EdenDiagnostic[] = [];
   const importedBindings = new Set<string>();
@@ -3306,58 +3314,197 @@ function semanticWorkerBindingDiagnostics(
     );
   }
 
-  function isKnownCallableCallResult(
+  const SAFE_INPUT_METHODS = new Set(["toUpperCase", "trim"]);
+  const SAFE_INPUT_PROPERTIES = new Set(["length"]);
+
+  function isParameterBackedExpression(
     expression: ts.Expression,
     seenSymbols: Set<ts.Symbol> = new Set(),
   ): boolean {
     const current = unwrapExpression(expression);
-    if (ts.isCallExpression(current)) {
-      return callableDeclarations(current.expression, new Set()).length > 0;
+    if (ts.isPropertyAccessExpression(current)) {
+      return isParameterBackedExpression(current.expression, seenSymbols);
     }
-    if (ts.isNewExpression(current)) return false;
-    if (
-      ts.isPropertyAccessExpression(current) ||
-      ts.isElementAccessExpression(current)
-    ) {
-      return isKnownCallableCallResult(current.expression, seenSymbols);
+    if (ts.isElementAccessExpression(current)) {
+      return isParameterBackedExpression(current.expression, seenSymbols);
     }
     if (!ts.isIdentifier(current)) return false;
     const symbol = checker.getSymbolAtLocation(current);
     if (symbol === undefined || seenSymbols.has(symbol)) return false;
     seenSymbols.add(symbol);
-    return (symbol.declarations ?? []).some(
-      (declaration) =>
-        ts.isVariableDeclaration(declaration) &&
-        declaration.initializer !== undefined &&
-        isKnownCallableCallResult(
-          declaration.initializer,
-          new Set(seenSymbols),
-        ),
+    return (symbol.declarations ?? []).some((declaration) =>
+      ts.isParameter(declaration),
     );
   }
 
-  function isTrustedZodCall(expression: ts.Expression): boolean {
+  function isSafeInputMethodCall(expression: ts.Expression): boolean {
     const current = unwrapExpression(expression);
+    if (!ts.isCallExpression(current)) return false;
+    const callee = unwrapExpression(current.expression);
+    if (
+      !ts.isPropertyAccessExpression(callee) &&
+      !ts.isElementAccessExpression(callee)
+    ) {
+      return false;
+    }
+    const propertyName = ts.isPropertyAccessExpression(callee)
+      ? callee.name.text
+      : propertyNameExpression(callee.argumentExpression);
+    if (propertyName === undefined || !SAFE_INPUT_METHODS.has(propertyName)) {
+      return false;
+    }
+    return (
+      isParameterBackedExpression(callee.expression) ||
+      isSafeInputMethodCall(callee.expression)
+    );
+  }
+
+  function isSafeInputMethodPropertyAccess(
+    expression: ts.Expression,
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (
+      !ts.isPropertyAccessExpression(current) &&
+      !ts.isElementAccessExpression(current)
+    ) {
+      return false;
+    }
+    const propertyName = ts.isPropertyAccessExpression(current)
+      ? current.name.text
+      : propertyNameExpression(current.argumentExpression);
+    if (
+      propertyName !== undefined &&
+      SAFE_INPUT_PROPERTIES.has(propertyName) &&
+      isSafeInputMethodCall(current.expression)
+    ) {
+      return true;
+    }
+    return (
+      propertyName !== undefined &&
+      SAFE_INPUT_METHODS.has(propertyName) &&
+      isSafeInputMethodCall(current.expression)
+    );
+  }
+
+  function zodImportSymbols(
+    expression: ts.Expression,
+    seenExpressions: Set<ts.Expression> = new Set(),
+  ): readonly ts.Symbol[] {
+    const current = unwrapExpression(expression);
+    if (seenExpressions.has(current)) return [];
+    seenExpressions.add(current);
     const callee =
       ts.isCallExpression(current)
         ? unwrapExpression(current.expression)
         : current;
-    const receiver =
-      ts.isPropertyAccessExpression(callee) ||
-      ts.isElementAccessExpression(callee)
-        ? callee.expression
-        : undefined;
-    if (receiver === undefined || !ts.isIdentifier(receiver)) return false;
+    if (
+      !ts.isPropertyAccessExpression(callee) &&
+      !ts.isElementAccessExpression(callee)
+    ) {
+      return [];
+    }
+    const receiver = callee.expression;
+    if (!ts.isIdentifier(receiver)) {
+      return zodImportSymbols(receiver, seenExpressions);
+    }
     const symbol = checker.getSymbolAtLocation(receiver);
-    return (symbol?.declarations ?? []).some((declaration) => {
-      if (!ts.isImportSpecifier(declaration)) return false;
-      const importDeclaration = declaration.parent.parent.parent;
+    if (symbol === undefined) return [];
+
+    const importedSymbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) importedSymbols.push(aliased);
+    }
+    const importedFromZod = (declaration: ts.Declaration): boolean => {
+      if (ts.isImportSpecifier(declaration)) {
+        const importDeclaration = declaration.parent.parent.parent;
+        return (
+          ts.isImportDeclaration(importDeclaration) &&
+          ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
+          importDeclaration.moduleSpecifier.text === "zod"
+        );
+      }
+      if (ts.isNamespaceImport(declaration)) {
+        const importDeclaration = declaration.parent.parent;
+        return (
+          ts.isImportDeclaration(importDeclaration) &&
+          ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
+          importDeclaration.moduleSpecifier.text === "zod"
+        );
+      }
+      if (ts.isImportClause(declaration)) {
+        const importDeclaration = declaration.parent;
+        return (
+          ts.isImportDeclaration(importDeclaration) &&
+          ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
+          importDeclaration.moduleSpecifier.text === "zod"
+        );
+      }
+      return false;
+    };
+    if (
+      !importedSymbols.some((candidate) =>
+        (candidate.declarations ?? []).some(importedFromZod),
+      )
+    ) {
+      return [];
+    }
+    return importedSymbols;
+  }
+
+  function isTrustedZodCall(expression: ts.Expression): boolean {
+    const importedSymbols = zodImportSymbols(expression);
+    if (importedSymbols.length === 0) return false;
+    return importedSymbols.some((candidate) => {
+      const importDeclaration = (candidate.declarations ?? []).find(
+        (declaration): declaration is ts.ImportSpecifier | ts.NamespaceImport | ts.ImportClause =>
+          ts.isImportSpecifier(declaration) ||
+          ts.isNamespaceImport(declaration) ||
+          ts.isImportClause(declaration),
+      );
+      if (importDeclaration === undefined) return false;
+      const importSourceFile = importDeclaration.getSourceFile();
+      const moduleSpecifier = ts.isImportSpecifier(importDeclaration)
+        ? importDeclaration.parent.parent.parent.moduleSpecifier
+        : ts.isNamespaceImport(importDeclaration)
+          ? importDeclaration.parent.parent.moduleSpecifier
+          : importDeclaration.parent.moduleSpecifier;
+      if (!ts.isStringLiteralLike(moduleSpecifier)) return false;
+      const resolved = trustedDependencyContext.resolveModule(
+        moduleSpecifier,
+        importSourceFile,
+      );
+      if (
+        resolved?.packageId?.name !== TRUSTED_ZOD_PACKAGE.name ||
+        resolved.packageId.version !== TRUSTED_ZOD_PACKAGE.version
+      ) {
+        return false;
+      }
+      const relativeResolved = toPosixPath(
+        relative(
+          normalize(trustedDependencyContext.sourceRoot),
+          normalize(resolved.resolvedFileName),
+        ),
+      );
+      if (
+        relativeResolved.startsWith("../") ||
+        relativeResolved === ".."
+      ) {
+        return false;
+      }
       return (
-        ts.isImportDeclaration(importDeclaration) &&
-        ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
-        importDeclaration.moduleSpecifier.text === "zod"
+        dependencyPackageRoot(relativeResolved) ===
+          TRUSTED_ZOD_PACKAGE.root &&
+        isTrustedWorkerDependency(
+          trustedDependencyContext.files,
+          relativeResolved,
+        )
       );
     });
+  }
+
+  function isZodCall(expression: ts.Expression): boolean {
+    return zodImportSymbols(expression).length > 0;
   }
 
   function isUnresolvedCallablePropertyAccess(
@@ -3371,11 +3518,11 @@ function semanticWorkerBindingDiagnostics(
       return false;
     }
     const receiver = current.expression;
+    if (!isCallResultExpression(receiver)) return false;
+    if (isTrustedZodCall(receiver)) return false;
+    if (isSafeInputMethodPropertyAccess(current)) return false;
     return (
-      isAnyOrUnknownType(receiver) &&
-      isCallResultExpression(receiver) &&
-      !isTrustedZodCall(receiver) &&
-      isKnownCallableCallResult(receiver)
+      isAnyOrUnknownType(receiver) || isZodCall(receiver)
     );
   }
 
@@ -4082,6 +4229,7 @@ function semanticWorkerBindingDiagnostics(
       return { kind: "callable", returns };
     }
     if (ts.isCallExpression(current)) {
+      if (isSafeInputMethodCall(current)) return undefined;
       const reflective = resolveReflectGetCallResult(current, seenSymbols);
       if (reflective !== undefined) return reflective;
       if (isReflectGetAliasExpression(current.expression)) {
@@ -4616,6 +4764,17 @@ async function validateAuthoredWorkerSources(
       sourceFile,
       file.relativePath,
       checker,
+      {
+        sourceRoot: snapshot.sourceRoot,
+        files,
+        resolveModule: (moduleSpecifier, containingFile) =>
+          ts.resolveModuleName(
+            moduleSpecifier.text,
+            containingFile.fileName,
+            compilerOptions,
+            host,
+          ).resolvedModule,
+      },
     );
     diagnostics.push(...semanticDiagnostics);
   }
