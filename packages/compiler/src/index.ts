@@ -4801,6 +4801,7 @@ type BundleShape =
   | { readonly kind: "number"; readonly value: number }
   | { readonly kind: "boolean"; readonly value: boolean }
   | { readonly kind: "function" }
+  | { readonly kind: "class" }
   | {
       readonly kind: "record";
       readonly properties: ReadonlyMap<string, BundleShape>;
@@ -4809,7 +4810,12 @@ type BundleShape =
   | { readonly kind: "schema-call" };
 
 interface BundleShapeEnvironment {
-  readonly bindings: ReadonlyMap<string, ts.Expression | "function">;
+  readonly bindings: ReadonlyMap<
+    string,
+    ts.Expression | "function" | "class"
+  >;
+  readonly trustedSchemaFactoryBindings: ReadonlySet<string>;
+  readonly mutatedBindings: ReadonlySet<string>;
 }
 
 const STANDARD_SCHEMA_FACTORY_NAMES = new Set([
@@ -4840,6 +4846,25 @@ const STANDARD_SCHEMA_FACTORY_NAMES = new Set([
   "unknown",
 ]);
 
+function isAssignmentOperator(kind: ts.SyntaxKind): boolean {
+  return (
+    kind === ts.SyntaxKind.EqualsToken ||
+    kind === ts.SyntaxKind.PlusEqualsToken ||
+    kind === ts.SyntaxKind.MinusEqualsToken ||
+    kind === ts.SyntaxKind.AsteriskEqualsToken ||
+    kind === ts.SyntaxKind.AsteriskAsteriskEqualsToken ||
+    kind === ts.SyntaxKind.SlashEqualsToken ||
+    kind === ts.SyntaxKind.PercentEqualsToken ||
+    kind === ts.SyntaxKind.LessThanLessThanEqualsToken ||
+    kind === ts.SyntaxKind.GreaterThanGreaterThanEqualsToken ||
+    kind === ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken ||
+    kind === ts.SyntaxKind.AmpersandEqualsToken ||
+    kind === ts.SyntaxKind.BarEqualsToken ||
+    kind === ts.SyntaxKind.CaretEqualsToken ||
+    kind === ts.SyntaxKind.QuestionQuestionEqualsToken
+  );
+}
+
 function bundlePropertyName(
   name: ts.PropertyName | ts.BindingName,
 ): string | undefined {
@@ -4863,6 +4888,8 @@ function bundleShapeForIdentifier(
   if (name === "null") return { kind: "null" };
   const binding = environment.bindings.get(name);
   if (binding === undefined) return { kind: "unknown" };
+  if (environment.mutatedBindings.has(name)) return { kind: "unknown" };
+  if (binding === "class") return { kind: "class" };
   if (binding === "function") return { kind: "function" };
   if (resolving.has(name)) return { kind: "unknown" };
   resolving.add(name);
@@ -4871,6 +4898,19 @@ function bundleShapeForIdentifier(
   } finally {
     resolving.delete(name);
   }
+}
+
+function isStandardSchemaFactoryCall(
+  expression: ts.CallExpression,
+  environment: BundleShapeEnvironment,
+): boolean {
+  if (!ts.isPropertyAccessExpression(expression.expression)) return false;
+  const target = expression.expression.expression;
+  if (!ts.isIdentifier(target)) return false;
+  return (
+    STANDARD_SCHEMA_FACTORY_NAMES.has(expression.expression.name.text) &&
+    environment.trustedSchemaFactoryBindings.has(target.text)
+  );
 }
 
 function isObjectMemberCall(
@@ -4883,18 +4923,6 @@ function isObjectMemberCall(
     ts.isIdentifier(expression.expression) &&
     expression.expression.text === objectName &&
     expression.name.text === propertyName
-  );
-}
-
-function isStandardSchemaFactoryCall(
-  expression: ts.CallExpression,
-): boolean {
-  if (!ts.isPropertyAccessExpression(expression.expression)) return false;
-  const target = expression.expression.expression;
-  if (!ts.isIdentifier(target)) return false;
-  return (
-    STANDARD_SCHEMA_FACTORY_NAMES.has(expression.expression.name.text) &&
-    (target.text === "z" || target.text.endsWith("_exports"))
   );
 }
 
@@ -4979,7 +5007,7 @@ function bundleShapeForExpression(
     return { kind: "function" };
   }
   if (ts.isClassExpression(expression)) {
-    return { kind: "function" };
+    return { kind: "class" };
   }
   if (ts.isArrayLiteralExpression(expression)) {
     return {
@@ -4994,37 +5022,50 @@ function bundleShapeForExpression(
   if (ts.isObjectLiteralExpression(expression)) {
     const properties = new Map<string, BundleShape>();
     for (const property of expression.properties) {
+      if (
+        property.name !== undefined &&
+        ts.isComputedPropertyName(property.name)
+      ) {
+        return { kind: "unknown" };
+      }
       if (ts.isSpreadAssignment(property)) {
         const spread = bundleShapeForExpression(
           property.expression,
           environment,
           resolving,
         );
-        if (spread.kind === "record") {
-          for (const [key, value] of spread.properties) {
-            properties.set(key, value);
-          }
+        if (spread.kind !== "record") {
+          return { kind: "unknown" };
+        }
+        for (const [key, value] of spread.properties) {
+          properties.set(key, value);
         }
         continue;
       }
       if (ts.isMethodDeclaration(property)) {
         const key = bundlePropertyName(property.name);
-        if (key !== undefined) properties.set(key, { kind: "function" });
+        if (key === undefined) return { kind: "unknown" };
+        properties.set(
+          key,
+          ts.isClassDeclaration(property.parent)
+            ? { kind: "class" }
+            : { kind: "function" },
+        );
         continue;
       }
       if (ts.isGetAccessorDeclaration(property) || ts.isSetAccessorDeclaration(property)) {
         const key = bundlePropertyName(property.name);
-        if (key !== undefined) properties.set(key, { kind: "unknown" });
+        if (key === undefined) return { kind: "unknown" };
+        properties.set(key, { kind: "unknown" });
         continue;
       }
       if (ts.isPropertyAssignment(property)) {
         const key = bundlePropertyName(property.name);
-        if (key !== undefined) {
-          properties.set(
-            key,
-            bundleShapeForExpression(property.initializer, environment, resolving),
-          );
-        }
+        if (key === undefined) return { kind: "unknown" };
+        properties.set(
+          key,
+          bundleShapeForExpression(property.initializer, environment, resolving),
+        );
         continue;
       }
       if (ts.isShorthandPropertyAssignment(property)) {
@@ -5037,13 +5078,35 @@ function bundleShapeForExpression(
     return bundleRecordShape(properties);
   }
   if (ts.isPropertyAccessExpression(expression)) {
+    if (
+      expression.name.text === "object" &&
+      ts.isIdentifier(expression.expression)
+    ) {
+      const targetBinding = environment.bindings.get(expression.expression.text);
+      if (
+        targetBinding !== undefined &&
+        !(
+          typeof targetBinding === "string" ||
+          ts.isIdentifier(targetBinding)
+        )
+      ) {
+        const target = bundleShapeForExpression(
+          targetBinding,
+          environment,
+          resolving,
+        );
+        if (target.kind === "record") return target;
+      }
+    }
     const target = bundleShapeForExpression(
       expression.expression,
       environment,
       resolving,
     );
     if (target.kind !== "record") return { kind: "unknown" };
-    return target.properties.get(expression.name.text) ?? { kind: "unknown" };
+    const property = target.properties.get(expression.name.text);
+    if (property !== undefined) return property;
+    return { kind: "unknown" };
   }
   if (ts.isElementAccessExpression(expression)) {
     const argument = expression.argumentExpression;
@@ -5178,7 +5241,7 @@ function bundleShapeForExpression(
       }
       return bundleRecordShape(properties);
     }
-    if (isStandardSchemaFactoryCall(expression)) {
+    if (isStandardSchemaFactoryCall(expression, environment)) {
       return { kind: "schema-call" };
     }
     return { kind: "unknown" };
@@ -5186,13 +5249,16 @@ function bundleShapeForExpression(
   if (ts.isNewExpression(expression)) {
     return { kind: "unknown" };
   }
+  if (ts.isFunctionLike(expression)) {
+    return ts.isClassLike(expression) ? { kind: "class" } : { kind: "function" };
+  }
   return { kind: "unknown" };
 }
 
 function bundleShapeEnvironment(
   sourceFile: ts.SourceFile,
 ): BundleShapeEnvironment {
-  const bindings = new Map<string, ts.Expression | "function">();
+  const bindings = new Map<string, ts.Expression | "function" | "class">();
   for (const statement of sourceFile.statements) {
     if (ts.isVariableStatement(statement)) {
       for (const declaration of statement.declarationList.declarations) {
@@ -5204,13 +5270,139 @@ function bundleShapeEnvironment(
         }
       }
     } else if (
-      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+      ts.isFunctionDeclaration(statement) &&
       statement.name !== undefined
     ) {
       bindings.set(statement.name.text, "function");
+    } else if (
+      ts.isClassDeclaration(statement) &&
+      statement.name !== undefined
+    ) {
+      bindings.set(statement.name.text, "class");
     }
   }
-  return { bindings };
+  const trustedSchemaFactoryBindings = new Set<string>();
+  const exportHelperNames = new Set<string>(["__export"]);
+  for (const statement of sourceFile.statements) {
+    function visit(node: ts.Node): void {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        exportHelperNames.has(node.expression.text) &&
+        node.arguments.length === 2
+      ) {
+        const namespaceArgument = node.arguments[0];
+        const exportArgument = node.arguments[1];
+        if (
+          namespaceArgument !== undefined &&
+          ts.isIdentifier(namespaceArgument) &&
+          exportArgument !== undefined &&
+          ts.isObjectLiteralExpression(exportArgument)
+        ) {
+          let hasFactory = false;
+          let hasObject = false;
+          let hasString = false;
+          for (const property of exportArgument.properties) {
+            if (
+              !ts.isPropertyAssignment(property) ||
+              ts.isComputedPropertyName(property.name)
+            ) {
+              continue;
+            }
+            const name = bundlePropertyName(property.name);
+            if (name === "object") hasObject = true;
+            if (name === "string") hasString = true;
+            if (
+              name !== undefined &&
+              STANDARD_SCHEMA_FACTORY_NAMES.has(name) &&
+              ts.isArrowFunction(property.initializer) &&
+              ts.isIdentifier(property.initializer.body)
+            ) {
+              const factory = property.initializer.body.text;
+              if (bindings.get(factory) === "function") {
+                hasFactory = true;
+              }
+            }
+          }
+          if (hasFactory && hasObject && hasString) {
+            trustedSchemaFactoryBindings.add(namespaceArgument.text);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(statement);
+  }
+  const mutatedBindings = new Set<string>();
+  const bindingRoots = (
+    name: string,
+    seen: Set<string> = new Set(),
+  ): Set<string> => {
+    if (seen.has(name)) return new Set([name]);
+    seen.add(name);
+    const binding = bindings.get(name);
+    if (binding === undefined || typeof binding === "string") {
+      return new Set([name]);
+    }
+    if (!ts.isIdentifier(binding)) {
+      if (
+        ts.isPropertyAccessExpression(binding) ||
+        ts.isElementAccessExpression(binding)
+      ) {
+        const expression = binding.expression;
+        if (ts.isIdentifier(expression)) {
+          return bindingRoots(expression.text, seen);
+        }
+      }
+      return new Set([name]);
+    }
+    return bindingRoots(binding.text, seen);
+  };
+  const mutationRoot = (expression: ts.Expression): string | undefined => {
+    let current = expression;
+    while (
+      ts.isPropertyAccessExpression(current) ||
+      ts.isElementAccessExpression(current)
+    ) {
+      current = current.expression;
+    }
+    return ts.isIdentifier(current) ? current.text : undefined;
+  };
+  function collectMutations(node: ts.Node): void {
+    if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind)) {
+      const root = mutationRoot(node.left);
+      if (root !== undefined) {
+        for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
+      }
+    } else if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      (node.operator === ts.SyntaxKind.PlusPlusToken ||
+        node.operator === ts.SyntaxKind.MinusMinusToken)
+    ) {
+      const root = mutationRoot(node.operand);
+      if (root !== undefined) {
+        for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
+      }
+    } else if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === "Object" &&
+      (node.expression.name.text === "assign" ||
+        node.expression.name.text === "defineProperty")
+    ) {
+      const firstArgument = node.arguments[0];
+      if (firstArgument !== undefined) {
+        const root = mutationRoot(firstArgument);
+        if (root !== undefined) {
+          for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
+        }
+      }
+    }
+    ts.forEachChild(node, collectMutations);
+  }
+  collectMutations(sourceFile);
+  return { bindings, trustedSchemaFactoryBindings, mutatedBindings };
 }
 
 function defaultBundleExpression(
@@ -5319,10 +5511,15 @@ function bundleShapeRecord(
 function assertRuntimeJsonShape(shape: BundleShape, path: string): void {
   if (
     shape.kind === "string" ||
-    shape.kind === "number" ||
     shape.kind === "boolean" ||
     shape.kind === "null"
   ) {
+    return;
+  }
+  if (shape.kind === "number") {
+    if (!Number.isFinite(shape.value)) {
+      artifactSchemaFailure(path, "must be a finite JSON-compatible number.");
+    }
     return;
   }
   if (shape.kind === "array") {

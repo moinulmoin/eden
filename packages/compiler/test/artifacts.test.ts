@@ -246,6 +246,143 @@ function replaceBundleCoherently(
   };
 }
 
+function replaceBundleDefault(
+  bundle: string,
+  expression: string,
+  declarations = "",
+): string {
+  const marker =
+    "var eden_artifact_entry_default = Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap });";
+  expect(bundle).toContain(marker);
+  return bundle.replace(
+    marker,
+    `${declarations}\nvar eden_artifact_entry_default = ${expression};`,
+  );
+}
+
+const closedBundleGrammarCases = [
+  {
+    name: "unknown object spread",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap, ...unknownOverride })",
+        'const unknownOverride = globalThis["edenRuntimeOverride"];',
+      ),
+  },
+  {
+    name: "computed object key",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap, [computedKey]: null })",
+        'const computedKey = "unvalidated";',
+      ),
+  },
+  {
+    name: "post-construction mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "edenArtifact",
+        `const edenArtifact = { agent, instructions, tools, toolSchemas, moduleMap };
+edenArtifact.agent.model = "tampered-after-construction";`,
+      ),
+  },
+  {
+    name: "class execute callable",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools: classTools, toolSchemas, moduleMap })",
+        `const classTools = Object.freeze(Object.fromEntries([
+  ["greet", {
+    description: "Greet a person.",
+    inputSchema: {
+      "~standard": {
+        version: 1,
+        vendor: "fixture",
+        validate(value) { return { value }; }
+      }
+    },
+    execute: class Execute {}
+  }]
+]));`,
+      ),
+  },
+  {
+    name: "class Standard Schema validate callable",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools: classValidateTools, toolSchemas, moduleMap })",
+        `const classValidateTools = Object.freeze(Object.fromEntries([
+  ["greet", {
+    description: "Greet a person.",
+    inputSchema: {
+      "~standard": {
+        version: 1,
+        vendor: "fixture",
+        validate: class Validate {}
+      }
+    },
+    execute(input) { return input; }
+  }]
+]));`,
+      ),
+  },
+  {
+    name: "unverified schema factory",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools: forgedTools, toolSchemas, moduleMap })",
+        `const forged_exports = {
+  object() {
+    return {
+      "~standard": {
+        version: 1,
+        vendor: "forged",
+        validate(value) { return { value }; }
+      }
+    };
+  }
+};
+const forgedTools = Object.freeze(Object.fromEntries([
+  ["greet", {
+    description: "Greet a person.",
+    inputSchema: forged_exports.object({}),
+    execute(input) { return input; }
+  }]
+]));`,
+      ),
+  },
+  {
+    name: "positive Infinity in JSON metadata",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools, toolSchemas: nonFiniteSchemas, moduleMap })",
+        `const nonFinite = 1e999;
+const nonFiniteSchemas = Object.freeze(Object.fromEntries([
+  ["greet", { type: "object", minimum: nonFinite }]
+]));`,
+      ),
+  },
+  {
+    name: "negative Infinity in JSON metadata",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "Object.freeze({ agent, instructions, tools, toolSchemas: nonFiniteSchemas, moduleMap })",
+        `const nonFinite = -1e999;
+const nonFiniteSchemas = Object.freeze(Object.fromEntries([
+  ["greet", { type: "object", minimum: nonFinite }]
+]));`,
+      ),
+  },
+] as const;
+
 describe("artifact generation", () => {
   test("publishes one coherent generation and executes without the source tree", async () => {
     const root = await createProject({
@@ -508,6 +645,164 @@ describe("artifact generation", () => {
     );
     expect(after.artifacts.bundle).toBe(previous.artifacts.bundle);
   });
+
+  test.each(closedBundleGrammarCases)(
+    "rejects $name through authoritative reads",
+    async ({ mutate }) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "closed bundle grammar reader fixture\n",
+        "agent/tools/greet.ts": toolSource,
+      });
+
+      await buildProject({ projectRoot: root });
+      const current = await readArtifactGeneration(join(root, ".eden"));
+      const contents = Object.fromEntries(
+        await Promise.all(
+          artifactNames.map(async (name) => [
+            name,
+            await readFile(join(current.directory, name), "utf8"),
+          ] as const),
+        ),
+      ) as Record<(typeof artifactNames)[number], string>;
+      const invalidContents = replaceBundleCoherently(
+        contents,
+        mutate(contents["agent-bundle.mjs"]),
+      );
+      await Promise.all(
+        artifactNames.map((name) =>
+          writeFile(join(current.directory, name), invalidContents[name], "utf8"),
+        ),
+      );
+
+      await expect(readArtifactGeneration(join(root, ".eden"))).rejects.toMatchObject({
+        name: "EdenCompilerError",
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({ code: "OUTPUT_INVALID" }),
+        ]),
+      } satisfies Partial<EdenCompilerError>);
+    },
+  );
+
+  test.each(closedBundleGrammarCases)(
+    "rejects $name through legacy migration",
+    async ({ mutate }) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "closed bundle grammar legacy fixture\n",
+        "agent/tools/greet.ts": toolSource,
+      });
+
+      await buildProject({ projectRoot: root });
+      const previous = await readArtifactGeneration(join(root, ".eden"));
+      const contents = Object.fromEntries(
+        await Promise.all(
+          artifactNames.map(async (name) => [
+            name,
+            await readFile(join(previous.directory, name), "utf8"),
+          ] as const),
+        ),
+      ) as Record<(typeof artifactNames)[number], string>;
+      const invalidContents = replaceBundleCoherently(
+        contents,
+        mutate(contents["agent-bundle.mjs"]),
+      );
+
+      await rm(join(root, ".eden"), { recursive: true, force: true });
+      await mkdir(join(root, ".eden"), { recursive: true });
+      await Promise.all(
+        artifactNames.map((name) =>
+          writeFile(join(root, ".eden", name), invalidContents[name], "utf8"),
+        ),
+      );
+      expect(
+        await lstat(join(root, ".eden", "CURRENT")).catch(() => undefined),
+      ).toBeUndefined();
+
+      await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+        name: "EdenCompilerError",
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({ code: "OUTPUT_INVALID" }),
+        ]),
+      } satisfies Partial<EdenCompilerError>);
+      await expect(lstat(join(root, ".eden", "CURRENT"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+
+  test.each(closedBundleGrammarCases)(
+    "rejects $name from a same-identity candidate before CURRENT promotion",
+    async ({ mutate }) => {
+      const root = await createProject({
+        "agent/agent.ts": agentSource,
+        "agent/instructions.md": "closed bundle grammar reuse fixture\n",
+        "agent/tools/greet.ts": toolSource,
+      });
+
+      await buildProject({ projectRoot: root });
+      const previous = await readArtifactGeneration(join(root, ".eden"));
+      await writeFile(
+        join(root, "agent/tools/greet.ts"),
+        toolSource.replace("Greet a person.", "new generation"),
+        "utf8",
+      );
+      await expect(
+        buildProject({
+          projectRoot: root,
+          hooks: {
+            onPublicationBoundary: (boundary) => {
+              if (boundary === "before-current-promotion") {
+                throw new Error("leave closed grammar candidate uncurrent");
+              }
+            },
+          },
+        }),
+      ).rejects.toThrow("leave closed grammar candidate uncurrent");
+
+      const generationNames = await readdir(join(root, ".eden", "generations"));
+      const candidateId = generationNames.find(
+        (name) =>
+          name.startsWith("gen_") &&
+          name !== previous.artifacts.buildMetadata.generationId,
+      );
+      expect(candidateId).toBeDefined();
+      const candidateDirectory = join(
+        root,
+        ".eden",
+        "generations",
+        candidateId as string,
+      );
+      const contents = Object.fromEntries(
+        await Promise.all(
+          artifactNames.map(async (name) => [
+            name,
+            await readFile(join(candidateDirectory, name), "utf8"),
+          ] as const),
+        ),
+      ) as Record<(typeof artifactNames)[number], string>;
+      const invalidContents = replaceBundleCoherently(
+        contents,
+        mutate(contents["agent-bundle.mjs"]),
+      );
+      await Promise.all(
+        artifactNames.map((name) =>
+          writeFile(join(candidateDirectory, name), invalidContents[name], "utf8"),
+        ),
+      );
+
+      await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+        name: "EdenCompilerError",
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({ code: "OUTPUT_INVALID" }),
+        ]),
+      } satisfies Partial<EdenCompilerError>);
+      const after = await readArtifactGeneration(join(root, ".eden"));
+      expect(after.artifacts.buildMetadata.generationId).toBe(
+        previous.artifacts.buildMetadata.generationId,
+      );
+    },
+  );
 
   test("keeps a resolved generation stable when CURRENT flips during reads", async () => {
     const root = await createProject({
