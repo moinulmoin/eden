@@ -2248,6 +2248,30 @@ describe("artifact generation", () => {
     });
   });
 
+  test("accepts typed call results used through ordinary methods", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Typed call-result fixture\n",
+      "agent/tools/typed-call-result.ts": `
+        function getText(): string {
+          return "safe";
+        }
+        export default {
+          description: "Typed call results must not be treated as unresolved ambient values.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: getText().trim() || input.name };
+          },
+        };
+      `,
+    });
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "typed-call-result" }),
+    ]);
+  });
+
   test.each([
     [
       "globalThis",
@@ -2472,6 +2496,106 @@ describe("artifact generation", () => {
           code: "MODULE_AMBIENT_BINDING",
           source: "agent/tools/unresolved-callable-chain.ts",
           line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
+      "assignment alias",
+      `
+        function makeHelpers(): any {
+          return {};
+        }
+        let first: any;
+        first = makeHelpers();
+        const hidden = first.getRuntime;
+        hidden();
+        export default {
+          description: "Assignment aliases must preserve unresolved callable capability.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: input.name };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "conditional alias",
+      `
+        function makeHelpers(): unknown {
+          return {};
+        }
+        export default {
+          description: "Conditional aliases must conservatively merge callable capability.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const first: any =
+              input.name.length > 0 ? makeHelpers() : makeHelpers();
+            const hidden = first.getRuntime;
+            hidden();
+            return { value: input.name };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "logical alias",
+      `
+        function makeHelpers(): any {
+          return {};
+        }
+        export default {
+          description: "Logical aliases must conservatively merge callable capability.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const first: any = makeHelpers() || makeHelpers();
+            const hidden = first.getRuntime;
+            hidden();
+            return { value: input.name };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "alias-only invocation",
+      `
+        function makeHelpers(): any {
+          return {};
+        }
+        export default {
+          description: "Aliases of unresolved call results must fail when invoked.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            const first: any = makeHelpers();
+            const hidden = first;
+            hidden();
+            return { value: input.name };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+  ])("rejects unresolved callable %s at the authored invocation site", async (_name, source, marker) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Callable alias provenance fixture\n",
+      "agent/tools/callable-alias-provenance.ts": source,
+    });
+    const expectedLine =
+      source.slice(0, source.indexOf(marker)).split("\n").length;
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/callable-alias-provenance.ts",
+          line: expectedLine,
           column: expect.any(Number),
         }),
       ]),
@@ -3026,6 +3150,40 @@ describe("artifact generation", () => {
     expect(result.artifacts.manifest.tools).toEqual([
       expect.objectContaining({ name: "zod-valid" }),
     ]);
+  });
+
+  test("does not exempt caller values flowing through verified Zod calls", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Zod caller-value fixture\n",
+      "agent/tools/zod-caller-value.ts": `
+        import { z } from "zod";
+        export default {
+          description: "Zod results must not hide ambient caller values.",
+          inputSchema: z.object({ name: z.string() }),
+          execute(input) {
+            const parsed = z.any().parse(globalThis);
+            return { value: parsed.EDEN_API_KEY ?? input.name };
+          },
+        };
+      `,
+    });
+    await mkdir(join(root, "node_modules"), { recursive: true });
+    await symlink(
+      join(process.cwd(), "node_modules/zod"),
+      join(root, "node_modules/zod"),
+    );
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/zod-caller-value.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
   });
 
   test("does not trust a path-only Zod dependency exemption", async () => {

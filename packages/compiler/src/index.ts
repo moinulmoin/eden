@@ -2883,6 +2883,14 @@ function semanticWorkerBindingDiagnostics(
         readonly kind: "callable";
         readonly returns: readonly AmbientValue[];
       }
+    | {
+        /**
+         * An any/unknown call result whose concrete shape is unresolved.
+         * Preserve this capability through aliases and branch expressions so
+         * later callable use fails closed instead of disappearing as unknown.
+         */
+        readonly kind: "call-result";
+      }
     | { readonly kind: "unknown-callable" };
 
   const ambientValues = new Map<ts.Symbol, AmbientValue>();
@@ -3521,27 +3529,84 @@ function semanticWorkerBindingDiagnostics(
   ): boolean {
     const current = unwrapExpression(expression);
     if (ts.isCallExpression(current) || ts.isNewExpression(current)) {
-      return true;
+      return isAnyOrUnknownType(current);
     }
     if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
       return isCallResultExpression(current.expression, seenSymbols);
+    }
+    if (ts.isConditionalExpression(current)) {
+      return (
+        isCallResultExpression(current.whenTrue, new Set(seenSymbols)) ||
+        isCallResultExpression(current.whenFalse, new Set(seenSymbols))
+      );
+    }
+    if (
+      ts.isBinaryExpression(current) &&
+      (current.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+        current.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+        current.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)
+    ) {
+      return (
+        isCallResultExpression(current.left, new Set(seenSymbols)) ||
+        isCallResultExpression(current.right, new Set(seenSymbols))
+      );
     }
     if (!ts.isIdentifier(current)) return false;
     const symbol = checker.getSymbolAtLocation(current);
     if (symbol === undefined || seenSymbols.has(symbol)) return false;
     seenSymbols.add(symbol);
+    const known = ambientValues.get(symbol);
+    if (
+      known?.kind === "call-result" ||
+      known?.kind === "unknown-callable"
+    ) {
+      return true;
+    }
     const symbols = [symbol];
     if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
       const aliased = checker.getAliasedSymbol(symbol);
       if (aliased !== symbol) symbols.push(aliased);
     }
-    return symbols.some((candidate) =>
-      (candidate.declarations ?? []).some(
-        (declaration) =>
-          ts.isVariableDeclaration(declaration) &&
-          declaration.initializer !== undefined &&
-          isCallResultExpression(declaration.initializer, new Set(seenSymbols)),
-      ),
+    return symbols.some((candidate) => {
+      if (
+        (candidate.declarations ?? []).some(
+          (declaration) =>
+            ts.isVariableDeclaration(declaration) &&
+            declaration.initializer !== undefined &&
+            isCallResultExpression(
+              declaration.initializer,
+              new Set(seenSymbols),
+            ),
+        )
+      ) {
+        return true;
+      }
+      return assignments.some((assignment) => {
+        if (!ts.isIdentifier(assignment.left)) return false;
+        const leftSymbol = checker.getSymbolAtLocation(assignment.left);
+        return (
+          leftSymbol === candidate &&
+          isCallResultExpression(assignment.right, new Set(seenSymbols))
+        );
+      });
+    });
+  }
+
+  function isAuthoredCallableExpression(
+    expression: ts.Expression,
+  ): boolean {
+    const declarations = callableDeclarations(
+      expression,
+      new Set<ts.Symbol>(),
+    );
+    return declarations.some(
+      (declaration) =>
+        ts.isFunctionDeclaration(declaration) ||
+        ts.isFunctionExpression(declaration) ||
+        ts.isArrowFunction(declaration) ||
+        ts.isMethodDeclaration(declaration) ||
+        ts.isGetAccessorDeclaration(declaration) ||
+        ts.isSetAccessorDeclaration(declaration),
     );
   }
 
@@ -3617,125 +3682,359 @@ function semanticWorkerBindingDiagnostics(
     );
   }
 
-  function zodImportSymbols(
+  const TRUSTED_ZOD_ROOT_FACTORIES = new Set([
+    "any",
+    "array",
+    "bigint",
+    "boolean",
+    "catch",
+    "date",
+    "discriminatedUnion",
+    "enum",
+    "file",
+    "function",
+    "instanceof",
+    "intersection",
+    "json",
+    "lazy",
+    "literal",
+    "map",
+    "nan",
+    "nativeEnum",
+    "never",
+    "null",
+    "nullable",
+    "number",
+    "object",
+    "promise",
+    "record",
+    "set",
+    "string",
+    "symbol",
+    "templateLiteral",
+    "tuple",
+    "undefined",
+    "union",
+    "unknown",
+    "void",
+  ]);
+  const TRUSTED_ZOD_NAMESPACE_PROPERTIES = new Set([
+    "coerce",
+    "codec",
+  ]);
+  const TRUSTED_ZOD_SCHEMA_METHODS = new Set([
+    "and",
+    "array",
+    "base64",
+    "brand",
+    "catch",
+    "check",
+    "cidr",
+    "cuid",
+    "cuid2",
+    "datetime",
+    "default",
+    "describe",
+    "email",
+    "endsWith",
+    "extend",
+    "extract",
+    "finite",
+    "gt",
+    "gte",
+    "includes",
+    "int",
+    "length",
+    "lt",
+    "lte",
+    "max",
+    "min",
+    "nonoptional",
+    "nullable",
+    "nullish",
+    "optional",
+    "or",
+    "overwrite",
+    "passthrough",
+    "pipe",
+    "prefix",
+    "readonly",
+    "regex",
+    "refine",
+    "refinement",
+    "safe",
+    "startsWith",
+    "strict",
+    "superRefine",
+    "transform",
+    "trim",
+    "toLowerCase",
+    "toUpperCase",
+    "unwrap",
+    "url",
+    "uuid",
+  ]);
+  function zodPropertyName(
+    expression: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+  ): string | undefined {
+    return ts.isPropertyAccessExpression(expression)
+      ? expression.name.text
+      : propertyNameExpression(expression.argumentExpression);
+  }
+
+  function isTrustedZodNamespaceExpression(
     expression: ts.Expression,
     seenExpressions: Set<ts.Expression> = new Set(),
-  ): readonly ts.Symbol[] {
+  ): boolean {
     const current = unwrapExpression(expression);
-    if (seenExpressions.has(current)) return [];
+    if (seenExpressions.has(current)) return false;
     seenExpressions.add(current);
-    const callee =
-      ts.isCallExpression(current)
-        ? unwrapExpression(current.expression)
-        : current;
     if (
-      !ts.isPropertyAccessExpression(callee) &&
-      !ts.isElementAccessExpression(callee)
+      !ts.isPropertyAccessExpression(current) &&
+      !ts.isElementAccessExpression(current)
     ) {
-      return [];
-    }
-    const receiver = callee.expression;
-    if (!ts.isIdentifier(receiver)) {
-      return zodImportSymbols(receiver, seenExpressions);
-    }
-    const symbol = checker.getSymbolAtLocation(receiver);
-    if (symbol === undefined) return [];
-
-    const importedSymbols = [symbol];
-    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
-      const aliased = checker.getAliasedSymbol(symbol);
-      if (aliased !== symbol) importedSymbols.push(aliased);
-    }
-    const importedFromZod = (declaration: ts.Declaration): boolean => {
-      if (ts.isImportSpecifier(declaration)) {
-        const importDeclaration = declaration.parent.parent.parent;
-        return (
-          ts.isImportDeclaration(importDeclaration) &&
-          ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
-          importDeclaration.moduleSpecifier.text === "zod"
-        );
-      }
-      if (ts.isNamespaceImport(declaration)) {
-        const importDeclaration = declaration.parent.parent;
-        return (
-          ts.isImportDeclaration(importDeclaration) &&
-          ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
-          importDeclaration.moduleSpecifier.text === "zod"
-        );
-      }
-      if (ts.isImportClause(declaration)) {
-        const importDeclaration = declaration.parent;
-        return (
-          ts.isImportDeclaration(importDeclaration) &&
-          ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
-          importDeclaration.moduleSpecifier.text === "zod"
-        );
-      }
       return false;
-    };
-    if (
-      !importedSymbols.some((candidate) =>
-        (candidate.declarations ?? []).some(importedFromZod),
-      )
-    ) {
-      return [];
     }
-    return importedSymbols;
+    const propertyName = zodPropertyName(current);
+    if (propertyName === undefined) return false;
+    const receiver = current.expression;
+    if (
+      ts.isIdentifier(unwrapExpression(receiver)) &&
+      isTrustedZodImportIdentifier(receiver)
+    ) {
+      return TRUSTED_ZOD_NAMESPACE_PROPERTIES.has(propertyName);
+    }
+    return (
+      TRUSTED_ZOD_NAMESPACE_PROPERTIES.has(propertyName) &&
+      isTrustedZodNamespaceExpression(receiver, seenExpressions)
+    );
+  }
+
+  function isTrustedZodSchemaCallee(
+    expression: ts.Expression,
+    seenExpressions: Set<ts.Expression> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (seenExpressions.has(current)) return false;
+    seenExpressions.add(current);
+    if (
+      !ts.isPropertyAccessExpression(current) &&
+      !ts.isElementAccessExpression(current)
+    ) {
+      return false;
+    }
+    const propertyName = zodPropertyName(current);
+    if (propertyName === undefined) return false;
+    const receiver = current.expression;
+    const receiverExpression = unwrapExpression(receiver);
+    if (
+      ts.isIdentifier(receiverExpression) &&
+      isTrustedZodImportIdentifier(receiverExpression)
+    ) {
+      return TRUSTED_ZOD_ROOT_FACTORIES.has(propertyName);
+    }
+    if (
+      TRUSTED_ZOD_ROOT_FACTORIES.has(propertyName) &&
+      isTrustedZodNamespaceExpression(receiverExpression)
+    ) {
+      return true;
+    }
+    return (
+      TRUSTED_ZOD_SCHEMA_METHODS.has(propertyName) &&
+      isTrustedZodExpression(receiver)
+    );
   }
 
   function isTrustedZodCall(expression: ts.Expression): boolean {
-    const importedSymbols = zodImportSymbols(expression);
-    if (importedSymbols.length === 0) return false;
-    return importedSymbols.some((candidate) => {
-      const importDeclaration = (candidate.declarations ?? []).find(
-        (declaration): declaration is ts.ImportSpecifier | ts.NamespaceImport | ts.ImportClause =>
-          ts.isImportSpecifier(declaration) ||
-          ts.isNamespaceImport(declaration) ||
-          ts.isImportClause(declaration),
-      );
-      if (importDeclaration === undefined) return false;
-      const importSourceFile = importDeclaration.getSourceFile();
-      const moduleSpecifier = ts.isImportSpecifier(importDeclaration)
-        ? importDeclaration.parent.parent.parent.moduleSpecifier
-        : ts.isNamespaceImport(importDeclaration)
-          ? importDeclaration.parent.parent.moduleSpecifier
-          : importDeclaration.parent.moduleSpecifier;
-      if (!ts.isStringLiteralLike(moduleSpecifier)) return false;
-      const resolved = trustedDependencyContext.resolveModule(
-        moduleSpecifier,
-        importSourceFile,
-      );
-      if (
-        resolved?.packageId?.name !== TRUSTED_ZOD_PACKAGE.name ||
-        resolved.packageId.version !== TRUSTED_ZOD_PACKAGE.version
-      ) {
-        return false;
-      }
-      const relativeResolved = toPosixPath(
-        relative(
-          normalize(trustedDependencyContext.sourceRoot),
-          normalize(resolved.resolvedFileName),
-        ),
-      );
-      if (
-        relativeResolved.startsWith("../") ||
-        relativeResolved === ".."
-      ) {
-        return false;
-      }
-      return (
-        dependencyPackageRoot(relativeResolved) ===
-          TRUSTED_ZOD_PACKAGE.root &&
-        isTrustedWorkerDependency(
-          trustedDependencyContext.files,
-          relativeResolved,
-        )
-      );
-    });
+    const current = unwrapExpression(expression);
+    return (
+      ts.isCallExpression(current) &&
+      isTrustedZodSchemaCallee(current.expression)
+    );
   }
 
-  function isZodCall(expression: ts.Expression): boolean {
-    return zodImportSymbols(expression).length > 0;
+  function isTrustedZodImportIdentifier(
+    expression: ts.Expression,
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (!ts.isIdentifier(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined) return false;
+    const symbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) symbols.push(aliased);
+    }
+    return symbols.some((candidate) =>
+      (candidate.declarations ?? []).some((declaration) => {
+        if (
+          !ts.isImportSpecifier(declaration) &&
+          !ts.isNamespaceImport(declaration) &&
+          !ts.isImportClause(declaration)
+        ) {
+          return false;
+        }
+        const importDeclaration = ts.isImportSpecifier(declaration)
+          ? declaration.parent.parent.parent
+          : ts.isNamespaceImport(declaration)
+            ? declaration.parent.parent
+            : declaration.parent;
+        if (
+          !ts.isImportDeclaration(importDeclaration) ||
+          !ts.isStringLiteralLike(importDeclaration.moduleSpecifier) ||
+          importDeclaration.moduleSpecifier.text !== "zod"
+        ) {
+          return false;
+        }
+        const resolved = trustedDependencyContext.resolveModule(
+          importDeclaration.moduleSpecifier,
+          importDeclaration.getSourceFile(),
+        );
+        return (
+          resolved?.packageId?.name === TRUSTED_ZOD_PACKAGE.name &&
+          resolved.packageId.version === TRUSTED_ZOD_PACKAGE.version &&
+          isTrustedWorkerDependency(
+            trustedDependencyContext.files,
+            toPosixPath(
+              relative(
+                normalize(trustedDependencyContext.sourceRoot),
+                normalize(resolved.resolvedFileName),
+              ),
+            ),
+          )
+        );
+      }),
+    );
+  }
+
+  function isZodImportIdentifier(expression: ts.Expression): boolean {
+    const current = unwrapExpression(expression);
+    if (!ts.isIdentifier(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined) return false;
+    const symbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) symbols.push(aliased);
+    }
+    return symbols.some((candidate) =>
+      (candidate.declarations ?? []).some((declaration) => {
+        const importDeclaration = ts.isImportSpecifier(declaration)
+          ? declaration.parent.parent.parent
+          : ts.isNamespaceImport(declaration)
+            ? declaration.parent.parent
+            : ts.isImportClause(declaration)
+              ? declaration.parent
+              : undefined;
+        return (
+          importDeclaration !== undefined &&
+          ts.isImportDeclaration(importDeclaration) &&
+          ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
+          importDeclaration.moduleSpecifier.text === "zod"
+        );
+      }),
+    );
+  }
+
+  function isUnresolvedZodImportExpression(
+    expression: ts.Expression,
+    seenExpressions: Set<ts.Expression> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (seenExpressions.has(current)) return false;
+    seenExpressions.add(current);
+    if (ts.isIdentifier(current)) {
+      const symbol = checker.getSymbolAtLocation(current);
+      if (symbol === undefined) return false;
+      const symbols = [symbol];
+      if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        const aliased = checker.getAliasedSymbol(symbol);
+        if (aliased !== symbol) symbols.push(aliased);
+      }
+      return symbols.some((candidate) =>
+        (candidate.declarations ?? []).some((declaration) => {
+          const importDeclaration = ts.isImportSpecifier(declaration)
+            ? declaration.parent.parent.parent
+            : ts.isNamespaceImport(declaration)
+              ? declaration.parent.parent
+              : ts.isImportClause(declaration)
+                ? declaration.parent
+                : undefined;
+          if (
+            importDeclaration === undefined ||
+            !ts.isImportDeclaration(importDeclaration) ||
+            !ts.isStringLiteralLike(importDeclaration.moduleSpecifier) ||
+            importDeclaration.moduleSpecifier.text !== "zod"
+          ) {
+            return false;
+          }
+          return !trustedDependencyContext.files.some(
+            (file) =>
+              file.relativePath === `${TRUSTED_ZOD_PACKAGE.root}/package.json`,
+          );
+        }),
+      );
+    }
+    if (
+      ts.isPropertyAccessExpression(current) ||
+      ts.isElementAccessExpression(current)
+    ) {
+      return isUnresolvedZodImportExpression(
+        current.expression,
+        seenExpressions,
+      );
+    }
+    return false;
+  }
+
+  function isZodImportExpression(
+    expression: ts.Expression,
+    seenExpressions: Set<ts.Expression> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (seenExpressions.has(current)) return false;
+    seenExpressions.add(current);
+    if (isZodImportIdentifier(current)) return true;
+    if (
+      ts.isPropertyAccessExpression(current) ||
+      ts.isElementAccessExpression(current)
+    ) {
+      return isZodImportExpression(current.expression, seenExpressions);
+    }
+    return false;
+  }
+
+  function isTrustedZodExpression(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (
+      isTrustedZodCall(current) ||
+      isTrustedZodSchemaCallee(current)
+    ) {
+      return true;
+    }
+    if (!ts.isIdentifier(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    seenSymbols.add(symbol);
+    const symbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) symbols.push(aliased);
+    }
+    return symbols.some((candidate) =>
+      (candidate.declarations ?? []).some(
+        (declaration) =>
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          isTrustedZodExpression(
+            declaration.initializer,
+            new Set(seenSymbols),
+          ),
+      ),
+    );
   }
 
   function isUnresolvedCallablePropertyAccess(
@@ -3749,12 +4048,24 @@ function semanticWorkerBindingDiagnostics(
       return false;
     }
     const receiver = current.expression;
-    if (!isCallResultExpression(receiver)) return false;
     if (isTrustedZodCall(receiver)) return false;
     if (isSafeInputMethodPropertyAccess(current)) return false;
-    return (
-      isAnyOrUnknownType(receiver) || isZodCall(receiver)
-    );
+    const unwrappedReceiver = unwrapExpression(receiver);
+    if (
+      ts.isCallExpression(unwrappedReceiver) &&
+      isUnresolvedZodImportExpression(unwrappedReceiver.expression)
+    ) {
+      return false;
+    }
+    const receiverValue = resolveAmbientValue(receiver);
+    if (
+      receiverValue?.kind === "call-result" ||
+      receiverValue?.kind === "unknown-callable"
+    ) {
+      return true;
+    }
+    if (!isCallResultExpression(receiver)) return false;
+    return isAnyOrUnknownType(receiver);
   }
 
   function ambientObjectPropertyValue(
@@ -3820,6 +4131,16 @@ function semanticWorkerBindingDiagnostics(
             if (value !== undefined) return value;
           }
         }
+      }
+      for (const assignment of assignments) {
+        if (!ts.isIdentifier(assignment.left)) continue;
+        const leftSymbol = checker.getSymbolAtLocation(assignment.left);
+        if (leftSymbol !== symbol) continue;
+        const value = resolveAmbientValue(
+          assignment.right,
+          new Set(seenSymbols),
+        );
+        if (value !== undefined) return value;
       }
     }
     const value = resolveAmbientValue(current, new Set(seenSymbols));
@@ -4031,6 +4352,9 @@ function semanticWorkerBindingDiagnostics(
     if (left.kind === "unknown-callable" || right.kind === "unknown-callable") {
       return { kind: "unknown-callable" };
     }
+    if (left.kind === "call-result" || right.kind === "call-result") {
+      return { kind: "call-result" };
+    }
     if (left.kind === "dynamic-code" || right.kind === "dynamic-code") {
       return {
         kind: "dynamic-code",
@@ -4119,6 +4443,9 @@ function semanticWorkerBindingDiagnostics(
         name: `${value.name}.${propertyName}`,
       };
     }
+    if (value.kind === "call-result") {
+      return { kind: "unknown-callable" };
+    }
     if (value.kind === "global") {
       return {
         kind: "global",
@@ -4202,9 +4529,28 @@ function semanticWorkerBindingDiagnostics(
         const callable = callableAmbientValue(candidate.declarations ?? []);
         if (callable !== undefined) return callable;
       }
+      for (const assignment of assignments) {
+        if (!ts.isIdentifier(assignment.left)) continue;
+        const leftSymbol = checker.getSymbolAtLocation(assignment.left);
+        if (leftSymbol !== symbol) continue;
+        const value = resolveAmbientValue(
+          assignment.right,
+          new Set(seenSymbols),
+        );
+        if (value !== undefined) return value;
+      }
       return undefined;
     }
     if (ts.isPropertyAccessExpression(current)) {
+      if (isUnresolvedZodImportExpression(current)) {
+        return undefined;
+      }
+      if (
+        isTrustedZodExpression(current.expression) &&
+        TRUSTED_ZOD_SCHEMA_METHODS.has(current.name.text)
+      ) {
+        return undefined;
+      }
       const base = resolveAmbientValue(current.expression, seenSymbols);
       if (base?.kind === "root") {
         if (DYNAMIC_CODE_GLOBALS.has(current.name.text)) {
@@ -4240,6 +4586,9 @@ function semanticWorkerBindingDiagnostics(
         };
       }
       if (base?.kind === "unknown-callable") return base;
+      if (base?.kind === "call-result") {
+        return { kind: "unknown-callable" };
+      }
       if (base?.kind === "callable") {
         return base.returns.reduce<AmbientValue | undefined>(
           (resolved, value) => mergeAmbientValues(resolved, value),
@@ -4276,6 +4625,32 @@ function semanticWorkerBindingDiagnostics(
       return undefined;
     }
     if (ts.isElementAccessExpression(current)) {
+      if (isUnresolvedZodImportExpression(current)) {
+        return undefined;
+      }
+      if (
+        isTrustedZodExpression(current.expression) &&
+        TRUSTED_ZOD_SCHEMA_METHODS.has(
+          propertyNameExpression(current.argumentExpression) ?? "",
+        )
+      ) {
+        return undefined;
+      }
+      if (isZodImportExpression(current.expression)) {
+        return { kind: "unknown-callable" };
+      }
+      const elementName = propertyNameExpression(current.argumentExpression);
+      if (
+        elementName !== undefined &&
+        ts.isIdentifier(unwrapExpression(current.expression)) &&
+        ambientRootName(current.expression) !== undefined &&
+        SUPPORTED_WORKER_GLOBALS.has(elementName)
+      ) {
+        return {
+          kind: "global",
+          name: elementName,
+        };
+      }
       if (isReflectGetExpression(current)) {
         return { kind: "reflect-get" };
       }
@@ -4312,6 +4687,9 @@ function semanticWorkerBindingDiagnostics(
         };
       }
       if (base?.kind === "unknown-callable") return base;
+      if (base?.kind === "call-result") {
+        return { kind: "unknown-callable" };
+      }
       if (base?.kind === "callable") {
         return base.returns.reduce<AmbientValue | undefined>(
           (resolved, value) => mergeAmbientValues(resolved, value),
@@ -4461,6 +4839,13 @@ function semanticWorkerBindingDiagnostics(
     }
     if (ts.isCallExpression(current)) {
       if (isSafeInputMethodCall(current)) return undefined;
+      if (isTrustedZodCall(current)) return undefined;
+      if (isZodImportExpression(current.expression)) {
+        if (isUnresolvedZodImportExpression(current.expression)) {
+          return { kind: "unknown-callable" };
+        }
+        return { kind: "unknown-callable" };
+      }
       const reflective = resolveReflectGetCallResult(current, seenSymbols);
       if (reflective !== undefined) return reflective;
       if (isReflectGetAliasExpression(current.expression)) {
@@ -4479,6 +4864,9 @@ function semanticWorkerBindingDiagnostics(
       if (callee?.kind === "dynamic-code") return callee;
       if (callee?.kind === "dynamic-property") return callee;
       if (callee?.kind === "unknown-callable") return callee;
+      if (callee?.kind === "call-result") {
+        return { kind: "unknown-callable" };
+      }
       if (callee?.kind === "callable") {
         return callee.returns.reduce<AmbientValue | undefined>(
           (resolved, value) => mergeAmbientValues(resolved, value),
@@ -4529,7 +4917,17 @@ function semanticWorkerBindingDiagnostics(
       ) {
         return { kind: "unknown-callable" };
       }
-      if (returns.length === 0) return undefined;
+      if (returns.length === 0) {
+        if (isCallResultExpression(current.expression)) {
+          return { kind: "unknown-callable" };
+        }
+        return (
+          isAnyOrUnknownType(current) &&
+          isAuthoredCallableExpression(current.expression)
+        )
+          ? { kind: "call-result" }
+          : undefined;
+      }
       return returns.slice(1).reduce(
         (currentValue, value) => mergeAmbientValues(currentValue, value),
         returns[0] as AmbientValue,
@@ -4540,6 +4938,9 @@ function semanticWorkerBindingDiagnostics(
       if (callee?.kind === "dynamic-code") return callee;
       if (callee?.kind === "dynamic-property") return callee;
       if (callee?.kind === "unknown-callable") return callee;
+      if (callee?.kind === "call-result") {
+        return { kind: "unknown-callable" };
+      }
       for (const argument of current.arguments ?? []) {
         const value = resolveAmbientValue(argument, seenSymbols);
         if (value?.kind === "dynamic-code") return value;
@@ -4720,6 +5121,10 @@ function semanticWorkerBindingDiagnostics(
     value: AmbientValue | undefined,
   ): void {
     if (value === undefined) return;
+    // A call-result is provenance, not itself an unsafe access. Preserve it
+    // for aliases and report only when a later property/call use remains
+    // unresolved.
+    if (value.kind === "call-result") return;
     const location = semanticLocation(sourceFile, node);
     if (value.kind === "dynamic-code") {
       diagnostics.push(
@@ -4846,6 +5251,7 @@ function semanticWorkerBindingDiagnostics(
       if (
         calleeValue === undefined ||
         calleeValue.kind === "reflect-get" ||
+        calleeValue.kind === "call-result" ||
         calleeValue.kind === "unknown-callable" ||
         calleeValue.kind === "callable"
       ) {
@@ -4974,6 +5380,48 @@ async function validateAuthoredWorkerSources(
   });
   const checker = program.getTypeChecker();
   const diagnostics: EdenDiagnostic[] = [];
+  const unresolvedBareImports = new Set<string>();
+  const hasRuntimeImportBinding = (
+    node: ts.ImportDeclaration | ts.ExportDeclaration,
+  ): boolean => {
+    if (ts.isImportDeclaration(node)) {
+      const clause = node.importClause;
+      if (clause === undefined || clause.isTypeOnly) {
+        return clause === undefined;
+      }
+      if (clause.namedBindings === undefined) return true;
+      if (ts.isNamespaceImport(clause.namedBindings)) return true;
+      return clause.namedBindings.elements.some(
+        (specifier) => !specifier.isTypeOnly,
+      );
+    }
+    if (node.isTypeOnly) return false;
+    if (node.exportClause === undefined) return true;
+    if (ts.isNamespaceExport(node.exportClause)) return true;
+    return node.exportClause.elements.some(
+      (specifier) => !specifier.isTypeOnly,
+    );
+  };
+  for (const source of sourceFiles) {
+    const sourceFile = program.getSourceFile(source.fileName);
+    if (sourceFile === undefined) continue;
+    sourceFile.forEachChild((node) => {
+      if (
+        (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+        hasRuntimeImportBinding(node) &&
+        node.moduleSpecifier !== undefined &&
+        ts.isStringLiteralLike(node.moduleSpecifier) &&
+        !node.moduleSpecifier.text.startsWith(".") &&
+        resolveSelectedProjectDependency(
+          snapshot.projectRoot,
+          join(snapshot.projectRoot, source.file.relativePath),
+          node.moduleSpecifier.text,
+        ) === undefined
+      ) {
+        unresolvedBareImports.add(source.file.relativePath);
+      }
+    });
+  }
 
   for (const file of files) {
     if (
@@ -5008,6 +5456,15 @@ async function validateAuthoredWorkerSources(
       },
     );
     diagnostics.push(...semanticDiagnostics);
+    if (unresolvedBareImports.has(file.relativePath)) {
+      diagnostics.push(
+        diagnostic(
+          "MODULE_LOAD_FAILED",
+          `Unable to resolve one or more imports in "${file.relativePath}" from the selected project.`,
+          file.relativePath,
+        ),
+      );
+    }
   }
   if (diagnostics.length > 0) {
     throw new EdenCompilerError(
