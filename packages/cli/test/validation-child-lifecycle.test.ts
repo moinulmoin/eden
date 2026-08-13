@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   runEdenCli,
+  type EdenCliDryRunHandle,
   type EdenCliDryRunResult,
   type EdenCliProcess,
   type EdenCliProcessRequest,
@@ -437,4 +438,215 @@ describe("CLI validation child lifecycle", () => {
     expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
     expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
   });
+
+  test("isolates concurrent injected build stops without process-global listeners", async () => {
+    const firstRoot = await createRoot();
+    const secondRoot = await createRoot();
+    await Promise.all([initRoot(firstRoot), initRoot(secondRoot)]);
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const beforeSigint = process.listenerCount("SIGINT");
+    const beforeSigterm = process.listenerCount("SIGTERM");
+    let firstStarted = false;
+    let secondStarted = false;
+    let releaseFirst: (() => void) | undefined;
+    let releaseSecond: (() => void) | undefined;
+    const firstResult = new Promise<{
+      readonly exitCode: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    }>((resolve) => {
+      releaseFirst = () => resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    const secondResult = new Promise<{
+      readonly exitCode: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    }>((resolve) => {
+      releaseSecond = () => resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    const firstProcess: EdenCliProcess = {
+      pid: 44_008,
+      startIdentity: "isolated-build-first",
+      exited: firstResult.then(() => ({ exitCode: 0, signal: null })),
+      async terminate() {
+        releaseFirst?.();
+      },
+    };
+    const secondProcess: EdenCliProcess = {
+      pid: 44_009,
+      startIdentity: "isolated-build-second",
+      exited: secondResult.then(() => ({ exitCode: 0, signal: null })),
+      async terminate() {
+        releaseSecond?.();
+      },
+    };
+
+    const firstBuild = runEdenCli(["build", "--project", firstRoot], {
+      cwd: firstRoot,
+      stopSignal: firstController.signal,
+      dryRunRunner: () => {
+        firstStarted = true;
+        return { process: firstProcess, result: firstResult };
+      },
+    });
+    const secondBuild = runEdenCli(["build", "--project", secondRoot], {
+      cwd: secondRoot,
+      stopSignal: secondController.signal,
+      dryRunRunner: () => {
+        secondStarted = true;
+        return { process: secondProcess, result: secondResult };
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(firstStarted).toBe(true);
+      expect(secondStarted).toBe(true);
+    });
+    expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
+    expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+
+    firstController.abort();
+    await expect(firstBuild).resolves.toBe(0);
+    expect(secondBuild).toBeInstanceOf(Promise);
+    const secondSettled = await Promise.race([
+      secondBuild.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
+    ]);
+    expect(secondSettled).toBe(false);
+
+    secondController.abort();
+    await expect(secondBuild).resolves.toBe(0);
+    expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
+    expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+  }, 15_000);
+
+  test("waits for a late compatibility handle before final cleanup", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const stopController = new AbortController();
+    let resolveLate: (
+      value: EdenCliDryRunHandle,
+    ) => void;
+    const lateResult = new Promise<EdenCliDryRunHandle>((resolve) => {
+      resolveLate = resolve;
+    });
+    let releaseChild: (() => void) | undefined;
+    let terminated = false;
+    const childExited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseChild = () => resolve({ exitCode: 0, signal: null });
+    });
+    const child: EdenCliProcess = {
+      pid: 44_010,
+      startIdentity: "late-compatibility-child",
+      exited: childExited,
+      async terminate() {
+        terminated = true;
+        releaseChild?.();
+      },
+    };
+    let releaseHook: (() => void) | undefined;
+    const hook = new Promise<void>((resolve) => {
+      releaseHook = resolve;
+    });
+    let runnerStarted: (() => void) | undefined;
+    const runnerStartedPromise = new Promise<void>((resolve) => {
+      runnerStarted = resolve;
+    });
+    const buildPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      stopSignal: stopController.signal,
+      dryRunRunner: () => {
+        runnerStarted?.();
+        return lateResult as never;
+      },
+      buildPublicationHook: async () => hook,
+    });
+
+    await runnerStartedPromise;
+    stopController.abort();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    resolveLate!({
+      process: child,
+      result: new Promise<EdenCliDryRunResult>(() => {}),
+    });
+    releaseHook?.();
+
+    await expect(buildPromise).resolves.toBe(0);
+    expect(terminated).toBe(true);
+  }, 15_000);
+
+  test("bounds a permanently pending generation continuation", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const stopController = new AbortController();
+    let hookStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      hookStarted = resolve;
+    });
+    let releaseHook: (() => void) | undefined;
+    const hook = new Promise<void>((resolve) => {
+      releaseHook = resolve;
+    });
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      stopSignal: stopController.signal,
+      processRunner: {
+        spawn() {
+          throw new Error("the runtime must not spawn while generation is pending");
+        },
+      },
+      dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      buildPublicationHook: async () => {
+        hookStarted?.();
+        await hook;
+      },
+    });
+
+    await started;
+    stopController.abort();
+    const settled = await Promise.race([
+      devPromise.then((code) => ({ settled: true, code })),
+      new Promise<{ readonly settled: false }>((resolve) =>
+        setTimeout(() => resolve({ settled: false }), 1_500),
+      ),
+    ]);
+    releaseHook?.();
+    await expect(devPromise).resolves.toBe(0);
+    expect(settled).toEqual({ settled: true, code: 0 });
+  }, 10_000);
+
+  test("fails closed when generation publication never settles", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    let releaseHook: (() => void) | undefined;
+    const hook = new Promise<void>((resolve) => {
+      releaseHook = resolve;
+    });
+    let hookStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      hookStarted = resolve;
+    });
+    const errors: string[] = [];
+    const buildPromise = runEdenCli(["build", "--project", root], {
+      cwd: root,
+      stderr: (line) => errors.push(line),
+      dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      buildPublicationHook: async () => {
+        hookStarted?.();
+        await hook;
+      },
+    });
+
+    await started;
+    const startedAt = Date.now();
+    await expect(buildPromise).resolves.toBe(1);
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
+    expect(errors.join("\n")).toMatch(/GENERATION_WORK_TIMEOUT|failed closed/i);
+    releaseHook?.();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }, 10_000);
 });

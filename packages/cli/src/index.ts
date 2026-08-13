@@ -4970,8 +4970,63 @@ interface OwnedProcessRegistry {
   readonly deferCleanup: (
     cleanup: () => void | Promise<void>,
   ) => Promise<void>;
-  readonly waitForQuiescence: () => Promise<void>;
-  readonly cleanup: (signal: NodeJS.Signals) => Promise<void>;
+  readonly waitForQuiescence: () => Promise<boolean>;
+  readonly cleanup: (
+    signal: NodeJS.Signals,
+    timeoutMs?: number,
+  ) => Promise<boolean>;
+}
+
+async function awaitBuildPublicationHook(
+  hook: EdenCliRunOptions["buildPublicationHook"],
+  boundary: EdenBuildPublicationBoundary,
+  ownedProcesses?: OwnedProcessRegistry,
+): Promise<boolean> {
+  if (hook === undefined) return true;
+  if (ownedProcesses?.isStopping() === true) return false;
+  const continuation = Promise.resolve().then(() => hook(boundary));
+  ownedProcesses?.trackLateResult(continuation);
+  if (ownedProcesses === undefined) {
+    await continuation;
+    return true;
+  }
+  return await Promise.race([
+    continuation.then(() => true),
+    ownedProcesses.stopped.then(() => false),
+  ]);
+}
+
+async function awaitBoundedGenerationWork<T>(
+  work: PromiseLike<T>,
+  ownedProcesses: OwnedProcessRegistry | undefined,
+  timeoutMs = GENERATION_WORK_TIMEOUT_MS,
+): Promise<T | undefined> {
+  const workPromise = Promise.resolve(work);
+  ownedProcesses?.trackLateResult(workPromise.then(() => undefined));
+  if (ownedProcesses === undefined) {
+    return await workPromise;
+  }
+  const timeout = Symbol("eden.generation.timeout");
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  try {
+    const result = await Promise.race([
+      workPromise,
+      ownedProcesses.stopped.then(() => undefined),
+      new Promise<typeof timeout>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(timeout), timeoutMs);
+      }),
+    ]);
+    if (result === timeout) {
+      throw cliError({
+        code: "GENERATION_WORK_TIMEOUT",
+        message:
+          `Eden generation work did not settle within ${timeoutMs}ms; the operation failed closed.`,
+      });
+    }
+    return result;
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+  }
 }
 
 const OWNED_PROCESS_TERMINATION_TIMEOUT_MS = 2_000;
@@ -4980,6 +5035,7 @@ const OWNED_PROCESS_CLEANUP_TIMEOUT_MS =
   OWNED_PROCESS_TERMINATION_TIMEOUT_MS * 2 +
   OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS * 2 +
   500;
+const GENERATION_WORK_TIMEOUT_MS = 1_000;
 
 interface OwnedRunnerReservation {
   readonly release: () => void;
@@ -5040,7 +5096,9 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
   }>();
   const deferredCleanups = new Set<() => void | Promise<void>>();
   let stopping = false;
-  let cleanupPromise: Promise<void> | undefined;
+  let cleanupPromise: Promise<boolean> | undefined;
+  let cleanupFinished = false;
+  let cleanupFinishedQuiescent = false;
   let cleanupSignal: NodeJS.Signals = "SIGTERM";
   let deferredCleanupPromise: Promise<void> | undefined;
   let resolveStopped: ((signal: NodeJS.Signals) => void) | undefined;
@@ -5073,6 +5131,10 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
     await deferredCleanupPromise;
   };
   const scheduleQuiescenceCheck = (): void => {
+    if (stopping && cleanupFinished && !isQuiescent()) {
+      cleanupFinished = false;
+      void cleanup(cleanupSignal, GENERATION_WORK_TIMEOUT_MS);
+    }
     if (isQuiescent()) {
       void drainDeferredCleanups();
     }
@@ -5129,15 +5191,18 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
     pendingTerminations.set(process, termination);
     return termination;
   };
-  async function cleanup(signal: NodeJS.Signals): Promise<void> {
+  async function cleanup(
+    signal: NodeJS.Signals,
+    timeoutMs = OWNED_PROCESS_CLEANUP_TIMEOUT_MS,
+  ): Promise<boolean> {
     cleanupSignal = signal;
     stopping = true;
     resolveStopped?.(signal);
     resolveStopped = undefined;
     if (cleanupPromise !== undefined) return cleanupPromise;
+    if (cleanupFinished) return cleanupFinishedQuiescent;
     cleanupPromise = (async () => {
-      const deadline =
-        Date.now() + OWNED_PROCESS_CLEANUP_TIMEOUT_MS;
+      const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
         const processSnapshot = [...processes];
         const reservationSnapshot = [...reservations];
@@ -5160,7 +5225,7 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
           isQuiescent()
         ) {
           await drainDeferredCleanups();
-          return;
+          return isQuiescent();
         }
         if (
           processes.size > 0 &&
@@ -5172,15 +5237,20 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
           // the process owned and leave deferred files/locks in place; a
           // later exit observation will drain them without a second signal
           // storm or a false quiescence result.
-          return;
+          return false;
         }
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
       await drainDeferredCleanups();
-    })().finally(() => {
+      return isQuiescent();
+    })();
+    try {
+      return await cleanupPromise;
+    } finally {
+      cleanupFinished = true;
+      cleanupFinishedQuiescent = isQuiescent();
       cleanupPromise = undefined;
-    });
-    return await cleanupPromise;
+    }
   }
   return {
     isStopping: () => stopping,
@@ -5200,6 +5270,7 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
         release: (): void => {
           if (released) return;
           released = true;
+          cleanupFinished = false;
           reservations.delete(reservation);
           resolveReservation?.();
           scheduleQuiescenceCheck();
@@ -5224,6 +5295,7 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
       return ownedReservation;
     },
     registerReservationProcess: (reservation, process) => {
+      cleanupFinished = false;
       if (!processRecords.has(process)) {
         processRecords.set(process, {
           releaseRequested: false,
@@ -5239,6 +5311,7 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
       }
     },
     register: (process) => {
+      cleanupFinished = false;
       if (processRecords.has(process)) return;
       processRecords.set(process, {
         releaseRequested: false,
@@ -5267,11 +5340,16 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
       scheduleQuiescenceCheck();
     },
     trackLateResult: (settlement) => {
+      const restartCleanup = stopping && cleanupFinished;
+      cleanupFinished = false;
       const tracked = Promise.resolve(settlement).then(
         () => undefined,
         () => undefined,
       );
       lateResults.add(tracked);
+      if (restartCleanup) {
+        void cleanup(cleanupSignal, GENERATION_WORK_TIMEOUT_MS);
+      }
       void tracked.then(() => {
         lateResults.delete(tracked);
         scheduleQuiescenceCheck();
@@ -5282,9 +5360,9 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
       await drainDeferredCleanups();
     },
     waitForQuiescence: async () => {
-      if (!stopping) return;
+      if (!stopping) return true;
       const signal = await stopped;
-      await cleanup(signal);
+      return await cleanup(signal);
     },
     cleanup,
   };
@@ -5604,6 +5682,7 @@ async function buildProjectFromCli(
   environment?: "preview" | "production",
   sourceFingerprint?: ProjectInputFingerprint,
   ownedProcesses?: OwnedProcessRegistry,
+  generationWorkTimeoutMs = GENERATION_WORK_TIMEOUT_MS,
 ): Promise<EdenArtifactGeneration> {
   const configuration = await readProjectConfiguration(root);
   const inputFingerprint =
@@ -5709,9 +5788,37 @@ async function buildProjectFromCli(
         relative(root, runtimeFiles?.entryPath ?? candidateOutput),
       ],
     );
-    await options.buildPublicationHook?.("before-canonical-prepare");
+    const beforeCanonicalPrepare = await awaitBoundedGenerationWork(
+      awaitBuildPublicationHook(
+        options.buildPublicationHook,
+        "before-canonical-prepare",
+        ownedProcesses,
+      ),
+      ownedProcesses,
+      generationWorkTimeoutMs,
+    );
+    if (beforeCanonicalPrepare !== true) {
+      return candidateGeneration;
+    }
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
+    }
     await ensureCanonicalArtifactDirectory(root, canonicalOutput);
-    await options.buildPublicationHook?.("after-canonical-prepare");
+    const afterCanonicalPrepare = await awaitBoundedGenerationWork(
+      awaitBuildPublicationHook(
+        options.buildPublicationHook,
+        "after-canonical-prepare",
+        ownedProcesses,
+      ),
+      ownedProcesses,
+      generationWorkTimeoutMs,
+    );
+    if (afterCanonicalPrepare !== true) {
+      return candidateGeneration;
+    }
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
+    }
 
     const generationId = result.artifacts.buildMetadata.generationId;
     const candidateGenerationPath = join(
@@ -5724,7 +5831,21 @@ async function buildProjectFromCli(
       "generations",
       generationId,
     );
-    await options.buildPublicationHook?.("before-generation-publish");
+    const beforeGenerationPublish = await awaitBoundedGenerationWork(
+      awaitBuildPublicationHook(
+        options.buildPublicationHook,
+        "before-generation-publish",
+        ownedProcesses,
+      ),
+      ownedProcesses,
+      generationWorkTimeoutMs,
+    );
+    if (beforeGenerationPublish !== true) {
+      return candidateGeneration;
+    }
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
+    }
     const existingGeneration = await lstat(canonicalGeneration).catch(
       () => undefined,
     );
@@ -5750,17 +5871,62 @@ async function buildProjectFromCli(
       );
       await rm(candidateGenerationPath, { recursive: true, force: true });
     }
-    await options.buildPublicationHook?.("after-generation-publish");
-    await options.buildPublicationHook?.("before-current-promotion");
+    const afterGenerationPublish = await awaitBoundedGenerationWork(
+      awaitBuildPublicationHook(
+        options.buildPublicationHook,
+        "after-generation-publish",
+        ownedProcesses,
+      ),
+      ownedProcesses,
+      generationWorkTimeoutMs,
+    );
+    if (afterGenerationPublish !== true) {
+      return candidateGeneration;
+    }
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
+    }
+    const beforeCurrentPromotion = await awaitBoundedGenerationWork(
+      awaitBuildPublicationHook(
+        options.buildPublicationHook,
+        "before-current-promotion",
+        ownedProcesses,
+      ),
+      ownedProcesses,
+      generationWorkTimeoutMs,
+    );
+    if (beforeCurrentPromotion !== true) {
+      return candidateGeneration;
+    }
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
+    }
     await assertCanonicalGenerationMatches(
       root,
       canonicalGeneration,
       generationId,
       result.artifacts,
     );
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
+    }
     await promoteCurrentGeneration(canonicalOutput, generationId);
     await assertArtifactDirectory(canonicalOutput);
-    await options.buildPublicationHook?.("after-current-promotion");
+    const afterCurrentPromotion = await awaitBoundedGenerationWork(
+      awaitBuildPublicationHook(
+        options.buildPublicationHook,
+        "after-current-promotion",
+        ownedProcesses,
+      ),
+      ownedProcesses,
+      generationWorkTimeoutMs,
+    );
+    if (afterCurrentPromotion !== true) {
+      return candidateGeneration;
+    }
+    if (ownedProcesses?.isStopping() === true) {
+      return candidateGeneration;
+    }
     options.stdout?.(
       `Built Eden project generation ${generationId}.`,
     );
@@ -6840,13 +7006,18 @@ async function runDev(
     }
   };
 
-  const cleanup = (): Promise<void> => {
+  const cleanup = (
+    timeoutMs = OWNED_PROCESS_CLEANUP_TIMEOUT_MS,
+  ): Promise<void> => {
     if (cleanupRunning && cleanupPromise !== undefined) return cleanupPromise;
     cleanupRunning = true;
     cleanupPromise = (async () => {
       stopped = true;
       readinessAbortController.abort();
-      await ownedValidationProcesses.cleanup(requestedSignal);
+      await ownedValidationProcesses.cleanup(
+        requestedSignal,
+        timeoutMs,
+      );
       if (rebuildTimer !== undefined) {
         clearTimeout(rebuildTimer);
         rebuildTimer = undefined;
@@ -6856,7 +7027,7 @@ async function runDev(
       await closeWatcher(watcher);
       watcher = undefined;
 
-      const cleanupDeadline = Date.now() + OWNED_PROCESS_CLEANUP_TIMEOUT_MS;
+      const cleanupDeadline = Date.now() + timeoutMs;
       while (Date.now() < cleanupDeadline) {
         await waitForSettlements(
           [
@@ -6878,9 +7049,11 @@ async function runDev(
         );
         let allChildrenTerminal = true;
         if (snapshot.length === 0) {
-          await ownedValidationProcesses.deferCleanup(
-            removeRuntimeOwnedResources,
-          );
+          if (rebuildTasks.size === 0 && scheduledRebuilds.size === 0) {
+            await ownedValidationProcesses.deferCleanup(
+              removeRuntimeOwnedResources,
+            );
+          }
           break;
         }
         for (const ownedProcess of snapshot) {
@@ -6936,19 +7109,15 @@ async function runDev(
         }
       }
 
-      while (
-        rebuildTasks.size > 0 ||
-        scheduledRebuilds.size > 0
-      ) {
-        await waitForSettlements([
+      await waitForSettlements(
+        [
           ...rebuildTasks,
           ...[...scheduledRebuilds].map((scheduled) => scheduled.task),
-        ]);
-      }
-      await waitForSettlements([
-        ...rebuildTasks,
-        ...[...scheduledRebuilds].map((scheduled) => scheduled.task),
-      ]);
+        ],
+        timeoutMs,
+      );
+      const rebuildWorkSettled =
+        rebuildTasks.size === 0 && scheduledRebuilds.size === 0;
       await ownedValidationProcesses.waitForQuiescence();
       const remainingChildren = [
         child,
@@ -6958,14 +7127,16 @@ async function runDev(
         (value, index, values): value is EdenCliProcess =>
           value !== undefined && values.indexOf(value) === index,
       );
-      if (remainingChildren.length === 0) {
+      if (remainingChildren.length === 0 && rebuildWorkSettled) {
         await ownedValidationProcesses.deferCleanup(
           removeRuntimeOwnedResources,
         );
       } else {
-        void Promise.allSettled(
-          remainingChildren.map((ownedProcess) => ownedProcess.exited),
-        ).then(async () => {
+        void Promise.allSettled([
+          ...remainingChildren.map((ownedProcess) => ownedProcess.exited),
+          ...rebuildTasks,
+          ...[...scheduledRebuilds].map((scheduled) => scheduled.task),
+        ]).then(async () => {
           for (const ownedProcess of remainingChildren) {
             if (ownedProcess === child) child = undefined;
             if (ownedProcess === replacementChild) replacementChild = undefined;
@@ -6976,11 +7147,16 @@ async function runDev(
             replacementChild,
             ...runtimeChildren,
           ].some((ownedProcess) => ownedProcess !== undefined);
-          if (!stillRunning) {
-            await ownedValidationProcesses.deferCleanup(
-              removeRuntimeOwnedResources,
-            );
+          if (
+            stillRunning ||
+            rebuildTasks.size > 0 ||
+            scheduledRebuilds.size > 0
+          ) {
+            return;
           }
+          await ownedValidationProcesses.deferCleanup(
+            removeRuntimeOwnedResources,
+          );
         });
       }
     })();
@@ -7000,7 +7176,7 @@ async function runDev(
     stopped = true;
     requestedSignal = signal;
     signalResolve?.();
-    void cleanup();
+    void cleanup(GENERATION_WORK_TIMEOUT_MS);
   };
   const stopOnSigint = (): void => requestStop("SIGINT");
   const stopOnSigterm = (): void => requestStop("SIGTERM");
@@ -7192,6 +7368,7 @@ async function runDev(
         }
         const task = Promise.resolve().then(() => rebuild());
         rebuildTasks.add(task);
+        ownedValidationProcesses.trackLateResult(task);
         void task.then(
           () => {
             rebuildTasks.delete(task);
@@ -7335,25 +7512,40 @@ async function runDeploy(
   const ownedValidationProcesses = createOwnedProcessRegistry();
   let deploymentLock: DeploymentLockHandle | undefined;
   let requestedSignal: NodeJS.Signals | undefined;
+  const usesProcessSignals = options.stopSignal === undefined;
   const requestStop = (signal: NodeJS.Signals): void => {
     requestedSignal ??= signal;
-    void ownedValidationProcesses.cleanup(signal);
+    void ownedValidationProcesses.cleanup(signal, GENERATION_WORK_TIMEOUT_MS);
   };
   const stopOnSigint = (): void => requestStop("SIGINT");
   const stopOnSigterm = (): void => requestStop("SIGTERM");
-  process.on("SIGINT", stopOnSigint);
-  process.on("SIGTERM", stopOnSigterm);
+  const stopOnInjectedSignal = (): void => requestStop("SIGTERM");
+  const removeStopListeners = (): void => {
+    if (usesProcessSignals) {
+      process.removeListener("SIGINT", stopOnSigint);
+      process.removeListener("SIGTERM", stopOnSigterm);
+    }
+    options.stopSignal?.removeEventListener("abort", stopOnInjectedSignal);
+  };
+  if (usesProcessSignals) {
+    process.on("SIGINT", stopOnSigint);
+    process.on("SIGTERM", stopOnSigterm);
+  }
+  options.stopSignal?.addEventListener("abort", stopOnInjectedSignal, {
+    once: true,
+  });
+  if (options.stopSignal?.aborted === true) {
+    requestStop("SIGTERM");
+  }
   try {
     deploymentLock = await acquireDeploymentLock(root);
   } catch (error: unknown) {
-    process.removeListener("SIGINT", stopOnSigint);
-    process.removeListener("SIGTERM", stopOnSigterm);
+    removeStopListeners();
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     throw error;
   }
   if (deploymentLock === undefined) {
-    process.removeListener("SIGINT", stopOnSigint);
-    process.removeListener("SIGTERM", stopOnSigterm);
+    removeStopListeners();
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     throw cliError({
       code: "DEPLOY_LOCK_UNAVAILABLE",
@@ -7412,8 +7604,7 @@ async function runDeploy(
       deploymentArtifactSnapshot.fileDigests;
     generation = deploymentArtifactSnapshot.generation;
   } catch (error: unknown) {
-    process.removeListener("SIGINT", stopOnSigint);
-    process.removeListener("SIGTERM", stopOnSigterm);
+    removeStopListeners();
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     releaseDeploymentLockAfterQuiescence = async () => {
       if (deploymentArtifactSnapshotRoot !== undefined) {
@@ -7456,8 +7647,7 @@ async function runDeploy(
       });
     }
   } catch (error: unknown) {
-    process.removeListener("SIGINT", stopOnSigint);
-    process.removeListener("SIGTERM", stopOnSigterm);
+    removeStopListeners();
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     releaseDeploymentLockAfterQuiescence = async () => {
       if (setupRuntimeFiles !== undefined) {
@@ -7482,8 +7672,7 @@ async function runDeploy(
   }
   const runtimeFiles = setupRuntimeFiles;
   if (runtimeFiles === undefined) {
-    process.removeListener("SIGINT", stopOnSigint);
-    process.removeListener("SIGTERM", stopOnSigterm);
+    removeStopListeners();
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     releaseDeploymentLockAfterQuiescence = async () => {
       if (deploymentArtifactSnapshotRoot !== undefined) {
@@ -7503,8 +7692,7 @@ async function runDeploy(
   }
   const temporaryConfig = runtimeFiles.configPath;
   if (deploymentRuntimeContents === undefined) {
-    process.removeListener("SIGINT", stopOnSigint);
-    process.removeListener("SIGTERM", stopOnSigterm);
+    removeStopListeners();
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     releaseDeploymentLockAfterQuiescence = async () => {
       await rm(runtimeFiles.configPath, { force: true }).catch(() => undefined);
@@ -7864,8 +8052,7 @@ async function runDeploy(
         );
       }
     }
-    process.removeListener("SIGINT", stopOnSigint);
-    process.removeListener("SIGTERM", stopOnSigterm);
+    removeStopListeners();
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
     releaseDeploymentLockAfterQuiescence = async () => {
       await rm(temporaryConfig, { force: true }).catch(() => undefined);
@@ -7889,14 +8076,24 @@ async function runBuild(
 ): Promise<void> {
   const ownedValidationProcesses = createOwnedProcessRegistry();
   let requestedSignal: NodeJS.Signals = "SIGTERM";
+  const usesProcessSignals = options.stopSignal === undefined;
   const requestStop = (signal: NodeJS.Signals): void => {
     requestedSignal = signal;
-    void ownedValidationProcesses.cleanup(signal);
+    void ownedValidationProcesses.cleanup(signal, GENERATION_WORK_TIMEOUT_MS);
   };
   const stopOnSigint = (): void => requestStop("SIGINT");
   const stopOnSigterm = (): void => requestStop("SIGTERM");
-  process.on("SIGINT", stopOnSigint);
-  process.on("SIGTERM", stopOnSigterm);
+  const stopOnInjectedSignal = (): void => requestStop("SIGTERM");
+  if (usesProcessSignals) {
+    process.on("SIGINT", stopOnSigint);
+    process.on("SIGTERM", stopOnSigterm);
+  }
+  options.stopSignal?.addEventListener("abort", stopOnInjectedSignal, {
+    once: true,
+  });
+  if (options.stopSignal?.aborted === true) {
+    requestStop("SIGTERM");
+  }
   try {
     await buildProjectFromCli(
       root,
@@ -7906,9 +8103,15 @@ async function runBuild(
       ownedValidationProcesses,
     );
   } finally {
-    process.removeListener("SIGINT", stopOnSigint);
-    process.removeListener("SIGTERM", stopOnSigterm);
-    await ownedValidationProcesses.cleanup(requestedSignal);
+    if (usesProcessSignals) {
+      process.removeListener("SIGINT", stopOnSigint);
+      process.removeListener("SIGTERM", stopOnSigterm);
+    }
+    options.stopSignal?.removeEventListener("abort", stopOnInjectedSignal);
+    await ownedValidationProcesses.cleanup(
+      requestedSignal,
+      GENERATION_WORK_TIMEOUT_MS,
+    );
   }
 }
 
