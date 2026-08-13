@@ -97,6 +97,37 @@ const toolSource = `
   };
 `;
 
+const pinnedZodToolSource = `
+  import { z } from "zod";
+  export default {
+    description: "Uses the pinned Zod Standard Schema implementation.",
+    inputSchema: z.object({ name: z.string() }),
+    execute(input) {
+      return { value: input.name };
+    },
+  };
+`;
+
+async function createClosedGrammarProject(
+  instructions: string,
+  requiresZod: boolean,
+): Promise<{ readonly root: string; readonly toolSource: string }> {
+  const authoredToolSource = requiresZod ? pinnedZodToolSource : toolSource;
+  const root = await createProject({
+    "agent/agent.ts": agentSource,
+    "agent/instructions.md": instructions,
+    "agent/tools/greet.ts": authoredToolSource,
+  });
+  if (requiresZod) {
+    await mkdir(join(root, "node_modules"), { recursive: true });
+    await symlink(
+      join(process.cwd(), "node_modules/zod"),
+      join(root, "node_modules/zod"),
+    );
+  }
+  return { root, toolSource: authoredToolSource };
+}
+
 async function readGeneration(root: string) {
   const outputDirectory = join(root, ".eden");
   const generation = await readArtifactGeneration(outputDirectory);
@@ -223,6 +254,7 @@ function sha256Text(value: string): string {
 function replaceBundleCoherently(
   contents: Record<(typeof artifactNames)[number], string>,
   bundle: string,
+  preserveIdentity = false,
 ): Record<(typeof artifactNames)[number], string> {
   const manifest = {
     ...(JSON.parse(contents["manifest.json"]) as Record<string, unknown>),
@@ -232,11 +264,15 @@ function replaceBundleCoherently(
   const buildMetadata = {
     ...(JSON.parse(contents["build-metadata.json"]) as Record<string, unknown>),
     bundleDigest: sha256Text(bundle),
-    generationId: createArtifactIdentity({
-      manifest: manifest as EdenArtifactSet["manifest"],
-      moduleMap,
-      bundle,
-    }),
+    ...(preserveIdentity
+      ? {}
+      : {
+          generationId: createArtifactIdentity({
+            manifest: manifest as EdenArtifactSet["manifest"],
+            moduleMap,
+            bundle,
+          }),
+        }),
   };
   return {
     ...contents,
@@ -260,7 +296,21 @@ function replaceBundleDefault(
   );
 }
 
-const closedBundleGrammarCases = [
+function insertBeforeGeneratedEntry(
+  bundle: string,
+  source: string,
+): string {
+  const marker = "// eden-artifact-entry.mjs";
+  const index = bundle.indexOf(marker);
+  expect(index).toBeGreaterThanOrEqual(0);
+  return `${bundle.slice(0, index)}${source}\n${bundle.slice(index)}`;
+}
+
+const closedBundleGrammarCases: readonly {
+  readonly name: string;
+  readonly mutate: (bundle: string) => string;
+  readonly requiresZod?: boolean;
+}[] = [
   {
     name: "unknown object spread",
     mutate: (bundle: string) =>
@@ -391,6 +441,104 @@ const forgedTools = Object.freeze(Object.fromEntries([
   }]
 ]));
 const forgedModuleMap = moduleMap;`,
+      ),
+  },
+  {
+    name: "forged pre-entry generated export namespace",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const forgedSchemaFactory = () => ({
+  "~standard": {
+    version: 1,
+    vendor: "forged",
+    validate(value) { return { value }; }
+  }
+});
+const forged_exports = {};
+__export(forged_exports, {
+  object: () => forgedSchemaFactory,
+  string: () => forgedSchemaFactory,
+  any: () => forgedSchemaFactory
+});
+const forgedInputSchema = forged_exports.object({});
+`,
+        "/* forged pre-entry namespace */\n",
+      ),
+        "Object.freeze({ agent, instructions, tools: forgedTools, toolSchemas, moduleMap })",
+        `const forgedTools = Object.freeze(Object.fromEntries([
+  ["greet", {
+    description: "Greet a person.",
+    inputSchema: forgedInputSchema,
+    execute(input) { return input; }
+  }]
+]));`,
+      ),
+  },
+  {
+    name: "forged trusted generated namespace factory",
+    requiresZod: true,
+    mutate: (bundle: string) =>
+      bundle.replace(
+        /(\b(?:external_exports|zod_exports)\s*=\s*\{\};[\s\S]*?object:\s*\(\)\s*=>\s*)object\b/u,
+        "$1forgedSchemaFactory",
+      ).replace(
+        /(?=\/\/ eden-artifact-entry\.mjs)/u,
+        `const forgedSchemaFactory = () => ({
+  "~standard": {
+    version: 1,
+    vendor: "forged",
+    validate(value) { return { value }; }
+  }
+});
+`,
+      ),
+  },
+  {
+    name: "parameter-mediated artifact mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "artifact",
+        `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+function mutateArtifact(value) {
+  value.agent = null;
+}
+mutateArtifact(artifact);`,
+      ),
+  },
+  {
+    name: "bound Object.assign artifact mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "artifact",
+        `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+const assignArtifact = Object.assign.bind(Object);
+assignArtifact(artifact, { agent: null });`,
+      ),
+  },
+  {
+    name: "Reflect.apply Object.assign artifact mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "artifact",
+        `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+Reflect.apply(Object.assign, null, [artifact, { agent: null }]);`,
+      ),
+  },
+  {
+    name: "aliased Reflect.apply artifact mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "artifact",
+        `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+const apply = Reflect.apply;
+const assign = Object.assign;
+apply(assign, null, [artifact, { agent: null }]);`,
       ),
   },
   {
@@ -764,12 +912,11 @@ describe("artifact generation", () => {
 
   test.each(closedBundleGrammarCases)(
     "rejects $name through authoritative reads",
-    async ({ mutate }) => {
-      const root = await createProject({
-        "agent/agent.ts": agentSource,
-        "agent/instructions.md": "closed bundle grammar reader fixture\n",
-        "agent/tools/greet.ts": toolSource,
-      });
+    async ({ mutate, requiresZod }) => {
+      const { root } = await createClosedGrammarProject(
+        "closed bundle grammar reader fixture\n",
+        requiresZod === true,
+      );
 
       await buildProject({ projectRoot: root });
       const current = await readArtifactGeneration(join(root, ".eden"));
@@ -784,6 +931,7 @@ describe("artifact generation", () => {
       const invalidContents = replaceBundleCoherently(
         contents,
         mutate(contents["agent-bundle.mjs"]),
+        true,
       );
       await Promise.all(
         artifactNames.map((name) =>
@@ -802,12 +950,11 @@ describe("artifact generation", () => {
 
   test.each(closedBundleGrammarCases)(
     "rejects $name through legacy migration",
-    async ({ mutate }) => {
-      const root = await createProject({
-        "agent/agent.ts": agentSource,
-        "agent/instructions.md": "closed bundle grammar legacy fixture\n",
-        "agent/tools/greet.ts": toolSource,
-      });
+    async ({ mutate, requiresZod }) => {
+      const { root } = await createClosedGrammarProject(
+        "closed bundle grammar legacy fixture\n",
+        requiresZod === true,
+      );
 
       await buildProject({ projectRoot: root });
       const previous = await readArtifactGeneration(join(root, ".eden"));
@@ -822,6 +969,7 @@ describe("artifact generation", () => {
       const invalidContents = replaceBundleCoherently(
         contents,
         mutate(contents["agent-bundle.mjs"]),
+        true,
       );
 
       await rm(join(root, ".eden"), { recursive: true, force: true });
@@ -849,18 +997,23 @@ describe("artifact generation", () => {
 
   test.each(closedBundleGrammarCases)(
     "rejects $name from a same-identity candidate before CURRENT promotion",
-    async ({ mutate }) => {
-      const root = await createProject({
-        "agent/agent.ts": agentSource,
-        "agent/instructions.md": "closed bundle grammar reuse fixture\n",
-        "agent/tools/greet.ts": toolSource,
-      });
+    async ({ mutate, requiresZod }) => {
+      const { root, toolSource: authoredToolSource } =
+        await createClosedGrammarProject(
+          "closed bundle grammar reuse fixture\n",
+          requiresZod === true,
+        );
 
       await buildProject({ projectRoot: root });
       const previous = await readArtifactGeneration(join(root, ".eden"));
       await writeFile(
         join(root, "agent/tools/greet.ts"),
-        toolSource.replace("Greet a person.", "new generation"),
+        requiresZod === true
+          ? authoredToolSource.replace(
+              "Uses the pinned Zod Standard Schema implementation.",
+              "new generation",
+            )
+          : authoredToolSource.replace("Greet a person.", "new generation"),
         "utf8",
       );
       await expect(
@@ -900,6 +1053,7 @@ describe("artifact generation", () => {
       const invalidContents = replaceBundleCoherently(
         contents,
         mutate(contents["agent-bundle.mjs"]),
+        true,
       );
       await Promise.all(
         artifactNames.map((name) =>

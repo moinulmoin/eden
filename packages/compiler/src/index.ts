@@ -2072,7 +2072,6 @@ function bundleEntrySource(
       return `[${JSON.stringify(tool.name)}, ${JSON.stringify(schema)}]`;
     })
     .join(",\n    ");
-
   return `${imports}
 
 const edenTools = Object.freeze(Object.fromEntries([
@@ -2375,6 +2374,9 @@ const TRUSTED_ZOD_PACKAGE = Object.freeze({
     "73a8deb738c4820403c98860048e14031bb17df2367592ae4f1d56e55a472fe7",
 });
 
+const TRUSTED_ZOD_GENERATED_DEPENDENCY_DIGEST =
+  "27dc003cd49baf8edbf0da0af36edb66e18c1ce66fa10667c5ba5b9c16bbf224";
+
 function dependencyPackageRoot(relativePath: string): string | undefined {
   const segments = relativePath.split("/");
   if (segments[0] !== "node_modules") return undefined;
@@ -2401,6 +2403,235 @@ function dependencyClosureIntegrity(
     hash.update("\0");
   }
   return hash.digest("hex");
+}
+
+interface GeneratedBundleLine {
+  readonly text: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+function generatedBundleLines(bundle: string): readonly GeneratedBundleLine[] {
+  const lines: GeneratedBundleLine[] = [];
+  let start = 0;
+  while (start <= bundle.length) {
+    const newline = bundle.indexOf("\n", start);
+    const end = newline < 0 ? bundle.length : newline;
+    lines.push({
+      text: bundle.slice(start, end).replace(/\r$/u, ""),
+      start,
+      end,
+    });
+    if (newline < 0) break;
+    start = newline + 1;
+  }
+  return lines;
+}
+
+function generatedBundleCommentLineStarts(
+  bundle: string,
+): ReadonlySet<number> {
+  const starts = new Set<number>();
+  const sourceFile = ts.createSourceFile(
+    "agent-bundle.mjs",
+    bundle,
+    ts.ScriptTarget.Latest,
+    false,
+    ts.ScriptKind.JS,
+  );
+  for (const statement of sourceFile.statements) {
+    for (const range of ts.getLeadingCommentRanges(bundle, statement.getFullStart()) ?? []) {
+      if (range.kind !== ts.SyntaxKind.SingleLineCommentTrivia) continue;
+      const start = range.pos;
+      const lineStart = bundle.lastIndexOf("\n", start - 1) + 1;
+      if (start === lineStart) starts.add(lineStart);
+    }
+  }
+  return starts;
+}
+
+function generatedDependencyNamespaceNames(
+  bundle: string,
+  packageRoot: string,
+): readonly string[] {
+  const namespaces = new Set<string>();
+  const commentLineStarts = generatedBundleCommentLineStarts(bundle);
+  let inPackageSection = false;
+  for (const line of generatedBundleLines(bundle)) {
+    if (commentLineStarts.has(line.start) && line.text.startsWith("// ")) {
+      inPackageSection =
+        line.text.startsWith(`// ${packageRoot}/`) ||
+        line.text.startsWith(`// ${packageRoot}:`);
+      continue;
+    }
+    if (!inPackageSection) continue;
+    const match = line.text.match(
+      /^\s*(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*\{\};\s*$/u,
+    );
+    if (match?.[1] !== undefined && /_exports\d*$/u.test(match[1])) {
+      namespaces.add(match[1]);
+    }
+  }
+  return [...namespaces].sort(comparePath);
+}
+
+function generatedDependencyHasPackageMarker(
+  bundle: string,
+  packageRoot: string,
+): boolean {
+  const commentLineStarts = generatedBundleCommentLineStarts(bundle);
+  return generatedBundleLines(bundle).some(
+    (line) =>
+      commentLineStarts.has(line.start) &&
+      (line.text.startsWith(`// ${packageRoot}/`) ||
+        line.text.startsWith(`// ${packageRoot}:`)),
+  );
+}
+
+function generatedDependencyContentDigest(
+  bundle: string,
+  packageRoot: string,
+): string {
+  const lines: string[] = [];
+  const commentLineStarts = generatedBundleCommentLineStarts(bundle);
+  let inPackageSection = false;
+  for (const line of generatedBundleLines(bundle)) {
+    if (commentLineStarts.has(line.start) && line.text.startsWith("// ")) {
+      inPackageSection =
+        line.text.startsWith(`// ${packageRoot}/`) ||
+        line.text.startsWith(`// ${packageRoot}:`);
+      if (inPackageSection) lines.push(line.text);
+      continue;
+    }
+    if (inPackageSection) lines.push(line.text);
+  }
+  return sha256(lines.join("\n"));
+}
+
+function generatedDependencySectionRanges(
+  bundle: string,
+  packageRoot: string,
+): readonly { readonly start: number; readonly end: number }[] {
+  const ranges: { start: number; end: number }[] = [];
+  const commentLineStarts = generatedBundleCommentLineStarts(bundle);
+  let activeStart = -1;
+  for (const line of generatedBundleLines(bundle)) {
+    if (commentLineStarts.has(line.start) && line.text.startsWith("// ")) {
+      const path = line.text.slice(3);
+      const isPackageSection =
+        path.startsWith(`${packageRoot}/`) ||
+        path.startsWith(`${packageRoot}:`);
+      const isSourceSection =
+        path.startsWith("node_modules/") ||
+        path.startsWith("agent/") ||
+        path === "eden-artifact-entry.mjs";
+      if (isPackageSection) {
+        if (activeStart >= 0) {
+          ranges.push({ start: activeStart, end: line.start });
+        }
+        activeStart = line.end < bundle.length ? line.end + 1 : bundle.length;
+      } else if (activeStart >= 0 && isSourceSection) {
+        ranges.push({ start: activeStart, end: line.start });
+        activeStart = -1;
+      }
+    }
+  }
+  if (activeStart >= 0) {
+    ranges.push({ start: activeStart, end: bundle.length });
+  }
+  return ranges;
+}
+
+function generatedDependencyNamespaceDigest(
+  namespaceNames: readonly string[],
+  contentDigest: string,
+): string {
+  return sha256(
+    stableJson({
+      packageName: TRUSTED_ZOD_PACKAGE.name,
+      packageVersion: TRUSTED_ZOD_PACKAGE.version,
+      packageRoot: TRUSTED_ZOD_PACKAGE.root,
+      integrity: TRUSTED_ZOD_PACKAGE.integrity,
+      namespaceNames,
+      contentDigest,
+    }),
+  );
+}
+
+function generatedArtifactEntryStart(bundle: string): number {
+  const sourceFile = sourceFileForValidation("agent-bundle.mjs", bundle);
+  let defaultStart = -1;
+  let entryBindingStart = -1;
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    if (
+      entryBindingStart < 0 &&
+      statement.declarationList.declarations.some(
+        (declaration) =>
+          ts.isIdentifier(declaration.name) &&
+          declaration.name.text === "edenTools",
+      )
+    ) {
+      entryBindingStart = statement.getStart(sourceFile);
+    }
+    if (
+      !statement.declarationList.declarations.some(
+        (declaration) =>
+          ts.isIdentifier(declaration.name) &&
+          declaration.name.text === "eden_artifact_entry_default",
+      )
+    ) {
+      continue;
+    }
+    defaultStart = statement.getStart(sourceFile);
+    break;
+  }
+  if (defaultStart < 0) return -1;
+  const markerPattern =
+    /(?:^|\r?\n)\/\/ eden-artifact-entry\.mjs[ \t]*(?=\r?\n|$)/gu;
+  let markerStart = -1;
+  for (const match of bundle.slice(0, defaultStart).matchAll(markerPattern)) {
+    markerStart =
+      (match.index ?? 0) + (match[0].startsWith("\n") ? 1 : 0);
+  }
+  return markerStart >= 0 && entryBindingStart >= 0 && markerStart < entryBindingStart
+    ? markerStart
+    : -1;
+}
+
+function attachGeneratedDependencyProvenance(
+  bundle: string,
+  verifiedDependency: boolean,
+): string {
+  if (!verifiedDependency) return bundle;
+  const entryStart = generatedArtifactEntryStart(bundle);
+  if (entryStart < 0) return bundle;
+  const namespaceNames = generatedDependencyNamespaceNames(
+    bundle,
+    TRUSTED_ZOD_PACKAGE.root,
+  );
+  if (namespaceNames.length === 0) return bundle;
+  const generatedDependencyDigest = generatedDependencyContentDigest(
+    bundle,
+    TRUSTED_ZOD_PACKAGE.root,
+  );
+  const provenance = `var edenVerifiedDependencyProvenance = {
+  packageName: ${JSON.stringify(TRUSTED_ZOD_PACKAGE.name)},
+  packageVersion: ${JSON.stringify(TRUSTED_ZOD_PACKAGE.version)},
+  packageRoot: ${JSON.stringify(TRUSTED_ZOD_PACKAGE.root)},
+  integrity: ${JSON.stringify(TRUSTED_ZOD_PACKAGE.integrity)},
+  namespaceNames: ${JSON.stringify(namespaceNames)},
+  generatedDependencyDigest: ${JSON.stringify(generatedDependencyDigest)},
+  namespaceDigest: ${JSON.stringify(
+    generatedDependencyNamespaceDigest(
+      namespaceNames,
+      generatedDependencyDigest,
+    ),
+  )}
+};
+
+`;
+  return `${bundle.slice(0, entryStart)}${provenance}${bundle.slice(entryStart)}`;
 }
 
 function isTrustedWorkerDependency(
@@ -4789,6 +5020,7 @@ async function validateAuthoredWorkerSources(
 async function bundleProject(
   normalized: EdenNormalizedProject,
   moduleMap: EdenModuleMap,
+  verifiedZodDependency: boolean,
 ): Promise<string> {
   const entry = bundleEntrySource(normalized, moduleMap);
   let compatibilityIssue:
@@ -4968,7 +5200,7 @@ async function bundleProject(
         diagnostic(unsupported.code, unsupported.message),
       ]);
     }
-    return output;
+    return attachGeneratedDependencyProvenance(output, verifiedZodDependency);
   } catch (error: unknown) {
     if (error instanceof EdenCompilerError) throw error;
     if (compatibilityIssue !== undefined) {
@@ -5088,6 +5320,7 @@ interface BundleShapeEnvironment {
   >;
   readonly trustedSchemaFactoryBindings: ReadonlySet<string>;
   readonly invalidGeneratedExportHelperUse: boolean;
+  readonly invalidGeneratedMutation: boolean;
   readonly mutatedBindings: ReadonlySet<string>;
 }
 
@@ -5545,11 +5778,24 @@ function bundleShapeForExpression(
     return { kind: "unknown" };
   }
   if (ts.isCallExpression(expression)) {
+    if (
+      ts.isPropertyAccessExpression(expression.expression) &&
+      expression.expression.name.text === "defineProperty" &&
+      ts.isIdentifier(expression.expression.expression) &&
+      expression.expression.expression.text === "Object"
+    ) {
+      return { kind: "unknown" };
+    }
     if (isObjectMemberCall(expression.expression, "Object", "freeze")) {
       const value = expression.arguments[0];
       return value === undefined
         ? { kind: "unknown" }
         : bundleShapeForExpression(value, environment, resolving);
+    }
+    if (
+      isObjectMemberCall(expression.expression, "Object", "defineProperty")
+    ) {
+      return { kind: "unknown" };
     }
     if (isObjectMemberCall(expression.expression, "Object", "assign")) {
       const properties = new Map<string, BundleShape>();
@@ -5662,10 +5908,132 @@ function bundleShapeEnvironment(
   }
   const trustedSchemaFactoryBindings = new Set<string>();
   const trustedGeneratedExportHelpers = new Set<string>();
-  const entryMarker = "// eden-artifact-entry.mjs";
-  const entryStart = sourceFile.text.indexOf(entryMarker);
+  const trustedGeneratedDependencyNamespaces = new Set<string>();
+  const generatedDependencyProvenanceBinding =
+    "edenVerifiedDependencyProvenance";
+  const entryStart = generatedArtifactEntryStart(sourceFile.text);
   const isBeforeGeneratedEntry = (node: ts.Node): boolean =>
     entryStart < 0 || node.getStart(sourceFile) < entryStart;
+  const isGeneratedEntryNode = (node: ts.Node): boolean =>
+    entryStart >= 0 && node.getStart(sourceFile) >= entryStart;
+  const provenanceDeclarations: ts.VariableDeclaration[] = [];
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (
+        ts.isIdentifier(declaration.name) &&
+        declaration.name.text === generatedDependencyProvenanceBinding
+      ) {
+        provenanceDeclarations.push(declaration);
+      }
+    }
+  }
+  let invalidGeneratedDependencyProvenance =
+    provenanceDeclarations.length > 1;
+  if (provenanceDeclarations.length === 1) {
+    const declaration = provenanceDeclarations[0] as ts.VariableDeclaration;
+    const initializer = declaration.initializer;
+    const properties =
+      initializer !== undefined && ts.isObjectLiteralExpression(initializer)
+        ? initializer.properties
+        : undefined;
+    const property = (name: string): ts.Expression | undefined => {
+      const match = properties?.find(
+        (candidate) =>
+          ts.isPropertyAssignment(candidate) &&
+          !ts.isComputedPropertyName(candidate.name) &&
+          bundlePropertyName(candidate.name) === name,
+      );
+      return match !== undefined && ts.isPropertyAssignment(match)
+        ? match.initializer
+        : undefined;
+    };
+    const stringValue = (
+      expression: ts.Expression | undefined,
+    ): string | undefined =>
+      expression !== undefined && ts.isStringLiteralLike(expression)
+        ? expression.text
+        : undefined;
+    const namespaceNamesExpression = property("namespaceNames");
+    const namespaceNames: readonly (string | undefined)[] | undefined =
+      namespaceNamesExpression !== undefined &&
+      ts.isArrayLiteralExpression(namespaceNamesExpression)
+        ? namespaceNamesExpression.elements.map((element) =>
+            ts.isStringLiteralLike(element) ? element.text : undefined,
+          )
+        : undefined;
+    const namespaceDigest = stringValue(property("namespaceDigest"));
+    const generatedDependencyDigest = stringValue(
+      property("generatedDependencyDigest"),
+    );
+    const expectedNamespaces = generatedDependencyNamespaceNames(
+      sourceFile.text,
+      TRUSTED_ZOD_PACKAGE.root,
+    );
+    const actualGeneratedDependencyDigest = generatedDependencyContentDigest(
+      sourceFile.text,
+      TRUSTED_ZOD_PACKAGE.root,
+    );
+    const expectedDigest =
+      namespaceNames === undefined ||
+      namespaceNames.some((name) => name === undefined) ||
+      generatedDependencyDigest !== TRUSTED_ZOD_GENERATED_DEPENDENCY_DIGEST ||
+      actualGeneratedDependencyDigest !== TRUSTED_ZOD_GENERATED_DEPENDENCY_DIGEST ||
+      new Set(namespaceNames).size !== namespaceNames.length
+        ? undefined
+        : generatedDependencyNamespaceDigest(
+            namespaceNames.filter((name): name is string => name !== undefined),
+            generatedDependencyDigest ?? "",
+          );
+    const namespaceValues =
+      namespaceNames === undefined
+        ? []
+        : namespaceNames.filter((name): name is string => name !== undefined);
+    const expectedProperties = new Set([
+      "packageName",
+      "packageVersion",
+      "packageRoot",
+      "integrity",
+      "namespaceNames",
+      "generatedDependencyDigest",
+      "namespaceDigest",
+    ]);
+    const actualProperties = new Set(
+      (properties ?? []).flatMap((candidate) => {
+        if (
+          !ts.isPropertyAssignment(candidate) ||
+          ts.isComputedPropertyName(candidate.name)
+        ) {
+          return [];
+        }
+        const name = bundlePropertyName(candidate.name);
+        return name === undefined ? [] : [name];
+      }),
+    );
+    if (
+      entryStart < 0 ||
+      declaration.getStart(sourceFile) >= entryStart ||
+      properties === undefined ||
+      actualProperties.size !== expectedProperties.size ||
+      [...expectedProperties].some((name) => !actualProperties.has(name)) ||
+      stringValue(property("packageName")) !== TRUSTED_ZOD_PACKAGE.name ||
+      stringValue(property("packageVersion")) !== TRUSTED_ZOD_PACKAGE.version ||
+      stringValue(property("packageRoot")) !== TRUSTED_ZOD_PACKAGE.root ||
+      stringValue(property("integrity")) !== TRUSTED_ZOD_PACKAGE.integrity ||
+      generatedDependencyDigest !== actualGeneratedDependencyDigest ||
+      namespaceNames === undefined ||
+      namespaceNames.some((name) => name === undefined) ||
+      [...namespaceValues].sort(comparePath).join("\0") !==
+        expectedNamespaces.join("\0") ||
+      namespaceDigest !== expectedDigest
+    ) {
+      invalidGeneratedDependencyProvenance = true;
+    } else {
+      for (const namespace of namespaceValues) {
+        trustedGeneratedDependencyNamespaces.add(namespace);
+      }
+    }
+  }
   const isObjectDefineProperty = (expression: ts.Expression): boolean =>
     ts.isPropertyAccessExpression(expression) &&
     ts.isIdentifier(expression.expression) &&
@@ -5797,6 +6165,14 @@ function bundleShapeEnvironment(
           isGeneratedExportHelper(declaration),
       ),
   );
+  const trustedGeneratedHelperRange =
+    generatedExportHelper !== undefined &&
+    generatedExportHelperCandidateCount === 1
+      ? {
+          start: generatedExportHelper.getStart(sourceFile),
+          end: generatedExportHelper.getEnd(),
+        }
+      : undefined;
   if (
     generatedExportHelper !== undefined &&
     generatedExportHelperCandidateCount === 1
@@ -5819,6 +6195,7 @@ function bundleShapeEnvironment(
           ts.isIdentifier(namespaceArgument) &&
           isBeforeGeneratedEntry(namespaceArgument) &&
           bindings.get(namespaceArgument.text) !== undefined &&
+          trustedGeneratedDependencyNamespaces.has(namespaceArgument.text) &&
           exportArgument !== undefined &&
           ts.isObjectLiteralExpression(exportArgument)
         ) {
@@ -5917,7 +6294,7 @@ function bundleShapeEnvironment(
   const mutationKind = (
     expression: ts.Expression,
     resolving: Set<string> = new Set(),
-  ): "object-assign" | "object-define-property" | "reflect-set" | "reflect-define-property" | undefined => {
+  ): "object-assign" | "object-define-property" | "reflect-set" | "reflect-define-property" | "reflect-apply" | undefined => {
     let current = expression;
     while (
       ts.isParenthesizedExpression(current) ||
@@ -5926,6 +6303,17 @@ function bundleShapeEnvironment(
       ts.isNonNullExpression(current)
     ) {
       current = current.expression;
+    }
+    if (ts.isCallExpression(current)) {
+      const callee = current.expression;
+      if (
+        ts.isPropertyAccessExpression(callee) &&
+        (callee.name.text === "bind" ||
+          callee.name.text === "call" ||
+          callee.name.text === "apply")
+      ) {
+        return mutationKind(callee.expression, resolving);
+      }
     }
     if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
       const propertyName = ts.isPropertyAccessExpression(current)
@@ -5952,6 +6340,9 @@ function bundleShapeEnvironment(
           ) {
             return "reflect-define-property";
           }
+          if (objectName === "Reflect" && propertyName === "apply") {
+            return "reflect-apply";
+          }
         }
       }
     }
@@ -5972,29 +6363,125 @@ function bundleShapeEnvironment(
   const markBindingMutation = (root: string): void => {
     for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
   };
+  const isAllowedGeneratedConstructionCall = (
+    expression: ts.Expression,
+  ): boolean =>
+    isObjectMemberCall(expression, "Object", "freeze") ||
+    isObjectMemberCall(expression, "Object", "fromEntries") ||
+    isObjectMemberCall(expression, "Object", "defineProperty") ||
+    isObjectMemberCall(expression, "Object", "assign");
+  let invalidGeneratedMutation = false;
+  const noteMutation = (): void => {
+    invalidGeneratedMutation = true;
+  };
+  const isTrustedGeneratedHelperNode = (node: ts.Node): boolean =>
+    trustedGeneratedHelperRange !== undefined &&
+    node.getStart(sourceFile) >= trustedGeneratedHelperRange.start &&
+    node.getEnd() <= trustedGeneratedHelperRange.end;
+  const isCompilerProvenanceNode = (node: ts.Node): boolean => {
+    const provenance = provenanceDeclarations[0];
+    return (
+      provenance !== undefined &&
+      node.getStart(sourceFile) >= provenance.getStart(sourceFile) &&
+      node.getEnd() <= provenance.getEnd()
+    );
+  };
+  const trustedGeneratedDependencyRanges: readonly {
+    readonly start: number;
+    readonly end: number;
+  }[] = generatedDependencySectionRanges(
+    sourceFile.text,
+    TRUSTED_ZOD_PACKAGE.root,
+  );
+  const isTrustedGeneratedDependencyNode = (node: ts.Node): boolean => {
+    const start = node.getStart(sourceFile);
+    return (
+      start < entryStart &&
+      trustedGeneratedDependencyRanges.some(
+        (range) => start >= range.start && start < range.end,
+      )
+    );
+  };
+  const isTrustedDependencySubtree = (node: ts.Node): boolean => {
+    const start = node.getStart(sourceFile);
+    return (
+      start < entryStart &&
+      trustedGeneratedDependencyRanges.some(
+        (range) => start >= range.start && start < range.end,
+      )
+    );
+  };
+  const isTrustedDependencyGeneratedExportCall = (
+    node: ts.CallExpression,
+  ): boolean => {
+    if (
+      !ts.isIdentifier(node.expression) ||
+      node.expression.text !== "__export" ||
+      node.arguments.length !== 2
+    ) {
+      return false;
+    }
+    const target = node.arguments[0];
+    return (
+      target !== undefined &&
+      ts.isIdentifier(target) &&
+      trustedGeneratedDependencyNamespaces.has(target.text)
+    );
+  };
+  const isFunctionParameterName = (name: string, node: ts.Node): boolean => {
+    let current: ts.Node | undefined = node;
+    while (current !== undefined && !ts.isSourceFile(current)) {
+      if (ts.isFunctionLike(current)) {
+        return current.parameters.some(
+          (parameter) =>
+            ts.isIdentifier(parameter.name) && parameter.name.text === name,
+        );
+      }
+      current = current.parent;
+    }
+    return false;
+  };
+  const mutationTargets = (node: ts.CallExpression): ts.Expression[] => {
+    const kind = mutationKind(node.expression);
+    if (kind === "reflect-apply") {
+      const argumentsList = node.arguments[2];
+      return argumentsList !== undefined &&
+        ts.isArrayLiteralExpression(argumentsList) &&
+        argumentsList.elements[0] !== undefined
+        ? [argumentsList.elements[0]]
+        : [];
+    }
+    if (kind === undefined) return [];
+    const target = node.arguments[0];
+    return target === undefined ? [] : [target];
+  };
   const markUnknownEntryMutation = (node: ts.Node): void => {
-    if (
-      entryStart < 0 ||
-      node.getStart(sourceFile) < entryStart ||
-      !ts.isCallExpression(node)
-    ) {
-      return;
-    }
+    if (!isGeneratedEntryNode(node)) return;
+    if (!ts.isCallExpression(node)) return;
     const callee = node.expression;
-    if (
-      isObjectMemberCall(callee, "Object", "freeze") ||
-      isObjectMemberCall(callee, "Object", "fromEntries")
-    ) {
-      return;
-    }
+    if (isAllowedGeneratedConstructionCall(callee)) return;
+    noteMutation();
     const root = ts.isIdentifier(callee) ? callee.text : undefined;
     if (root !== undefined) markBindingMutation(root);
   };
   function collectMutations(node: ts.Node): void {
+    if (
+      isTrustedGeneratedHelperNode(node) ||
+      isTrustedGeneratedDependencyNode(node)
+    ) {
+      ts.forEachChild(node, collectMutations);
+      return;
+    }
+    if (isGeneratedEntryNode(node) && ts.isDeleteExpression(node)) {
+      noteMutation();
+    }
     if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind)) {
       const root = mutationRoot(node.left);
       if (root !== undefined) {
         for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
+      }
+      if (isGeneratedEntryNode(node)) {
+        noteMutation();
       }
     } else if (
       (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
@@ -6005,18 +6492,46 @@ function bundleShapeEnvironment(
       if (root !== undefined) {
         for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
       }
+      if (isGeneratedEntryNode(node)) {
+        noteMutation();
+      }
+    } else if (ts.isNewExpression(node) && isGeneratedEntryNode(node)) {
+      noteMutation();
     } else if (ts.isCallExpression(node)) {
-      const firstArgument = node.arguments[0];
+      const targets = mutationTargets(node);
+      const isTrustedDependencyMutation =
+        targets.length > 0 &&
+        isTrustedDependencyGeneratedExportCall(node);
       if (
-        firstArgument !== undefined &&
-        mutationKind(node.expression) !== undefined
+        targets.length > 0 &&
+        isGeneratedEntryNode(node) &&
+        !isTrustedGeneratedHelperNode(node) &&
+        !isCompilerProvenanceNode(node)
       ) {
-        const root = mutationRoot(firstArgument);
+        noteMutation();
+        const root = mutationRoot(targets[0] as ts.Expression);
         if (root !== undefined) {
           markBindingMutation(root);
         }
       }
-      markUnknownEntryMutation(node);
+      if (
+        !isTrustedDependencyMutation &&
+        !isTrustedDependencySubtree(node) &&
+        targets.some((target) => {
+          const root = mutationRoot(target);
+          return root !== undefined && isFunctionParameterName(root, node);
+        })
+      ) {
+        noteMutation();
+      }
+      if (
+        !isTrustedDependencyMutation &&
+        !isTrustedGeneratedHelperNode(node) &&
+        !isCompilerProvenanceNode(node) &&
+        !isTrustedDependencySubtree(node)
+      ) {
+        markUnknownEntryMutation(node);
+      }
     }
     ts.forEachChild(node, collectMutations);
   }
@@ -6024,7 +6539,10 @@ function bundleShapeEnvironment(
   return {
     bindings,
     trustedSchemaFactoryBindings,
-    invalidGeneratedExportHelperUse,
+    invalidGeneratedExportHelperUse:
+      invalidGeneratedExportHelperUse ||
+      invalidGeneratedDependencyProvenance,
+    invalidGeneratedMutation,
     mutatedBindings,
   };
 }
@@ -6273,10 +6791,19 @@ function assertRuntimeBundleContract(
     );
   }
   const environment = bundleShapeEnvironment(sourceFile);
+  // The injected provenance declaration is itself compiler-owned metadata.
+  // It must not make the generated dependency's pre-entry construction
+  // appear to be authored artifact mutation.
   if (environment.invalidGeneratedExportHelperUse) {
     artifactSchemaFailure(
       "agent-bundle.mjs",
       "contains an unverified generated export helper declaration or use.",
+    );
+  }
+  if (environment.invalidGeneratedMutation) {
+    artifactSchemaFailure(
+      "agent-bundle.mjs",
+      "contains an unresolved or unsupported generated artifact mutation.",
     );
   }
   const artifact = bundleShapeForExpression(expression, environment);
@@ -6437,6 +6964,43 @@ function assertArtifactCoherence(
   bundle: string,
   buildMetadata: EdenBuildMetadata,
 ): void {
+  assertRuntimeBundleContract(bundle, manifest);
+  const sourceFile = sourceFileForValidation("agent-bundle.mjs", bundle);
+  const provenanceDeclaration = sourceFile.text.match(
+    /var\s+edenVerifiedDependencyProvenance\s*=\s*\{[\s\S]*?\};/u,
+  )?.[0];
+  const provenanceDigest = provenanceDeclaration?.match(
+    /generatedDependencyDigest:\s*"(?<digest>[a-f0-9]{64})"/u,
+  )?.groups?.digest;
+  const expectedGeneratedDependencyDigest = generatedDependencyContentDigest(
+    sourceFile.text,
+    TRUSTED_ZOD_PACKAGE.root,
+  );
+  if (provenanceDeclaration === undefined) {
+    if (
+      generatedDependencyHasPackageMarker(
+        sourceFile.text,
+        TRUSTED_ZOD_PACKAGE.root,
+      )
+    ) {
+      throw new EdenCompilerError("Generated dependency provenance is missing", [
+        diagnostic(
+          "OUTPUT_INVALID",
+          "Verified generated dependencies must include compiler-owned provenance.",
+        ),
+      ]);
+    }
+  } else if (
+    provenanceDigest === undefined ||
+    expectedGeneratedDependencyDigest !== provenanceDigest
+  ) {
+    throw new EdenCompilerError("Generated dependency provenance mismatch", [
+      diagnostic(
+        "OUTPUT_INVALID",
+        "Generated dependency content does not match its verified provenance.",
+      ),
+    ]);
+  }
   const bundleDigest = sha256(bundle);
   if (manifest.bundleDigest !== bundleDigest) {
     throw new EdenCompilerError("Generated artifact digest mismatch", [
@@ -6507,7 +7071,6 @@ function assertArtifactCoherence(
       ),
     ]);
   }
-  assertRuntimeBundleContract(bundle, manifest);
 }
 
 function sourceReferenceEqual(
@@ -8124,7 +8687,15 @@ export async function buildProject(
     await validateAuthoredWorkerSources(snapshot);
     const normalized = await normalizeSnapshot(snapshot);
     const moduleMap = artifactModuleMap(normalized);
-    const bundle = await bundleProject(normalized, moduleMap);
+    const verifiedZodDependency = isTrustedWorkerDependency(
+      [...snapshot.files.values()],
+      `${TRUSTED_ZOD_PACKAGE.root}/package.json`,
+    );
+    const bundle = await bundleProject(
+      normalized,
+      moduleMap,
+      verifiedZodDependency,
+    );
     const manifest = createGeneratedManifest(
       normalized,
       moduleMap,
