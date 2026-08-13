@@ -386,6 +386,134 @@ describe("eden CLI project commands", () => {
     ).resolves.toContain('"eden-basic-agent"');
   });
 
+  test("retains a replacement installed at the tombstone pathname", async () => {
+    const root = await createRoot("eden-cli-init-tombstone-replacement-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("seed incomplete scaffold");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    const replacement = "replacement tombstone bytes\n";
+    let replaced = false;
+    let tombstonePath: string | undefined;
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary, target) => {
+          if (
+            replaced ||
+            boundary !== "after-init-tombstone" ||
+            target?.includes("package.json") !== true
+          ) {
+            return;
+          }
+          replaced = true;
+          tombstonePath = target;
+          await rm(target, { force: false });
+          await writeFile(target, replacement, "utf8");
+        },
+      }),
+    ).resolves.toBe(1);
+
+    expect(replaced).toBe(true);
+    expect(tombstonePath).toBeDefined();
+    await expect(readFile(tombstonePath as string, "utf8"))
+      .resolves.toBe(replacement);
+    await expect(stat(join(root, ".eden-init-incomplete.json"))).resolves.toBeDefined();
+  });
+
+  test("records and retries a destination that disappears after hard-link creation", async () => {
+    const root = await createRoot("eden-cli-init-post-link-disappearance-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("seed incomplete scaffold");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    let disappeared = false;
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        initPublicationHook: async (boundary, target) => {
+          if (
+            disappeared ||
+            boundary !== "after-init-link" ||
+            target?.endsWith("package.json") !== true
+          ) {
+            return;
+          }
+          disappeared = true;
+          await rm(target, { force: false });
+        },
+      }),
+    ).resolves.toBe(0);
+
+    expect(disappeared).toBe(true);
+    const provenanceDirectory = (await readdir(root)).find((entry) =>
+      entry.startsWith(".eden-init-provenance-"),
+    );
+    expect(provenanceDirectory).toBeDefined();
+    const provenanceContents = (
+      await Promise.all(
+        (await readdir(join(root, provenanceDirectory as string))).map(async (entry) =>
+          readFile(join(root, provenanceDirectory as string, entry), "utf8"),
+        ),
+      )
+    ).join("\n");
+    expect(provenanceContents).toMatch(/destination-disappeared|link outcome|reconcile/i);
+    await expect(readFile(join(root, "package.json"), "utf8"))
+      .resolves.toContain('"eden-basic-agent"');
+  });
+
+  test("reconciles a destination that disappears after source retirement", async () => {
+    const root = await createRoot("eden-cli-init-post-retirement-disappearance-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("seed incomplete scaffold");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    let disappeared = false;
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary, target) => {
+          if (
+            disappeared ||
+            boundary !== "after-init-tombstone" ||
+            target?.includes("package.json") !== true
+          ) {
+            return;
+          }
+          disappeared = true;
+          await rm(join(root, "package.json"), { force: false });
+        },
+      }),
+    ).resolves.toBe(0);
+
+    expect(disappeared).toBe(true);
+    await expect(readFile(join(root, "package.json"), "utf8"))
+      .resolves.toContain('"eden-basic-agent"');
+  });
+
   test("fails one of two concurrent init attempts without losing scaffold bytes", async () => {
     const root = await createRoot("eden-cli-init-concurrent-");
     const results = await Promise.all([
