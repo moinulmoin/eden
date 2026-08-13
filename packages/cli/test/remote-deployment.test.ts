@@ -603,4 +603,204 @@ describe("eden remote deployment orchestration", () => {
       "post-preflight-replacement",
     );
   });
+
+  test("rejects a lock replacement after the final read before the lease CAS", async () => {
+    const root = await createRoot();
+    const lockPath = join(root, ".eden-deploy.lock");
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    const errors: string[] = [];
+    let replaced = false;
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(
+        [
+          "deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eden-post-final-read-cas",
+        ],
+        {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+          dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+          deploymentBoundaryHook: async (boundary) => {
+            if (String(boundary) !== "after-remote-final-read" || replaced) {
+              return;
+            }
+            replaced = true;
+            const current = JSON.parse(await readFile(lockPath, "utf8")) as {
+              readonly kind: string;
+              readonly version: number;
+              readonly pid: number;
+              readonly startedAt: string;
+              readonly token: string;
+            };
+            await writeFile(
+              lockPath,
+              `${JSON.stringify({
+                ...current,
+                token: "post-final-read-replacement",
+              })}\n`,
+              "utf8",
+            );
+          },
+          remoteCommandRunner: async (request) => {
+            commands.push(request);
+            return {
+              exitCode: 0,
+              stdout: request.kind === "deploy"
+                ? "https://eden-post-final-read-cas.example.workers.dev\n"
+                : "",
+              stderr: "",
+            };
+          },
+          remoteValidationRunner: async () => ({ ok: true }),
+          remoteBearerSecret: "post-final-read-secret",
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(replaced).toBe(true);
+    expect(commands).toEqual([]);
+    expect(errors.join("\n")).toMatch(/ownership|lock|replaced|changed/i);
+    await expect(readFile(lockPath, "utf8")).resolves.toContain(
+      "post-final-read-replacement",
+    );
+  });
+
+  test("bounds a never-settling Promise returned by remote cleanup", async () => {
+    const root = await createRoot();
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    let releaseCleanup: (() => void) | undefined;
+    const pendingCleanup = new Promise<{
+      readonly exitCode: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    }>((resolve) => {
+      releaseCleanup = () => resolve({ exitCode: 1, stdout: "", stderr: "" });
+    });
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    const deployPromise = runEdenCli(
+      [
+        "deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-pending-remote-cleanup",
+      ],
+      {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+        remoteCommandRunner: (request) => {
+          commands.push(request);
+          if (request.kind === "secret-delete") return pendingCleanup;
+          if (request.kind === "deploy") {
+            return {
+              exitCode: 1,
+              stdout: "",
+              stderr: "deploy fixture failed",
+            };
+          }
+          return {
+            exitCode: 0,
+            stdout: request.kind === "deploy"
+              ? "https://eden-pending-remote-cleanup.example.workers.dev\n"
+              : "",
+            stderr: "",
+          };
+        },
+        remoteBearerSecret: "pending-remote-cleanup-secret",
+      },
+    );
+
+    const observed = await Promise.race([
+      deployPromise.then((code) => ({ settled: true, code })),
+      new Promise<{ readonly settled: false }>((resolve) => {
+        setTimeout(() => resolve({ settled: false }), 2_500);
+      }),
+    ]);
+    expect(observed).toEqual({ settled: true, code: 1 });
+    releaseCleanup?.();
+    await expect(deployPromise).resolves.toBe(1);
+    expect(commands.map((request) => request.kind)).toContain("secret-delete");
+    await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  }, 8_000);
+
+  test("compensates after a Promise-returned remote handle may have mutated", async () => {
+    const root = await createRoot();
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    let terminateCount = 0;
+    const result = Promise.resolve({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+    const handle = {
+      process: {
+        pid: 55_300,
+        startIdentity: "promise-mutation-handle",
+        exited: result.then(() => ({ exitCode: 0, signal: null })),
+        async terminate() {
+          terminateCount += 1;
+        },
+      },
+      result,
+    };
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(
+        [
+          "deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eden-promise-mutation-compensation",
+        ],
+        {
+          cwd: root,
+          dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+          remoteCommandRunner: (request) => {
+            commands.push(request);
+            if (request.kind === "secret-put") {
+              return Promise.resolve(handle);
+            }
+            return {
+              exitCode: 0,
+              stdout: "",
+              stderr: "",
+            };
+          },
+          remoteBearerSecret: "promise-mutation-compensation-secret",
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(terminateCount).toBeGreaterThan(0);
+    expect(commands.map((request) => request.kind)).toEqual([
+      "secret-put",
+      "secret-delete",
+      "delete",
+    ]);
+    await expect(readFile(join(root, ".eden-deploy.lock", "ignored"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
 });

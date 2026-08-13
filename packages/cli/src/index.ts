@@ -222,6 +222,7 @@ export type EdenDeploymentBoundary =
   | "before-compatibility-dry-run"
   | "before-remote-runner-invocation"
   | "after-remote-runner-preflight"
+  | "after-remote-final-read"
   | "after-compatibility-dry-run"
   | "before-secret-provision"
   | "after-secret-provision"
@@ -365,6 +366,18 @@ interface DeploymentLockState {
   readonly token: string;
 }
 
+interface DeploymentLeaseHandle {
+  readonly path: string;
+  readonly lockPath: string;
+  readonly state: DeploymentLockState;
+  readonly serialized: string;
+  readonly identity: {
+    readonly dev: number;
+    readonly ino: number;
+  };
+  readonly release: () => Promise<boolean>;
+}
+
 interface InitPublicationLockState {
   readonly kind: "eden.init.lock";
   readonly version: 1;
@@ -376,6 +389,8 @@ interface InitPublicationLockState {
 const INIT_STATE_FILE = ".eden-init-incomplete.json";
 const INIT_LOCK_FILE = ".eden-init.lock";
 const DEPLOY_LOCK_FILE = ".eden-deploy.lock";
+const DEPLOY_LEASE_PATTERN =
+  /^\.eden-deploy-lease-[0-9]+-[a-f0-9-]+$/u;
 const DEPLOY_LOCK_QUARANTINE_PATTERN =
   /^\.eden-deploy-(?:stale-lock|release-lock)-[0-9]+-[a-f0-9-]+$/u;
 const INIT_QUARANTINE_TOKEN_PATTERN =
@@ -385,6 +400,7 @@ const INIT_LOCK_QUARANTINE_PATTERN =
     `^\\.eden-init-(?:stale-lock|release-lock|recovery)-[0-9]+-(${INIT_QUARANTINE_TOKEN_PATTERN.source})-([a-f0-9]{64})$`,
     "u",
   );
+const REMOTE_RESULT_TIMEOUT_MS = 500;
 const INIT_PROVENANCE_DIRECTORY_PREFIX = ".eden-init-provenance-";
 const INIT_PROVENANCE_KEY_NAME = "key";
 const CANONICAL_ARTIFACT_NAMES = [
@@ -3573,6 +3589,11 @@ function assertArtifactSnapshotStable(
 interface DeploymentLockHandle {
   readonly path: string;
   readonly state: DeploymentLockState;
+  readonly serialized: string;
+  readonly identity: {
+    readonly dev: number;
+    readonly ino: number;
+  };
   readonly release: () => Promise<boolean>;
 }
 
@@ -3612,8 +3633,16 @@ async function readDeploymentLockState(
 async function assertDeploymentLockOwned(
   lock: DeploymentLockHandle,
 ): Promise<void> {
+  const details = await lstat(lock.path).catch(() => undefined);
+  const serialized = await readFile(lock.path, "utf8").catch(
+    () => undefined,
+  );
   const observed = await readDeploymentLockState(lock.path);
   if (
+    details === undefined ||
+    details.dev !== lock.identity.dev ||
+    details.ino !== lock.identity.ino ||
+    serialized !== lock.serialized ||
     observed?.pid !== lock.state.pid ||
     observed.startedAt !== lock.state.startedAt ||
     observed.token !== lock.state.token
@@ -3625,6 +3654,187 @@ async function assertDeploymentLockOwned(
       source: DEPLOY_LOCK_FILE,
     });
   }
+}
+
+async function removeOwnedDeploymentLease(
+  lease: DeploymentLeaseHandle,
+): Promise<boolean> {
+  const observedDetails = await lstat(lease.path).catch(
+    (error: unknown) => {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") return undefined;
+      throw error;
+    },
+  );
+  if (observedDetails === undefined) return false;
+  if (
+    observedDetails.dev !== lease.identity.dev ||
+    observedDetails.ino !== lease.identity.ino
+  ) {
+    return false;
+  }
+  const observed = await readFile(lease.path, "utf8").catch(
+    () => undefined,
+  );
+  if (observed !== lease.serialized) return false;
+  const quarantine = join(
+    dirname(lease.path),
+    uniqueTemporaryName("eden-deploy-release-lease"),
+  );
+  await rename(lease.path, quarantine);
+  const quarantinedDetails = await lstat(quarantine).catch(
+    () => undefined,
+  );
+  const quarantined = await readFile(quarantine, "utf8").catch(
+    () => undefined,
+  );
+  if (
+    quarantinedDetails?.dev !== lease.identity.dev ||
+    quarantinedDetails.ino !== lease.identity.ino ||
+    quarantined !== lease.serialized
+  ) {
+    await link(quarantine, lease.path).catch(() => undefined);
+    return false;
+  }
+  await rm(quarantine, { force: true });
+  return true;
+}
+
+async function acquireDeploymentLease(
+  root: string,
+  lock: DeploymentLockHandle,
+): Promise<DeploymentLeaseHandle> {
+  const path = join(root, uniqueTemporaryName("eden-deploy-lease"));
+  assertWithinRoot(root, path, "The deployment lease path");
+  try {
+    await link(lock.path, path);
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "EEXIST" || code.code === "ENOENT") {
+      throw cliError({
+        code: "DEPLOY_OWNERSHIP_LOST",
+        message:
+          "The Eden deployment ownership changed before its cross-process lease could be acquired.",
+        source: DEPLOY_LOCK_FILE,
+      });
+    }
+    throw error;
+  }
+  const details = await lstat(path);
+  const serialized = await readFile(path, "utf8");
+  if (
+    details.dev !== lock.identity.dev ||
+    details.ino !== lock.identity.ino ||
+    serialized !== lock.serialized
+  ) {
+    await rm(path, { force: true }).catch(() => undefined);
+    throw cliError({
+      code: "DEPLOY_OWNERSHIP_LOST",
+      message:
+        "The Eden deployment ownership changed before its cross-process lease could be established.",
+      source: DEPLOY_LOCK_FILE,
+    });
+  }
+  let state: DeploymentLockState | undefined;
+  try {
+    state = parseDeploymentLockState(JSON.parse(serialized) as unknown);
+  } catch {
+    state = undefined;
+  }
+  if (state === undefined) {
+    await rm(path, { force: true }).catch(() => undefined);
+    throw cliError({
+      code: "DEPLOY_OWNERSHIP_LOST",
+      message:
+        "The Eden deployment ownership lease contained an invalid identity.",
+      source: DEPLOY_LOCK_FILE,
+    });
+  }
+  const lease: DeploymentLeaseHandle = {
+    path,
+    lockPath: lock.path,
+    state,
+    serialized,
+    identity: {
+      dev: details.dev,
+      ino: details.ino,
+    },
+    release: async () => removeOwnedDeploymentLease(lease),
+  };
+  return lease;
+}
+
+async function assertDeploymentLeaseOwned(
+  lease: DeploymentLeaseHandle,
+): Promise<void> {
+  const details = await lstat(lease.path).catch(() => undefined);
+  const lockDetails = await lstat(lease.lockPath).catch(() => undefined);
+  const serialized = await readFile(lease.path, "utf8").catch(
+    () => undefined,
+  );
+  const lockSerialized = await readFile(lease.lockPath, "utf8").catch(
+    () => undefined,
+  );
+  let parsed: DeploymentLockState | undefined;
+  try {
+    parsed = parseDeploymentLockState(
+      JSON.parse(serialized ?? "null") as unknown,
+    );
+  } catch {
+    parsed = undefined;
+  }
+  if (
+    details === undefined ||
+    details.dev !== lease.identity.dev ||
+    details.ino !== lease.identity.ino ||
+    lockDetails === undefined ||
+    lockDetails.dev !== lease.identity.dev ||
+    lockDetails.ino !== lease.identity.ino ||
+    serialized !== lease.serialized ||
+    lockSerialized !== lease.serialized ||
+    parsed === undefined
+  ) {
+    throw cliError({
+      code: "DEPLOY_OWNERSHIP_LOST",
+      message:
+        "The Eden deployment cross-process lease changed or disappeared; no stale remote mutation was started.",
+      source: DEPLOY_LOCK_FILE,
+    });
+  }
+}
+
+async function recoverDeploymentLeases(root: string): Promise<boolean> {
+  const entries = await readdir(root, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!DEPLOY_LEASE_PATTERN.test(entry.name)) continue;
+    if (!entry.isFile()) {
+      throw cliError({
+        code: "DEPLOY_BUSY",
+        message:
+          "A deployment lease record is not a regular file and cannot be recovered safely.",
+        source: entry.name,
+      });
+    }
+    const leasePath = join(root, entry.name);
+    const state = await readDeploymentLockState(leasePath);
+    if (state === undefined) {
+      throw cliError({
+        code: "DEPLOY_BUSY",
+        message:
+          "A deployment lease record is present but its ownership identity could not be verified.",
+        source: entry.name,
+      });
+    }
+    const observedStartedAt = await readProcessStartTime(state.pid);
+    if (
+      observedStartedAt === state.startedAt ||
+      (observedStartedAt === undefined && isProcessAlive(state.pid))
+    ) {
+      return true;
+    }
+    await rm(leasePath, { force: true });
+  }
+  return false;
 }
 
 async function removeOwnedDeploymentLock(
@@ -3640,6 +3850,18 @@ async function removeOwnedDeploymentLock(
     quarantinePath,
     "The deployment lock release quarantine path",
   );
+  const currentDetails = await lstat(lock.path).catch(() => undefined);
+  const currentSerialized = await readFile(lock.path, "utf8").catch(
+    () => undefined,
+  );
+  if (
+    currentDetails === undefined ||
+    currentDetails.dev !== lock.identity.dev ||
+    currentDetails.ino !== lock.identity.ino ||
+    currentSerialized !== lock.serialized
+  ) {
+    return false;
+  }
   try {
     await rename(lock.path, quarantinePath);
   } catch (error: unknown) {
@@ -3647,8 +3869,18 @@ async function removeOwnedDeploymentLock(
     if (code.code === "ENOENT") return false;
     throw error;
   }
+  const quarantinedDetails = await lstat(quarantinePath).catch(
+    () => undefined,
+  );
+  const quarantinedSerialized = await readFile(
+    quarantinePath,
+    "utf8",
+  ).catch(() => undefined);
   const observed = await readDeploymentLockState(quarantinePath);
   if (
+    quarantinedDetails?.dev === lock.identity.dev &&
+    quarantinedDetails.ino === lock.identity.ino &&
+    quarantinedSerialized === lock.serialized &&
     observed?.pid === lock.state.pid &&
     observed.startedAt === lock.state.startedAt &&
     observed.token === lock.state.token
@@ -3711,6 +3943,14 @@ async function acquireDeploymentLock(root: string): Promise<DeploymentLockHandle
     });
   }
   const path = await resolveContainedProjectPath(root, DEPLOY_LOCK_FILE);
+  if (await recoverDeploymentLeases(root)) {
+    throw cliError({
+      code: "DEPLOY_BUSY",
+      message:
+        "Another Eden deploy owns the selected project's cross-process lease; wait for it to finish before retrying.",
+      source: DEPLOY_LOCK_FILE,
+    });
+  }
   if (await recoverDeploymentLockQuarantines(root)) {
     throw cliError({
       code: "DEPLOY_BUSY",
@@ -3734,9 +3974,15 @@ async function acquireDeploymentLock(root: string): Promise<DeploymentLockHandle
         mode: 0o600,
         flag: "wx",
       });
+      const identity = await lstat(path);
       const handle: DeploymentLockHandle = {
         path,
         state,
+        serialized,
+        identity: {
+          dev: identity.dev,
+          ino: identity.ino,
+        },
         release: async () => removeOwnedDeploymentLock(root, handle),
       };
       return handle;
@@ -5670,9 +5916,7 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
             Math.min(OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS, remainingMs),
           ),
         ]);
-        if (
-          isQuiescent()
-        ) {
+        if (isQuiescent()) {
           await drainDeferredCleanups();
           return isQuiescent();
         }
@@ -5948,8 +6192,10 @@ async function runRemoteCommand(
   ownedProcesses: OwnedProcessRegistry,
   allowWhenStopping = false,
   onStarted?: () => void,
+  onPossiblyStarted?: () => void,
   beforeStart?: () => void | Promise<void>,
   afterPreflight?: () => void | Promise<void>,
+  acquireLease?: () => Promise<DeploymentLeaseHandle>,
 ): Promise<EdenCliRemoteCommandResult> {
   if (!allowWhenStopping && ownedProcesses.isStopping()) {
     throw cliError({
@@ -5961,6 +6207,8 @@ async function runRemoteCommand(
   const runner = options.remoteCommandRunner ?? runDefaultRemoteCommand;
   const reservation = ownedProcesses.reserve();
   let returned: EdenCliRemoteCommandReturn;
+  let lease: DeploymentLeaseHandle | undefined;
+  let runnerInvoked = false;
   try {
     await beforeStart?.();
     if (!allowWhenStopping && ownedProcesses.isStopping()) {
@@ -5978,11 +6226,25 @@ async function runRemoteCommand(
           "Eden deploy was cancelled during the remote runner handoff.",
       });
     }
+    lease = await acquireLease?.();
+    if (!allowWhenStopping && ownedProcesses.isStopping()) {
+      throw cliError({
+        code: "DEPLOY_CANCELLED",
+        message:
+          "Eden deploy was cancelled before the cross-process remote lease handoff completed.",
+      });
+    }
+    runnerInvoked = true;
     returned = reservation.start(
       () => runner(request),
       allowWhenStopping,
     );
+    onPossiblyStarted?.();
   } catch (error: unknown) {
+    if (runnerInvoked) {
+      onPossiblyStarted?.();
+    }
+    await lease?.release().catch(() => undefined);
     reservation.release();
     throw error;
   }
@@ -6019,6 +6281,12 @@ async function runRemoteCommand(
       ]);
     } finally {
       ownedProcesses.unregister(returned.process);
+      ownedProcesses.trackLateResult(
+        Promise.resolve(returned.process.exited).then(
+          () => lease?.release().then(() => undefined),
+          () => lease?.release().then(() => undefined),
+        ),
+      );
     }
   }
   let resolved: EdenCliRemoteCommandResult | EdenCliRemoteCommandHandle;
@@ -6028,6 +6296,7 @@ async function runRemoteCommand(
         returned,
         ownedProcesses,
         "The remote command was cancelled before its result settled.",
+        REMOTE_RESULT_TIMEOUT_MS,
       );
     } else {
       resolved = returned;
@@ -6035,17 +6304,46 @@ async function runRemoteCommand(
   } catch (error: unknown) {
     const lateSettlement = settleLateChildResult(
       Promise.resolve(returned),
-      reservation,
+      undefined,
       isRemoteCommandHandle,
       ownedProcesses,
-    );
-    ownedProcesses.trackLateResult(lateSettlement);
+    ).then(async () => {
+      await lease?.release().catch(() => undefined);
+    });
+    const boundedLateSettlement = Promise.race([
+      lateSettlement,
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, REMOTE_RESULT_TIMEOUT_MS);
+      }),
+    ]);
+    reservation.release();
+    onPossiblyStarted?.();
+    ownedProcesses.trackLateResult(boundedLateSettlement);
     throw error;
   }
   if (isRemoteCommandHandle(resolved)) {
+    onPossiblyStarted?.();
     ownedProcesses.register(resolved.process);
-    await ownedProcesses.terminate(resolved.process);
+    const terminated = await ownedProcesses.terminate(resolved.process);
+    onStarted?.();
+    if (terminated) {
+      await lease?.release().catch(() => undefined);
+    } else {
+      ownedProcesses.trackLateResult(
+        Promise.resolve(resolved.process.exited).then(
+          () => lease?.release().then(() => undefined),
+          () => lease?.release().then(() => undefined),
+        ),
+      );
+    }
     reservation.release();
+    if (allowWhenStopping && terminated) {
+      return {
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      };
+    }
     throw cliError({
       code: "REMOTE_COMMAND_HANDLE_UNSUPPORTED",
       message:
@@ -6110,10 +6408,26 @@ async function raceOwnedResult<T>(
   result: T | PromiseLike<T>,
   ownedProcesses: OwnedProcessRegistry | undefined,
   cancellationMessage: string,
+  timeoutMs?: number,
 ): Promise<T> {
   if (ownedProcesses === undefined) {
     return await result;
   }
+  const timeout = timeoutMs === undefined
+    ? []
+    : [
+        new Promise<never>((_, reject) => {
+          setTimeout(() => {
+            reject(
+              cliError({
+                code: "REMOTE_RESULT_TIMEOUT",
+                message:
+                  `The remote command result did not settle within ${timeoutMs}ms.`,
+              }),
+            );
+          }, timeoutMs);
+        }),
+      ];
   return await Promise.race([
     Promise.resolve(result),
     ownedProcesses.stopped.then(() => {
@@ -6122,6 +6436,7 @@ async function raceOwnedResult<T>(
         message: cancellationMessage,
       });
     }),
+    ...timeout,
   ]);
 }
 
@@ -7990,12 +8305,18 @@ async function runDeploy(
     deploymentLock = await acquireDeploymentLock(root);
   } catch (error: unknown) {
     removeStopListeners();
-    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await ownedValidationProcesses.cleanup(
+      requestedSignal ?? "SIGTERM",
+      GENERATION_WORK_TIMEOUT_MS,
+    );
     throw error;
   }
   if (deploymentLock === undefined) {
     removeStopListeners();
-    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await ownedValidationProcesses.cleanup(
+      requestedSignal ?? "SIGTERM",
+      GENERATION_WORK_TIMEOUT_MS,
+    );
     throw cliError({
       code: "DEPLOY_LOCK_UNAVAILABLE",
       message: "The Eden deployment ownership lock could not be acquired.",
@@ -8003,6 +8324,8 @@ async function runDeploy(
     });
   }
   const lock: DeploymentLockHandle = deploymentLock;
+  const deploymentLeases = new Set<DeploymentLeaseHandle>();
+  let deploymentLease: DeploymentLeaseHandle | undefined;
   let releaseDeploymentLockAfterQuiescence: (() => Promise<void>) | undefined;
   const assertDeploymentActive = (): void => {
     if (requestedSignal !== undefined) {
@@ -8021,6 +8344,22 @@ async function runDeploy(
     | DeploymentArtifactSnapshot["fileDigests"]
     | undefined;
   let deploymentRuntimeContents: RuntimeFileContents | undefined;
+  const acquireTrackedDeploymentLease = async (): Promise<DeploymentLeaseHandle> => {
+    const rawLease = await acquireDeploymentLease(root, lock);
+    const trackedLease: DeploymentLeaseHandle = {
+      ...rawLease,
+      release: async () => {
+        deploymentLeases.delete(trackedLease);
+        if (deploymentLease === trackedLease) {
+          deploymentLease = undefined;
+        }
+        return await rawLease.release();
+      },
+    };
+    deploymentLeases.add(trackedLease);
+    deploymentLease = trackedLease;
+    return trackedLease;
+  };
   const assertBoundGeneration = async (): Promise<void> => {
     await assertCanonicalGenerationMatches(
       root,
@@ -8054,7 +8393,10 @@ async function runDeploy(
     generation = deploymentArtifactSnapshot.generation;
   } catch (error: unknown) {
     removeStopListeners();
-    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await ownedValidationProcesses.cleanup(
+      requestedSignal ?? "SIGTERM",
+      GENERATION_WORK_TIMEOUT_MS,
+    );
     releaseDeploymentLockAfterQuiescence = async () => {
       if (deploymentArtifactSnapshotRoot !== undefined) {
         await rm(deploymentArtifactSnapshotRoot, {
@@ -8097,7 +8439,10 @@ async function runDeploy(
     }
   } catch (error: unknown) {
     removeStopListeners();
-    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await ownedValidationProcesses.cleanup(
+      requestedSignal ?? "SIGTERM",
+      GENERATION_WORK_TIMEOUT_MS,
+    );
     releaseDeploymentLockAfterQuiescence = async () => {
       if (setupRuntimeFiles !== undefined) {
         await rm(setupRuntimeFiles.configPath, { force: true }).catch(
@@ -8122,7 +8467,10 @@ async function runDeploy(
   const runtimeFiles = setupRuntimeFiles;
   if (runtimeFiles === undefined) {
     removeStopListeners();
-    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await ownedValidationProcesses.cleanup(
+      requestedSignal ?? "SIGTERM",
+      GENERATION_WORK_TIMEOUT_MS,
+    );
     releaseDeploymentLockAfterQuiescence = async () => {
       if (deploymentArtifactSnapshotRoot !== undefined) {
         await rm(deploymentArtifactSnapshotRoot, {
@@ -8142,7 +8490,10 @@ async function runDeploy(
   const temporaryConfig = runtimeFiles.configPath;
   if (deploymentRuntimeContents === undefined) {
     removeStopListeners();
-    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await ownedValidationProcesses.cleanup(
+      requestedSignal ?? "SIGTERM",
+      GENERATION_WORK_TIMEOUT_MS,
+    );
     releaseDeploymentLockAfterQuiescence = async () => {
       await rm(runtimeFiles.configPath, { force: true }).catch(() => undefined);
       await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
@@ -8164,6 +8515,9 @@ async function runDeploy(
   const assertDeploymentCandidateStable = async (): Promise<void> => {
     assertDeploymentActive();
     await assertDeploymentLockOwned(lock);
+    if (deploymentLease !== undefined) {
+      await assertDeploymentLeaseOwned(deploymentLease);
+    }
     await assertBoundGeneration();
     if (deploymentArtifactSnapshotFileDigests !== undefined) {
       assertArtifactSnapshotStable(
@@ -8194,6 +8548,9 @@ async function runDeploy(
       });
     }
     await assertDeploymentLockOwned(lock);
+    if (deploymentLease !== undefined) {
+      await assertDeploymentLeaseOwned(deploymentLease);
+    }
   };
   const assertDeploymentCompatibilityStable = async (): Promise<void> => {
     assertDeploymentActive();
@@ -8252,6 +8609,7 @@ async function runDeploy(
       ownedValidationProcesses,
       false,
       markStarted,
+      markStarted,
       async () => {
         await options.deploymentBoundaryHook?.(
           "before-remote-runner-invocation",
@@ -8265,6 +8623,13 @@ async function runDeploy(
         await assertDeploymentCandidateStable();
         preflightCompleted = true;
       },
+      async () => {
+        deploymentLease = await acquireTrackedDeploymentLease();
+        await options.deploymentBoundaryHook?.("after-remote-final-read");
+        await assertDeploymentLockOwned(lock);
+        await assertDeploymentLeaseOwned(deploymentLease);
+        return deploymentLease;
+      },
     );
     if (!preflightCompleted) {
       throw cliError({
@@ -8274,21 +8639,47 @@ async function runDeploy(
       });
     }
     await assertDeploymentCandidateStable();
+    const completedLease = deploymentLease;
+    deploymentLease = undefined;
+    if (completedLease !== undefined) {
+      await completedLease.release().catch(() => undefined);
+    }
     return result;
   };
   const runOwnedRemoteCleanup = async (
     request: EdenCliRemoteCommandRequest,
   ): Promise<EdenCliRemoteCommandResult> => {
-    const result = await runRemoteCommand(
-      options,
-      request,
-      ownedValidationProcesses,
-      true,
-      undefined,
-      () => assertDeploymentLockOwned(lock),
-    );
+    let result: EdenCliRemoteCommandResult;
+    try {
+      result = await runRemoteCommand(
+        options,
+        request,
+        ownedValidationProcesses,
+        true,
+        undefined,
+        undefined,
+        () => assertDeploymentLockOwned(lock),
+        undefined,
+        async () => {
+          deploymentLease = await acquireTrackedDeploymentLease();
+          return deploymentLease;
+        },
+      );
+    } catch (error: unknown) {
+      const pendingLease = deploymentLease;
+      deploymentLease = undefined;
+      if (pendingLease !== undefined) {
+        await pendingLease.release().catch(() => undefined);
+      }
+      throw error;
+    }
     if (!ownedValidationProcesses.isStopping()) {
       await assertDeploymentLockOwned(lock);
+    }
+    const completedLease = deploymentLease;
+    deploymentLease = undefined;
+    if (completedLease !== undefined) {
+      await completedLease.release().catch(() => undefined);
     }
     return result;
   };
@@ -8502,8 +8893,15 @@ async function runDeploy(
       }
     }
     removeStopListeners();
-    await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
+    await ownedValidationProcesses.cleanup(
+      requestedSignal ?? "SIGTERM",
+      GENERATION_WORK_TIMEOUT_MS,
+    );
     releaseDeploymentLockAfterQuiescence = async () => {
+      for (const lease of [...deploymentLeases]) {
+        await lease.release().catch(() => undefined);
+      }
+      deploymentLease = undefined;
       await rm(temporaryConfig, { force: true }).catch(() => undefined);
       await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
       if (deploymentArtifactSnapshotRoot !== undefined) {
