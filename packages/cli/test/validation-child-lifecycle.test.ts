@@ -1,5 +1,6 @@
 import {
   mkdtemp,
+  readdir,
   readFile,
   rm,
 } from "node:fs/promises";
@@ -226,6 +227,13 @@ describe("CLI validation child lifecycle", () => {
     const termination = new Promise<void>((resolve) => {
       releaseTermination = resolve;
     });
+    let releaseExit: (() => void) | undefined;
+    const remoteExited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseExit = () => resolve({ exitCode: 0, signal: null });
+    });
     const remoteResult = new Promise<{
       readonly exitCode: number;
       readonly stdout: string;
@@ -234,7 +242,7 @@ describe("CLI validation child lifecycle", () => {
     const processHandle: EdenCliProcess = {
       pid: 44_004,
       startIdentity: "reserved-remote-spawn",
-      exited: new Promise(() => {}),
+      exited: remoteExited,
       async terminate(signal?: NodeJS.Signals) {
         if (signal !== undefined) signals.push(signal);
         await termination;
@@ -285,7 +293,12 @@ describe("CLI validation child lifecycle", () => {
     expect(signals).toContain("SIGTERM");
     expect(errors.join("\n")).toMatch(/cancel|signal|remote/i);
     await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
-      .rejects.toMatchObject({ code: "ENOENT" });
+      .resolves.toContain("eden.deploy.lock");
+    releaseExit?.();
+    await vi.waitFor(async () => {
+      await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    });
   });
 
   test("escalates a stubborn validation child with independent SIGKILL", async () => {
@@ -322,4 +335,106 @@ describe("CLI validation child lifecycle", () => {
     ).resolves.toBe(0);
     expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
   }, 12_000);
+
+  test("retains a child and temporary files until failed termination later proves exit", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const signals: NodeJS.Signals[] = [];
+    let releaseExit: (() => void) | undefined;
+    let releaseResult: (() => void) | undefined;
+    const exited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseExit = () => resolve({ exitCode: 0, signal: null });
+    });
+    const result = new Promise<EdenCliDryRunResult>((resolve) => {
+      releaseResult = () => resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    const processHandle: EdenCliProcess = {
+      pid: 44_006,
+      startIdentity: "late-proven-exit",
+      exited,
+      async terminate(signal?: NodeJS.Signals) {
+        if (signal !== undefined) signals.push(signal);
+      },
+    };
+    const buildPromise = runEdenCli(["build", "--project", root], {
+      cwd: root,
+      dryRunRunner: () => {
+        queueMicrotask(() => process.emit("SIGTERM"));
+        return {
+          process: processHandle,
+          result,
+        };
+      },
+    });
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 3_000));
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    const temporaryFiles = (await readdir(root)).filter((entry) =>
+      entry.includes("eden-dev-worker") ||
+      entry.includes("eden-dev-config") ||
+      entry.includes("eden-build-candidate"),
+    );
+    expect(temporaryFiles.length).toBeGreaterThan(0);
+    releaseExit?.();
+    releaseResult?.();
+    await expect(buildPromise).resolves.toBe(0);
+    await vi.waitFor(
+      async () => {
+        await expect(
+          readdir(root).then((entries) =>
+            entries.filter((entry) =>
+              entry.includes("eden-dev-worker") ||
+              entry.includes("eden-dev-config") ||
+              entry.includes("eden-build-candidate"),
+            ),
+          ),
+        ).resolves.toEqual([]);
+      },
+      { timeout: 2_000 },
+    );
+  }, 12_000);
+
+  test("does not install process-global signal listeners for injected dev stops", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const beforeSigint = process.listenerCount("SIGINT");
+    const beforeSigterm = process.listenerCount("SIGTERM");
+    const stopController = new AbortController();
+    let releaseExit: (() => void) | undefined;
+    const exited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseExit = () => resolve({ exitCode: 0, signal: null });
+    });
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      stopSignal: stopController.signal,
+      processRunner: {
+        spawn() {
+          return {
+            pid: 44_007,
+            startIdentity: "injected-stop-no-global-listener",
+            ready: Promise.resolve(),
+            exited,
+            async terminate() {
+              releaseExit?.();
+            },
+          };
+        },
+      },
+      dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
+    expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+    stopController.abort();
+    await expect(devPromise).resolves.toBe(0);
+    expect(process.listenerCount("SIGINT")).toBe(beforeSigint);
+    expect(process.listenerCount("SIGTERM")).toBe(beforeSigterm);
+  });
 });

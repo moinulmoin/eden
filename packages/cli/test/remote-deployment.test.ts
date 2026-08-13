@@ -272,6 +272,72 @@ describe("eden remote deployment orchestration", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  test("starts remote cleanup commands even after deploy cancellation", async () => {
+    const root = await createRoot();
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    let releaseSecretPut: (() => void) | undefined;
+    const secretPutResult = new Promise<{
+      readonly exitCode: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    }>((resolve) => {
+      releaseSecretPut = () =>
+        resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(
+        [
+          "deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eden-cancel-cleanup",
+        ],
+        {
+          cwd: root,
+          dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+          remoteCommandRunner: (request) => {
+            commands.push(request);
+            if (request.kind === "secret-put") {
+              queueMicrotask(() => {
+                process.emit("SIGTERM");
+                releaseSecretPut?.();
+              });
+              return {
+                process: {
+                  pid: 55_200,
+                  startIdentity: "cancel-cleanup-secret-put",
+                  exited: secretPutResult.then(() => ({
+                    exitCode: 0,
+                    signal: null,
+                  })),
+                  async terminate() {
+                    releaseSecretPut?.();
+                  },
+                },
+                result: secretPutResult,
+              };
+            }
+            return { exitCode: 0, stdout: "", stderr: "" };
+          },
+          remoteBearerSecret: "cancel-cleanup-secret",
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(commands.map((request) => request.kind)).toEqual([
+      "secret-put",
+      "secret-delete",
+      "delete",
+    ]);
+  });
+
   test("rejects a promise-returned remote handle before awaiting it", async () => {
     const root = await createRoot();
     let terminateCount = 0;
@@ -470,6 +536,71 @@ describe("eden remote deployment orchestration", () => {
     expect(errors.join("\n")).toMatch(/ownership|lock|replaced|changed/i);
     await expect(readFile(lockPath, "utf8")).resolves.toContain(
       "final-spawn-replacement",
+    );
+  });
+
+  test("revalidates ownership after final preflight before runner handoff", async () => {
+    const root = await createRoot();
+    const lockPath = join(root, ".eden-deploy.lock");
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    const errors: string[] = [];
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(
+        [
+          "deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eden-post-preflight-cas",
+        ],
+        {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+          dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+          deploymentBoundaryHook: async (boundary) => {
+            if (boundary !== "after-remote-runner-preflight") return;
+            const current = JSON.parse(await readFile(lockPath, "utf8")) as {
+              readonly kind: string;
+              readonly version: number;
+              readonly pid: number;
+              readonly startedAt: string;
+              readonly token: string;
+            };
+            await writeFile(
+              lockPath,
+              `${JSON.stringify({
+                ...current,
+                token: "post-preflight-replacement",
+              })}\n`,
+              "utf8",
+            );
+          },
+          remoteCommandRunner: async (request) => {
+            commands.push(request);
+            return {
+              exitCode: 0,
+              stdout: request.kind === "deploy"
+                ? "https://eden-post-preflight-cas.example.workers.dev\n"
+                : "",
+              stderr: "",
+            };
+          },
+          remoteValidationRunner: async () => ({ ok: true }),
+          remoteBearerSecret: "post-preflight-cas-secret",
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(commands).toEqual([]);
+    expect(errors.join("\n")).toMatch(/ownership|lock|replaced|changed/i);
+    await expect(readFile(lockPath, "utf8")).resolves.toContain(
+      "post-preflight-replacement",
     );
   });
 });

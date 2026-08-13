@@ -35,6 +35,7 @@ import {
   runEdenCli,
   stopEdenDev,
   type EdenCliDryRunRequest,
+  type EdenCliProcess,
   type EdenCliProcessRequest,
 } from "../src/index.js";
 
@@ -943,6 +944,53 @@ describe("eden dev and deploy orchestration", () => {
     }
   }, 15_000);
 
+  test("escalates a stubborn ordinary dev child after SIGTERM does not prove exit", async () => {
+    const root = await createRoot("eden-cli-dev-stubborn-child-");
+    await initRoot(root);
+    const stopController = new AbortController();
+    const signals: NodeJS.Signals[] = [];
+    let spawned = false;
+    const processHandle: EdenCliProcess = {
+      pid: 41_011,
+      startIdentity: "stubborn-ordinary-dev-child",
+      ready: Promise.resolve(),
+      exited: new Promise(() => {}),
+      async terminate(signal?: NodeJS.Signals) {
+        if (signal !== undefined) signals.push(signal);
+      },
+    };
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      stopSignal: stopController.signal,
+      processRunner: {
+        spawn: () => {
+          spawned = true;
+          return processHandle;
+        },
+      },
+      dryRunRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      }),
+    });
+
+    await vi.waitFor(() => {
+      expect(spawned).toBe(true);
+    }, { timeout: 3_000 });
+    stopController.abort();
+    await expect(
+      Promise.race([
+        devPromise,
+        new Promise<number>((resolve) => {
+          setTimeout(() => resolve(-1), 8_000);
+        }),
+      ]),
+    ).resolves.toBe(0);
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+  }, 12_000);
+
   test("does not spawn when the initial build fails", async () => {
     const root = await createRoot("eden-cli-dev-invalid-");
     await initRoot(root);
@@ -1058,7 +1106,9 @@ export default {
       }),
     ).resolves.toBe(1);
 
-    expect(terminated).toBe(true);
+    await vi.waitFor(() => {
+      expect(terminated).toBe(true);
+    });
     expect(errors.join("\n")).toMatch(/ready|readiness/i);
     await expect(readFile(join(root, ".eden-dev-state.json"), "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });

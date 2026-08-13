@@ -9,6 +9,7 @@ import {
 } from "crypto";
 import {
   existsSync,
+  readFileSync,
 } from "fs";
 import {
   cp,
@@ -220,6 +221,7 @@ export type EdenRuntimePublicationBoundary =
 export type EdenDeploymentBoundary =
   | "before-compatibility-dry-run"
   | "before-remote-runner-invocation"
+  | "after-remote-runner-preflight"
   | "after-compatibility-dry-run"
   | "before-secret-provision"
   | "after-secret-provision"
@@ -2987,6 +2989,9 @@ interface DeploymentSourceSnapshot {
 interface DeploymentArtifactSnapshot {
   readonly root: string;
   readonly generation: EdenArtifactGeneration;
+  readonly fileDigests: Readonly<
+    Record<(typeof CANONICAL_ARTIFACT_NAMES)[number], string>
+  >;
 }
 
 async function captureDeploymentSourceSnapshot(
@@ -3074,12 +3079,45 @@ async function copyDeploymentGenerationSnapshot(
         directory: snapshotGeneration,
         artifacts: validated.artifacts,
       },
+      fileDigests: captureArtifactFileDigests(snapshotGeneration),
     };
   } catch (error: unknown) {
     await rm(snapshotRoot, { recursive: true, force: true }).catch(
       () => undefined,
     );
     throw error;
+  }
+}
+
+function captureArtifactFileDigests(
+  generationDirectory: string,
+): Readonly<
+  Record<(typeof CANONICAL_ARTIFACT_NAMES)[number], string>
+> {
+  return Object.fromEntries(
+    CANONICAL_ARTIFACT_NAMES.map((name) => [
+      name,
+      sha256(readFileSync(join(generationDirectory, name))),
+    ]),
+  ) as Record<(typeof CANONICAL_ARTIFACT_NAMES)[number], string>;
+}
+
+function assertArtifactSnapshotStable(
+  generationDirectory: string,
+  expected: Readonly<
+    Record<(typeof CANONICAL_ARTIFACT_NAMES)[number], string>
+  >,
+): void {
+  for (const name of CANONICAL_ARTIFACT_NAMES) {
+    const observed = sha256(readFileSync(join(generationDirectory, name)));
+    if (observed !== expected[name]) {
+      throw cliError({
+        code: "DEPLOYMENT_SNAPSHOT_CHANGED",
+        message:
+          "The immutable deployment artifact snapshot changed; no stale remote mutation may continue.",
+        source: name,
+      });
+    }
   }
 }
 
@@ -4139,7 +4177,7 @@ async function waitForOwnedProcessExit(
   if (cleanupSignal?.aborted === true) return false;
   const exited = process.exited.then(
     () => true,
-    () => true,
+    () => false,
   );
   let timeout: NodeJS.Timeout | undefined;
   let abort: (() => void) | undefined;
@@ -4188,17 +4226,11 @@ async function resolveOwnedProcessIdentity(
 async function terminateRuntimeChild(
   process: EdenCliProcess,
   signal: NodeJS.Signals,
-  cleanupSignal?: AbortSignal,
 ): Promise<boolean> {
   const identity = await resolveOwnedProcessIdentity(process);
   if (identity === undefined) return false;
-  if (cleanupSignal?.aborted === true) {
-    return await waitForOwnedProcessExit(
-      process,
-      OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
-      cleanupSignal,
-    );
-  }
+  // A stop aborts readiness polling, but it must not abort child termination.
+  // The child remains owned until its exit promise proves a terminal state.
   const termination: boolean = await Promise.race<boolean>([
     Promise.resolve()
       .then(() => process.terminate(signal))
@@ -4207,23 +4239,24 @@ async function terminateRuntimeChild(
       setTimeout(() => resolveResult(false), OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS);
     }),
   ]);
-  if (
-    termination === false &&
-    (cleanupSignal === undefined || cleanupSignal.aborted === false)
-  ) {
-    await Promise.race([
-      Promise.resolve()
-        .then(() => process.terminate("SIGKILL"))
-        .then(() => undefined, () => undefined),
-      new Promise<void>((resolveResult) => {
-        setTimeout(resolveResult, OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS);
-      }),
-    ]);
+  if (termination) {
+    const exitedAfterSignal = await waitForOwnedProcessExit(
+      process,
+      OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
+    );
+    if (exitedAfterSignal) return true;
   }
+  await Promise.race([
+    Promise.resolve()
+      .then(() => process.terminate("SIGKILL"))
+      .then(() => undefined, () => undefined),
+    new Promise<void>((resolveResult) => {
+      setTimeout(resolveResult, OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS);
+    }),
+  ]);
   return await waitForOwnedProcessExit(
     process,
     OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
-    cleanupSignal,
   );
 }
 
@@ -4440,9 +4473,7 @@ function createDefaultProcessHandle(
     waitForProcessIdentity(pid, processMarker),
     exited.then(() => undefined),
   ]);
-  const signalOwnedChild = async (
-    signal: NodeJS.Signals,
-  ): Promise<boolean> => {
+  const signalOwnedChild = async (signal: NodeJS.Signals): Promise<boolean> => {
     const expected = await resolveOwnedProcessIdentity(
       {
         pid,
@@ -4920,10 +4951,25 @@ async function runDefaultRemoteValidation(
 
 interface OwnedProcessRegistry {
   readonly isStopping: () => boolean;
+  readonly isQuiescent: () => boolean;
   readonly stopped: Promise<NodeJS.Signals>;
-  readonly reserve: () => { readonly release: () => void };
+  readonly reserve: () => {
+    readonly release: () => void;
+    readonly start: <T>(runner: () => T, allowWhenStopping?: boolean) => T;
+  };
+  readonly registerReservationProcess: (
+    reservation: {
+      readonly release: () => void;
+    },
+    process: EdenCliProcess,
+  ) => void;
   readonly register: (process: EdenCliProcess) => void;
+  readonly terminate: (process: EdenCliProcess) => Promise<boolean>;
   readonly unregister: (process: EdenCliProcess) => void;
+  readonly trackLateResult: (settlement: PromiseLike<void>) => void;
+  readonly deferCleanup: (
+    cleanup: () => void | Promise<void>,
+  ) => Promise<void>;
   readonly waitForQuiescence: () => Promise<void>;
   readonly cleanup: (signal: NodeJS.Signals) => Promise<void>;
 }
@@ -4934,6 +4980,11 @@ const OWNED_PROCESS_CLEANUP_TIMEOUT_MS =
   OWNED_PROCESS_TERMINATION_TIMEOUT_MS * 2 +
   OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS * 2 +
   500;
+
+interface OwnedRunnerReservation {
+  readonly release: () => void;
+  readonly start: <T>(runner: () => T, allowWhenStopping?: boolean) => T;
+}
 
 async function terminateOwnedProcess(
   process: EdenCliProcess,
@@ -4973,34 +5024,112 @@ async function terminateOwnedProcess(
 
 function createOwnedProcessRegistry(): OwnedProcessRegistry {
   const processes = new Set<EdenCliProcess>();
+  const processRecords = new Map<
+    EdenCliProcess,
+    {
+      releaseRequested: boolean;
+      terminal: boolean;
+      terminationAttempted: boolean;
+    }
+  >();
   const pendingTerminations = new Map<EdenCliProcess, Promise<boolean>>();
+  const lateResults = new Set<Promise<void>>();
   const reservations = new Set<{
     readonly settled: Promise<void>;
     readonly release: () => void;
   }>();
+  const deferredCleanups = new Set<() => void | Promise<void>>();
   let stopping = false;
   let cleanupPromise: Promise<void> | undefined;
   let cleanupSignal: NodeJS.Signals = "SIGTERM";
+  let deferredCleanupPromise: Promise<void> | undefined;
   let resolveStopped: ((signal: NodeJS.Signals) => void) | undefined;
   const stopped = new Promise<NodeJS.Signals>((resolve) => {
     resolveStopped = resolve;
   });
+  const isQuiescent = (): boolean =>
+    processes.size === 0 &&
+    pendingTerminations.size === 0 &&
+    reservations.size === 0 &&
+    lateResults.size === 0;
+  const drainDeferredCleanups = async (): Promise<void> => {
+    if (!isQuiescent() || deferredCleanups.size === 0) return;
+    if (deferredCleanupPromise !== undefined) {
+      await deferredCleanupPromise;
+      return;
+    }
+    deferredCleanupPromise = (async () => {
+      while (isQuiescent() && deferredCleanups.size > 0) {
+        const cleanupTask = deferredCleanups.values().next().value as
+          | (() => void | Promise<void>)
+          | undefined;
+        if (cleanupTask === undefined) break;
+        deferredCleanups.delete(cleanupTask);
+        await Promise.resolve().then(cleanupTask).catch(() => undefined);
+      }
+    })().finally(() => {
+      deferredCleanupPromise = undefined;
+    });
+    await deferredCleanupPromise;
+  };
+  const scheduleQuiescenceCheck = (): void => {
+    if (isQuiescent()) {
+      void drainDeferredCleanups();
+    }
+  };
+  const markTerminal = (process: EdenCliProcess): void => {
+    const record = processRecords.get(process);
+    if (record === undefined) return;
+    record.terminal = true;
+    if (
+      (record.releaseRequested || stopping) &&
+      !pendingTerminations.has(process)
+    ) {
+      processRecords.delete(process);
+      processes.delete(process);
+    }
+    scheduleQuiescenceCheck();
+  };
+  const observeProcess = (process: EdenCliProcess): void => {
+    void process.exited.then(
+      () => markTerminal(process),
+      () => undefined,
+    );
+  };
   const terminateTracked = (process: EdenCliProcess): Promise<boolean> => {
     const existing = pendingTerminations.get(process);
     if (existing !== undefined) return existing;
+    const record = processRecords.get(process);
+    if (record === undefined) return Promise.resolve(true);
+    if (record.terminal) {
+      processRecords.delete(process);
+      processes.delete(process);
+      scheduleQuiescenceCheck();
+      return Promise.resolve(true);
+    }
+    if (record.terminationAttempted) return Promise.resolve(false);
+    record.terminationAttempted = true;
     const termination = terminateOwnedProcess(process, cleanupSignal)
       .then((settled) => {
-        processes.delete(process);
+        if (settled) {
+          processRecords.delete(process);
+          processes.delete(process);
+        }
         return settled;
       })
       .finally(() => {
         pendingTerminations.delete(process);
-        void cleanup(cleanupSignal);
+        const record = processRecords.get(process);
+        if (record?.terminal && (record.releaseRequested || stopping)) {
+          processRecords.delete(process);
+          processes.delete(process);
+        }
+        scheduleQuiescenceCheck();
       });
     pendingTerminations.set(process, termination);
     return termination;
   };
-  const cleanup = (signal: NodeJS.Signals): Promise<void> => {
+  async function cleanup(signal: NodeJS.Signals): Promise<void> {
     cleanupSignal = signal;
     stopping = true;
     resolveStopped?.(signal);
@@ -5028,24 +5157,34 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
           ),
         ]);
         if (
-          processes.size === 0 &&
-          pendingTerminations.size === 0 &&
-          reservations.size === 0
+          isQuiescent()
         ) {
+          await drainDeferredCleanups();
+          return;
+        }
+        if (
+          processes.size > 0 &&
+          pendingTerminations.size === 0 &&
+          reservations.size === 0 &&
+          lateResults.size === 0
+        ) {
+          // A termination attempt was bounded but exit was not proven. Keep
+          // the process owned and leave deferred files/locks in place; a
+          // later exit observation will drain them without a second signal
+          // storm or a false quiescence result.
           return;
         }
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
-      for (const reservation of [...reservations]) {
-        reservation.release();
-      }
+      await drainDeferredCleanups();
     })().finally(() => {
       cleanupPromise = undefined;
     });
-    return cleanupPromise;
-  };
+    return await cleanupPromise;
+  }
   return {
     isStopping: () => stopping,
+    isQuiescent,
     stopped,
     reserve: () => {
       let resolveReservation: (() => void) | undefined;
@@ -5063,25 +5202,84 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
           released = true;
           reservations.delete(reservation);
           resolveReservation?.();
+          scheduleQuiescenceCheck();
         },
       };
       reservations.add(reservation);
-      return {
+      const ownedReservation: OwnedRunnerReservation = {
         release: (): void => {
           reservation.release();
         },
+        start: <T>(runner: () => T, allowWhenStopping = false): T => {
+          if (stopping && !allowWhenStopping) {
+            throw cliError({
+              code: "DEPLOY_CANCELLED",
+              message:
+                "The Eden operation was cancelled before the owned runner handoff completed.",
+            });
+          }
+          return runner();
+        },
       };
+      return ownedReservation;
     },
-    register: (process) => {
-      processes.add(process);
+    registerReservationProcess: (reservation, process) => {
+      if (!processRecords.has(process)) {
+        processRecords.set(process, {
+          releaseRequested: false,
+          terminal: false,
+          terminationAttempted: false,
+        });
+        processes.add(process);
+        observeProcess(process);
+      }
+      reservation.release();
       if (stopping) {
         void terminateTracked(process);
       }
     },
+    register: (process) => {
+      if (processRecords.has(process)) return;
+      processRecords.set(process, {
+        releaseRequested: false,
+        terminal: false,
+        terminationAttempted: false,
+      });
+      processes.add(process);
+      observeProcess(process);
+      if (stopping) {
+        void terminateTracked(process);
+      }
+    },
+    terminate: terminateTracked,
     unregister: (process) => {
-      if (!stopping && !pendingTerminations.has(process)) {
+      const record = processRecords.get(process);
+      if (record === undefined) return;
+      record.releaseRequested = true;
+      if (
+        !stopping &&
+        record.terminal &&
+        !pendingTerminations.has(process)
+      ) {
+        processRecords.delete(process);
         processes.delete(process);
       }
+      scheduleQuiescenceCheck();
+    },
+    trackLateResult: (settlement) => {
+      const tracked = Promise.resolve(settlement).then(
+        () => undefined,
+        () => undefined,
+      );
+      lateResults.add(tracked);
+      void tracked.then(() => {
+        lateResults.delete(tracked);
+        scheduleQuiescenceCheck();
+      });
+    },
+    deferCleanup: async (cleanupTask) => {
+      deferredCleanups.add(cleanupTask);
+      await drainDeferredCleanups();
     },
     waitForQuiescence: async () => {
       if (!stopping) return;
@@ -5129,6 +5327,7 @@ async function runCompatibilityDryRun(
   request: EdenCliDryRunRequest,
   ownedProcesses?: OwnedProcessRegistry,
   beforeStart?: () => void | Promise<void>,
+  afterPreflight?: () => void | Promise<void>,
 ): Promise<EdenCliDryRunResult> {
   const runner = options.dryRunRunner ?? runDefaultDryRun;
   const reservation = ownedProcesses?.reserve();
@@ -5141,14 +5340,28 @@ async function runCompatibilityDryRun(
         message: "The Eden operation was cancelled before compatibility validation started.",
       });
     }
-    returned = runner(request);
+    await afterPreflight?.();
+    if (ownedProcesses?.isStopping() === true) {
+      throw cliError({
+        code: "DEPLOY_CANCELLED",
+        message:
+          "The Eden operation was cancelled during the compatibility runner handoff.",
+      });
+    }
+    returned = reservation === undefined
+      ? runner(request)
+      : reservation.start(() => runner(request));
   } catch (error: unknown) {
     reservation?.release();
     throw error;
   }
   if (isDryRunHandle(returned)) {
-    ownedProcesses?.register(returned.process);
-    reservation?.release();
+    if (ownedProcesses !== undefined && reservation !== undefined) {
+      ownedProcesses.registerReservationProcess(reservation, returned.process);
+    } else {
+      ownedProcesses?.register(returned.process);
+      reservation?.release();
+    }
     try {
       return await raceOwnedResult(
         returned.result,
@@ -5171,11 +5384,13 @@ async function runCompatibilityDryRun(
       resolved = returned;
     }
   } catch (error: unknown) {
-    void settleLateChildResult(
+    const lateSettlement = settleLateChildResult(
       Promise.resolve(returned),
       reservation,
       isDryRunHandle,
+      ownedProcesses,
     );
+    ownedProcesses?.trackLateResult(lateSettlement);
     throw error;
   }
   if (isDryRunHandle(resolved)) {
@@ -5183,7 +5398,12 @@ async function runCompatibilityDryRun(
     // It cannot be registered synchronously, so this shape is unsupported.
     // Give the returned owner one best-effort termination opportunity rather
     // than leaving an untracked child behind.
-    await terminateOwnedProcess(resolved.process, "SIGTERM");
+    if (ownedProcesses !== undefined) {
+      ownedProcesses.register(resolved.process);
+      await ownedProcesses.terminate(resolved.process);
+    } else {
+      await terminateOwnedProcess(resolved.process, "SIGTERM");
+    }
     reservation?.release();
     throw cliError({
       code: "DRY_RUN_HANDLE_UNSUPPORTED",
@@ -5202,6 +5422,7 @@ async function runRemoteCommand(
   allowWhenStopping = false,
   onStarted?: () => void,
   beforeStart?: () => void | Promise<void>,
+  afterPreflight?: () => void | Promise<void>,
 ): Promise<EdenCliRemoteCommandResult> {
   if (!allowWhenStopping && ownedProcesses.isStopping()) {
     throw cliError({
@@ -5222,14 +5443,24 @@ async function runRemoteCommand(
           "Eden deploy was cancelled before the remote command could start.",
       });
     }
-    returned = runner(request);
+    await afterPreflight?.();
+    if (!allowWhenStopping && ownedProcesses.isStopping()) {
+      throw cliError({
+        code: "DEPLOY_CANCELLED",
+        message:
+          "Eden deploy was cancelled during the remote runner handoff.",
+      });
+    }
+    returned = reservation.start(
+      () => runner(request),
+      allowWhenStopping,
+    );
   } catch (error: unknown) {
     reservation.release();
     throw error;
   }
   if (isRemoteCommandHandle(returned)) {
-    ownedProcesses.register(returned.process);
-    reservation.release();
+    ownedProcesses.registerReservationProcess(reservation, returned.process);
     onStarted?.();
     try {
       if (allowWhenStopping) {
@@ -5243,11 +5474,10 @@ async function runRemoteCommand(
                   stdout: "",
                   stderr: "Remote cleanup command did not settle.",
                 }),
-              OWNED_PROCESS_TERMINATION_TIMEOUT_MS,
+              OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
             );
           }),
         ]);
-        await ownedProcesses.waitForQuiescence();
         return result;
       }
       return await Promise.race([
@@ -5276,15 +5506,18 @@ async function runRemoteCommand(
       resolved = returned;
     }
   } catch (error: unknown) {
-    void settleLateChildResult(
+    const lateSettlement = settleLateChildResult(
       Promise.resolve(returned),
       reservation,
       isRemoteCommandHandle,
+      ownedProcesses,
     );
+    ownedProcesses.trackLateResult(lateSettlement);
     throw error;
   }
   if (isRemoteCommandHandle(resolved)) {
-    await terminateOwnedProcess(resolved.process, "SIGTERM");
+    ownedProcesses.register(resolved.process);
+    await ownedProcesses.terminate(resolved.process);
     reservation.release();
     throw cliError({
       code: "REMOTE_COMMAND_HANDLE_UNSUPPORTED",
@@ -5322,21 +5555,22 @@ async function settleLateChildResult<T>(
   isHandle: (value: unknown) => value is {
     readonly process: EdenCliProcess;
   },
+  ownedProcesses?: OwnedProcessRegistry,
 ): Promise<void> {
-  let resolved: T | undefined;
+  let resolved: T;
   try {
-    resolved = await Promise.race([
-      Promise.resolve(returned),
-      new Promise<undefined>((resolve) => {
-        setTimeout(resolve, OWNED_PROCESS_TERMINATION_TIMEOUT_MS);
-      }),
-    ]);
+    resolved = await Promise.resolve(returned);
   } catch {
     reservation?.release();
     return;
   }
-  if (resolved !== undefined && isHandle(resolved)) {
-    await terminateOwnedProcess(resolved.process, "SIGTERM");
+  if (isHandle(resolved)) {
+    if (ownedProcesses === undefined) {
+      await terminateOwnedProcess(resolved.process, "SIGTERM");
+    } else {
+      ownedProcesses.register(resolved.process);
+      await ownedProcesses.terminate(resolved.process);
+    }
   }
   reservation?.release();
 }
@@ -5536,14 +5770,21 @@ async function buildProjectFromCli(
       artifacts: result.artifacts,
     };
   } finally {
-    await rm(candidateOutput, { recursive: true, force: true }).catch(
-      () => undefined,
-    );
-    if (temporaryConfig !== undefined) {
-      await rm(temporaryConfig, { force: true }).catch(() => undefined);
-    }
-    if (runtimeFiles !== undefined) {
-      await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
+    const cleanupTemporaryBuildFiles = async (): Promise<void> => {
+      await rm(candidateOutput, { recursive: true, force: true }).catch(
+        () => undefined,
+      );
+      if (temporaryConfig !== undefined) {
+        await rm(temporaryConfig, { force: true }).catch(() => undefined);
+      }
+      if (runtimeFiles !== undefined) {
+        await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
+      }
+    };
+    if (ownedProcesses === undefined) {
+      await cleanupTemporaryBuildFiles();
+    } else {
+      await ownedProcesses.deferCleanup(cleanupTemporaryBuildFiles);
     }
   }
 }
@@ -5941,6 +6182,10 @@ async function runDev(
   let runtimeArtifact: EdenArtifactGeneration | undefined;
   let replacementChild: EdenCliProcess | undefined;
   const runtimeChildren = new Set<EdenCliProcess>();
+  const runtimeTerminationAttempts = new Map<
+    EdenCliProcess,
+    Promise<boolean>
+  >();
   const runtimeTemporaryFiles = new Set<string>();
   const readinessAbortController = new AbortController();
   let localSecretPath: string | undefined;
@@ -5994,6 +6239,31 @@ async function runDev(
       await rm(runtimeEntryPath, { force: true }).catch(() => undefined);
       runtimeEntryPath = undefined;
     }
+  };
+  const removeRuntimeOwnedResources = async (): Promise<void> => {
+    await removeRuntimeTemporaryFiles();
+    if (localSecretPath !== undefined) {
+      await rm(localSecretPath, { force: true }).catch(() => undefined);
+      localSecretPath = undefined;
+    }
+    if (statePath !== undefined && stateOwner !== undefined) {
+      await removeOwnedDevState(root, stateOwner).catch(() => undefined);
+      statePath = undefined;
+      stateOwner = undefined;
+    }
+  };
+  const terminateRuntimeChildOnce = (
+    processHandle: EdenCliProcess,
+    signal: NodeJS.Signals,
+  ): Promise<boolean> => {
+    const existing = runtimeTerminationAttempts.get(processHandle);
+    if (existing !== undefined) return existing;
+    const attempt = terminateRuntimeChild(
+      processHandle,
+      signal,
+    );
+    runtimeTerminationAttempts.set(processHandle, attempt);
+    return attempt;
   };
   const createTrackedRuntimeFiles = async (
     configurationPath: string,
@@ -6101,10 +6371,14 @@ async function runDev(
     runtimeChildren.add(processHandle);
     void processHandle.exited.finally(() => {
       runtimeChildren.delete(processHandle);
+      if (stopped) {
+        if (child === processHandle) child = undefined;
+        if (replacementChild === processHandle) replacementChild = undefined;
+      }
     });
     replacementChild = processHandle;
     if (stopped) {
-      await terminateRuntimeChild(processHandle, requestedSignal);
+      await terminateRuntimeChildOnce(processHandle, requestedSignal);
       replacementChild = undefined;
       return startupStopped;
     }
@@ -6124,7 +6398,7 @@ async function runDev(
     ]);
     if (startIdentityResult === startupStopped) return startupStopped;
     if (stopped) {
-      await terminateRuntimeChild(processHandle, requestedSignal);
+      await terminateRuntimeChildOnce(processHandle, requestedSignal);
       replacementChild = undefined;
       return startupStopped;
     }
@@ -6159,7 +6433,7 @@ async function runDev(
       ]);
       if (readinessResult === startupStopped) return startupStopped;
       if (stopped) {
-        await terminateRuntimeChild(processHandle, requestedSignal);
+        await terminateRuntimeChildOnce(processHandle, requestedSignal);
         replacementChild = undefined;
         return startupStopped;
       }
@@ -6238,10 +6512,9 @@ async function runDev(
               source: DEV_STATE_FILE,
             });
           }
-          oldRuntimeStopped = await terminateRuntimeChild(
+          oldRuntimeStopped = await terminateRuntimeChildOnce(
             oldChild,
             "SIGTERM",
-            readinessAbortController.signal,
           );
           if (stopped) return;
           if (oldRuntimeStopped) {
@@ -6363,7 +6636,7 @@ async function runDev(
             ? replacementChild
             : undefined);
         if (pendingCandidate !== undefined) {
-          await terminateRuntimeChild(
+          await terminateRuntimeChildOnce(
             pendingCandidate,
             "SIGTERM",
           );
@@ -6498,7 +6771,7 @@ async function runDev(
         } catch (rollbackError: unknown) {
           const pendingRollback = rollbackChild ?? replacementChild;
           if (pendingRollback !== undefined) {
-            await terminateRuntimeChild(
+            await terminateRuntimeChildOnce(
               pendingRollback,
               "SIGTERM",
             );
@@ -6603,17 +6876,11 @@ async function runDev(
           (value, index, values): value is EdenCliProcess =>
             value !== undefined && values.indexOf(value) === index,
         );
+        let allChildrenTerminal = true;
         if (snapshot.length === 0) {
-          await removeRuntimeTemporaryFiles();
-          if (localSecretPath !== undefined) {
-            await rm(localSecretPath, { force: true }).catch(() => undefined);
-            localSecretPath = undefined;
-          }
-          if (statePath !== undefined && stateOwner !== undefined) {
-            await removeOwnedDevState(root, stateOwner).catch(() => undefined);
-            statePath = undefined;
-            stateOwner = undefined;
-          }
+          await ownedValidationProcesses.deferCleanup(
+            removeRuntimeOwnedResources,
+          );
           break;
         }
         for (const ownedProcess of snapshot) {
@@ -6630,42 +6897,43 @@ async function runDev(
             continue;
           }
           const identity = await resolveOwnedProcessIdentity(ownedProcess);
-          if (identity === undefined) continue;
+          if (identity === undefined) {
+            allChildrenTerminal = false;
+            continue;
+          }
           if (ownedProcess === child) childCleanupRequested = true;
-          const settled = await terminateRuntimeChild(
+          const settled = await terminateRuntimeChildOnce(
             ownedProcess,
             requestedSignal,
           );
+          allChildrenTerminal &&= settled;
           if (settled) {
             if (ownedProcess === child) child = undefined;
             if (ownedProcess === replacementChild) replacementChild = undefined;
+            runtimeChildren.delete(ownedProcess);
           }
         }
         await waitForSettlements(
           snapshot.map((ownedProcess) => ownedProcess.exited),
           OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
         );
-        await removeRuntimeTemporaryFiles();
-        if (localSecretPath !== undefined) {
-          await rm(localSecretPath, { force: true }).catch(() => undefined);
-          localSecretPath = undefined;
-        }
-        if (statePath !== undefined && stateOwner !== undefined) {
-          await removeOwnedDevState(root, stateOwner).catch(() => undefined);
-          statePath = undefined;
-          stateOwner = undefined;
-        }
         const remaining = [child, replacementChild, ...runtimeChildren].filter(
           (value, index, values): value is EdenCliProcess =>
             value !== undefined && values.indexOf(value) === index,
         );
         if (
           remaining.length === 0 &&
+          allChildrenTerminal &&
           rebuildTasks.size === 0 &&
           scheduledRebuilds.size === 0 &&
           runtimeTemporaryFiles.size === 0 &&
           statePath === undefined
-        ) break;
+        ) {
+          await ownedValidationProcesses.deferCleanup(
+            removeRuntimeOwnedResources,
+          );
+          break;
+        }
       }
 
       while (
@@ -6681,15 +6949,39 @@ async function runDev(
         ...rebuildTasks,
         ...[...scheduledRebuilds].map((scheduled) => scheduled.task),
       ]);
-      await removeRuntimeTemporaryFiles();
-      if (localSecretPath !== undefined) {
-        await rm(localSecretPath, { force: true }).catch(() => undefined);
-        localSecretPath = undefined;
-      }
-      if (statePath !== undefined && stateOwner !== undefined) {
-        await removeOwnedDevState(root, stateOwner).catch(() => undefined);
-        statePath = undefined;
-        stateOwner = undefined;
+      await ownedValidationProcesses.waitForQuiescence();
+      const remainingChildren = [
+        child,
+        replacementChild,
+        ...runtimeChildren,
+      ].filter(
+        (value, index, values): value is EdenCliProcess =>
+          value !== undefined && values.indexOf(value) === index,
+      );
+      if (remainingChildren.length === 0) {
+        await ownedValidationProcesses.deferCleanup(
+          removeRuntimeOwnedResources,
+        );
+      } else {
+        void Promise.allSettled(
+          remainingChildren.map((ownedProcess) => ownedProcess.exited),
+        ).then(async () => {
+          for (const ownedProcess of remainingChildren) {
+            if (ownedProcess === child) child = undefined;
+            if (ownedProcess === replacementChild) replacementChild = undefined;
+            runtimeChildren.delete(ownedProcess);
+          }
+          const stillRunning = [
+            child,
+            replacementChild,
+            ...runtimeChildren,
+          ].some((ownedProcess) => ownedProcess !== undefined);
+          if (!stillRunning) {
+            await ownedValidationProcesses.deferCleanup(
+              removeRuntimeOwnedResources,
+            );
+          }
+        });
       }
     })();
     void cleanupPromise.then(
@@ -6713,8 +7005,11 @@ async function runDev(
   const stopOnSigint = (): void => requestStop("SIGINT");
   const stopOnSigterm = (): void => requestStop("SIGTERM");
   const stopOnInjectedSignal = (): void => requestStop("SIGTERM");
-  process.once("SIGINT", stopOnSigint);
-  process.once("SIGTERM", stopOnSigterm);
+  const usesProcessSignals = options.stopSignal === undefined;
+  if (usesProcessSignals) {
+    process.once("SIGINT", stopOnSigint);
+    process.once("SIGTERM", stopOnSigterm);
+  }
   options.stopSignal?.addEventListener("abort", stopOnInjectedSignal, {
     once: true,
   });
@@ -6978,8 +7273,10 @@ async function runDev(
     }
     await assertApprovedPortsAvailable();
   } finally {
-    process.removeListener("SIGINT", stopOnSigint);
-    process.removeListener("SIGTERM", stopOnSigterm);
+    if (usesProcessSignals) {
+      process.removeListener("SIGINT", stopOnSigint);
+      process.removeListener("SIGTERM", stopOnSigterm);
+    }
     options.stopSignal?.removeEventListener("abort", stopOnInjectedSignal);
     await cleanup();
   }
@@ -7065,6 +7362,7 @@ async function runDeploy(
     });
   }
   const lock: DeploymentLockHandle = deploymentLock;
+  let releaseDeploymentLockAfterQuiescence: (() => Promise<void>) | undefined;
   const assertDeploymentActive = (): void => {
     if (requestedSignal !== undefined) {
       throw cliError({
@@ -7078,6 +7376,9 @@ async function runDeploy(
   let generation: EdenArtifactGeneration;
   let deploymentSnapshot: DeploymentSourceSnapshot;
   let deploymentArtifactSnapshotRoot: string | undefined;
+  let deploymentArtifactSnapshotFileDigests:
+    | DeploymentArtifactSnapshot["fileDigests"]
+    | undefined;
   let deploymentRuntimeContents: RuntimeFileContents | undefined;
   const assertBoundGeneration = async (): Promise<void> => {
     await assertCanonicalGenerationMatches(
@@ -7107,18 +7408,24 @@ async function runDeploy(
     const deploymentArtifactSnapshot =
       await copyDeploymentGenerationSnapshot(root, generation);
     deploymentArtifactSnapshotRoot = deploymentArtifactSnapshot.root;
+    deploymentArtifactSnapshotFileDigests =
+      deploymentArtifactSnapshot.fileDigests;
     generation = deploymentArtifactSnapshot.generation;
   } catch (error: unknown) {
     process.removeListener("SIGINT", stopOnSigint);
     process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
-    await lock.release().catch(() => undefined);
-    if (deploymentArtifactSnapshotRoot !== undefined) {
-      await rm(deploymentArtifactSnapshotRoot, {
-        recursive: true,
-        force: true,
-      }).catch(() => undefined);
-    }
+    releaseDeploymentLockAfterQuiescence = async () => {
+      if (deploymentArtifactSnapshotRoot !== undefined) {
+        await rm(deploymentArtifactSnapshotRoot, {
+          recursive: true,
+          force: true,
+        }).catch(() => undefined);
+        deploymentArtifactSnapshotRoot = undefined;
+      }
+      await lock.release().catch(() => undefined);
+    };
+    await ownedValidationProcesses.deferCleanup(releaseDeploymentLockAfterQuiescence);
     throw error;
   }
   let runtimeGeneration: RuntimeGeneration;
@@ -7149,24 +7456,28 @@ async function runDeploy(
       });
     }
   } catch (error: unknown) {
-    if (setupRuntimeFiles !== undefined) {
-      await rm(setupRuntimeFiles.configPath, { force: true }).catch(
-        () => undefined,
-      );
-      await rm(setupRuntimeFiles.entryPath, { force: true }).catch(
-        () => undefined,
-      );
-    }
     process.removeListener("SIGINT", stopOnSigint);
     process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
-    await lock.release().catch(() => undefined);
-    if (deploymentArtifactSnapshotRoot !== undefined) {
-      await rm(deploymentArtifactSnapshotRoot, {
-        recursive: true,
-        force: true,
-      }).catch(() => undefined);
-    }
+    releaseDeploymentLockAfterQuiescence = async () => {
+      if (setupRuntimeFiles !== undefined) {
+        await rm(setupRuntimeFiles.configPath, { force: true }).catch(
+          () => undefined,
+        );
+        await rm(setupRuntimeFiles.entryPath, { force: true }).catch(
+          () => undefined,
+        );
+      }
+      if (deploymentArtifactSnapshotRoot !== undefined) {
+        await rm(deploymentArtifactSnapshotRoot, {
+          recursive: true,
+          force: true,
+        }).catch(() => undefined);
+        deploymentArtifactSnapshotRoot = undefined;
+      }
+      await lock.release().catch(() => undefined);
+    };
+    await ownedValidationProcesses.deferCleanup(releaseDeploymentLockAfterQuiescence);
     throw error;
   }
   const runtimeFiles = setupRuntimeFiles;
@@ -7174,13 +7485,17 @@ async function runDeploy(
     process.removeListener("SIGINT", stopOnSigint);
     process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
-    await lock.release().catch(() => undefined);
-    if (deploymentArtifactSnapshotRoot !== undefined) {
-      await rm(deploymentArtifactSnapshotRoot, {
-        recursive: true,
-        force: true,
-      }).catch(() => undefined);
-    }
+    releaseDeploymentLockAfterQuiescence = async () => {
+      if (deploymentArtifactSnapshotRoot !== undefined) {
+        await rm(deploymentArtifactSnapshotRoot, {
+          recursive: true,
+          force: true,
+        }).catch(() => undefined);
+        deploymentArtifactSnapshotRoot = undefined;
+      }
+      await lock.release().catch(() => undefined);
+    };
+    await ownedValidationProcesses.deferCleanup(releaseDeploymentLockAfterQuiescence);
     throw cliError({
       code: "DEPLOY_RUNTIME_UNAVAILABLE",
       message: "The deployment runtime files could not be created.",
@@ -7191,13 +7506,19 @@ async function runDeploy(
     process.removeListener("SIGINT", stopOnSigint);
     process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
-    await lock.release().catch(() => undefined);
-    if (deploymentArtifactSnapshotRoot !== undefined) {
-      await rm(deploymentArtifactSnapshotRoot, {
-        recursive: true,
-        force: true,
-      }).catch(() => undefined);
-    }
+    releaseDeploymentLockAfterQuiescence = async () => {
+      await rm(runtimeFiles.configPath, { force: true }).catch(() => undefined);
+      await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
+      if (deploymentArtifactSnapshotRoot !== undefined) {
+        await rm(deploymentArtifactSnapshotRoot, {
+          recursive: true,
+          force: true,
+        }).catch(() => undefined);
+        deploymentArtifactSnapshotRoot = undefined;
+      }
+      await lock.release().catch(() => undefined);
+    };
+    await ownedValidationProcesses.deferCleanup(releaseDeploymentLockAfterQuiescence);
     throw cliError({
       code: "DEPLOY_RUNTIME_UNAVAILABLE",
       message: "The deployment runtime snapshot could not be read.",
@@ -7207,6 +7528,12 @@ async function runDeploy(
     assertDeploymentActive();
     await assertDeploymentLockOwned(lock);
     await assertBoundGeneration();
+    if (deploymentArtifactSnapshotFileDigests !== undefined) {
+      assertArtifactSnapshotStable(
+        generation.directory,
+        deploymentArtifactSnapshotFileDigests,
+      );
+    }
     await assertProjectInputsUnchanged(
       root,
       configuration,
@@ -7235,6 +7562,12 @@ async function runDeploy(
     assertDeploymentActive();
     await assertDeploymentLockOwned(lock);
     await assertBoundGeneration();
+    if (deploymentArtifactSnapshotFileDigests !== undefined) {
+      assertArtifactSnapshotStable(
+        generation.directory,
+        deploymentArtifactSnapshotFileDigests,
+      );
+    }
     const currentRuntimeContents = await readRuntimeFileContents(runtimeFiles);
     if (
       currentRuntimeContents.config !== deploymentRuntimeContents.config ||
@@ -7275,6 +7608,7 @@ async function runDeploy(
     request: EdenCliRemoteCommandRequest,
     markStarted?: () => void,
   ): Promise<EdenCliRemoteCommandResult> => {
+    let preflightCompleted = false;
     const result = await runRemoteCommand(
       options,
       request,
@@ -7287,7 +7621,21 @@ async function runDeploy(
         );
         await assertDeploymentCandidateStable();
       },
+      async () => {
+        await options.deploymentBoundaryHook?.(
+          "after-remote-runner-preflight",
+        );
+        await assertDeploymentCandidateStable();
+        preflightCompleted = true;
+      },
     );
+    if (!preflightCompleted) {
+      throw cliError({
+        code: "DEPLOYMENT_HANDOFF_INVALID",
+        message:
+          "The remote deployment runner did not complete its ownership preflight before starting.",
+      });
+    }
     await assertDeploymentCandidateStable();
     return result;
   };
@@ -7328,6 +7676,7 @@ async function runDeploy(
         options,
         compatibilityRequest,
         ownedValidationProcesses,
+        () => assertDeploymentCompatibilityStable(),
         () => assertDeploymentCompatibilityStable(),
       );
     } catch (error: unknown) {
@@ -7493,7 +7842,7 @@ async function runDeploy(
         }).catch(() => ({ exitCode: 1 }));
         cleanupFailed ||= removed.exitCode !== 0;
       }
-      if (deploymentAttempted) {
+      if (deploymentAttempted || secretProvisioned) {
         const deleted = await runOwnedRemoteCleanup({
           kind: "delete",
           cwd: root,
@@ -7515,19 +7864,22 @@ async function runDeploy(
         );
       }
     }
-    await rm(temporaryConfig, { force: true }).catch(() => undefined);
-    await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
-    if (deploymentArtifactSnapshotRoot !== undefined) {
-      await rm(deploymentArtifactSnapshotRoot, {
-        recursive: true,
-        force: true,
-      }).catch(() => undefined);
-      deploymentArtifactSnapshotRoot = undefined;
-    }
     process.removeListener("SIGINT", stopOnSigint);
     process.removeListener("SIGTERM", stopOnSigterm);
     await ownedValidationProcesses.cleanup(requestedSignal ?? "SIGTERM");
-    await lock.release().catch(() => undefined);
+    releaseDeploymentLockAfterQuiescence = async () => {
+      await rm(temporaryConfig, { force: true }).catch(() => undefined);
+      await rm(runtimeFiles.entryPath, { force: true }).catch(() => undefined);
+      if (deploymentArtifactSnapshotRoot !== undefined) {
+        await rm(deploymentArtifactSnapshotRoot, {
+          recursive: true,
+          force: true,
+        }).catch(() => undefined);
+        deploymentArtifactSnapshotRoot = undefined;
+      }
+      await lock.release().catch(() => undefined);
+    };
+    await ownedValidationProcesses.deferCleanup(releaseDeploymentLockAfterQuiescence);
   }
 }
 
