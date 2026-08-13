@@ -168,6 +168,7 @@ describe("eden dev and deploy orchestration", () => {
           };
         },
       },
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -254,6 +255,7 @@ describe("eden dev and deploy orchestration", () => {
             };
           },
         },
+        runtimeGenerationProof: "authenticated-fetch",
         dryRunRunner: async () => ({
           exitCode: 0,
           stdout: "",
@@ -299,6 +301,7 @@ describe("eden dev and deploy orchestration", () => {
       runEdenCli(["dev", "--project", root], {
         cwd: root,
         processRunner,
+        runtimeGenerationProof: async () => true,
         dryRunRunner: async () => ({
           exitCode: 0,
           stdout: "",
@@ -362,6 +365,7 @@ describe("eden dev and deploy orchestration", () => {
             };
           },
         },
+        runtimeGenerationProof: async () => true,
         dryRunRunner: async () => ({
           exitCode: 0,
           stdout: "",
@@ -398,6 +402,7 @@ describe("eden dev and deploy orchestration", () => {
             };
           },
         },
+        runtimeGenerationProof: async () => true,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => ({
           exitCode: 0,
@@ -434,6 +439,7 @@ describe("eden dev and deploy orchestration", () => {
             };
           },
         },
+        runtimeGenerationProof: async () => true,
         dryRunRunner: async () => ({
           exitCode: 0,
           stdout: "",
@@ -462,6 +468,7 @@ describe("eden dev and deploy orchestration", () => {
             throw new Error("spawn fixture failed");
           },
         },
+        runtimeGenerationProof: "authenticated-fetch",
         dryRunRunner: async () => ({
           exitCode: 0,
           stdout: "",
@@ -509,6 +516,7 @@ describe("eden dev and deploy orchestration", () => {
           };
         },
       },
+      runtimeGenerationProof: async () => true,
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -568,6 +576,7 @@ describe("eden dev and deploy orchestration", () => {
           };
         },
       },
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -684,6 +693,7 @@ describe("eden dev and deploy orchestration", () => {
           };
         },
       },
+      runtimeGenerationProof: async () => true,
       dryRunRunner: () => {
         dryRunCount += 1;
         if (dryRunCount === 1) {
@@ -777,6 +787,7 @@ describe("eden dev and deploy orchestration", () => {
           };
         },
       },
+      runtimeGenerationProof: async () => true,
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -808,6 +819,7 @@ describe("eden dev and deploy orchestration", () => {
             throw new Error("startup signal should prevent spawn");
           },
         },
+        runtimeGenerationProof: async () => true,
         dryRunRunner: async () => {
           process.emit("SIGINT");
           return {
@@ -969,6 +981,7 @@ describe("eden dev and deploy orchestration", () => {
           return processHandle;
         },
       },
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -987,7 +1000,7 @@ describe("eden dev and deploy orchestration", () => {
           setTimeout(() => resolve(-1), 8_000);
         }),
       ]),
-    ).resolves.toBe(0);
+    ).resolves.toBe(1);
     expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
   }, 12_000);
 
@@ -1022,6 +1035,7 @@ export default {
             };
           },
         },
+        runtimeGenerationProof: async () => true,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => {
           throw new Error("dry run must not be reached");
@@ -1058,6 +1072,7 @@ export default {
               };
             },
           },
+        runtimeGenerationProof: "authenticated-fetch",
           stderr: (line) => errors.push(line),
           dryRunRunner: async () => ({
             exitCode: 0,
@@ -1097,6 +1112,7 @@ export default {
             };
           },
         },
+        runtimeGenerationProof: async () => true,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => ({
           exitCode: 0,
@@ -1176,6 +1192,7 @@ export default {
           };
         },
       },
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async (request) => {
         dryRuns.push(request);
         return { exitCode: 0, stdout: "", stderr: "" };
@@ -1344,6 +1361,7 @@ export default greet;
           };
         },
       },
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -1469,6 +1487,7 @@ export default greet;
           };
         },
       },
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",

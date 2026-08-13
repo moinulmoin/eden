@@ -226,6 +226,7 @@ describe("eden dev watch blue-green replacement", () => {
         cwd: root,
         stopSignal: stopController.signal,
         processRunner,
+        runtimeGenerationProof: "authenticated-fetch",
         dryRunRunner: async () => ({
           exitCode: 0,
           stdout: "",
@@ -258,6 +259,7 @@ describe("eden dev watch blue-green replacement", () => {
         await publicationReached;
         if (boundary === "after-runtime-ready") {
           stopController.abort();
+          releasePublicationHook?.();
         }
         await expect(devPromise).resolves.toBe(0);
         await expect(access(join(root, ".eden-dev-state.json")))
@@ -372,6 +374,7 @@ describe("eden dev watch blue-green replacement", () => {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -520,6 +523,7 @@ describe("eden dev watch blue-green replacement", () => {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -678,6 +682,7 @@ describe("eden dev watch blue-green replacement", () => {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -800,6 +805,7 @@ describe("eden dev watch blue-green replacement", () => {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -906,6 +912,7 @@ describe("eden dev watch blue-green replacement", () => {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: async () => ({
         exitCode: 0,
         stdout: "",
@@ -945,7 +952,7 @@ describe("eden dev watch blue-green replacement", () => {
       expect(servedGeneration?.generationId).toBe(initial.generationId);
     } finally {
       stopController.abort();
-      await expect(devPromise).resolves.toBe(0);
+      await expect(devPromise).resolves.toBe(1);
     }
   }, 15_000);
 
@@ -1011,6 +1018,7 @@ describe("eden dev watch blue-green replacement", () => {
           };
         },
       },
+      runtimeGenerationProof: "authenticated-fetch",
       dryRunRunner: () => {
         dryRunCount += 1;
         if (dryRunCount === 2) {

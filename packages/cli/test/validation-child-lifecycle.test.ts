@@ -37,6 +37,7 @@ async function initRoot(root: string): Promise<void> {
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -67,6 +68,7 @@ describe("CLI validation child lifecycle", () => {
             };
           },
         },
+        runtimeGenerationProof: async () => true,
         dryRunRunner: () => ({
           exitCode: 0,
           stdout: "",
@@ -427,6 +429,7 @@ describe("CLI validation child lifecycle", () => {
           };
         },
       },
+      runtimeGenerationProof: async () => true,
       dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
     });
 
@@ -599,6 +602,7 @@ describe("CLI validation child lifecycle", () => {
           throw new Error("the runtime must not spawn while generation is pending");
         },
       },
+      runtimeGenerationProof: async () => true,
       dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       buildPublicationHook: async () => {
         hookStarted?.();
@@ -615,8 +619,8 @@ describe("CLI validation child lifecycle", () => {
       ),
     ]);
     releaseHook?.();
-    await expect(devPromise).resolves.toBe(0);
-    expect(settled).toEqual({ settled: true, code: 0 });
+    await expect(devPromise).resolves.toBe(1);
+    expect(settled).toEqual({ settled: true, code: 1 });
   }, 10_000);
 
   test("fails closed when generation publication never settles", async () => {
@@ -649,4 +653,122 @@ describe("CLI validation child lifecycle", () => {
     releaseHook?.();
     await new Promise((resolve) => setTimeout(resolve, 50));
   }, 10_000);
+
+  test("fails closed when the initial compiler generation never settles", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const stopController = new AbortController();
+    const errors: string[] = [];
+    let resolveInitialBuild: (() => void) | undefined;
+    const initialBuildStarted = new Promise<void>((resolve) => {
+      resolveInitialBuild = resolve;
+    });
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      stopSignal: stopController.signal,
+      stderr: (line) => errors.push(line),
+      processRunner: {
+        spawn() {
+          throw new Error("the runtime must not spawn while initial build is pending");
+        },
+      },
+      buildProjectRunner: async () => {
+        resolveInitialBuild?.();
+        return new Promise<never>(() => {});
+      },
+      dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      runtimeGenerationProof: async () => true,
+    } as Parameters<typeof runEdenCli>[1]);
+
+    await initialBuildStarted;
+    const startedAt = Date.now();
+    stopController.abort();
+    await expect(devPromise).resolves.toBe(1);
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
+    expect(errors.join("\n")).toMatch(/quiescence|retained|generation/i);
+  }, 10_000);
+
+  test("requires an explicit proof seam for an injected process runner", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const errors: string[] = [];
+    let spawned = false;
+
+    await expect(
+      runEdenCli(["dev", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        processRunner: {
+          spawn() {
+            spawned = true;
+            return {
+              pid: 44_011,
+              startIdentity: "missing-explicit-proof-seam",
+              ready: Promise.resolve(),
+              exited: Promise.resolve({ exitCode: 0, signal: null }),
+              async terminate() {},
+            };
+          },
+        },
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(1);
+
+    expect(spawned).toBe(false);
+    expect(errors.join("\n")).toMatch(/proof|authenticated|generation/i);
+  });
+
+  test("uses an explicit authenticated proof seam with an injected process runner", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const stopController = new AbortController();
+    let releaseExit: (() => void) | undefined;
+    const exited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseExit = () => resolve({ exitCode: 0, signal: null });
+    });
+    let proofCalls = 0;
+    let ready: (() => void) | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      stopSignal: stopController.signal,
+      processRunner: {
+        spawn() {
+          return {
+            pid: 44_012,
+            startIdentity: "explicit-proof-seam",
+            ready: Promise.resolve(),
+            exited,
+            async terminate() {
+              releaseExit?.();
+            },
+          };
+        },
+      },
+      dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      runtimeGenerationProof: async ({ generation, signal }) => {
+        proofCalls += 1;
+        expect(generation.generationId).toMatch(/^gen_[a-f0-9]{64}$/u);
+        expect(signal).toBeInstanceOf(AbortSignal);
+        ready?.();
+        return true;
+      },
+      stdout: (line) => {
+        if (line.includes("Eden dev ready")) {
+          stopController.abort();
+        }
+      },
+    } as Parameters<typeof runEdenCli>[1]);
+
+    await readyPromise;
+    await expect(devPromise).resolves.toBe(0);
+    expect(proofCalls).toBeGreaterThan(0);
+  });
 });
