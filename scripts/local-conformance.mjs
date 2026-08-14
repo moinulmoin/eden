@@ -1,8 +1,9 @@
-/* global AbortController, TextDecoder, clearTimeout, fetch, process, setTimeout */
+/* global AbortController, AbortSignal, TextDecoder, clearTimeout, fetch, process, setTimeout */
 
 import { createHash, randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createConnection, createServer } from "node:net";
+import { accessSync, constants as fsConstants } from "node:fs";
 import {
   mkdtemp,
   readFile,
@@ -11,8 +12,13 @@ import {
   stat,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  ownedProcessReservationCount,
+  runOwnedProcess,
+  spawnOwnedProcess,
+} from "../test/owned-process.mjs";
 
 const EDEN_HOST = "127.0.0.1";
 const EDEN_PORT = 8797;
@@ -22,6 +28,35 @@ const EDEN_CLI_PATH = join("packages", "cli", "dist", "index.js");
 const STARTUP_TIMEOUT_MS = 15_000;
 const STREAM_TIMEOUT_MS = 15_000;
 const PROCESS_TIMEOUT_MS = 120_000;
+const OPERATION_TIMEOUT_MS = 45_000;
+const CLEANUP_RETRY_COUNT = 2;
+const CLEANUP_RETRY_DELAY_MS = 100;
+
+function resolveExecutable(name) {
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    if (directory.length === 0) continue;
+    const candidate = join(directory, name);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // Keep looking through PATH.
+    }
+  }
+  try {
+    const resolved = execFileSync("which", [name], {
+      encoding: "utf8",
+      env: childEnvironment(),
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (resolved.length > 0) return resolved;
+  } catch {
+    // Let the child process report the missing executable.
+  }
+  return name;
+}
+
+const COREPACK_ENTRYPOINT = resolveExecutable("corepack");
 
 export const LOCAL_RECOVERY_FIXTURES = Object.freeze([
   "packages/runtime-cloudflare/test/turn-runner.test.ts",
@@ -60,8 +95,65 @@ const HAPPY_PATH_LIFECYCLE = Object.freeze([
   "session.waiting",
 ]);
 
-function delay(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function delay(milliseconds, signal) {
+  return new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    timer = setTimeout(finish, milliseconds);
+    signal?.addEventListener("abort", finish, { once: true });
+    if (signal?.aborted === true) finish();
+  });
+}
+
+function abortError(signal) {
+  const reason = signal?.reason;
+  return reason instanceof Error
+    ? reason
+    : new Error("Local conformance operation aborted.");
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted === true) throw abortError(signal);
+}
+
+function createOperationSignal(parentSignal, timeoutMs) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError("runLocalConformance requires a positive operation timeout.");
+  }
+  const controller = new AbortController();
+  const abortFromParent = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(parentSignal?.reason ?? abortError(parentSignal));
+    }
+  };
+  const timer = setTimeout(() => {
+    if (!controller.signal.aborted) {
+      controller.abort(
+        new Error(`Local conformance operation exceeded ${timeoutMs}ms.`),
+      );
+    }
+  }, timeoutMs);
+  parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  if (parentSignal?.aborted === true) abortFromParent();
+  return {
+    signal: controller.signal,
+    dispose() {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener("abort", abortFromParent);
+    },
+  };
+}
+
+function childEnvironment(overrides = {}) {
+  const environment = { ...process.env, ...overrides };
+  if (overrides.EDEN_BEARER_SECRET === undefined) {
+    delete environment.EDEN_BEARER_SECRET;
+  }
+  return environment;
 }
 
 function redact(value, secret) {
@@ -96,110 +188,161 @@ function readStreamOutput(child) {
 function waitForChild(child) {
   return new Promise((resolve) => {
     child.once("error", () => resolve({ code: 1, signal: null }));
-    child.once("exit", (code, signal) => resolve({ code: code ?? 1, signal }));
+    child.once("close", (code, signal) => resolve({ code: code ?? 1, signal }));
   });
 }
 
-function runProcess(
+async function runProcess(
   command,
   args,
   {
     cwd,
-    env = {},
+    env,
     timeoutMs = PROCESS_TIMEOUT_MS,
+    signal,
+    label = `conformance-${command}`,
   },
 ) {
-  return new Promise((resolve, reject) => {
-    const processIdentity = `eden-conformance-${randomUUID()}`;
-    const childEnv = { ...process.env, ...env };
-    if (env.EDEN_BEARER_SECRET === undefined) {
-      delete childEnv.EDEN_BEARER_SECRET;
-    }
-    const child = spawn(command, args, {
-      argv0: processIdentity,
-      cwd,
-      env: childEnv,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const owner = { pid: child.pid, startedAt: processIdentity };
-    const collectOutput = readStreamOutput(child);
-    const timer = setTimeout(() => {
-      void (async () => {
-        if (child.exitCode === null && await ownedProcessAlive(owner)) {
-          child.kill("SIGTERM");
-          await delay(2_000);
-          if (child.exitCode === null && await ownedProcessAlive(owner)) {
-            child.kill("SIGKILL");
-          }
-        }
-      })();
-    }, timeoutMs);
-    waitForChild(child).then((exit) => {
-      clearTimeout(timer);
-      resolve({ ...exit, ...collectOutput() });
-    });
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
+  const file = command === "corepack" ? process.execPath : command;
+  const processArgs =
+    command === "corepack"
+      ? [COREPACK_ENTRYPOINT, ...args]
+      : args;
+  const result = await runOwnedProcess({
+    file,
+    args: processArgs,
+    cwd,
+    env: env ?? childEnvironment(),
+    timeoutMs,
+    signal,
+    label,
   });
+  if (!result.unresolvedCleanup) return result;
+  let retry = await result.retryCleanup();
+  for (
+    let attempt = 1;
+    attempt < CLEANUP_RETRY_COUNT && retry.unresolvedCleanup;
+    attempt += 1
+  ) {
+    await delay(CLEANUP_RETRY_DELAY_MS);
+    retry = await result.retryCleanup();
+  }
+  const cleanupVerified = retry.cleanupVerified;
+  const cleanupFailure = retry.cleanupFailure;
+  const ok =
+    result.code === 0 &&
+    result.signal === null &&
+    result.error === undefined &&
+    !result.timedOut &&
+    !result.aborted &&
+    !result.outputLimitExceeded &&
+    !result.stdoutTruncated &&
+    !result.stderrTruncated &&
+    cleanupVerified;
+  return {
+    ...result,
+    ok,
+    cleanupVerified,
+    unresolvedCleanup: !cleanupVerified,
+    cleanupStatus: cleanupVerified ? "verified" : "unresolved",
+    cleanupFailure,
+  };
 }
 
-async function runRepositoryBuild(repositoryRoot) {
+async function runRepositoryBuild(repositoryRoot, signal) {
+  throwIfAborted(signal);
   const result = await runProcess(
     "corepack",
     ["pnpm", "run", "build"],
-    { cwd: repositoryRoot },
+    { cwd: repositoryRoot, signal, label: "conformance-repository-build" },
   );
-  if (result.code !== 0) {
+  throwIfAborted(signal);
+  if (!result.ok) {
     throw new Error(
-      `The repository build failed before local conformance (exit code ${result.code}).`,
+      `The repository build failed before local conformance (exit code ${
+        result.code ?? "unknown"
+      }, signal ${result.signal ?? "none"}, cleanup ${result.cleanupStatus}): ${
+        result.error?.message ?? `${result.stdout}\n${result.stderr}`.trim()
+      }`,
     );
   }
 }
 
-async function runCli(repositoryRoot, projectRoot, args, secret) {
+async function runCli(repositoryRoot, projectRoot, args, secret, signal) {
+  throwIfAborted(signal);
   const result = await runProcess(
     process.execPath,
     [join(repositoryRoot, EDEN_CLI_PATH), ...args],
     {
       cwd: repositoryRoot,
-      env: secret === undefined ? {} : { EDEN_BEARER_SECRET: secret },
+      env: childEnvironment(
+        secret === undefined ? {} : { EDEN_BEARER_SECRET: secret },
+      ),
+      signal,
+      label: `conformance-eden-${args[0] ?? "command"}`,
     },
   );
-  if (result.code !== 0) {
+  throwIfAborted(signal);
+  if (!result.ok) {
     throw new Error(
       `eden ${args[0] ?? "command"} failed: ${
         redact(`${result.stdout}\n${result.stderr}`, secret ?? "")
-      }`,
+      } (cleanup ${result.cleanupStatus}).`,
     );
   }
   return result;
 }
 
-function portOpen(host, port) {
+function portOpen(host, port, signal) {
   return new Promise((resolve) => {
     const socket = createConnection({ host, port });
+    let settled = false;
     const finish = (value) => {
+      if (settled) return;
+      settled = true;
       socket.removeAllListeners();
       socket.destroy();
+      signal?.removeEventListener("abort", abort);
       resolve(value);
     };
+    const abort = () => finish(false);
     socket.once("connect", () => finish(true));
     socket.once("error", () => finish(false));
     socket.setTimeout(500, () => finish(false));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted === true) {
+      abort();
+      return;
+    }
   });
 }
 
-function portAvailable(host, port) {
+function portAvailable(host, port, signal) {
   return new Promise((resolve) => {
     const server = createServer();
+    let settled = false;
     const finish = (value) => {
+      if (settled) return;
+      settled = true;
       server.removeAllListeners();
-      server.close(() => resolve(value));
+      if (!server.listening) {
+        signal?.removeEventListener("abort", abort);
+        resolve(value);
+        return;
+      }
+      server.close(() => {
+        signal?.removeEventListener("abort", abort);
+        resolve(value);
+      });
     };
+    const abort = () => finish(false);
     server.once("error", () => finish(false));
     server.listen({ host, port }, () => finish(true));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted === true) {
+      abort();
+      return;
+    }
   });
 }
 
@@ -213,44 +356,40 @@ function processAlive(pid) {
   }
 }
 
-function readProcessCommand(pid) {
+function readProcessStartTime(pid) {
   return new Promise((resolve) => {
     execFile(
       "ps",
-      ["-p", String(pid), "-o", "command="],
+      ["-p", String(pid), "-o", "lstart="],
       {
         encoding: "utf8",
-        env: {
-          ...process.env,
-          EDEN_BEARER_SECRET: undefined,
-        },
+        env: childEnvironment(),
       },
       (error, stdout) => {
         if (error !== null) {
           resolve(undefined);
           return;
         }
-        const command = String(stdout).trim();
-        resolve(command.length === 0 ? undefined : command);
+        const startedAt = String(stdout).trim();
+        resolve(startedAt.length === 0 ? undefined : startedAt);
       },
     );
   });
 }
 
-async function ownedProcessAlive(owner) {
+async function recordedProcessAlive(owner) {
   if (!processAlive(owner.pid)) return false;
   if (owner.startedAt === undefined) return false;
-  const command = await readProcessCommand(owner.pid);
-  return command?.includes(owner.startedAt) === true;
+  return await readProcessStartTime(owner.pid) === owner.startedAt;
 }
 
-async function waitForProcessExit(owner, timeoutMs = 5_000) {
+async function waitForRecordedProcessExit(owner, timeoutMs = 5_000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (!(await ownedProcessAlive(owner))) return true;
+    if (!(await recordedProcessAlive(owner))) return true;
     await delay(100);
   }
-  return !(await ownedProcessAlive(owner));
+  return !(await recordedProcessAlive(owner));
 }
 
 async function waitForPortAvailability(host, port, timeoutMs = 5_000) {
@@ -262,11 +401,24 @@ async function waitForPortAvailability(host, port, timeoutMs = 5_000) {
   return false;
 }
 
-async function fetchWithTimeout(url, options, timeoutMs = 5_000) {
+function remainingCleanupTime(deadline) {
+  return Math.max(1, deadline - Date.now());
+}
+
+async function fetchWithTimeout(
+  url,
+  options,
+  timeoutMs = 5_000,
+  signal,
+) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const requestSignal =
+      signal === undefined
+        ? controller.signal
+        : AbortSignal.any([controller.signal, signal]);
+    return await fetch(url, { ...options, signal: requestSignal });
   } finally {
     clearTimeout(timer);
   }
@@ -290,23 +442,25 @@ function authorizationHeaders(secret, contentType = false) {
   };
 }
 
-async function waitForLocalRuntime(secret) {
+async function waitForLocalRuntime(secret, signal) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < STARTUP_TIMEOUT_MS) {
-    if (await portOpen(EDEN_HOST, EDEN_INSPECTOR_PORT)) {
+    throwIfAborted(signal);
+    if (await portOpen(EDEN_HOST, EDEN_INSPECTOR_PORT, signal)) {
       try {
         const { response, body } = await readJsonResponse(
           await fetchWithTimeout(`${EDEN_BASE_URL}/eden/v1/health`, {
             headers: authorizationHeaders(secret),
-          }),
+          }, 5_000, signal),
         );
         if (response.status === 200 && body?.status === "ok") return;
       } catch {
         // The Worker can accept TCP before its HTTP route is ready.
       }
     }
-    await delay(100);
+    await delay(100, signal);
   }
+  throwIfAborted(signal);
   throw new Error("The local Eden Worker did not become ready.");
 }
 
@@ -317,26 +471,31 @@ function parseNdjson(text) {
     .map((line) => JSON.parse(line));
 }
 
-async function readInitialStream(sessionId, secret, expectedCount) {
+async function readInitialStream(sessionId, secret, expectedCount, signal) {
   const controller = new AbortController();
-  const response = await fetch(
-    `${EDEN_BASE_URL}/eden/v1/session/${sessionId}/stream?startIndex=0&follow=true`,
-    {
-      headers: authorizationHeaders(secret),
-      signal: controller.signal,
-    },
-  );
-  if (response.status !== 200 || response.body === null) {
-    throw new Error(`Initial NDJSON stream failed with HTTP ${response.status}.`);
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  const events = [];
-  let buffered = "";
-  const deadline = Date.now() + STREAM_TIMEOUT_MS;
+  const abort = () => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted === true) abort();
+  let reader;
   try {
+    const response = await fetch(
+      `${EDEN_BASE_URL}/eden/v1/session/${sessionId}/stream?startIndex=0&follow=true`,
+      {
+        headers: authorizationHeaders(secret),
+        signal: controller.signal,
+      },
+    );
+    if (response.status !== 200 || response.body === null) {
+      throw new Error(`Initial NDJSON stream failed with HTTP ${response.status}.`);
+    }
+
+    reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const events = [];
+    let buffered = "";
+    const deadline = Date.now() + STREAM_TIMEOUT_MS;
     while (Date.now() < deadline) {
+      throwIfAborted(signal);
       const next = await reader.read();
       if (next.done) break;
       buffered += decoder.decode(next.value, { stream: true });
@@ -347,28 +506,35 @@ async function readInitialStream(sessionId, secret, expectedCount) {
         events.push(JSON.parse(line));
         if (events.length === expectedCount) {
           await reader.cancel();
-          controller.abort();
           return events;
         }
       }
     }
-  } catch (error) {
-    if (events.length !== expectedCount) throw error;
+    throwIfAborted(signal);
+    throw new Error("The initial NDJSON stream did not reach the disconnect cursor.");
   } finally {
     controller.abort();
-    reader.releaseLock();
+    signal?.removeEventListener("abort", abort);
+    reader?.releaseLock();
   }
-  throw new Error("The initial NDJSON stream did not reach the disconnect cursor.");
 }
 
-async function readCatchupUntilTerminal(sessionId, secret, startIndex) {
+async function readCatchupUntilTerminal(
+  sessionId,
+  secret,
+  startIndex,
+  signal,
+) {
   const events = [];
   let cursor = startIndex;
   const deadline = Date.now() + STREAM_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    throwIfAborted(signal);
     const response = await fetchWithTimeout(
       `${EDEN_BASE_URL}/eden/v1/session/${sessionId}/stream?startIndex=${cursor}&follow=false`,
       { headers: authorizationHeaders(secret) },
+      5_000,
+      signal,
     );
     if (response.status !== 200) {
       throw new Error(`Reconnect NDJSON stream failed with HTTP ${response.status}.`);
@@ -386,15 +552,18 @@ async function readCatchupUntilTerminal(sessionId, secret, startIndex) {
     ) {
       return events;
     }
-    await delay(100);
+    await delay(100, signal);
   }
+  throwIfAborted(signal);
   throw new Error("Reconnect did not reach a terminal session event.");
 }
 
-async function readNdjsonCatchup(sessionId, secret, startIndex) {
+async function readNdjsonCatchup(sessionId, secret, startIndex, signal) {
   const response = await fetchWithTimeout(
     `${EDEN_BASE_URL}/eden/v1/session/${sessionId}/stream?startIndex=${startIndex}&follow=false`,
     { headers: authorizationHeaders(secret) },
+    5_000,
+    signal,
   );
   if (response.status !== 200) {
     throw new Error(`Reconnect NDJSON stream failed with HTTP ${response.status}.`);
@@ -406,100 +575,115 @@ async function readOwnedProcess(projectRoot) {
   try {
     const contents = await readFile(join(projectRoot, ".eden-dev-state.json"), "utf8");
     const state = JSON.parse(contents);
-    return Number.isSafeInteger(state.pid)
-      ? {
-          pid: state.pid,
-          startedAt: typeof state.startedAt === "string"
-            ? state.startedAt
-            : undefined,
-        }
-      : undefined;
-  } catch {
-    return undefined;
+    if (
+      !Number.isSafeInteger(state.pid) ||
+      state.pid <= 0 ||
+      typeof state.startedAt !== "string" ||
+      state.startedAt.length === 0
+    ) {
+      return { invalid: true };
+    }
+    return {
+      pid: state.pid,
+      startedAt: state.startedAt,
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    return { invalid: true };
   }
+}
+
+async function stateFileExists(projectRoot) {
+  try {
+    await stat(join(projectRoot, ".eden-dev-state.json"));
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    return true;
+  }
+}
+
+async function readOwnedProcessOrFailClosed(projectRoot) {
+  const ownedProcess = await readOwnedProcess(projectRoot);
+  if (ownedProcess !== undefined) return ownedProcess;
+  if (await stateFileExists(projectRoot)) return { invalid: true };
+  return undefined;
 }
 
 async function signalOwnedChild(devProcess, signal) {
-  if (!(await ownedProcessAlive(devProcess.owner))) return false;
-  try {
-    devProcess.child.kill(signal);
-    return true;
-  } catch (error) {
-    return error?.code === "ESRCH";
-  }
+  if (devProcess.child.terminateOwned === undefined) return false;
+  return await devProcess.child.terminateOwned(signal);
 }
 
 async function terminateProcessGroup(owner, signal) {
-  if (!(await ownedProcessAlive(owner))) return false;
+  if (!processAlive(owner.pid)) return true;
+  if (!(await recordedProcessAlive(owner))) {
+    return !processAlive(owner.pid);
+  }
   try {
     process.kill(-owner.pid, signal);
     return true;
   } catch (error) {
-    return error?.code === "ESRCH";
+    return error?.code === "ESRCH" && !processAlive(owner.pid);
   }
 }
 
-async function stopLocalRuntime(projectRoot, devProcess) {
+async function stopLocalRuntime(projectRoot, devProcess, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
   let processStopped = true;
   let childExited = devProcess === undefined;
   if (devProcess !== undefined) {
-    if (
-      devProcess.child.exitCode === null &&
-      !(await signalOwnedChild(devProcess, "SIGINT")) &&
-      await ownedProcessAlive(devProcess.owner)
-    ) {
-      processStopped = false;
-    }
-    childExited = (await Promise.race([
-      devProcess.exited,
-      delay(5_000),
-    ])) !== undefined;
-    if (!childExited) {
-      if (
-        !(await signalOwnedChild(devProcess, "SIGTERM")) &&
-        await ownedProcessAlive(devProcess.owner)
-      ) {
-        processStopped = false;
-      }
-      childExited = (await Promise.race([
-        devProcess.exited,
-        delay(2_000),
-      ])) !== undefined;
+    const terminated = await signalOwnedChild(devProcess, "SIGTERM");
+    processStopped &&= terminated;
+    childExited = await Promise.race([
+      devProcess.exited.then(() => true),
+      delay(remainingCleanupTime(deadline)).then(() => false),
+    ]);
+    if (!childExited && Date.now() < deadline) {
+      const killed = await signalOwnedChild(devProcess, "SIGKILL");
+      processStopped &&= killed;
+      childExited = await Promise.race([
+        devProcess.exited.then(() => true),
+        delay(remainingCleanupTime(deadline)).then(() => false),
+      ]);
     }
   }
 
-  const ownedProcess = await readOwnedProcess(projectRoot);
-  if (ownedProcess !== undefined && await ownedProcessAlive(ownedProcess)) {
-    if (!(await terminateProcessGroup(ownedProcess, "SIGTERM"))) {
+  const ownedProcess = await readOwnedProcessOrFailClosed(projectRoot);
+  if (ownedProcess?.invalid === true) {
+    processStopped = false;
+  } else if (ownedProcess !== undefined && processAlive(ownedProcess.pid)) {
+    if (!(await recordedProcessAlive(ownedProcess))) {
       processStopped = false;
-    }
-    if (!(await waitForProcessExit(ownedProcess))) {
-      if (!(await terminateProcessGroup(ownedProcess, "SIGKILL"))) {
-        processStopped = false;
+    } else {
+      const termSent = await terminateProcessGroup(ownedProcess, "SIGTERM");
+      processStopped &&= termSent;
+      if (!(await waitForRecordedProcessExit(
+        ownedProcess,
+        remainingCleanupTime(deadline),
+      ))) {
+        const killSent = await terminateProcessGroup(ownedProcess, "SIGKILL");
+        processStopped &&= killSent;
+        if (!(await waitForRecordedProcessExit(
+          ownedProcess,
+          remainingCleanupTime(deadline),
+        ))) {
+          processStopped = false;
+        }
       }
-      if (!(await waitForProcessExit(ownedProcess))) {
-        processStopped = false;
-      }
     }
-  }
-  if (!childExited && devProcess !== undefined) {
-    if (
-      !(await signalOwnedChild(devProcess, "SIGKILL")) &&
-      await ownedProcessAlive(devProcess.owner)
-    ) {
-      processStopped = false;
-    }
-    childExited = (await Promise.race([
-      devProcess.exited,
-      delay(2_000),
-    ])) !== undefined;
   }
   if (!childExited) processStopped = false;
 
-  const workerPortFree = await waitForPortAvailability(EDEN_HOST, EDEN_PORT);
+  const workerPortFree = await waitForPortAvailability(
+    EDEN_HOST,
+    EDEN_PORT,
+    remainingCleanupTime(deadline),
+  );
   const inspectorPortFree = await waitForPortAvailability(
     EDEN_HOST,
     EDEN_INSPECTOR_PORT,
+    remainingCleanupTime(deadline),
   );
   return { processStopped, workerPortFree, inspectorPortFree };
 }
@@ -590,21 +774,35 @@ async function runLocalFirstUse(
   repositoryRoot,
   projectRoot,
   secret,
+  signal,
   registerDevProcess = () => {},
 ) {
-  await runCli(repositoryRoot, projectRoot, ["init", "--project", projectRoot]);
-  await runCli(repositoryRoot, projectRoot, ["build", "--project", projectRoot]);
+  await runCli(
+    repositoryRoot,
+    projectRoot,
+    ["init", "--project", projectRoot],
+    undefined,
+    signal,
+  );
+  await runCli(
+    repositoryRoot,
+    projectRoot,
+    ["build", "--project", projectRoot],
+    undefined,
+    signal,
+  );
+  throwIfAborted(signal);
   const generation = await assertCleanRoomArtifacts(projectRoot);
   await assertNoSecretOrPlatformLocator(projectRoot, secret, generation);
 
-  const devProcess = startDev(repositoryRoot, projectRoot, secret);
+  const devProcess = startDev(repositoryRoot, projectRoot, secret, signal);
   registerDevProcess(devProcess);
-  await waitForLocalRuntime(secret);
+  await waitForLocalRuntime(secret, signal);
 
   const health = await readJsonResponse(
     await fetchWithTimeout(`${EDEN_BASE_URL}/eden/v1/health`, {
       headers: authorizationHeaders(secret),
-    }),
+    }, 5_000, signal),
   );
   if (health.response.status !== 200 || health.body?.status !== "ok") {
     throw new Error("Authenticated local health check failed.");
@@ -612,7 +810,7 @@ async function runLocalFirstUse(
   assertSafePublicValue(health.body, secret);
 
   const unauthorized = await readJsonResponse(
-    await fetchWithTimeout(`${EDEN_BASE_URL}/eden/v1/health`),
+    await fetchWithTimeout(`${EDEN_BASE_URL}/eden/v1/health`, {}, 5_000, signal),
   );
   if (unauthorized.response.status !== 401 || JSON.stringify(unauthorized.body).includes(secret)) {
     throw new Error("Local health did not fail closed without the bearer.");
@@ -622,7 +820,7 @@ async function runLocalFirstUse(
   const info = await readJsonResponse(
     await fetchWithTimeout(`${EDEN_BASE_URL}/eden/v1/info`, {
       headers: authorizationHeaders(secret),
-    }),
+    }, 5_000, signal),
   );
   if (
     info.response.status !== 200 ||
@@ -638,7 +836,7 @@ async function runLocalFirstUse(
       method: "POST",
       headers: authorizationHeaders(secret, true),
       body: "{}",
-    }),
+    }, 5_000, signal),
   );
   const sessionId = session.body?.sessionId;
   if (
@@ -655,14 +853,14 @@ async function runLocalFirstUse(
       method: "POST",
       headers: authorizationHeaders(secret, true),
       body: JSON.stringify({ message: "Say hello to Eden." }),
-    }),
+    }, 5_000, signal),
   );
   if (command.response.status !== 202 || command.body?.status !== "accepted") {
     throw new Error("Authenticated command acceptance failed.");
   }
   assertSafePublicValue(command.body, secret);
 
-  const firstEvents = await readInitialStream(sessionId, secret, 5);
+  const firstEvents = await readInitialStream(sessionId, secret, 5, signal);
   const disconnectedCursor = firstEvents.at(-1)?.streamIndex;
   if (disconnectedCursor !== 5) {
     throw new Error("The disconnected stream did not save cursor 5.");
@@ -672,11 +870,13 @@ async function runLocalFirstUse(
     sessionId,
     secret,
     disconnectedCursor,
+    signal,
   );
   const reconnectEvents = await readNdjsonCatchup(
     sessionId,
     secret,
     disconnectedCursor,
+    signal,
   );
   const allEvents = [...firstEvents, ...remainingEvents];
   const lifecycle = allEvents.map((event) => event.type);
@@ -701,33 +901,33 @@ async function runLocalFirstUse(
   };
 }
 
-function startDev(repositoryRoot, projectRoot, secret) {
-  const processIdentity = `eden-conformance-${randomUUID()}`;
-  const child = spawn(
-    process.execPath,
-    [join(repositoryRoot, EDEN_CLI_PATH), "dev", "--project", projectRoot],
-    {
-      argv0: processIdentity,
-      cwd: repositoryRoot,
-      env: { ...process.env, EDEN_BEARER_SECRET: secret },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
+function startDev(repositoryRoot, projectRoot, secret, signal) {
+  throwIfAborted(signal);
+  const child = spawnOwnedProcess({
+    file: process.execPath,
+    args: [join(repositoryRoot, EDEN_CLI_PATH), "dev", "--project", projectRoot],
+    cwd: repositoryRoot,
+    env: childEnvironment({ EDEN_BEARER_SECRET: secret }),
+    label: "conformance-eden-dev",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   const output = readStreamOutput(child);
+  const abort = () => {
+    void child.terminateOwned();
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+  child.once("close", () => signal?.removeEventListener("abort", abort));
   return {
     child,
-    owner: {
-      pid: child.pid,
-      startedAt: processIdentity,
-    },
     exited: waitForChild(child),
     output,
   };
 }
 
-async function runRecoveryFixtures(repositoryRoot) {
+async function runRecoveryFixtures(repositoryRoot, signal) {
   const summaries = [];
   for (const fixture of LOCAL_RECOVERY_FIXTURES) {
+    throwIfAborted(signal);
     const isRuntimeFixture = fixture.startsWith("packages/runtime-cloudflare/");
     const args = [
       "pnpm",
@@ -740,17 +940,26 @@ async function runRecoveryFixtures(repositoryRoot) {
       fixture,
       "--maxWorkers=1",
     ];
-    const reportRoot = await mkdtemp(join(tmpdir(), "eden-recovery-report-"));
-    const reportPath = join(reportRoot, "vitest.json");
+    let reportRoot;
     try {
+      throwIfAborted(signal);
+      reportRoot = await mkdtemp(join(tmpdir(), "eden-recovery-report-"));
+      const reportPath = join(reportRoot, "vitest.json");
       const result = await runProcess(
         "corepack",
         [...args, "--reporter=json", "--outputFile", reportPath],
-        { cwd: repositoryRoot },
+        {
+          cwd: repositoryRoot,
+          signal,
+          label: `conformance-recovery-${fixture.replaceAll("/", "-")}`,
+        },
       );
-      if (result.code !== 0) {
+      throwIfAborted(signal);
+      if (!result.ok) {
         throw new Error(
-          `Deterministic recovery fixture ${fixture} failed (exit code ${result.code}).`,
+          `Deterministic recovery fixture ${fixture} failed (exit code ${
+            result.code ?? "unknown"
+          }, cleanup ${result.cleanupStatus}).`,
         );
       }
 
@@ -780,7 +989,9 @@ async function runRecoveryFixtures(repositoryRoot) {
           : {}),
       });
     } finally {
-      await rm(reportRoot, { recursive: true, force: true });
+      if (reportRoot !== undefined) {
+        await rm(reportRoot, { recursive: true, force: true });
+      }
     }
   }
   return summaries;
@@ -789,84 +1000,162 @@ async function runRecoveryFixtures(repositoryRoot) {
 export async function runLocalConformance({
   repositoryRoot,
   runRecoveryFixtures: shouldRunRecoveryFixtures = true,
+  signal: parentSignal,
+  operationTimeoutMs = OPERATION_TIMEOUT_MS,
 }) {
-  await runRepositoryBuild(repositoryRoot);
-  const projectRoot = await mkdtemp(join(tmpdir(), "eden-local-conformance-"));
-  const secret = `eden-local-${randomUUID()}`;
+  const operation = createOperationSignal(parentSignal, operationTimeoutMs);
+  const { signal } = operation;
+  let projectRoot;
   let localResult;
   let recoveryResults = [];
   let failure;
   let devProcess;
   let localCleanup;
   let devOutput;
+  let cleanupError;
+  const cleanup = {
+    projectRemoved: false,
+    workerPortFree: false,
+    inspectorPortFree: false,
+    processStopped: false,
+  };
   try {
     try {
-      localResult = await runLocalFirstUse(
-        repositoryRoot,
-        projectRoot,
-        secret,
-        (ownedProcess) => {
-          devProcess = ownedProcess;
-        },
-      );
-    } catch (error) {
-      failure = error;
-    } finally {
-      devOutput = devProcess?.output();
-      localCleanup = await stopLocalRuntime(projectRoot, devProcess);
-      devProcess = undefined;
-      if (
-        !localCleanup.processStopped ||
-        !localCleanup.workerPortFree ||
-        !localCleanup.inspectorPortFree
-      ) {
-        failure ??= new Error(
-          `Local resource cleanup failed: ${JSON.stringify(localCleanup)}`,
+      await runRepositoryBuild(repositoryRoot, signal);
+      throwIfAborted(signal);
+      projectRoot = await mkdtemp(join(tmpdir(), "eden-local-conformance-"));
+      const secret = `eden-local-${randomUUID()}`;
+      try {
+        localResult = await runLocalFirstUse(
+          repositoryRoot,
+          projectRoot,
+          secret,
+          signal,
+          (ownedProcess) => {
+            devProcess = ownedProcess;
+          },
         );
+      } catch (error) {
+        failure = error;
+      } finally {
+        devOutput = devProcess?.output();
+        if (devProcess !== undefined) {
+          localCleanup = await stopLocalRuntime(projectRoot, devProcess);
+          if (
+            !localCleanup.processStopped ||
+            !localCleanup.workerPortFree ||
+            !localCleanup.inspectorPortFree
+          ) {
+            failure ??= new Error(
+              `Local resource cleanup failed: ${JSON.stringify(localCleanup)}`,
+            );
+          }
+          if (
+            localCleanup.processStopped &&
+            localCleanup.workerPortFree &&
+            localCleanup.inspectorPortFree
+          ) {
+            devProcess = undefined;
+          }
+        } else {
+          localCleanup = {
+            processStopped: true,
+            workerPortFree: await waitForPortAvailability(EDEN_HOST, EDEN_PORT),
+            inspectorPortFree: await waitForPortAvailability(
+              EDEN_HOST,
+              EDEN_INSPECTOR_PORT,
+            ),
+          };
+        }
+        const output = `${devOutput?.stdout ?? ""}\n${devOutput?.stderr ?? ""}`;
+        if (
+          output.includes(secret) ||
+          output.includes("eden-session:") ||
+          output.includes("durable-object-id")
+        ) {
+          failure ??= new Error("Local runtime output contained a forbidden value.");
+        }
       }
-      const output = `${devOutput?.stdout ?? ""}\n${devOutput?.stderr ?? ""}`;
-      if (
-        output.includes(secret) ||
-        output.includes("eden-session:") ||
-        output.includes("durable-object-id")
-      ) {
-        failure ??= new Error("Local runtime output contained a forbidden value.");
-      }
+    } catch (error) {
+      failure ??= error;
     }
 
     if (failure === undefined && shouldRunRecoveryFixtures) {
       try {
-        recoveryResults = await runRecoveryFixtures(repositoryRoot);
+        recoveryResults = await runRecoveryFixtures(repositoryRoot, signal);
       } catch (error) {
         failure = error;
       }
     }
   } finally {
-    if (devProcess !== undefined) {
-      await stopLocalRuntime(projectRoot, devProcess);
+    try {
+      if (devProcess !== undefined && projectRoot !== undefined) {
+        const retryCleanup = await stopLocalRuntime(
+          projectRoot,
+          devProcess,
+          10_000,
+        );
+        localCleanup = retryCleanup;
+        if (
+          retryCleanup.processStopped &&
+          retryCleanup.workerPortFree &&
+          retryCleanup.inspectorPortFree
+        ) {
+          devProcess = undefined;
+        }
+      }
+      cleanup.processStopped =
+        devProcess === undefined &&
+        (localCleanup?.processStopped ?? projectRoot === undefined);
+      cleanup.workerPortFree = await waitForPortAvailability(
+        EDEN_HOST,
+        EDEN_PORT,
+      );
+      cleanup.inspectorPortFree = await waitForPortAvailability(
+        EDEN_HOST,
+        EDEN_INSPECTOR_PORT,
+      );
+
+      const localResourcesReleased =
+        projectRoot === undefined ||
+        (cleanup.processStopped &&
+          cleanup.workerPortFree &&
+          cleanup.inspectorPortFree &&
+          ownedProcessReservationCount() === 0);
+      if (projectRoot === undefined) cleanup.projectRemoved = true;
+      if (projectRoot !== undefined && localResourcesReleased) {
+        await rm(projectRoot, { recursive: true, force: true });
+        cleanup.projectRemoved = !(await stat(projectRoot).catch(() => undefined));
+      }
+      if (
+        !localResourcesReleased ||
+        (projectRoot !== undefined && !cleanup.projectRemoved)
+      ) {
+        cleanupError = new Error(
+          `Validation cleanup failed: ${JSON.stringify(cleanup)}`,
+        );
+      }
+      if (ownedProcessReservationCount() !== 0) {
+        cleanupError ??= new Error(
+          "Validation cleanup retained owned process reservations.",
+        );
+      }
+    } catch (error) {
+      cleanupError = error;
+    } finally {
+      if (signal.aborted && failure === undefined) failure = abortError(signal);
+      operation.dispose();
     }
   }
-
-  const cleanup = {
-    projectRemoved: false,
-    workerPortFree: false,
-    inspectorPortFree: false,
-    processStopped: localCleanup?.processStopped ?? false,
-  };
-  await rm(projectRoot, { recursive: true, force: true });
-  cleanup.projectRemoved = !(await stat(projectRoot).catch(() => undefined));
-  cleanup.workerPortFree = await waitForPortAvailability(EDEN_HOST, EDEN_PORT);
-  cleanup.inspectorPortFree = await waitForPortAvailability(
-    EDEN_HOST,
-    EDEN_INSPECTOR_PORT,
-  );
-  if (!cleanup.projectRemoved || !cleanup.workerPortFree || !cleanup.inspectorPortFree) {
-    failure ??= new Error(`Validation cleanup failed: ${JSON.stringify(cleanup)}`);
+  if (cleanupError !== undefined) {
+    failure ??= cleanupError;
   }
-
   if (failure !== undefined) {
+    const cleanupDetails = JSON.stringify(cleanup);
     throw new Error(
-      `${errorMessage(failure)} Cleanup: ${JSON.stringify(cleanup)}`,
+      `${errorMessage(failure)} Cleanup: ${cleanupDetails}${
+        cleanupError === undefined ? "" : ` Cleanup failure: ${errorMessage(cleanupError)}`
+      }`,
     );
   }
   if (localResult === undefined) {
