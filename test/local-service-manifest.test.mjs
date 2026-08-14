@@ -53,6 +53,7 @@ function ownedShellArgs(command) {
 }
 
 async function runShell(command, env) {
+  const reservationsBefore = ownedProcessReservationCount();
   const result = await runOwnedProcess({
     file: process.execPath,
     args: ownedShellArgs(command),
@@ -61,12 +62,42 @@ async function runShell(command, env) {
     label: `manifest-command-${randomUUID()}`,
     timeoutMs: 60_000,
   });
+  let cleanupRetry;
+  let cleanupVerified = result.cleanupVerified;
+  let cleanupFailure = result.cleanupFailure;
+  let unresolvedCleanup = result.unresolvedCleanup;
+  let ok = result.ok;
+  if (result.unresolvedCleanup) {
+    cleanupRetry = await result.retryCleanup();
+    cleanupVerified = cleanupRetry.cleanupVerified;
+    cleanupFailure = cleanupRetry.cleanupFailure;
+    unresolvedCleanup = cleanupRetry.unresolvedCleanup;
+    ok =
+      result.code === 0 &&
+      result.signal === null &&
+      result.error === undefined &&
+      !result.timedOut &&
+      !result.aborted &&
+      !result.outputLimitExceeded &&
+      !result.stdoutTruncated &&
+      !result.stderrTruncated &&
+      cleanupVerified;
+  }
+  expect(
+    ownedProcessReservationCount(),
+    JSON.stringify(ownedProcessReservationLabels()),
+  ).toBe(reservationsBefore);
   return {
-    code: result.ok ? 0 : result.code ?? 1,
+    ...result,
+    ok,
+    code: ok ? 0 : result.code ?? 1,
     signal: result.signal,
     stdout: result.stdout,
     stderr: result.stderr,
-    cleanupVerified: result.cleanupVerified,
+    cleanupVerified,
+    unresolvedCleanup,
+    cleanupFailure,
+    cleanupRetry,
     error: result.error?.message,
   };
 }
@@ -129,9 +160,14 @@ async function waitForHealth(command, env, child) {
 }
 
 async function waitForExit(child, timeout = 10_000) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (
+    (child.exitCode !== null || child.signalCode !== null) &&
+    child.closeObserved === true
+  ) {
+    return;
+  }
   await Promise.race([
-    new Promise((resolve) => child.once("exit", resolve)),
+    new Promise((resolve) => child.once("close", resolve)),
     delay(timeout),
   ]);
 }
@@ -220,11 +256,13 @@ test("executes the authoritative eden-local manifest lifecycle without disturbin
 
     const stopped = await runShell(commands.stop, stopEnv);
     expect(
-      stopped.code,
-      `${stopped.stderr || stopped.stdout} error=${stopped.error ?? "none"} signal=${stopped.signal ?? "none"} cleanup=${stopped.cleanupVerified}`,
-    ).toBe(0);
-    const ownedTerminationVerified = await service.terminateOwned();
+      stopped.ok,
+      `${stopped.stderr || stopped.stdout} error=${stopped.error ?? "none"} signal=${stopped.signal ?? "none"} cleanup=${stopped.cleanupVerified} cleanupFailure=${stopped.cleanupFailure ?? "none"} outputLimitExceeded=${stopped.outputLimitExceeded}`,
+    ).toBe(true);
+    const [ownedTerminationVerified, duplicateTerminationVerified] =
+      await Promise.all([service.terminateOwned(), service.terminateOwned()]);
     expect(ownedTerminationVerified).toBe(true);
+    expect(duplicateTerminationVerified).toBe(true);
     await waitForExit(service);
     expect(service.exitCode !== null || service.signalCode !== null).toBe(true);
     await expect(ownedServiceAlive(service)).resolves.toBe(false);

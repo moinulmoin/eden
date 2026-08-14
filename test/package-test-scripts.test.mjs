@@ -4,7 +4,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
 import { expect, test } from "vitest";
-import { runOwnedProcess } from "./owned-process.mjs";
+import {
+  ownedProcessReservationCount,
+  ownedProcessReservationLabels,
+  runOwnedProcess,
+} from "./owned-process.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workspacePackageDirectories = [
@@ -15,16 +19,20 @@ const workspacePackageDirectories = [
   "packages/cli",
   "examples/basic-agent",
 ];
-// Six package-local processes run serially. The exact services gate measured
-// 204.5s for this assertion and 88.8s for the separate compiler-filter
-// assertion on a cold run. A 240s budget leaves at least a 35s margin for the
-// slower assertion while staying scoped to this portability regression instead
-// of masking unrelated hangs globally.
+// Six package-local processes run serially. Repeated cold runs measured
+// 225.9s for this assertion and 96.0s for the separate compiler-filter
+// assertion. A 240s budget leaves at least a 14s margin for the slower
+// assertion while staying scoped to this portability regression instead of
+// masking unrelated hangs globally.
 const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS = 240_000;
-// The slowest observed package-local compiler run is below 90s in isolation;
-// retain a measured 60s cushion for cold starts and serial load while still
-// bounding one hung child well inside the enclosing 240s assertion.
+// The slowest observed compiler-filter child was 96.0s; retain a measured 54s
+// cushion for cold starts and serial load while still bounding one hung child
+// well inside the enclosing 240s assertion.
 const PACKAGE_TEST_PROCESS_TIMEOUT_MS = 150_000;
+// Keep compiler output bounded while leaving a measured margin over the
+// harness default for six serial package logs. This is intentionally finite;
+// a noisy or stuck compiler must produce an explicit harness failure.
+const PACKAGE_TEST_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
 
 function resolveExecutable(name) {
   for (const directory of (process.env.PATH ?? "").split(":")) {
@@ -51,12 +59,81 @@ async function runPnpm(args, cwd, options = {}) {
         : args,
     cwd,
     timeoutMs: options.timeoutMs ?? PACKAGE_TEST_PROCESS_TIMEOUT_MS,
+    maxBuffer: options.maxBuffer ?? PACKAGE_TEST_MAX_BUFFER_BYTES,
     label: options.label ?? "package-test",
   });
+  let cleanupRetry;
+  let finalResult = result;
+  if (result.unresolvedCleanup) {
+    cleanupRetry = await result.retryCleanup();
+    finalResult = {
+      ...result,
+      cleanupVerified: cleanupRetry.cleanupVerified,
+      unresolvedCleanup: cleanupRetry.unresolvedCleanup,
+      cleanupFailure: cleanupRetry.cleanupFailure,
+      cleanupStatus: cleanupRetry.cleanupStatus,
+      remainingPids: async () => cleanupRetry.remainingPids,
+      ok:
+        result.code === 0 &&
+        result.signal === null &&
+        result.error === undefined &&
+        !result.timedOut &&
+        !result.aborted &&
+        !result.outputLimitExceeded &&
+        !result.stdoutTruncated &&
+        !result.stderrTruncated &&
+        cleanupRetry.cleanupVerified,
+    };
+  }
   return {
-    ...result,
-    exitCode: result.ok ? 0 : result.code ?? 1,
+    ...finalResult,
+    initialCleanupFailure: result.unresolvedCleanup
+      ? result.cleanupFailure
+      : undefined,
+    cleanupRetry,
   };
+}
+
+function outcomeDiagnostic(result, label) {
+  return [
+    `${label} failed`,
+    `timedOut=${result.timedOut}`,
+    `aborted=${result.aborted}`,
+    `code=${result.code ?? "null"}`,
+    `signal=${result.signal ?? "null"}`,
+    `cleanupFailure=${result.cleanupFailure ?? "none"}`,
+    `initialCleanupFailure=${result.initialCleanupFailure ?? "none"}`,
+    `cleanupStatus=${result.cleanupStatus}`,
+    `stdoutTruncated=${result.stdoutTruncated}`,
+    `stderrTruncated=${result.stderrTruncated}`,
+    `outputLimitExceeded=${result.outputLimitExceeded}`,
+    `terminationReason=${result.terminationReason ?? "none"}`,
+    `reservations=${JSON.stringify(ownedProcessReservationLabels())}`,
+    `stdout=${result.stdout}`,
+    `stderr=${result.stderr}`,
+    `error=${result.error?.message ?? "none"}`,
+  ].join(" ");
+}
+
+function expectNoReservations(label) {
+  expect(
+    ownedProcessReservationCount(),
+    `${label} reservations=${JSON.stringify(ownedProcessReservationLabels())}`,
+  ).toBe(0);
+}
+
+function expectSuccessfulPackageChild(result, label) {
+  try {
+    expect(result.ok, outcomeDiagnostic(result, label)).toBe(true);
+    expect(result.timedOut, outcomeDiagnostic(result, label)).toBe(false);
+    expect(result.cleanupFailure, outcomeDiagnostic(result, label)).toBeUndefined();
+    expect(result.unresolvedCleanup, outcomeDiagnostic(result, label)).toBe(false);
+    expect(result.stdoutTruncated, outcomeDiagnostic(result, label)).toBe(false);
+    expect(result.stderrTruncated, outcomeDiagnostic(result, label)).toBe(false);
+    expect(result.outputLimitExceeded, outcomeDiagnostic(result, label)).toBe(false);
+  } finally {
+    expectNoReservations(label);
+  }
 }
 
 test.sequential(
@@ -72,7 +149,7 @@ test.sequential(
         ["run", "test"],
         join(repositoryRoot, directory),
       );
-      expect(result.exitCode, `${directory} test script failed`).toBe(0);
+      expectSuccessfulPackageChild(result, directory);
     }
   },
   PACKAGE_TEST_SCRIPTS_TIMEOUT_MS,
@@ -86,7 +163,7 @@ test.sequential(
       repositoryRoot,
       { timeoutMs: PACKAGE_TEST_PROCESS_TIMEOUT_MS },
     );
-    expect(result.exitCode).toBe(0);
+    expectSuccessfulPackageChild(result, "@eden/compiler filter");
   },
   PACKAGE_TEST_SCRIPTS_TIMEOUT_MS,
 );
@@ -110,12 +187,18 @@ test("aborts a hung package child tree before the next package script", async ()
     },
   );
 
-  expect(result.exitCode).not.toBe(0);
-  expect(result.code).toBeNull();
-  expect(result.signal).not.toBeNull();
-  expect(result.timedOut).toBe(true);
-  expect(result.cleanupVerified).toBe(true);
-  await expect(result.remainingPids()).resolves.toEqual([]);
+  try {
+    expect(result.ok, outcomeDiagnostic(result, "package hung fixture")).toBe(
+      false,
+    );
+    expect(result.code).toBeNull();
+    expect(result.signal).not.toBeNull();
+    expect(result.timedOut).toBe(true);
+    expect(result.cleanupVerified).toBe(true);
+    await expect(result.remainingPids()).resolves.toEqual([]);
+  } finally {
+    expectNoReservations("package hung fixture");
+  }
 
   const followUp = await runPnpm(
     [
@@ -129,7 +212,7 @@ test("aborts a hung package child tree before the next package script", async ()
       label: "package-follow-up",
     },
   );
-  expect(followUp.exitCode).toBe(0);
+  expectSuccessfulPackageChild(followUp, "package follow-up");
   expect(followUp.stdout).toBe("after-hung-package");
 });
 
@@ -137,7 +220,7 @@ test("treats a signal or null-code package child as a failure", async () => {
   const result = await runPnpm(
     [
       "-e",
-      'setTimeout(() => process.kill(process.pid, "SIGTERM"), 100)',
+      'setTimeout(() => process.kill(process.pid, "SIGTERM"), 500)',
     ],
     repositoryRoot,
     {
@@ -147,10 +230,15 @@ test("treats a signal or null-code package child as a failure", async () => {
     },
   );
 
-  expect(result.code).toBeNull();
-  expect(result.signal).toBe("SIGTERM");
-  expect(result.exitCode).not.toBe(0);
-  expect(result.ok).toBe(false);
-  expect(result.cleanupVerified).toBe(true);
-  await expect(result.remainingPids()).resolves.toEqual([]);
+  try {
+    expect(result.code).toBeNull();
+    expect(result.signal).toBe("SIGTERM");
+    expect(result.ok, outcomeDiagnostic(result, "package signal fixture")).toBe(
+      false,
+    );
+    expect(result.cleanupVerified).toBe(true);
+    await expect(result.remainingPids()).resolves.toEqual([]);
+  } finally {
+    expectNoReservations("package signal fixture");
+  }
 });

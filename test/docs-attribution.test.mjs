@@ -7,6 +7,8 @@ import { expect, test } from "vitest";
 
 import { runEdenCli } from "../packages/cli/src/index.ts";
 import {
+  ownedProcessReservationCount,
+  ownedProcessReservationLabels,
   runOwnedProcess,
   snapshotOwnedProcesses,
 } from "./owned-process.mjs";
@@ -43,6 +45,30 @@ function extractDocumentedWranglerCommands(readme) {
 
 function tokensForCommand(command) {
   return command.match(/"[^"]*"|'[^']*'|\S+/gu)?.map((token) => token.replace(/^["']|["']$/gu, "")) ?? [];
+}
+
+function processDiagnostic(result) {
+  return [
+    `timedOut=${result.timedOut}`,
+    `aborted=${result.aborted}`,
+    `code=${result.code ?? "null"}`,
+    `signal=${result.signal ?? "null"}`,
+    `cleanupFailure=${result.cleanupFailure ?? "none"}`,
+    `cleanupStatus=${result.cleanupStatus}`,
+    `stdoutTruncated=${result.stdoutTruncated}`,
+    `stderrTruncated=${result.stderrTruncated}`,
+    `outputLimitExceeded=${result.outputLimitExceeded}`,
+    `terminationReason=${result.terminationReason ?? "none"}`,
+    `reservations=${JSON.stringify(ownedProcessReservationLabels())}`,
+    `error=${result.error?.message ?? "none"}`,
+  ].join(" ");
+}
+
+function expectNoProcessReservations(label) {
+  expect(
+    ownedProcessReservationCount(),
+    `${label}: ${JSON.stringify(ownedProcessReservationLabels())}`,
+  ).toBe(0);
 }
 
 test("documents the supported CLI and clean-room operator boundaries", async () => {
@@ -190,6 +216,7 @@ test(
         result.ok,
         `${command} Wrangler help failed: ${result.stderr || result.stdout}`,
       ).toBe(true);
+      expectNoProcessReservations(`Wrangler help ${command}`);
       helpByCommand.set(command, `${result.stdout}\n${result.stderr}`);
     }
 
@@ -257,6 +284,7 @@ test(
     });
     expect(followUp.ok).toBe(true);
     expect(followUp.stdout).toBe("after-hung-wrangler");
+    expectNoProcessReservations("hung Wrangler follow-up");
   },
   5_000,
 );
@@ -266,7 +294,7 @@ test("classifies a signal-terminated Wrangler child as a failure", async () => {
     file: process.execPath,
     args: [
       "-e",
-      'setTimeout(() => process.kill(process.pid, "SIGTERM"), 100)',
+      'setTimeout(() => process.kill(process.pid, "SIGTERM"), 500)',
     ],
     cwd: repositoryRoot,
     timeoutMs: 2_000,
@@ -278,6 +306,140 @@ test("classifies a signal-terminated Wrangler child as a failure", async () => {
   expect(result.ok).toBe(false);
   expect(result.cleanupVerified).toBe(true);
   await expect(result.remainingPids()).resolves.toEqual([]);
+  expectNoProcessReservations("signal-terminated Wrangler child");
+});
+
+test("waits for close before returning trailing descendant output", async () => {
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: [
+      "-e",
+      [
+        'const { spawn } = await import("node:child_process");',
+        'spawn(process.execPath, ["-e", \'setTimeout(() => process.stdout.write("descendant-tail"), 350)\'], { stdio: ["ignore", "inherit", "ignore"] });',
+        'process.stdout.write("root-head");',
+        "setTimeout(() => process.exit(0), 300);",
+      ].join("\n"),
+    ],
+    cwd: repositoryRoot,
+    timeoutMs: 2_000,
+    label: "wrangler-close-trailing-output-fixture",
+  });
+
+  expect(result.ok, processDiagnostic(result)).toBe(true);
+  expect(result.stdout).toBe("root-headdescendant-tail");
+  expect(result.code).toBe(0);
+  expect(result.signal).toBeNull();
+  expect(result.cleanupVerified).toBe(true);
+  expectNoProcessReservations("close trailing output");
+});
+
+test("retries a transient root identity observation before cleanup", async () => {
+  let injected = false;
+  let observations = 0;
+  const snapshot = () => {
+    const entries = snapshotOwnedProcesses();
+    if (entries === undefined) return entries;
+    const root = entries.find((entry) =>
+      entry.command.includes("eden-owned-wrangler-transient-identity-"),
+    );
+    if (root !== undefined) {
+      observations += 1;
+      if (!injected) {
+        injected = true;
+        return entries.map((entry) =>
+          entry.pid === root.pid
+            ? { ...entry, command: "transient-wrong-marker" }
+            : entry,
+        );
+      }
+    }
+    return entries;
+  };
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: ["-e", 'setTimeout(() => {}, 500)'],
+    cwd: repositoryRoot,
+    timeoutMs: 2_000,
+    label: "wrangler-transient-identity-fixture",
+    snapshot,
+  });
+
+  expect(observations).toBeGreaterThanOrEqual(2);
+  expect(result.ok, processDiagnostic(result)).toBe(true);
+  expect(result.cleanupVerified).toBe(true);
+  await expect(result.remainingPids()).resolves.toEqual([]);
+  expectNoProcessReservations("transient identity observation");
+});
+
+test("retries a root hidden once after SIGKILL before declaring cleanup", async () => {
+  let hideRootOnNextSnapshot = false;
+  let rootHidden = false;
+  let rootPid;
+  let snapshotsAfterHide = 0;
+  const snapshot = () => {
+    const entries = snapshotOwnedProcesses();
+    if (entries === undefined) return entries;
+    if (rootHidden) snapshotsAfterHide += 1;
+    const root = entries.find((entry) =>
+      entry.command.includes("eden-owned-wrangler-hidden-root-"),
+    );
+    if (root !== undefined) rootPid = root.pid;
+    if (hideRootOnNextSnapshot) {
+      hideRootOnNextSnapshot = false;
+      rootHidden = rootPid !== undefined;
+      return entries.filter((entry) => entry.pid !== rootPid);
+    }
+    return entries;
+  };
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: [
+      "-e",
+      'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)',
+    ],
+    cwd: repositoryRoot,
+    timeoutMs: 150,
+    label: "wrangler-hidden-root-fixture",
+    snapshot,
+    sendSignal: (target, signal) => {
+      if (signal === "SIGKILL") hideRootOnNextSnapshot = true;
+      return process.kill(target, signal);
+    },
+  });
+
+  expect(rootHidden).toBe(true);
+  expect(snapshotsAfterHide).toBeGreaterThan(0);
+  expect(result.ok, processDiagnostic(result)).toBe(false);
+  expect(result.timedOut).toBe(true);
+  expect(result.signal).toBe("SIGKILL");
+  expect(result.cleanupVerified, processDiagnostic(result)).toBe(true);
+  await expect(result.remainingPids()).resolves.toEqual([]);
+  expectNoProcessReservations("hidden root after SIGKILL");
+});
+
+test("diagnoses output-limit termination without retaining a reservation", async () => {
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: [
+      "-e",
+      [
+        'process.stdout.write("x".repeat(1024 * 1024 + 1));',
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    ],
+    cwd: repositoryRoot,
+    timeoutMs: 2_000,
+    label: "wrangler-output-limit-fixture",
+  });
+
+  expect(result.ok, processDiagnostic(result)).toBe(false);
+  expect(result.outputLimitExceeded).toBe(true);
+  expect(result.stdoutTruncated).toBe(true);
+  expect(result.error?.message).toMatch(/output limit exceeded/iu);
+  expect(result.cleanupVerified, processDiagnostic(result)).toBe(true);
+  await expect(result.remainingPids()).resolves.toEqual([]);
+  expectNoProcessReservations("output-limit termination");
 });
 
 test("aborts a hung Wrangler child tree within the owned cleanup bound", async () => {
@@ -300,9 +462,12 @@ test("aborts a hung Wrangler child tree within the owned cleanup bound", async (
   expect(result.aborted).toBe(true);
   expect(result.cleanupVerified).toBe(true);
   await expect(result.remainingPids()).resolves.toEqual([]);
+  expectNoProcessReservations("aborted Wrangler child");
 });
 
-test("fails closed on an empty process snapshot before recovering owned cleanup", async () => {
+test(
+  "fails closed on an empty process snapshot before recovering owned cleanup",
+  async () => {
   let observe = false;
   const result = await runOwnedProcess({
     file: process.execPath,
@@ -321,15 +486,21 @@ test("fails closed on an empty process snapshot before recovering owned cleanup"
   expect(result.unresolvedCleanup).toBe(true);
   expect(result.cleanupStatus).toBe("unresolved");
   await expect(result.remainingPids()).resolves.toBeUndefined();
+  expect(ownedProcessReservationCount()).toBe(1);
 
   observe = true;
   const cleanup = await result.retryCleanup();
   expect(cleanup.cleanupVerified).toBe(true);
   expect(cleanup.unresolvedCleanup).toBe(false);
   expect(cleanup.remainingPids).toEqual([]);
-});
+  expectNoProcessReservations("empty snapshot retry");
+  },
+  10_000,
+);
 
-test("fails closed when process observation itself is unavailable", async () => {
+test(
+  "fails closed when process observation itself is unavailable",
+  async () => {
   let observe = false;
   const result = await runOwnedProcess({
     file: process.execPath,
@@ -348,14 +519,65 @@ test("fails closed when process observation itself is unavailable", async () => 
   expect(result.cleanupFailure).toBe("process-observation-failed");
   expect(result.unresolvedCleanup).toBe(true);
   await expect(result.remainingPids()).resolves.toBeUndefined();
+  expect(ownedProcessReservationCount()).toBe(1);
 
   observe = true;
   const cleanup = await result.retryCleanup();
   expect(cleanup.cleanupVerified).toBe(true);
   expect(cleanup.remainingPids).toEqual([]);
-});
+  expectNoProcessReservations("unavailable snapshot retry");
+  },
+  10_000,
+);
 
-test("refuses a replaced root identity before both termination escalations", async () => {
+test(
+  "fails a zero-code child when cleanup evidence is unavailable",
+  async () => {
+  let identityObserved = false;
+  let restoreObservation = false;
+  const snapshot = () => {
+    const entries = snapshotOwnedProcesses();
+    if (entries === undefined) return entries;
+    const root = entries.find((entry) =>
+      entry.command.includes("eden-owned-wrangler-zero-code-cleanup-"),
+    );
+    if (root !== undefined) identityObserved = true;
+    if (identityObserved && !restoreObservation && root === undefined) {
+      return undefined;
+    }
+    return entries;
+  };
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: ["-e", "setTimeout(() => process.exit(0), 100)"],
+    cwd: repositoryRoot,
+    timeoutMs: 2_000,
+    label: "wrangler-zero-code-cleanup-fixture",
+    snapshot,
+  });
+
+  expect(identityObserved).toBe(true);
+  expect(result.code).toBe(0);
+  expect(result.signal).toBeNull();
+  expect(result.ok, processDiagnostic(result)).toBe(false);
+  expect(result.cleanupVerified).toBe(false);
+  expect(result.unresolvedCleanup).toBe(true);
+  expect(result.cleanupFailure).toBe("process-observation-failed");
+  expect(ownedProcessReservationCount()).toBe(1);
+
+  restoreObservation = true;
+  const cleanup = await result.retryCleanup();
+  expect(cleanup.cleanupVerified).toBe(true);
+  expect(cleanup.unresolvedCleanup).toBe(false);
+  expect(cleanup.remainingPids).toEqual([]);
+  expectNoProcessReservations("zero-code cleanup retry");
+  },
+  10_000,
+);
+
+test(
+  "refuses a replaced root identity before both termination escalations",
+  async () => {
   let replaceIdentity = false;
   let replacementInjected = false;
   const signals = [];
@@ -402,4 +624,6 @@ test("refuses a replaced root identity before both termination escalations", asy
   const cleanup = await result.retryCleanup();
   expect(cleanup.cleanupVerified).toBe(true);
   expect(cleanup.remainingPids).toEqual([]);
-});
+  },
+  10_000,
+);

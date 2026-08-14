@@ -8,6 +8,13 @@ const DEFAULT_MAX_BUFFER = 1024 * 1024;
 const TERMINATION_GRACE_MS = 1_000;
 const KILL_GRACE_MS = 2_000;
 const PROCESS_SNAPSHOT_TIMEOUT_MS = 250;
+// A process can be visible to `ps` only after spawn has returned and can be
+// briefly absent while the kernel is reaping it. Four snapshot budgets plus
+// one termination-sized margin make startup evidence bounded without making a
+// single transient observation permanently sticky.
+const STARTUP_IDENTITY_TIMEOUT_MS =
+  PROCESS_SNAPSHOT_TIMEOUT_MS * 4 + TERMINATION_GRACE_MS;
+const OBSERVATION_RETRY_DELAY_MS = 50;
 const activeReservations = new Set();
 
 function boundedText(parts) {
@@ -92,27 +99,88 @@ function createReservation(label, options = {}) {
     startId: undefined,
     knownPids: new Set(),
     knownGroups: new Set(),
+    knownIdentities: new Map(),
+    identityAttempted: false,
     lastFailure: undefined,
   };
+}
+
+function isProcessEntry(entry) {
+  return (
+    entry !== null &&
+    typeof entry === "object" &&
+    Number.isSafeInteger(entry.pid) &&
+    entry.pid > 0 &&
+    Number.isSafeInteger(entry.ppid) &&
+    entry.ppid >= 0 &&
+    Number.isSafeInteger(entry.pgid) &&
+    entry.pgid > 0 &&
+    typeof entry.start === "string" &&
+    entry.start.length > 0 &&
+    typeof entry.state === "string" &&
+    entry.state.length > 0 &&
+    typeof entry.command === "string"
+  );
 }
 
 function captureSnapshot(reservation) {
   try {
     const entries = reservation.snapshot();
-    if (!Array.isArray(entries)) {
-      reservation.observationFailed = true;
+    if (!Array.isArray(entries) || entries.some((entry) => !isProcessEntry(entry))) {
       reservation.lastFailure = "process-observation-failed";
       return undefined;
     }
     return entries;
   } catch {
-    reservation.observationFailed = true;
     reservation.lastFailure = "process-observation-failed";
     return undefined;
   }
 }
 
+function rememberOwnedEntries(reservation, entries) {
+  for (const entry of entries) {
+    reservation.knownPids.add(entry.pid);
+    reservation.knownGroups.add(entry.pgid);
+    reservation.knownIdentities.set(entry.pid, {
+      start: entry.start,
+      pgid: entry.pgid,
+    });
+  }
+}
+
+function knownOwnedEntries(reservation, entries) {
+  return entries.filter((entry) => {
+    const known = reservation.knownIdentities.get(entry.pid);
+    if (known !== undefined) {
+      return (
+        known.start === entry.start &&
+        known.pgid === entry.pgid
+      );
+    }
+    return reservation.knownGroups.has(entry.pgid);
+  });
+}
+
+function persistObservationFailure(reservation, failure) {
+  reservation.lastFailure = failure;
+  if (failure === "process-observation-failed") {
+    reservation.observationFailed = true;
+  }
+  if (
+    failure === "root-marker-mismatch" ||
+    failure === "root-pid-mismatch" ||
+    failure === "root-pgid-mismatch" ||
+    failure === "root-start-mismatch"
+  ) {
+    reservation.identityMismatch = true;
+  }
+}
+
 function childIsTerminal(reservation) {
+  return childHasExited(reservation);
+}
+
+function childHasExited(reservation) {
   const child = reservation.child;
   return (
     child === undefined ||
@@ -120,6 +188,16 @@ function childIsTerminal(reservation) {
     child.exitCode !== null ||
     child.signalCode !== null ||
     reservation.exitObserved === true ||
+    reservation.spawnFailed === true
+  );
+}
+
+function childHasClosed(reservation) {
+  const child = reservation.child;
+  return (
+    child === undefined ||
+    child.pid === undefined ||
+    reservation.closeObserved === true ||
     reservation.spawnFailed === true
   );
 }
@@ -171,7 +249,6 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
       failure: "missing-root-pid",
     };
   }
-
   const root = entries.find((entry) => entry.pid === rootPid);
   if (root === undefined) {
     if (allowTerminalRootGone && childIsTerminal(reservation)) {
@@ -189,10 +266,12 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
           failure: "missing-root-identity",
         };
       }
+      const owned = knownOwnedEntries(reservation, entries);
       return {
         entries,
-        owned: [],
+        owned,
         rootPresent: false,
+        terminalRoot: true,
         verified: true,
         failure: undefined,
       };
@@ -220,6 +299,7 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
     root.start === reservation.startId;
   if (terminalRootIdentity) {
     const owned = processTree(entries, root);
+    rememberOwnedEntries(reservation, owned);
     return {
       entries,
       owned,
@@ -231,7 +311,6 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
   }
 
   if (!root.command.includes(reservation.marker)) {
-    reservation.identityMismatch = true;
     reservation.lastFailure = "root-marker-mismatch";
     return {
       entries,
@@ -242,7 +321,6 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
     };
   }
   if (root.pid !== rootPid) {
-    reservation.identityMismatch = true;
     reservation.lastFailure = "root-pid-mismatch";
     return {
       entries,
@@ -256,7 +334,6 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
     process.platform !== "win32" &&
     (reservation.groupId === undefined || root.pgid !== reservation.groupId)
   ) {
-    reservation.identityMismatch = true;
     reservation.lastFailure = "root-pgid-mismatch";
     return {
       entries,
@@ -270,7 +347,6 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
     reservation.startId !== undefined &&
     root.start !== reservation.startId
   ) {
-    reservation.identityMismatch = true;
     reservation.lastFailure = "root-start-mismatch";
     return {
       entries,
@@ -286,10 +362,7 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
 
   const owned = processTree(entries, root);
   reservation.identityObserved = true;
-  for (const entry of owned) {
-    reservation.knownPids.add(entry.pid);
-    reservation.knownGroups.add(entry.pgid);
-  }
+  rememberOwnedEntries(reservation, owned);
   reservation.lastFailure = undefined;
   return {
     entries,
@@ -305,11 +378,7 @@ function remainingOwnedEntries(
   entries,
   { excludeTerminalRoot = false } = {},
 ) {
-  return entries.filter(
-    (entry) =>
-      reservation.knownPids.has(entry.pid) ||
-      reservation.knownGroups.has(entry.pgid),
-  ).filter(
+  return knownOwnedEntries(reservation, entries).filter(
     (entry) =>
       !excludeTerminalRoot ||
       entry.pid !== reservation.child?.pid,
@@ -329,36 +398,31 @@ async function waitForOwnedTreeEmpty(reservation, timeoutMs) {
     const observed = observeOwnedTree(reservation, {
       allowTerminalRootGone: true,
     });
-    if (!observed.verified || observed.entries === undefined) {
-      return {
-        verified: false,
-        failure: observed.failure ?? "cleanup-unverified",
-        remaining:
-          observed.entries === undefined
-            ? undefined
-            : remainingOwnedEntries(reservation, observed.entries),
-        terminalRoot: observed.terminalRoot === true,
-      };
+    if (observed.verified && observed.entries !== undefined) {
+      const remaining = remainingOwnedEntries(reservation, observed.entries, {
+        excludeTerminalRoot: observed.terminalRoot === true,
+      });
+      if (
+        remaining.length === 0 &&
+        childHasClosed(reservation) &&
+        (childHasExited(reservation) || observed.terminalRoot === true)
+      ) {
+        return {
+          verified: true,
+          failure: undefined,
+          remaining,
+          terminalRoot: observed.terminalRoot === true,
+        };
+      }
+      lastFailure = childHasClosed(reservation)
+        ? observed.rootPresent
+          ? "owned-processes-still-running"
+          : "missing-root-process"
+        : "process-close-pending";
+    } else {
+      lastFailure = observed.failure ?? "cleanup-unverified";
     }
-
-    const remaining = remainingOwnedEntries(reservation, observed.entries, {
-      excludeTerminalRoot: observed.terminalRoot === true,
-    });
-    if (
-      remaining.length === 0 &&
-      (childIsTerminal(reservation) || observed.terminalRoot === true)
-    ) {
-      return {
-        verified: true,
-        failure: undefined,
-        remaining,
-        terminalRoot: observed.terminalRoot === true,
-      };
-    }
-    lastFailure = observed.rootPresent
-      ? "owned-processes-still-running"
-      : "missing-root-process";
-    await wait(50);
+    await wait(OBSERVATION_RETRY_DELAY_MS);
   }
 
   const observed = observeOwnedTree(reservation, {
@@ -370,7 +434,8 @@ async function waitForOwnedTreeEmpty(reservation, timeoutMs) {
     });
     if (
       remaining.length === 0 &&
-      (childIsTerminal(reservation) || observed.terminalRoot === true)
+      childHasClosed(reservation) &&
+      (childHasExited(reservation) || observed.terminalRoot === true)
     ) {
       return {
         verified: true,
@@ -380,13 +445,15 @@ async function waitForOwnedTreeEmpty(reservation, timeoutMs) {
       };
     }
   }
+  const failure =
+    observed.failure ??
+    (!childHasClosed(reservation)
+      ? "process-close-pending"
+      : lastFailure ?? reservation.lastFailure ?? "cleanup-unverified");
+  persistObservationFailure(reservation, failure);
   return {
     verified: false,
-    failure:
-      observed.failure ??
-      lastFailure ??
-      reservation.lastFailure ??
-      "cleanup-unverified",
+    failure,
     remaining:
       observed.entries === undefined
         ? undefined
@@ -399,7 +466,12 @@ async function waitForOwnedTreeEmpty(reservation, timeoutMs) {
  * Send one signal only after a fresh identity observation. In particular,
  * this never uses an identityVerified cache or a previously observed PGID.
  */
-function signalOwnedTree(reservation, signal) {
+async function signalOwnedTree(
+  reservation,
+  signal,
+  timeoutMs = TERMINATION_GRACE_MS,
+  { allowTerminalRootGone = true } = {},
+) {
   if (
     reservation.child === undefined ||
     reservation.child.pid === undefined
@@ -407,33 +479,94 @@ function signalOwnedTree(reservation, signal) {
     return { sent: true, failure: undefined, signal };
   }
 
-  const observed = observeOwnedTree(reservation);
-  if (!observed.verified || observed.owned === undefined) {
-    return {
-      sent: false,
-      failure: observed.failure ?? "ownership-unverified",
-      signal,
-    };
+  const deadline = Date.now() + timeoutMs;
+  let lastFailure = reservation.lastFailure ?? "ownership-unverified";
+  while (Date.now() < deadline) {
+    const observed = observeOwnedTree(reservation, {
+      allowTerminalRootGone,
+    });
+    if (observed.verified && observed.owned !== undefined) {
+      const root = observed.owned.find(
+        (entry) => entry.pid === reservation.child?.pid,
+      );
+      if (root === undefined) {
+        if (childHasExited(reservation)) {
+          if (
+            !observed.terminalRoot ||
+            observed.owned.length === 0 ||
+            reservation.groupId === undefined
+          ) {
+            return { sent: true, failure: undefined, signal };
+          }
+          let sent = false;
+          try {
+            sent =
+              reservation.sendSignal(-reservation.groupId, signal) === true;
+          } catch {
+            sent = false;
+          }
+          if (sent) return { sent: true, failure: undefined, signal };
+          lastFailure = "signal-failed";
+        } else {
+          lastFailure = "missing-root-process";
+        }
+      } else {
+        const target =
+          process.platform === "win32" ? root.pid : -root.pgid;
+        let sent = false;
+        try {
+          sent = reservation.sendSignal(target, signal) === true;
+        } catch {
+          sent = false;
+        }
+        if (sent || childHasExited(reservation)) {
+          return {
+            sent: sent || childHasExited(reservation),
+            failure: sent || childHasExited(reservation)
+              ? undefined
+              : "signal-failed",
+            signal,
+          };
+        }
+        lastFailure = "signal-failed";
+      }
+    } else {
+      lastFailure = observed.failure ?? lastFailure;
+    }
+    await wait(OBSERVATION_RETRY_DELAY_MS);
   }
 
-  const root = observed.owned.find(
-    (entry) => entry.pid === reservation.child?.pid,
+  const observed = observeOwnedTree(reservation, {
+    allowTerminalRootGone,
+  });
+  if (observed.verified && observed.owned !== undefined) {
+    const root = observed.owned.find(
+      (entry) => entry.pid === reservation.child?.pid,
+    );
+    if (root === undefined && childHasExited(reservation)) {
+      if (
+        !observed.terminalRoot ||
+        observed.owned.length === 0 ||
+        reservation.groupId === undefined
+      ) {
+        return { sent: true, failure: undefined, signal };
+      }
+      try {
+        if (reservation.sendSignal(-reservation.groupId, signal) === true) {
+          return { sent: true, failure: undefined, signal };
+        }
+      } catch {
+        // The group may have disappeared between observation and signaling.
+      }
+    }
+  }
+  persistObservationFailure(
+    reservation,
+    observed.failure ?? lastFailure ?? "ownership-unverified",
   );
-  if (root === undefined) {
-    return { sent: false, failure: "missing-root-process", signal };
-  }
-
-  const target =
-    process.platform === "win32" ? root.pid : -root.pgid;
-  let sent = false;
-  try {
-    sent = reservation.sendSignal(target, signal) === true;
-  } catch {
-    sent = false;
-  }
   return {
-    sent,
-    failure: sent ? undefined : "signal-failed",
+    sent: false,
+    failure: observed.failure ?? lastFailure ?? "signal-failed",
     signal,
   };
 }
@@ -447,17 +580,67 @@ async function terminateOwnedTree(reservation) {
     };
   }
 
+  if (!reservation.identityObserved) {
+    let identityEstablished;
+    if (reservation.identityPromise !== undefined && reservation.identityAttempted) {
+      identityEstablished = await reservation.identityPromise;
+    } else if (!reservation.identityAttempted) {
+      reservation.identityPromise = waitForOwnedIdentity(reservation);
+      identityEstablished = await reservation.identityPromise;
+    }
+    if (!identityEstablished) {
+      const settled = await waitForOwnedTreeEmpty(reservation, KILL_GRACE_MS);
+      return {
+        verified: false,
+        failure: settled.failure ?? "ownership-unverified",
+        lastSignal: undefined,
+        settled,
+      };
+    }
+  }
+
   if (childIsTerminal(reservation)) {
     const settled = await waitForOwnedTreeEmpty(reservation, KILL_GRACE_MS);
+    if (settled.verified) {
+      return {
+        verified: true,
+        failure: undefined,
+        lastSignal: undefined,
+        settled,
+      };
+    }
+    if (
+      settled.remaining === undefined ||
+      settled.remaining.length === 0
+    ) {
+      return {
+        verified: false,
+        failure: settled.failure ?? "cleanup-unverified",
+        lastSignal: undefined,
+        settled,
+      };
+    }
+    const kill = await signalOwnedTree(reservation, "SIGKILL", undefined, {
+      allowTerminalRootGone: true,
+    });
+    const killSettled = await waitForOwnedTreeEmpty(
+      reservation,
+      KILL_GRACE_MS,
+    );
+    const verified = kill.sent && killSettled.verified;
     return {
-      verified: settled.verified,
-      failure: settled.failure,
-      lastSignal: undefined,
-      settled,
+      verified,
+      failure: verified
+        ? undefined
+        : kill.failure ?? killSettled.failure ?? settled.failure,
+      lastSignal: kill.sent ? kill.signal : undefined,
+      settled: killSettled,
     };
   }
 
-  const term = signalOwnedTree(reservation, "SIGTERM");
+  const term = await signalOwnedTree(reservation, "SIGTERM", undefined, {
+    allowTerminalRootGone: true,
+  });
   const termSettled = await waitForOwnedTreeEmpty(
     reservation,
     TERMINATION_GRACE_MS,
@@ -473,7 +656,9 @@ async function terminateOwnedTree(reservation) {
 
   // SIGKILL is independently identity-checked by signalOwnedTree. A failed
   // SIGTERM observation must never authorize a cached-group SIGKILL.
-  const kill = signalOwnedTree(reservation, "SIGKILL");
+  const kill = await signalOwnedTree(reservation, "SIGKILL", undefined, {
+    allowTerminalRootGone: true,
+  });
   const killSettled = await waitForOwnedTreeEmpty(reservation, KILL_GRACE_MS);
   const verified = term.sent && kill.sent && killSettled.verified;
   return {
@@ -541,7 +726,8 @@ function resultFor({
   stderrTruncated,
   outputLimitExceeded,
 }) {
-  const reportedSignal = signal ?? (timedOut || aborted ? lastSignal : null);
+  const reportedSignal =
+    signal ?? (timedOut || aborted || outputLimitExceeded ? lastSignal : null);
   const result = {
     ok:
       error === undefined &&
@@ -567,6 +753,19 @@ function resultFor({
     stdoutTruncated,
     stderrTruncated,
     outputLimitExceeded,
+    terminationReason: outputLimitExceeded
+      ? "output-limit-exceeded"
+      : timedOut
+        ? "timeout"
+        : aborted
+          ? "aborted"
+          : signal !== null
+            ? "signal"
+            : code !== 0
+              ? "exit-code"
+            : cleanupVerified
+              ? undefined
+              : "cleanup-failure",
     remainingPids: async () => {
       const observed = observeOwnedTree(reservation, {
         allowTerminalRootGone: true,
@@ -585,31 +784,60 @@ function resultFor({
     },
   };
   result.retryCleanup = async () => {
-    reservation.observationFailed = false;
-    reservation.identityMismatch = false;
-    reservation.lastFailure = undefined;
-    const termination = await terminateOwnedTree(reservation);
-    const verified = await verifyAndRelease(reservation, termination);
-    return {
-      cleanupVerified: verified.cleanupVerified,
-      unresolvedCleanup: !verified.cleanupVerified,
-      cleanupFailure: verified.cleanupFailure,
-      cleanupStatus: verified.cleanupVerified ? "verified" : "unresolved",
-      remainingPids: verified.remaining?.map((entry) => entry.pid),
-    };
+    if (reservation.retryCleanupPromise !== undefined) {
+      return reservation.retryCleanupPromise;
+    }
+    const attempt = (async () => {
+      reservation.observationFailed = false;
+      reservation.identityMismatch = false;
+      reservation.identityAttempted = false;
+      reservation.lastFailure = undefined;
+      const termination = await terminateOwnedTree(reservation);
+      const verified = await verifyAndRelease(reservation, termination);
+      return {
+        cleanupVerified: verified.cleanupVerified,
+        unresolvedCleanup: !verified.cleanupVerified,
+        cleanupFailure: verified.cleanupFailure,
+        cleanupStatus: verified.cleanupVerified ? "verified" : "unresolved",
+        remainingPids: verified.remaining?.map((entry) => entry.pid),
+      };
+    })();
+    const completed = attempt.then((outcome) => {
+      if (outcome.unresolvedCleanup) {
+        reservation.retryCleanupPromise = undefined;
+      }
+      return outcome;
+    });
+    reservation.retryCleanupPromise = completed;
+    return completed;
   };
   return result;
 }
 
-async function waitForOwnedIdentity(reservation, timeoutMs = 500) {
+async function waitForOwnedIdentity(
+  reservation,
+  timeoutMs = STARTUP_IDENTITY_TIMEOUT_MS,
+) {
+  reservation.identityAttempted = true;
   if (process.platform === "win32") return false;
   const deadline = Date.now() + timeoutMs;
+  let lastFailure = reservation.lastFailure ?? "ownership-unverified";
   while (Date.now() < deadline) {
     const observed = observeOwnedTree(reservation);
     if (observed.verified) return true;
-    if (childIsTerminal(reservation)) return false;
-    await wait(10);
+    lastFailure = observed.failure ?? lastFailure;
+    if (childIsTerminal(reservation)) {
+      persistObservationFailure(reservation, lastFailure);
+      return false;
+    }
+    await wait(OBSERVATION_RETRY_DELAY_MS);
   }
+  const observed = observeOwnedTree(reservation);
+  if (observed.verified) return true;
+  persistObservationFailure(
+    reservation,
+    observed.failure ?? lastFailure ?? "ownership-unverified",
+  );
   return false;
 }
 
@@ -656,7 +884,6 @@ export async function runOwnedProcess({
   let spawnError;
   let exitCode = null;
   let exitSignal = null;
-  let settled = false;
   let timeoutHandle;
   let abortListener;
   let terminatePromise;
@@ -665,7 +892,7 @@ export async function runOwnedProcess({
   let finalResult;
   let outputLimitExceeded = false;
 
-  const exitPromise = new Promise((resolve) => {
+  const completionPromise = new Promise((resolve) => {
     resolveExit = resolve;
   });
   const cancellationPromise = new Promise((resolve) => {
@@ -675,6 +902,7 @@ export async function runOwnedProcess({
   const requestTermination = (reason) => {
     if (reason === "timeout") timedOut = true;
     if (reason === "abort") aborted = true;
+    if (reason === "output") outputLimitExceeded = true;
     resolveCancellation?.();
     if (terminatePromise !== undefined) return terminatePromise;
     terminatePromise = terminateOwnedTree(reservation);
@@ -699,6 +927,11 @@ export async function runOwnedProcess({
       termination = await requestTermination("cleanup");
     }
     const verified = await verifyAndRelease(reservation, termination);
+    if (outputLimitExceeded && spawnError === undefined) {
+      spawnError = new Error(
+        `Owned process output limit exceeded (${maxBuffer} bytes).`,
+      );
+    }
     const cleanupVerified = verified.cleanupVerified;
     finalResult = resultFor({
       reservation,
@@ -753,20 +986,19 @@ export async function runOwnedProcess({
     child.once("error", (error) => {
       spawnError = error;
       reservation.spawnFailed = true;
-      reservation.exitObserved = true;
-      if (!settled) {
-        settled = true;
-        resolveExit();
-      }
     });
     child.once("exit", (code, signalName) => {
       exitCode = code;
       exitSignal = signalName;
       reservation.exitObserved = true;
-      if (!settled) {
-        settled = true;
-        resolveExit();
+    });
+    child.once("close", (code, signalName) => {
+      if (!reservation.exitObserved) {
+        exitCode = code;
+        exitSignal = signalName;
       }
+      reservation.closeObserved = true;
+      resolveExit();
     });
 
     let resolveTimeout;
@@ -786,7 +1018,8 @@ export async function runOwnedProcess({
     signal?.addEventListener("abort", abortListener, { once: true });
     if (signal?.aborted === true) abortListener();
 
-    const ownershipEstablished = await waitForOwnedIdentity(reservation);
+    reservation.identityPromise = waitForOwnedIdentity(reservation);
+    const ownershipEstablished = await reservation.identityPromise;
     if (!ownershipEstablished) {
       spawnError = new Error(
         "Owned process identity could not be verified; cleanup failed closed.",
@@ -796,7 +1029,11 @@ export async function runOwnedProcess({
       }
     }
 
-    await Promise.race([exitPromise, timeoutPromise, cancellationPromise]);
+    await Promise.race([
+      completionPromise,
+      timeoutPromise,
+      cancellationPromise,
+    ]);
   } catch (error) {
     spawnError = error;
     reservation.spawnFailed = true;
@@ -853,19 +1090,46 @@ export function spawnOwnedProcess({
     reservation.child = child;
     reservation.groupId = process.platform === "win32" ? child.pid : child.pid;
     child.processIdentity = reservation.marker;
+    child.closeObserved = false;
     reservation.identityPromise = waitForOwnedIdentity(reservation);
-    child.terminateOwned = async () => {
-      await reservation.identityPromise;
-      const termination = await terminateOwnedTree(reservation);
-      const verified = await verifyAndRelease(reservation, termination);
-      return verified.cleanupVerified;
+    child.terminateOwned = () => {
+      if (reservation.terminatePromise !== undefined) {
+        return reservation.terminatePromise;
+      }
+      reservation.terminatePromise = (async () => {
+        await reservation.identityPromise;
+        reservation.observationFailed = false;
+        reservation.identityMismatch = false;
+        reservation.lastFailure = undefined;
+        if (!reservation.identityObserved) {
+          reservation.identityAttempted = false;
+        }
+        const termination = await terminateOwnedTree(reservation);
+        const verified = await verifyAndRelease(reservation, termination);
+        return verified.cleanupVerified;
+      })();
+      const completed = reservation.terminatePromise.then((verified) => {
+        if (!verified) reservation.terminatePromise = undefined;
+        return verified;
+      });
+      reservation.terminatePromise = completed;
+      return completed;
     };
     child.once("error", () => {
       reservation.spawnFailed = true;
     });
     child.once("exit", () => {
+      reservation.exitObserved = true;
+    });
+    child.once("close", () => {
+      reservation.closeObserved = true;
+      child.closeObserved = true;
       void waitForOwnedTreeEmpty(reservation, KILL_GRACE_MS).then((empty) => {
-        if (empty.verified) activeReservations.delete(reservation);
+        if (empty.verified) {
+          activeReservations.delete(reservation);
+          return;
+        }
+        void child.terminateOwned();
       });
     });
     return child;
