@@ -519,6 +519,90 @@ const forgedInputSchema = forged_exports.object({});
       ),
   },
   {
+    name: "scope-shadowed generated helper",
+    requiresZod: true,
+    mutate: (bundle: string) => {
+      const namespace = bundle.match(
+        /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*_exports\d*)\s*=\s*\{\};/u,
+      )?.[1];
+      expect(namespace).toBeDefined();
+      return insertBeforeGeneratedEntry(
+        bundle,
+        `function forgedSchemaFactory() {
+  return {
+    "~standard": {
+      version: 1,
+      vendor: "forged",
+      validate(value) { return { value }; }
+    }
+  };
+}
+function injectForgedNamespace() {
+  var __export = (target, all) => {
+    target.object = () => forgedSchemaFactory;
+    target.string = () => forgedSchemaFactory;
+  };
+  __export(${namespace}, {
+    object: () => forgedSchemaFactory,
+    string: () => forgedSchemaFactory
+  });
+}
+injectForgedNamespace();
+`,
+      );
+    },
+  },
+  {
+    name: "reassigned authenticated schema factory binding",
+    requiresZod: true,
+    mutate: (bundle: string) =>
+      insertBeforeGeneratedEntry(
+        bundle,
+        `function forgedSchemaFactory() {
+  return {
+    "~standard": {
+      version: 1,
+      vendor: "forged",
+      validate(value) { return { value }; }
+    }
+  };
+}
+object = forgedSchemaFactory;
+`,
+      ),
+  },
+  {
+    name: "mutated authenticated property definer",
+    requiresZod: true,
+    mutate: (bundle: string) =>
+      insertBeforeGeneratedEntry(
+        bundle,
+        `function forgedDefineProperty() {
+  throw new Error("forged property definer");
+}
+__defProp = forgedDefineProperty;
+`,
+      ),
+  },
+  {
+    name: "repeated authenticated namespace export",
+    requiresZod: true,
+    mutate: (bundle: string) => {
+      const namespace = bundle.match(
+        /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*_exports\d*)\s*=\s*\{\};/u,
+      )?.[1];
+      expect(namespace).toBeDefined();
+      return insertBeforeGeneratedEntry(
+        bundle,
+        `__export(${namespace}, {
+  object: () => object,
+  string: () => string
+});
+`,
+      );
+    },
+  },
+  {
     name: "reassigned authenticated generated namespace",
     requiresZod: true,
     mutate: (bundle: string) =>
@@ -616,6 +700,143 @@ mutateArtifact(artifact);
         "artifact",
       ),
     ),
+  },
+  {
+    name: "pre-entry authored helper call mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+function mutateArtifact(value) {
+  value.agent = null;
+}
+mutateArtifact.call(null, artifact);
+`,
+        ),
+        "artifact",
+      ),
+  },
+  {
+    name: "pre-entry authored helper apply mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+function mutateArtifact(value) {
+  value.agent = null;
+}
+mutateArtifact.apply(null, [artifact]);
+`,
+        ),
+        "artifact",
+      ),
+  },
+  {
+    name: "pre-entry authored helper bind mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+function mutateArtifact(value) {
+  value.agent = null;
+}
+mutateArtifact.bind(null)(artifact);
+`,
+        ),
+        "artifact",
+      ),
+  },
+  {
+    name: "pre-entry authored helper bound alias mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+function mutateArtifact(value) {
+  value.agent = null;
+}
+const boundMutateArtifact = mutateArtifact.bind(null);
+boundMutateArtifact(artifact);
+`,
+        ),
+        "artifact",
+      ),
+  },
+  {
+    name: "pre-entry nested authored helper call mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `function mutateArtifact(value) {
+  value.agent = null;
+}
+function invokeMutation(value) {
+  mutateArtifact.call(null, value);
+}
+const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+invokeMutation(artifact);
+`,
+        ),
+        "artifact",
+      ),
+  },
+  {
+    name: "pre-entry wrapped Object.assign mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+Object.assign((artifact), { agent: null });
+`,
+        ),
+        "artifact",
+      ),
+  },
+  {
+    name: "pre-entry ambiguous Reflect.apply mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+const mutationArguments = [artifact, { agent: null }];
+Reflect.apply(Object.assign, null, mutationArguments);
+`,
+        ),
+        "artifact",
+      ),
+  },
+  {
+    name: "module default re-export",
+    mutate: (bundle: string) =>
+      `${bundle}
+export { eden_artifact_entry_default as default } from "./forged.mjs";
+`,
+  },
+  {
+    name: "extra default export declaration",
+    mutate: (bundle: string) => {
+      const marker =
+        "var eden_artifact_entry_default = Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap });";
+      expect(bundle).toContain(marker);
+      return bundle
+        .replace(
+          marker,
+          `var extra_artifact_default = eden_artifact_entry_default;
+${marker}`,
+        )
+        .concat(
+          `
+export { extra_artifact_default as default };
+`,
+        );
+    },
   },
   {
     name: "bound Object.assign artifact mutation",
@@ -730,6 +951,38 @@ agentAlias.model = "tampered-through-destructure";`,
         `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
 const reflectSet = Reflect.set;
 reflectSet(artifact, "agent", null);`,
+      ),
+  },
+  {
+    name: "shadowed Object.assign mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "artifact",
+        `const Object = {
+  assign(target, properties) {
+    target.agent = properties.agent;
+    return target;
+  }
+};
+const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+Object.assign(artifact, { agent: null });`,
+      ),
+  },
+  {
+    name: "shadowed Reflect.set mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        bundle,
+        "artifact",
+        `const Reflect = {
+  set(target, key, value) {
+    target[key] = value;
+    return true;
+  }
+};
+const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+Reflect.set(artifact, "agent", null);`,
       ),
   },
   {
@@ -3503,6 +3756,44 @@ describe("artifact generation", () => {
     const result = await buildProject({ projectRoot: root });
     expect(result.artifacts.manifest.tools).toEqual([
       expect.objectContaining({ name: "zod-valid" }),
+    ]);
+  });
+
+  test.each([
+    ["optional", "z.object({ name: z.string() }).optional()"],
+    ["nullable", "z.object({ name: z.string() }).nullable()"],
+    [
+      "transform",
+      'z.object({ name: z.string() }).transform((value) => ({ name: value.name.trim() }))',
+    ],
+    [
+      "composed optional nullable transform",
+      'z.object({ name: z.string() }).nullable().optional().transform((value) => value ?? { name: "fallback" })',
+    ],
+  ])("accepts a valid pinned Zod %s schema chain", async (name, schema) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": `Pinned Zod ${name} chain fixture\n`,
+      "agent/tools/zod-chain.ts": `
+        import { z } from "zod";
+        export default {
+          description: "Uses a composed pinned Zod Standard Schema implementation.",
+          inputSchema: ${schema},
+          execute(input) {
+            return { value: input };
+          },
+        };
+      `,
+    });
+    await mkdir(join(root, "node_modules"), { recursive: true });
+    await symlink(
+      join(process.cwd(), "node_modules/zod"),
+      join(root, "node_modules/zod"),
+    );
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "zod-chain" }),
     ]);
   });
 

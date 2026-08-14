@@ -6024,7 +6024,15 @@ interface BundleShapeEnvironment {
     string,
     ts.Expression | "function" | "class"
   >;
+  readonly bindingExpressions: ReadonlyMap<
+    ts.Declaration,
+    ts.Expression | "function" | "class"
+  >;
+  readonly declarationForIdentifier: (
+    identifier: ts.Identifier,
+  ) => ts.Declaration | undefined;
   readonly trustedSchemaFactoryBindings: ReadonlySet<ts.VariableDeclaration>;
+  readonly trustedSchemaFactoryFunctionBindings: ReadonlySet<ts.Declaration>;
   readonly bindingDeclarations: ReadonlyMap<string, ts.Declaration>;
   readonly valueDeclarationCounts: ReadonlyMap<string, number>;
   readonly trustedGeneratedDependencyNamespaces: ReadonlySet<
@@ -6039,7 +6047,7 @@ interface BundleShapeEnvironment {
   readonly generatedExportHelperDigest: string | undefined;
   readonly invalidGeneratedExportHelperUse: boolean;
   readonly invalidGeneratedMutation: boolean;
-  readonly mutatedBindings: ReadonlySet<string>;
+  readonly mutatedBindings: ReadonlySet<ts.Declaration>;
 }
 
 const STANDARD_SCHEMA_FACTORY_NAMES = new Set([
@@ -6068,6 +6076,23 @@ const STANDARD_SCHEMA_FACTORY_NAMES = new Set([
   "tuple",
   "union",
   "unknown",
+]);
+
+const STANDARD_SCHEMA_COMPOSITION_METHOD_NAMES = new Set([
+  "and",
+  "array",
+  "brand",
+  "catch",
+  "default",
+  "describe",
+  "extend",
+  "nullable",
+  "optional",
+  "or",
+  "pipe",
+  "preprocess",
+  "readonly",
+  "transform",
 ]);
 
 function isAssignmentOperator(kind: ts.SyntaxKind): boolean {
@@ -6104,23 +6129,26 @@ function bundleRecordShape(
 }
 
 function bundleShapeForIdentifier(
-  name: string,
+  identifier: ts.Identifier,
   environment: BundleShapeEnvironment,
-  resolving: Set<string>,
+  resolving: Set<ts.Declaration>,
 ): BundleShape {
+  const name = identifier.text;
   if (name === "undefined") return { kind: "undefined" };
   if (name === "null") return { kind: "null" };
-  const binding = environment.bindings.get(name);
+  const declaration = environment.declarationForIdentifier(identifier);
+  if (declaration === undefined) return { kind: "unknown" };
+  const binding = environment.bindingExpressions.get(declaration);
   if (binding === undefined) return { kind: "unknown" };
-  if (environment.mutatedBindings.has(name)) return { kind: "unknown" };
+  if (environment.mutatedBindings.has(declaration)) return { kind: "unknown" };
   if (binding === "class") return { kind: "class" };
   if (binding === "function") return { kind: "function" };
-  if (resolving.has(name)) return { kind: "unknown" };
-  resolving.add(name);
+  if (resolving.has(declaration)) return { kind: "unknown" };
+  resolving.add(declaration);
   try {
     return bundleShapeForExpression(binding, environment, resolving);
   } finally {
-    resolving.delete(name);
+    resolving.delete(declaration);
   }
 }
 
@@ -6131,13 +6159,11 @@ function isStandardSchemaFactoryCall(
   if (!ts.isPropertyAccessExpression(expression.expression)) return false;
   const target = expression.expression.expression;
   if (!ts.isIdentifier(target)) return false;
-  const trustedNamespaceDeclaration =
-    environment.bindingDeclarations.get(target.text);
+  const trustedNamespaceDeclaration = environment.declarationForIdentifier(target);
   if (
     trustedNamespaceDeclaration === undefined ||
     !ts.isVariableDeclaration(trustedNamespaceDeclaration) ||
-    environment.valueDeclarationCounts.get(target.text) !== 1 ||
-    environment.mutatedBindings.has(target.text)
+    environment.mutatedBindings.has(trustedNamespaceDeclaration)
   ) {
     return false;
   }
@@ -6145,6 +6171,9 @@ function isStandardSchemaFactoryCall(
     STANDARD_SCHEMA_FACTORY_NAMES.has(expression.expression.name.text) &&
     environment.trustedSchemaFactoryBindings.has(
       trustedNamespaceDeclaration,
+    ) &&
+    [...environment.trustedSchemaFactoryFunctionBindings].every(
+      (declaration) => !environment.mutatedBindings.has(declaration),
     )
   );
 }
@@ -6153,12 +6182,15 @@ function isObjectMemberCall(
   expression: ts.Expression,
   objectName: string,
   propertyName: string,
+  environment?: BundleShapeEnvironment,
 ): expression is ts.PropertyAccessExpression {
   return (
     ts.isPropertyAccessExpression(expression) &&
     ts.isIdentifier(expression.expression) &&
     expression.expression.text === objectName &&
-    expression.name.text === propertyName
+    expression.name.text === propertyName &&
+    (environment === undefined ||
+      environment.declarationForIdentifier(expression.expression) === undefined)
   );
 }
 
@@ -6189,7 +6221,7 @@ function bundleShapeTruthiness(
 function bundleShapeForExpression(
   expression: ts.Expression,
   environment: BundleShapeEnvironment,
-  resolving: Set<string> = new Set(),
+  resolving: Set<ts.Declaration> = new Set(),
 ): BundleShape {
   if (ts.isParenthesizedExpression(expression)) {
     return bundleShapeForExpression(expression.expression, environment, resolving);
@@ -6205,7 +6237,7 @@ function bundleShapeForExpression(
     return bundleShapeForExpression(expression.expression, environment, resolving);
   }
   if (ts.isIdentifier(expression)) {
-    return bundleShapeForIdentifier(expression.text, environment, resolving);
+    return bundleShapeForIdentifier(expression, environment, resolving);
   }
   if (ts.isStringLiteralLike(expression)) {
     return { kind: "string", value: expression.text };
@@ -6336,7 +6368,7 @@ function bundleShapeForExpression(
         if (properties.has(property.name.text)) return { kind: "unknown" };
         properties.set(
           property.name.text,
-          bundleShapeForIdentifier(property.name.text, environment, resolving),
+          bundleShapeForIdentifier(property.name, environment, resolving),
         );
       }
     }
@@ -6347,7 +6379,13 @@ function bundleShapeForExpression(
       expression.name.text === "object" &&
       ts.isIdentifier(expression.expression)
     ) {
-      const targetBinding = environment.bindings.get(expression.expression.text);
+      const targetDeclaration = environment.declarationForIdentifier(
+        expression.expression,
+      );
+      const targetBinding =
+        targetDeclaration === undefined
+          ? undefined
+          : environment.bindingExpressions.get(targetDeclaration);
       if (
         targetBinding !== undefined &&
         !(
@@ -6516,18 +6554,37 @@ function bundleShapeForExpression(
     ) {
       return { kind: "unknown" };
     }
-    if (isObjectMemberCall(expression.expression, "Object", "freeze")) {
+    if (
+      isObjectMemberCall(
+        expression.expression,
+        "Object",
+        "freeze",
+        environment,
+      )
+    ) {
       const value = expression.arguments[0];
       return value === undefined
         ? { kind: "unknown" }
         : bundleShapeForExpression(value, environment, resolving);
     }
     if (
-      isObjectMemberCall(expression.expression, "Object", "defineProperty")
+      isObjectMemberCall(
+        expression.expression,
+        "Object",
+        "defineProperty",
+        environment,
+      )
     ) {
       return { kind: "unknown" };
     }
-    if (isObjectMemberCall(expression.expression, "Object", "assign")) {
+    if (
+      isObjectMemberCall(
+        expression.expression,
+        "Object",
+        "assign",
+        environment,
+      )
+    ) {
       const properties = new Map<string, BundleShape>();
       for (const argument of expression.arguments) {
         const value = bundleShapeForExpression(argument, environment, resolving);
@@ -6538,7 +6595,14 @@ function bundleShapeForExpression(
       }
       return bundleRecordShape(properties);
     }
-    if (isObjectMemberCall(expression.expression, "Object", "fromEntries")) {
+    if (
+      isObjectMemberCall(
+        expression.expression,
+        "Object",
+        "fromEntries",
+        environment,
+      )
+    ) {
       const argument = expression.arguments[0];
       if (argument === undefined) return { kind: "unknown" };
       const entries = bundleShapeForExpression(argument, environment, resolving);
@@ -6561,6 +6625,21 @@ function bundleShapeForExpression(
     if (isStandardSchemaFactoryCall(expression, environment)) {
       return { kind: "schema-call" };
     }
+    if (ts.isPropertyAccessExpression(expression.expression)) {
+      const receiver = bundleShapeForExpression(
+        expression.expression.expression,
+        environment,
+        resolving,
+      );
+      if (
+        receiver.kind === "schema-call" &&
+        STANDARD_SCHEMA_COMPOSITION_METHOD_NAMES.has(
+          expression.expression.name.text,
+        )
+      ) {
+        return { kind: "schema-call" };
+      }
+    }
     return { kind: "unknown" };
   }
   if (ts.isNewExpression(expression)) {
@@ -6576,15 +6655,88 @@ function bundleShapeEnvironment(
   sourceFile: ts.SourceFile,
 ): BundleShapeEnvironment {
   const bindings = new Map<string, ts.Expression | "function" | "class">();
+  const bindingExpressions = new Map<
+    ts.Declaration,
+    ts.Expression | "function" | "class"
+  >();
   const bindingDeclarations = new Map<string, ts.Declaration>();
   const valueDeclarationCounts = new Map<string, number>();
-  const functionDeclarations = new Map<string, ts.FunctionLikeDeclaration>();
+  const functionDeclarations = new Map<
+    ts.Declaration,
+    ts.FunctionLikeDeclaration
+  >();
+  const checkerOptions: ts.CompilerOptions = {
+    allowJs: true,
+    checkJs: false,
+    module: ts.ModuleKind.ESNext,
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.ES2022,
+  };
+  const compilerHost = ts.createCompilerHost(checkerOptions, true);
+  const originalGetSourceFile = compilerHost.getSourceFile.bind(compilerHost);
+  const sourceFileName = sourceFile.fileName;
+  const sameSourceFile = (fileName: string): boolean =>
+    normalize(fileName) === normalize(sourceFileName) ||
+    basename(fileName) === basename(sourceFileName);
+  compilerHost.fileExists = (fileName) =>
+    sameSourceFile(fileName) || ts.sys.fileExists(fileName);
+  compilerHost.readFile = (fileName) =>
+    sameSourceFile(fileName) ? sourceFile.text : ts.sys.readFile(fileName);
+  compilerHost.getSourceFile = (
+    fileName,
+    languageVersion,
+    onError,
+    shouldCreateNewSourceFile,
+  ) =>
+    sameSourceFile(fileName)
+      ? sourceFile
+      : originalGetSourceFile(
+          fileName,
+          languageVersion,
+          onError,
+          shouldCreateNewSourceFile,
+        );
+  const checker = ts
+    .createProgram([sourceFileName], checkerOptions, compilerHost)
+    .getTypeChecker();
+  const declarationForIdentifier = (
+    identifier: ts.Identifier,
+  ): ts.Declaration | undefined => {
+    const shorthand = ts.isShorthandPropertyAssignment(identifier.parent)
+      ? identifier.parent
+      : undefined;
+    const symbol =
+      shorthand !== undefined
+        ? checker.getShorthandAssignmentValueSymbol(shorthand)
+        : checker.getSymbolAtLocation(identifier);
+    if (symbol === undefined) return undefined;
+    return (
+      (symbol.valueDeclaration?.getSourceFile() === sourceFile
+        ? symbol.valueDeclaration
+        : undefined) ??
+      symbol.declarations?.find((declaration) => {
+        return (
+          declaration.getSourceFile() === sourceFile &&
+          (ts.isVariableDeclaration(declaration) ||
+            ts.isBindingElement(declaration) ||
+            ts.isParameter(declaration) ||
+            ts.isFunctionDeclaration(declaration) ||
+            ts.isClassDeclaration(declaration))
+        );
+      })
+    );
+  };
   const bindPattern = (
     pattern: ts.BindingName,
     initializer: ts.Expression,
   ): void => {
     if (ts.isIdentifier(pattern)) {
       bindings.set(pattern.text, initializer);
+      const declaration = declarationForIdentifier(pattern);
+      if (declaration !== undefined) {
+        bindingExpressions.set(declaration, initializer);
+      }
       return;
     }
     if (ts.isObjectBindingPattern(pattern)) {
@@ -6637,10 +6789,13 @@ function bundleShapeEnvironment(
             ts.isFunctionLike(declaration.initializer) &&
             !ts.isClassLike(declaration.initializer)
           ) {
-            functionDeclarations.set(
-              declaration.name.text,
-              declaration.initializer,
-            );
+            const bindingDeclaration = declarationForIdentifier(declaration.name);
+            if (bindingDeclaration !== undefined) {
+              functionDeclarations.set(
+                bindingDeclaration,
+                declaration.initializer,
+              );
+            }
           }
         }
       }
@@ -6649,18 +6804,32 @@ function bundleShapeEnvironment(
       statement.name !== undefined
     ) {
       bindings.set(statement.name.text, "function");
-      functionDeclarations.set(statement.name.text, statement);
+      const declaration = declarationForIdentifier(statement.name);
+      if (declaration !== undefined) {
+        bindingExpressions.set(declaration, "function");
+        functionDeclarations.set(declaration, statement);
+      }
     } else if (
       ts.isClassDeclaration(statement) &&
       statement.name !== undefined
     ) {
       bindings.set(statement.name.text, "class");
+      const declaration = declarationForIdentifier(statement.name);
+      if (declaration !== undefined) {
+        bindingExpressions.set(declaration, "class");
+      }
     }
   }
   const trustedSchemaFactoryBindings = new Set<ts.VariableDeclaration>();
+  const trustedSchemaFactoryFunctionBindings = new Set<ts.Declaration>();
+  const trustedGeneratedPropertyDefinerBindings = new Set<ts.Declaration>();
   const trustedGeneratedExportHelpers = new Set<ts.VariableDeclaration>();
   const trustedGeneratedDependencyNamespaces = new Set<
     ts.VariableDeclaration
+  >();
+  const trustedGeneratedDependencyExportCallCounts = new Map<
+    ts.VariableDeclaration,
+    number
   >();
   const generatedDependencyProvenanceBinding =
     "edenVerifiedDependencyProvenance";
@@ -6794,11 +6963,21 @@ function bundleShapeEnvironment(
       invalidGeneratedDependencyProvenance = true;
     } else {
       for (const namespace of namespaceValues) {
-        const namespaceDeclaration = bindingDeclarations.get(namespace);
+        const namespaceDeclarations = sourceFile.statements
+          .filter(ts.isVariableStatement)
+          .flatMap((statement) => [...statement.declarationList.declarations])
+          .filter(
+            (candidate) =>
+              ts.isIdentifier(candidate.name) &&
+              candidate.name.text === namespace,
+          );
+        const namespaceDeclaration =
+          namespaceDeclarations.length === 1
+            ? namespaceDeclarations[0]
+            : undefined;
         if (
           namespaceDeclaration !== undefined &&
-          ts.isVariableDeclaration(namespaceDeclaration) &&
-          valueDeclarationCounts.get(namespace) === 1
+          ts.isVariableDeclaration(namespaceDeclaration)
         ) {
           trustedGeneratedDependencyNamespaces.add(namespaceDeclaration);
         } else {
@@ -6861,13 +7040,20 @@ function bundleShapeEnvironment(
     ) {
       return false;
     }
-    const helperBinding = bindings.get(call.expression.text);
+    const helperDeclaration = declarationForIdentifier(call.expression);
+    const helperBinding =
+      helperDeclaration === undefined
+        ? undefined
+        : bindingExpressions.get(helperDeclaration);
     if (
       helperBinding === undefined ||
       typeof helperBinding === "string" ||
       !isObjectDefineProperty(helperBinding)
     ) {
       return false;
+    }
+    if (helperDeclaration !== undefined) {
+      trustedGeneratedPropertyDefinerBindings.add(helperDeclaration);
     }
     const [target, key, descriptor] = call.arguments;
     if (
@@ -6927,6 +7113,14 @@ function bundleShapeEnvironment(
         : 0),
     0,
   );
+  const generatedExportHelperDeclarationCount = sourceFile.statements
+    .filter(ts.isVariableStatement)
+    .flatMap((statement) => [...statement.declarationList.declarations])
+    .filter(
+      (declaration) =>
+        ts.isIdentifier(declaration.name) &&
+        declaration.name.text === generatedExportHelperName,
+    ).length;
   const generatedExportHelper = sourceFile.statements.find(
     (statement) =>
       isBeforeGeneratedEntry(statement) &&
@@ -6960,11 +7154,17 @@ function bundleShapeEnvironment(
     generatedExportHelperCandidateCount === 1 &&
     generatedExportHelperDigest === TRUSTED_GENERATED_EXPORT_HELPER_DIGEST
   ) {
-    const helperDeclaration = bindingDeclarations.get("__export");
+    const helperDeclaration = sourceFile.statements
+      .filter(ts.isVariableStatement)
+      .flatMap((statement) => [...statement.declarationList.declarations])
+      .find(
+        (declaration) =>
+          ts.isIdentifier(declaration.name) &&
+          declaration.name.text === generatedExportHelperName,
+      );
     if (
       helperDeclaration !== undefined &&
-      ts.isVariableDeclaration(helperDeclaration) &&
-      valueDeclarationCounts.get("__export") === 1
+      ts.isVariableDeclaration(helperDeclaration)
     ) {
       trustedGeneratedExportHelpers.add(helperDeclaration);
     }
@@ -6976,11 +7176,10 @@ function bundleShapeEnvironment(
         ts.isIdentifier(node.expression) &&
         isBeforeGeneratedEntry(node) &&
         (() => {
-          const declaration = bindingDeclarations.get(node.expression.text);
+          const declaration = declarationForIdentifier(node.expression);
           return (
             declaration !== undefined &&
             ts.isVariableDeclaration(declaration) &&
-            valueDeclarationCounts.get(node.expression.text) === 1 &&
             trustedGeneratedExportHelpers.has(declaration)
           );
         })() &&
@@ -6993,17 +7192,29 @@ function bundleShapeEnvironment(
           ts.isIdentifier(namespaceArgument) &&
           isBeforeGeneratedEntry(namespaceArgument) &&
           (() => {
-            const declaration = bindingDeclarations.get(namespaceArgument.text);
+            const declaration = declarationForIdentifier(namespaceArgument);
             return (
               declaration !== undefined &&
               ts.isVariableDeclaration(declaration) &&
-              valueDeclarationCounts.get(namespaceArgument.text) === 1 &&
               trustedGeneratedDependencyNamespaces.has(declaration)
             );
           })() &&
           exportArgument !== undefined &&
           ts.isObjectLiteralExpression(exportArgument)
         ) {
+          const namespaceDeclaration =
+            declarationForIdentifier(namespaceArgument);
+          if (
+            namespaceDeclaration !== undefined &&
+            ts.isVariableDeclaration(namespaceDeclaration)
+          ) {
+            trustedGeneratedDependencyExportCallCounts.set(
+              namespaceDeclaration,
+              (trustedGeneratedDependencyExportCallCounts.get(
+                namespaceDeclaration,
+              ) ?? 0) + 1,
+            );
+          }
           let hasFactory = false;
           let hasObject = false;
           let hasString = false;
@@ -7024,16 +7235,20 @@ function bundleShapeEnvironment(
               ts.isIdentifier(property.initializer.body) &&
               property.initializer.body.text === name
             ) {
-              const factory = property.initializer.body.text;
-              if (bindings.get(factory) === "function") {
+              const factoryDeclaration = declarationForIdentifier(
+                property.initializer.body,
+              );
+              if (
+                factoryDeclaration !== undefined &&
+                (bindingExpressions.get(factoryDeclaration) === "function" ||
+                  ts.isFunctionLike(factoryDeclaration))
+              ) {
                 hasFactory = true;
+                trustedSchemaFactoryFunctionBindings.add(factoryDeclaration);
               }
             }
           }
           if (hasFactory && hasObject && hasString) {
-            const namespaceDeclaration = bindingDeclarations.get(
-              namespaceArgument.text,
-            );
             if (
               namespaceDeclaration !== undefined &&
               ts.isVariableDeclaration(namespaceDeclaration)
@@ -7063,11 +7278,10 @@ function bundleShapeEnvironment(
       node.expression.text === "__export" &&
       (!isBeforeGeneratedEntry(node) ||
         (() => {
-          const declaration = bindingDeclarations.get(node.expression.text);
+          const declaration = declarationForIdentifier(node.expression);
           return (
             declaration === undefined ||
             !ts.isVariableDeclaration(declaration) ||
-            valueDeclarationCounts.get(node.expression.text) !== 1 ||
             !trustedGeneratedExportHelpers.has(declaration)
           );
         })())
@@ -7086,16 +7300,16 @@ function bundleShapeEnvironment(
     ts.forEachChild(node, inspectGeneratedExportHelperUse);
   }
   inspectGeneratedExportHelperUse(sourceFile);
-  const mutatedBindings = new Set<string>();
+  const mutatedBindings = new Set<ts.Declaration>();
   const bindingRoots = (
-    name: string,
-    seen: Set<string> = new Set(),
-  ): Set<string> => {
-    if (seen.has(name)) return new Set([name]);
-    seen.add(name);
-    const binding = bindings.get(name);
+    declaration: ts.Declaration,
+    seen: Set<ts.Declaration> = new Set(),
+  ): Set<ts.Declaration> => {
+    if (seen.has(declaration)) return new Set([declaration]);
+    seen.add(declaration);
+    const binding = bindingExpressions.get(declaration);
     if (binding === undefined || typeof binding === "string") {
-      return new Set([name]);
+      return new Set([declaration]);
     }
     if (!ts.isIdentifier(binding)) {
       if (
@@ -7104,22 +7318,32 @@ function bundleShapeEnvironment(
       ) {
         const expression = binding.expression;
         if (ts.isIdentifier(expression)) {
-          return bindingRoots(expression.text, seen);
+          const target = declarationForIdentifier(expression);
+          return target === undefined
+            ? new Set([declaration])
+            : bindingRoots(target, seen);
         }
       }
-      return new Set([name]);
+      return new Set([declaration]);
     }
-    return bindingRoots(binding.text, seen);
+    const target = declarationForIdentifier(binding);
+    return target === undefined
+      ? new Set([declaration])
+      : bindingRoots(target, seen);
   };
-  const mutationRoot = (expression: ts.Expression): string | undefined => {
-    let current = expression;
+  const mutationRoot = (
+    expression: ts.Expression,
+  ): ts.Declaration | undefined => {
+    let current = unwrapMutationExpression(expression);
     while (
       ts.isPropertyAccessExpression(current) ||
       ts.isElementAccessExpression(current)
     ) {
       current = current.expression;
     }
-    return ts.isIdentifier(current) ? current.text : undefined;
+    return ts.isIdentifier(current)
+      ? declarationForIdentifier(current)
+      : undefined;
   };
   const mutatedFunctionParameters = new Map<
     ts.FunctionLikeDeclaration,
@@ -7127,7 +7351,7 @@ function bundleShapeEnvironment(
   >();
   const functionParameterIndex = (
     node: ts.Node,
-    name: string,
+    parameterDeclaration: ts.Declaration,
   ): {
     readonly declaration: ts.FunctionLikeDeclaration;
     readonly index: number;
@@ -7143,10 +7367,10 @@ function bundleShapeEnvironment(
         ts.isSetAccessorDeclaration(current) ||
         ts.isConstructorDeclaration(current)
       ) {
-        const index = current.parameters.findIndex(
-          (parameter) =>
-            ts.isIdentifier(parameter.name) && parameter.name.text === name,
-        );
+        const index = current.parameters.findIndex((parameter) => {
+          if (!ts.isIdentifier(parameter.name)) return false;
+          return declarationForIdentifier(parameter.name) === parameterDeclaration;
+        });
         if (index >= 0) {
           return { declaration: current, index };
         }
@@ -7158,7 +7382,7 @@ function bundleShapeEnvironment(
   };
   const noteFunctionParameterMutation = (
     node: ts.Node,
-    root: string,
+    root: ts.Declaration,
   ): boolean => {
     const parameter = functionParameterIndex(node, root);
     if (parameter === undefined) return false;
@@ -7213,7 +7437,9 @@ function bundleShapeEnvironment(
       return undefined;
     }
     const objectName = current.expression.text;
-    if (bindings.has(objectName)) return undefined;
+    if (declarationForIdentifier(current.expression) !== undefined) {
+      return undefined;
+    }
     if (objectName === "Object" && propertyName === "assign") {
       return "object-assign";
     }
@@ -7231,9 +7457,103 @@ function bundleShapeEnvironment(
     }
     return undefined;
   };
+  const nativeMutationPropertyNames = new Set([
+    "assign",
+    "defineProperty",
+    "freeze",
+    "fromEntries",
+    "set",
+    "apply",
+  ]);
+  const isNativeMutationPropertyReference = (
+    expression: ts.Expression,
+  ): boolean => {
+    const current = unwrapMutationExpression(expression);
+    if (
+      !(
+        ts.isPropertyAccessExpression(current) ||
+        ts.isElementAccessExpression(current)
+      ) ||
+      !ts.isIdentifier(current.expression)
+    ) {
+      return false;
+    }
+    const propertyName = ts.isPropertyAccessExpression(current)
+      ? current.name.text
+      : current.argumentExpression !== undefined &&
+          ts.isStringLiteralLike(current.argumentExpression)
+        ? current.argumentExpression.text
+        : undefined;
+    return (
+      propertyName !== undefined &&
+      nativeMutationPropertyNames.has(propertyName) &&
+      (current.expression.text === "Object" ||
+        current.expression.text === "Reflect") &&
+      declarationForIdentifier(current.expression) === undefined
+    );
+  };
+  const isShadowedNativeMutationReference = (
+    expression: ts.Expression,
+    resolving: Set<ts.Declaration> = new Set(),
+  ): boolean => {
+    const current = unwrapMutationExpression(expression);
+    if (ts.isCallExpression(current)) {
+      const callee = unwrapMutationExpression(current.expression);
+      if (
+        ts.isPropertyAccessExpression(callee) &&
+        callee.name.text === "bind"
+      ) {
+        return isShadowedNativeMutationReference(callee.expression, resolving);
+      }
+    }
+    if (
+      ts.isPropertyAccessExpression(current) &&
+      (current.name.text === "call" || current.name.text === "apply")
+    ) {
+      return isShadowedNativeMutationReference(current.expression, resolving);
+    }
+    if (
+      (ts.isPropertyAccessExpression(current) ||
+        ts.isElementAccessExpression(current)) &&
+      ts.isIdentifier(current.expression)
+    ) {
+      const propertyName = ts.isPropertyAccessExpression(current)
+        ? current.name.text
+        : current.argumentExpression !== undefined &&
+            ts.isStringLiteralLike(current.argumentExpression)
+          ? current.argumentExpression.text
+          : undefined;
+      if (
+        propertyName !== undefined &&
+        nativeMutationPropertyNames.has(propertyName) &&
+        (current.expression.text === "Object" ||
+          current.expression.text === "Reflect") &&
+        declarationForIdentifier(current.expression) !== undefined
+      ) {
+        return true;
+      }
+    }
+    if (!ts.isIdentifier(current)) return false;
+    const declaration = declarationForIdentifier(current);
+    if (
+      declaration === undefined ||
+      resolving.has(declaration) ||
+      !bindingExpressions.has(declaration)
+    ) {
+      return false;
+    }
+    const binding = bindingExpressions.get(declaration);
+    if (binding === undefined || typeof binding === "string") return false;
+    resolving.add(declaration);
+    try {
+      return isShadowedNativeMutationReference(binding, resolving);
+    } finally {
+      resolving.delete(declaration);
+    }
+  };
   const mutationCallable = (
     expression: ts.Expression,
-    resolving: Set<string> = new Set(),
+    resolving: Set<ts.Declaration> = new Set(),
   ): MutationCallable | undefined => {
     const current = unwrapMutationExpression(expression);
     if (ts.isCallExpression(current)) {
@@ -7253,6 +7573,10 @@ function bundleShapeEnvironment(
         };
       }
     }
+    const direct = directMutationKind(current);
+    if (direct !== undefined) {
+      return { kind: direct, boundArguments: [] };
+    }
     if (
       ts.isPropertyAccessExpression(current) &&
       (current.name.text === "call" || current.name.text === "apply")
@@ -7264,22 +7588,22 @@ function bundleShapeEnvironment(
         invocation: current.name.text,
       };
     }
-    const direct = directMutationKind(current);
-    if (direct !== undefined) {
-      return { kind: direct, boundArguments: [] };
-    }
-    if (!ts.isIdentifier(current) || resolving.has(current.text)) {
+    if (!ts.isIdentifier(current)) {
       return undefined;
     }
-    const binding = bindings.get(current.text);
+    const declaration = declarationForIdentifier(current);
+    if (declaration === undefined || resolving.has(declaration)) {
+      return undefined;
+    }
+    const binding = bindingExpressions.get(declaration);
     if (binding === undefined || typeof binding === "string") {
       return undefined;
     }
-    resolving.add(current.text);
+    resolving.add(declaration);
     try {
       return mutationCallable(binding, resolving);
     } finally {
-      resolving.delete(current.text);
+      resolving.delete(declaration);
     }
   };
   const mutationInvocationArguments = (
@@ -7289,7 +7613,8 @@ function bundleShapeEnvironment(
     if (
       ts.isPropertyAccessExpression(callExpression) &&
       (callExpression.name.text === "call" ||
-        callExpression.name.text === "apply")
+        (callExpression.name.text === "apply" &&
+          directMutationKind(callExpression) === undefined))
     ) {
       const callable = mutationCallable(callExpression.expression);
       if (callable === undefined) return undefined;
@@ -7351,41 +7676,152 @@ function bundleShapeEnvironment(
       arguments: [...callable.boundArguments, ...node.arguments],
     };
   };
-  const functionDeclarationForExpression = (
+  interface FunctionReference {
+    readonly declaration: ts.FunctionLikeDeclaration;
+    readonly boundArguments: readonly ts.Expression[];
+  }
+  const functionReferenceForExpression = (
     expression: ts.Expression,
-    resolving: Set<string> = new Set(),
-  ): ts.FunctionLikeDeclaration | undefined => {
+    resolving: Set<ts.Declaration> = new Set(),
+  ): FunctionReference | undefined => {
     const current = unwrapMutationExpression(expression);
-    if (!ts.isIdentifier(current) || resolving.has(current.text)) {
-      return undefined;
+    if (ts.isCallExpression(current)) {
+      const callee = unwrapMutationExpression(current.expression);
+      if (
+        ts.isPropertyAccessExpression(callee) &&
+        callee.name.text === "bind"
+      ) {
+        const target = functionReferenceForExpression(
+          callee.expression,
+          resolving,
+        );
+        if (target === undefined) return undefined;
+        return {
+          declaration: target.declaration,
+          boundArguments: [
+            ...target.boundArguments,
+            ...current.arguments.slice(1),
+          ],
+        };
+      }
     }
-    const declaration = functionDeclarations.get(current.text);
-    if (declaration !== undefined) return declaration;
-    const binding = bindings.get(current.text);
     if (
-      binding === undefined ||
-      typeof binding === "string" ||
-      ts.isFunctionLike(binding)
+      ts.isPropertyAccessExpression(current) &&
+      (current.name.text === "call" || current.name.text === "apply")
     ) {
+      return functionReferenceForExpression(current.expression, resolving);
+    }
+    if (!ts.isIdentifier(current)) return undefined;
+    const bindingDeclaration = declarationForIdentifier(current);
+    if (bindingDeclaration === undefined || resolving.has(bindingDeclaration)) {
       return undefined;
     }
-    resolving.add(current.text);
+    const declaration = functionDeclarations.get(bindingDeclaration);
+    if (declaration !== undefined) {
+      return { declaration, boundArguments: [] };
+    }
+    const binding = bindingExpressions.get(bindingDeclaration);
+    if (binding === undefined || typeof binding === "string") {
+      return undefined;
+    }
+    if (ts.isFunctionLike(binding)) {
+      return {
+        declaration: binding,
+        boundArguments: [],
+      };
+    }
+    resolving.add(bindingDeclaration);
     try {
-      return functionDeclarationForExpression(binding, resolving);
+      return functionReferenceForExpression(binding, resolving);
     } finally {
-      resolving.delete(current.text);
+      resolving.delete(bindingDeclaration);
     }
   };
-  const markBindingMutation = (root: string): void => {
+  interface FunctionInvocation {
+    readonly declaration: ts.FunctionLikeDeclaration;
+    readonly arguments: readonly ts.Expression[];
+  }
+  const functionInvocationArguments = (
+    node: ts.CallExpression,
+  ): FunctionInvocation | undefined => {
+    const callee = unwrapMutationExpression(node.expression);
+    if (
+      ts.isPropertyAccessExpression(callee) &&
+      callee.name.text === "call"
+    ) {
+      const target = functionReferenceForExpression(callee.expression);
+      if (target === undefined) return undefined;
+      return {
+        declaration: target.declaration,
+        arguments: [...target.boundArguments, ...node.arguments.slice(1)],
+      };
+    }
+    if (
+      ts.isPropertyAccessExpression(callee) &&
+      callee.name.text === "apply"
+    ) {
+      const target = functionReferenceForExpression(callee.expression);
+      const argumentList = node.arguments[1];
+      if (
+        target === undefined ||
+        argumentList === undefined ||
+        !ts.isArrayLiteralExpression(argumentList) ||
+        argumentList.elements.some(ts.isSpreadElement)
+      ) {
+        return undefined;
+      }
+      return {
+        declaration: target.declaration,
+        arguments: [...target.boundArguments, ...argumentList.elements],
+      };
+    }
+    const target = functionReferenceForExpression(node.expression);
+    if (target === undefined) return undefined;
+    return {
+      declaration: target.declaration,
+      arguments: [...target.boundArguments, ...node.arguments],
+    };
+  };
+  const hasAmbiguousFunctionMutationInvocation = (
+    node: ts.CallExpression,
+  ): boolean => {
+    const callee = unwrapMutationExpression(node.expression);
+    if (
+      !ts.isPropertyAccessExpression(callee) ||
+      callee.name.text !== "apply"
+    ) {
+      return false;
+    }
+    const target = functionReferenceForExpression(callee.expression);
+    if (
+      target === undefined ||
+      !mutatedFunctionParameters.has(target.declaration)
+    ) {
+      return false;
+    }
+    const argumentList = node.arguments[1];
+    return (
+      argumentList === undefined ||
+      !ts.isArrayLiteralExpression(argumentList) ||
+      argumentList.elements.some(ts.isSpreadElement)
+    );
+  };
+  const markBindingMutation = (root: ts.Declaration): void => {
     for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
   };
+  const isUnshadowedObjectMemberCall = (
+    expression: ts.Expression,
+    propertyName: string,
+  ): boolean =>
+    isObjectMemberCall(expression, "Object", propertyName) &&
+    ts.isPropertyAccessExpression(expression) &&
+    ts.isIdentifier(expression.expression) &&
+    declarationForIdentifier(expression.expression) === undefined;
   const isAllowedGeneratedConstructionCall = (
     expression: ts.Expression,
   ): boolean =>
-    isObjectMemberCall(expression, "Object", "freeze") ||
-    isObjectMemberCall(expression, "Object", "fromEntries") ||
-    isObjectMemberCall(expression, "Object", "defineProperty") ||
-    isObjectMemberCall(expression, "Object", "assign");
+    isUnshadowedObjectMemberCall(expression, "freeze") ||
+    isUnshadowedObjectMemberCall(expression, "fromEntries");
   let invalidGeneratedMutation = false;
   const noteMutation = (): void => {
     invalidGeneratedMutation = true;
@@ -7442,19 +7878,19 @@ function bundleShapeEnvironment(
       target !== undefined &&
       ts.isIdentifier(target) &&
       (() => {
-        const declaration = bindingDeclarations.get(target.text);
+        const declaration = declarationForIdentifier(target);
         return (
           declaration !== undefined &&
           ts.isVariableDeclaration(declaration) &&
-          valueDeclarationCounts.get(target.text) === 1 &&
           trustedGeneratedDependencyNamespaces.has(declaration)
         );
       })()
     );
   };
-  const isFunctionParameterName = (name: string, node: ts.Node): boolean => {
-    return functionParameterIndex(node, name) !== undefined;
-  };
+  const isFunctionParameterDeclaration = (
+    declaration: ts.Declaration,
+    node: ts.Node,
+  ): boolean => functionParameterIndex(node, declaration) !== undefined;
   const mutationTargets = (node: ts.CallExpression): ts.Expression[] => {
     const invocation = mutationInvocationArguments(node);
     if (invocation === undefined) return [];
@@ -7470,13 +7906,29 @@ function bundleShapeEnvironment(
     const target = invocation.arguments[0];
     return target === undefined ? [] : [target];
   };
+  const hasAmbiguousMutationInvocation = (
+    node: ts.CallExpression,
+  ): boolean => {
+    if (mutationCallable(node.expression) === undefined) return false;
+    const invocation = mutationInvocationArguments(node);
+    if (invocation === undefined) return true;
+    if (invocation.callable.kind !== "reflect-apply") return false;
+    const argumentsList = invocation.arguments[2];
+    return (
+      argumentsList === undefined ||
+      !ts.isArrayLiteralExpression(argumentsList) ||
+      argumentsList.elements.some(ts.isSpreadElement)
+    );
+  };
   const markUnknownEntryMutation = (node: ts.Node): void => {
     if (!isGeneratedEntryNode(node)) return;
     if (!ts.isCallExpression(node)) return;
     const callee = node.expression;
     if (isAllowedGeneratedConstructionCall(callee)) return;
     noteMutation();
-    const root = ts.isIdentifier(callee) ? callee.text : undefined;
+    const root = ts.isIdentifier(callee)
+      ? declarationForIdentifier(callee)
+      : undefined;
     if (root !== undefined) markBindingMutation(root);
   };
   function collectMutations(node: ts.Node): void {
@@ -7491,6 +7943,17 @@ function bundleShapeEnvironment(
       noteMutation();
     }
     if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind)) {
+      if (
+        (isNativeMutationPropertyReference(node.left) ||
+          (ts.isIdentifier(node.left) &&
+            (node.left.text === "Object" || node.left.text === "Reflect") &&
+            declarationForIdentifier(node.left) === undefined)) &&
+        !isTrustedGeneratedHelperNode(node) &&
+        !isCompilerProvenanceNode(node) &&
+        !isTrustedDependencySubtree(node)
+      ) {
+        noteMutation();
+      }
       const root = mutationRoot(node.left);
       if (root !== undefined) {
         if (isGeneratedEntryNode(node)) {
@@ -7517,10 +7980,36 @@ function bundleShapeEnvironment(
     } else if (ts.isNewExpression(node) && isGeneratedEntryNode(node)) {
       noteMutation();
     } else if (ts.isCallExpression(node)) {
-      const targets = mutationTargets(node);
       const isTrustedDependencyMutation =
-        targets.length > 0 &&
         isTrustedDependencyGeneratedExportCall(node);
+      if (
+        hasAmbiguousFunctionMutationInvocation(node) &&
+        !isTrustedDependencyMutation &&
+        !isTrustedGeneratedHelperNode(node) &&
+        !isCompilerProvenanceNode(node) &&
+        !isTrustedDependencySubtree(node)
+      ) {
+        noteMutation();
+      }
+      if (
+        isShadowedNativeMutationReference(node.expression) &&
+        !isTrustedDependencyMutation &&
+        !isTrustedGeneratedHelperNode(node) &&
+        !isCompilerProvenanceNode(node) &&
+        !isTrustedDependencySubtree(node)
+      ) {
+        noteMutation();
+      }
+      if (
+        hasAmbiguousMutationInvocation(node) &&
+        !isTrustedDependencyMutation &&
+        !isTrustedGeneratedHelperNode(node) &&
+        !isCompilerProvenanceNode(node) &&
+        !isTrustedDependencySubtree(node)
+      ) {
+        noteMutation();
+      }
+      const targets = mutationTargets(node);
       if (
         targets.length > 0 &&
         !isTrustedGeneratedHelperNode(node) &&
@@ -7543,7 +8032,10 @@ function bundleShapeEnvironment(
         !isTrustedDependencySubtree(node) &&
         targets.some((target) => {
           const root = mutationRoot(target);
-          return root !== undefined && isFunctionParameterName(root, node);
+          return (
+            root !== undefined &&
+            isFunctionParameterDeclaration(root, node)
+          );
         })
       ) {
         noteMutation();
@@ -7565,15 +8057,25 @@ function bundleShapeEnvironment(
       changed = false;
       function visit(node: ts.Node): void {
         if (ts.isCallExpression(node)) {
-          const declaration = functionDeclarationForExpression(node.expression);
+          if (
+            hasAmbiguousFunctionMutationInvocation(node) &&
+            !isTrustedGeneratedHelperNode(node) &&
+            !isCompilerProvenanceNode(node) &&
+            !isTrustedDependencySubtree(node)
+          ) {
+            noteMutation();
+          }
+          const invocation = functionInvocationArguments(node);
+          const declaration = invocation?.declaration;
           const mutatedParameters =
             declaration === undefined
               ? undefined
               : mutatedFunctionParameters.get(declaration);
           if (mutatedParameters !== undefined) {
             for (const index of mutatedParameters) {
-              const argument = node.arguments[index];
+              const argument = invocation?.arguments[index];
               if (argument === undefined || ts.isSpreadElement(argument)) {
+                noteMutation();
                 continue;
               }
               const root = mutationRoot(argument);
@@ -7611,7 +8113,10 @@ function bundleShapeEnvironment(
   propagateFunctionParameterMutations();
   return {
     bindings,
+    bindingExpressions,
+    declarationForIdentifier,
     trustedSchemaFactoryBindings,
+    trustedSchemaFactoryFunctionBindings,
     bindingDeclarations,
     valueDeclarationCounts,
     trustedGeneratedDependencyNamespaces,
@@ -7623,11 +8128,19 @@ function bundleShapeEnvironment(
     invalidGeneratedExportHelperUse:
       invalidGeneratedExportHelperUse ||
       invalidGeneratedDependencyProvenance ||
+      [...trustedGeneratedDependencyExportCallCounts.values()].some(
+        (count) => count !== 1,
+      ) ||
+      [...trustedGeneratedPropertyDefinerBindings].some((declaration) =>
+        mutatedBindings.has(declaration),
+      ) ||
       generatedEntryBoundary === undefined ||
       (hasVerifiedDependencyMarker
         ? generatedExportHelperCandidateCount !== 1 ||
+          generatedExportHelperDeclarationCount !== 1 ||
           generatedExportHelperDigest !== TRUSTED_GENERATED_EXPORT_HELPER_DIGEST
-        : generatedExportHelperCandidateCount !== 0),
+        : generatedExportHelperCandidateCount !== 0 ||
+          generatedExportHelperDeclarationCount !== 0),
     invalidGeneratedMutation,
     mutatedBindings,
   };
@@ -7657,27 +8170,32 @@ function defaultBundleExpression(
   const isOwnedTarget = (expression: ts.Expression): boolean =>
     ts.isIdentifier(expression) &&
     expression.text === "eden_artifact_entry_default";
+  let defaultExportCount = 0;
+  let ownedDefaultExport: ts.Expression | undefined;
   for (const statement of sourceFile.statements) {
     if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
-      return isOwnedTarget(statement.expression)
-        ? statement.expression
-        : undefined;
+      defaultExportCount += 1;
+      if (!isOwnedTarget(statement.expression)) return undefined;
+      ownedDefaultExport = statement.expression;
+      continue;
     }
-    if (
-      ts.isExportDeclaration(statement) &&
-      statement.exportClause !== undefined &&
-      ts.isNamedExports(statement.exportClause)
-    ) {
-      const defaultSpecifier = statement.exportClause.elements.find(
-        (specifier) => specifier.name.text === "default",
-      );
-      if (defaultSpecifier !== undefined) {
-        const target = defaultSpecifier.propertyName ?? defaultSpecifier.name;
-        return isOwnedTarget(target) ? target : undefined;
+    if (ts.isExportDeclaration(statement)) {
+      if (statement.moduleSpecifier !== undefined) return undefined;
+      if (
+        statement.exportClause !== undefined &&
+        ts.isNamedExports(statement.exportClause)
+      ) {
+        for (const specifier of statement.exportClause.elements) {
+          if (specifier.name.text !== "default") continue;
+          defaultExportCount += 1;
+          const target = specifier.propertyName ?? specifier.name;
+          if (!isOwnedTarget(target)) return undefined;
+          ownedDefaultExport = target;
+        }
       }
     }
   }
-  return undefined;
+  return defaultExportCount === 1 ? ownedDefaultExport : undefined;
 }
 
 function bundleShapeProperty(
