@@ -1,16 +1,17 @@
 import { access, readFile } from "node:fs/promises";
-import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { dirname } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import { expect, test } from "vitest";
 
 import { runEdenCli } from "../packages/cli/src/index.ts";
+import {
+  runOwnedProcess,
+  snapshotOwnedProcesses,
+} from "./owned-process.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const execFileAsync = promisify(execFile);
 const wranglerEntrypoint = join(
   repositoryRoot,
   "node_modules",
@@ -20,8 +21,10 @@ const wranglerEntrypoint = join(
 );
 // The four pinned Wrangler help probes take about 1.9s without the pnpm
 // launcher and about 3.0s in Vitest. Keep the margin local to this expensive
-// assertion rather than increasing the global Vitest timeout.
+// assertion rather than increasing the global Vitest timeout. Each owned
+// child also has its own shorter cancellation deadline.
 const WRANGLER_HELP_TEST_TIMEOUT_MS = 15_000;
+const WRANGLER_HELP_PROCESS_TIMEOUT_MS = 10_000;
 
 async function readRepositoryFile(relativePath) {
   return readFile(join(repositoryRoot, relativePath), "utf8");
@@ -176,11 +179,17 @@ test(
     const helpByCommand = new Map();
     for (const command of ["deploy", "secret put", "secret delete", "delete"]) {
       const commandParts = command.split(" ");
-      const result = await execFileAsync(
-        process.execPath,
-        [wranglerEntrypoint, ...commandParts, "--help"],
-        { cwd: repositoryRoot },
-      );
+      const result = await runOwnedProcess({
+        file: process.execPath,
+        args: [wranglerEntrypoint, ...commandParts, "--help"],
+        cwd: repositoryRoot,
+        timeoutMs: WRANGLER_HELP_PROCESS_TIMEOUT_MS,
+        label: `wrangler-help-${command.replaceAll(" ", "-")}`,
+      });
+      expect(
+        result.ok,
+        `${command} Wrangler help failed: ${result.stderr || result.stdout}`,
+      ).toBe(true);
       helpByCommand.set(command, `${result.stdout}\n${result.stderr}`);
     }
 
@@ -209,3 +218,188 @@ test(
   },
   WRANGLER_HELP_TEST_TIMEOUT_MS,
 );
+
+test(
+  "aborts a hung Wrangler help child and its descendants before the next probe",
+  async () => {
+    const result = await runOwnedProcess({
+      file: process.execPath,
+      args: [
+        "-e",
+        [
+          'const { spawn } = await import("node:child_process");',
+          'process.on("SIGTERM", () => {});',
+          'spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+      ],
+      cwd: repositoryRoot,
+      timeoutMs: 150,
+      label: "wrangler-hung-help-fixture",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.timedOut).toBe(true);
+    expect(result.code).toBeNull();
+    expect(result.signal).not.toBeNull();
+    expect(result.cleanupVerified).toBe(true);
+    await expect(result.remainingPids()).resolves.toEqual([]);
+
+    const followUp = await runOwnedProcess({
+      file: process.execPath,
+      args: [
+        "-e",
+        'setTimeout(() => process.stdout.write("after-hung-wrangler"), 100)',
+      ],
+      cwd: repositoryRoot,
+      timeoutMs: 2_000,
+      label: "wrangler-follow-up",
+    });
+    expect(followUp.ok).toBe(true);
+    expect(followUp.stdout).toBe("after-hung-wrangler");
+  },
+  5_000,
+);
+
+test("classifies a signal-terminated Wrangler child as a failure", async () => {
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: [
+      "-e",
+      'setTimeout(() => process.kill(process.pid, "SIGTERM"), 100)',
+    ],
+    cwd: repositoryRoot,
+    timeoutMs: 2_000,
+    label: "wrangler-signal-fixture",
+  });
+
+  expect(result.code).toBeNull();
+  expect(result.signal).toBe("SIGTERM");
+  expect(result.ok).toBe(false);
+  expect(result.cleanupVerified).toBe(true);
+  await expect(result.remainingPids()).resolves.toEqual([]);
+});
+
+test("aborts a hung Wrangler child tree within the owned cleanup bound", async () => {
+  const controller = new globalThis.AbortController();
+  const abortTimer = globalThis.setTimeout(() => controller.abort(), 100);
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: [
+      "-e",
+      'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)',
+    ],
+    cwd: repositoryRoot,
+    timeoutMs: 5_000,
+    signal: controller.signal,
+    label: "wrangler-abort-fixture",
+  });
+  globalThis.clearTimeout(abortTimer);
+
+  expect(result.ok).toBe(false);
+  expect(result.aborted).toBe(true);
+  expect(result.cleanupVerified).toBe(true);
+  await expect(result.remainingPids()).resolves.toEqual([]);
+});
+
+test("fails closed on an empty process snapshot before recovering owned cleanup", async () => {
+  let observe = false;
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: [
+      "-e",
+      'setInterval(() => {}, 1000)',
+    ],
+    cwd: repositoryRoot,
+    timeoutMs: 1_000,
+    label: "wrangler-empty-snapshot-fixture",
+    snapshot: () => (observe ? snapshotOwnedProcesses() : []),
+  });
+
+  expect(result.ok).toBe(false);
+  expect(result.cleanupVerified).toBe(false);
+  expect(result.unresolvedCleanup).toBe(true);
+  expect(result.cleanupStatus).toBe("unresolved");
+  await expect(result.remainingPids()).resolves.toBeUndefined();
+
+  observe = true;
+  const cleanup = await result.retryCleanup();
+  expect(cleanup.cleanupVerified).toBe(true);
+  expect(cleanup.unresolvedCleanup).toBe(false);
+  expect(cleanup.remainingPids).toEqual([]);
+});
+
+test("fails closed when process observation itself is unavailable", async () => {
+  let observe = false;
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: [
+      "-e",
+      'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)',
+    ],
+    cwd: repositoryRoot,
+    timeoutMs: 1_000,
+    label: "wrangler-failed-observation-fixture",
+    snapshot: () => (observe ? snapshotOwnedProcesses() : undefined),
+  });
+
+  expect(result.ok).toBe(false);
+  expect(result.cleanupVerified).toBe(false);
+  expect(result.cleanupFailure).toBe("process-observation-failed");
+  expect(result.unresolvedCleanup).toBe(true);
+  await expect(result.remainingPids()).resolves.toBeUndefined();
+
+  observe = true;
+  const cleanup = await result.retryCleanup();
+  expect(cleanup.cleanupVerified).toBe(true);
+  expect(cleanup.remainingPids).toEqual([]);
+});
+
+test("refuses a replaced root identity before both termination escalations", async () => {
+  let replaceIdentity = false;
+  let replacementInjected = false;
+  const signals = [];
+  const snapshot = () => {
+    const entries = snapshotOwnedProcesses();
+    if (!replaceIdentity || entries === undefined) return entries;
+    return entries.map((entry) =>
+      entry.command.includes("eden-owned-wrangler-identity-replacement-")
+        ? { ...entry, command: "unrelated-replacement-process" }
+        : entry,
+    );
+  };
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: [
+      "-e",
+      'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)',
+    ],
+    cwd: repositoryRoot,
+    timeoutMs: 150,
+    label: "wrangler-identity-replacement-fixture",
+    snapshot,
+    sendSignal: (target, signal) => {
+      signals.push(signal);
+      if (signal === "SIGTERM" && !replacementInjected) {
+        replacementInjected = true;
+        replaceIdentity = true;
+      }
+      return process.kill(target, signal);
+    },
+  });
+
+  expect(result.ok).toBe(false);
+  expect(result.timedOut).toBe(true);
+  expect(result.cleanupVerified).toBe(false);
+  expect(result.unresolvedCleanup).toBe(true);
+  expect(result.cleanupFailure).toMatch(
+    /root-marker-mismatch|ownership-unverified|cleanup-unverified/u,
+  );
+  expect(signals).toEqual(["SIGTERM"]);
+  await expect(result.remainingPids()).resolves.toBeUndefined();
+
+  replaceIdentity = false;
+  const cleanup = await result.retryCleanup();
+  expect(cleanup.cleanupVerified).toBe(true);
+  expect(cleanup.remainingPids).toEqual([]);
+});

@@ -9,6 +9,12 @@ import { join } from "node:path";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
+import {
+  runOwnedProcess,
+  ownedProcessReservationCount,
+  ownedProcessReservationLabels,
+  spawnOwnedProcess,
+} from "./owned-process.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const missionManifestPath = process.env.EDEN_SERVICES_MANIFEST ??
@@ -34,31 +40,46 @@ function manifestCommands(source) {
   return commands;
 }
 
-function runShell(command, env) {
-  return new Promise((resolve) => {
-    const child = spawn("/bin/sh", ["-c", command], {
-      cwd: repositoryRoot,
-      env,
-      stdio: ["ignore", "ignore", "ignore"],
-    });
-    child.once("exit", (code, signal) => resolve({
-      code: code ?? 1,
-      signal,
-    }));
-    child.once("error", () => resolve({ code: 1, signal: null }));
+function ownedShellArgs(command) {
+  return [
+    "-e",
+    [
+      'import { spawn } from "node:child_process";',
+      `const child = spawn("/bin/sh", ["-c", ${JSON.stringify(command)}], { stdio: ["ignore", "inherit", "inherit"] });`,
+      'child.once("error", () => { process.exitCode = 1; });',
+      'child.once("exit", (code) => { process.exitCode = code ?? 1; });',
+    ].join("\n"),
+  ];
+}
+
+async function runShell(command, env) {
+  const result = await runOwnedProcess({
+    file: process.execPath,
+    args: ownedShellArgs(command),
+    cwd: repositoryRoot,
+    env,
+    label: `manifest-command-${randomUUID()}`,
+    timeoutMs: 60_000,
   });
+  return {
+    code: result.ok ? 0 : result.code ?? 1,
+    signal: result.signal,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    cleanupVerified: result.cleanupVerified,
+    error: result.error?.message,
+  };
 }
 
 function startShell(command, env) {
-  const processIdentity = `eden-manifest-${randomUUID()}`;
-  const child = spawn("/bin/sh", ["-c", command], {
-    argv0: processIdentity,
+  const child = spawnOwnedProcess({
+    file: process.execPath,
+    args: ownedShellArgs(command),
     cwd: repositoryRoot,
     env,
-    detached: process.platform !== "win32",
+    label: `manifest-${randomUUID()}`,
     stdio: ["ignore", "ignore", "ignore"],
   });
-  child.processIdentity = processIdentity;
   return child;
 }
 
@@ -99,7 +120,7 @@ function delay(milliseconds) {
 async function waitForHealth(command, env, child) {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) return false;
+    if (child.exitCode !== null || child.signalCode !== null) return false;
     const result = await runShell(command, env);
     if (result.code === 0) return true;
     await delay(250);
@@ -108,7 +129,7 @@ async function waitForHealth(command, env, child) {
 }
 
 async function waitForExit(child, timeout = 10_000) {
-  if (child.exitCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
   await Promise.race([
     new Promise((resolve) => child.once("exit", resolve)),
     delay(timeout),
@@ -162,9 +183,11 @@ test("checks in isolated preview and production Wrangler targets for basic-agent
   }
 });
 
-const lifecycleTest = missionManifestPath === undefined ? test.skip : test;
-
-lifecycleTest("executes the eden-local manifest lifecycle without disturbing a sentinel", async () => {
+test("executes the authoritative eden-local manifest lifecycle without disturbing a sentinel", async () => {
+  expect(
+    missionManifestPath,
+    "Authoritative local-service evidence requires EDEN_SERVICES_MANIFEST (or FACTORY_RUNTIME_SETTINGS_PATH pointing beside services.yaml).",
+  ).toBeDefined();
   const manifest = await readFile(missionManifestPath, "utf8");
   const commands = manifestCommands(manifest);
   expect(commands.start).toContain("packages/cli/dist/index.js dev");
@@ -196,28 +219,31 @@ lifecycleTest("executes the eden-local manifest lifecycle without disturbing a s
     expect(sentinel.exitCode).toBeNull();
 
     const stopped = await runShell(commands.stop, stopEnv);
-    expect(stopped.code).toBe(0);
+    expect(
+      stopped.code,
+      `${stopped.stderr || stopped.stdout} error=${stopped.error ?? "none"} signal=${stopped.signal ?? "none"} cleanup=${stopped.cleanupVerified}`,
+    ).toBe(0);
+    const ownedTerminationVerified = await service.terminateOwned();
+    expect(ownedTerminationVerified).toBe(true);
     await waitForExit(service);
-    expect(service.exitCode).not.toBeNull();
+    expect(service.exitCode !== null || service.signalCode !== null).toBe(true);
+    await expect(ownedServiceAlive(service)).resolves.toBe(false);
+    expect(
+      ownedProcessReservationCount(),
+      JSON.stringify(ownedProcessReservationLabels()),
+    ).toBe(0);
     await expect(portAvailable(8797)).resolves.toBe(true);
     await expect(portAvailable(9297)).resolves.toBe(true);
     expect(sentinel.exitCode).toBeNull();
   } finally {
-    if (healthy || service.exitCode === null) {
+    if (
+      healthy ||
+      (service.exitCode === null && service.signalCode === null)
+    ) {
       await runShell(commands.stop, stopEnv);
     }
-    if (await ownedServiceAlive(service)) {
-      if (process.platform !== "win32") {
-        try {
-          process.kill(-service.pid, "SIGTERM");
-        } catch (error) {
-          if (error?.code !== "ESRCH") service.kill("SIGKILL");
-        }
-      } else {
-        service.kill("SIGTERM");
-      }
-      await waitForExit(service);
-    }
+    await service.terminateOwned();
+    await waitForExit(service);
     if (sentinel.exitCode === null) {
       sentinel.kill("SIGTERM");
       await waitForExit(sentinel);

@@ -108,6 +108,13 @@ const pinnedZodToolSource = `
   };
 `;
 
+// Each composed pinned-Zod generation assertion performs a fresh selected-root
+// bundle and semantic validation. Three isolated runs measured the four-case
+// group at 5.62s–5.69s of test work (6.82s–6.91s wall time), while individual
+// cases remain well below this budget. Keep the timeout scoped to this exact
+// expensive assertion group rather than weakening the default for all tests.
+const PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS = 15_000;
+
 async function createClosedGrammarProject(
   instructions: string,
   requiresZod: boolean,
@@ -4145,7 +4152,7 @@ describe("artifact generation", () => {
     expect(result.artifacts.manifest.tools).toEqual([
       expect.objectContaining({ name: "zod-chain" }),
     ]);
-  });
+  }, PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS);
 
   test("does not exempt caller values flowing through verified Zod calls", async () => {
     const root = await createProject({
