@@ -2074,6 +2074,7 @@ function bundleEntrySource(
     .join(",\n    ");
   return `${imports}
 
+// eden-artifact-entry.mjs
 const edenTools = Object.freeze(Object.fromEntries([
     ${toolEntries}
   ]));
@@ -2376,6 +2377,8 @@ const TRUSTED_ZOD_PACKAGE = Object.freeze({
 
 const TRUSTED_ZOD_GENERATED_DEPENDENCY_DIGEST =
   "27dc003cd49baf8edbf0da0af36edb66e18c1ce66fa10667c5ba5b9c16bbf224";
+const TRUSTED_GENERATED_EXPORT_HELPER_DIGEST =
+  "8880c33da927f05af9f8b8f873eaf291c5c30dbd61d7d1268a09615c7c33da10";
 
 function dependencyPackageRoot(relativePath: string): string | undefined {
   const segments = relativePath.split("/");
@@ -2466,10 +2469,46 @@ function generatedDependencyNamespaceNames(
     }
     if (!inPackageSection) continue;
     const match = line.text.match(
-      /^\s*(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*\{\};\s*$/u,
+      /^\s*(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*\{\};/u,
     );
     if (match?.[1] !== undefined && /_exports\d*$/u.test(match[1])) {
       namespaces.add(match[1]);
+    }
+  }
+  return [...namespaces].sort(comparePath);
+}
+
+function generatedDependencyNamespaceCandidates(
+  bundle: string,
+  packageRoot: string,
+): readonly string[] {
+  const sourceFile = ts.createSourceFile(
+    "agent-bundle.mjs",
+    bundle,
+    ts.ScriptTarget.Latest,
+    false,
+    ts.ScriptKind.JS,
+  );
+  const ranges = generatedDependencySectionRanges(bundle, packageRoot);
+  const namespaces = new Set<string>();
+  for (const statement of sourceFile.statements) {
+    const start = statement.getStart(sourceFile);
+    if (
+      !ranges.some((range) => start >= range.start && start < range.end) ||
+      !ts.isVariableStatement(statement)
+    ) {
+      continue;
+    }
+    for (const declaration of statement.declarationList.declarations) {
+      if (
+        ts.isIdentifier(declaration.name) &&
+        /_exports\d*$/u.test(declaration.name.text) &&
+        declaration.initializer !== undefined &&
+        ts.isObjectLiteralExpression(declaration.initializer) &&
+        declaration.initializer.properties.length === 0
+      ) {
+        namespaces.add(declaration.name.text);
+      }
     }
   }
   return [...namespaces].sort(comparePath);
@@ -2558,45 +2597,96 @@ function generatedDependencyNamespaceDigest(
   );
 }
 
-function generatedArtifactEntryStart(bundle: string): number {
+interface GeneratedArtifactEntryBoundary {
+  readonly markerStart: number;
+  readonly markerEnd: number;
+  readonly entryStart: number;
+  readonly defaultStart: number;
+}
+
+function generatedArtifactEntryBoundary(
+  bundle: string,
+): GeneratedArtifactEntryBoundary | undefined {
   const sourceFile = sourceFileForValidation("agent-bundle.mjs", bundle);
-  let defaultStart = -1;
-  let entryBindingStart = -1;
+  const markerRanges = new Map<number, { start: number; end: number }>();
+  const markerPattern =
+    /(?:^|\r?\n)[ \t]*\/\/ eden-artifact-entry\.mjs[ \t]*(?=\r?\n|$)/gu;
+  for (const match of bundle.matchAll(markerPattern)) {
+    const matchStart = match.index ?? 0;
+    const lineStart = bundle[matchStart] === "\n" ? matchStart + 1 : matchStart;
+    const leadingWhitespace =
+      bundle.slice(lineStart).match(/^[ \t]*/u)?.[0] ?? "";
+    const start = lineStart + leadingWhitespace.length;
+    const end = start + "// eden-artifact-entry.mjs".length;
+    markerRanges.set(start, { start, end });
+  }
   for (const statement of sourceFile.statements) {
-    if (!ts.isVariableStatement(statement)) continue;
-    if (
-      entryBindingStart < 0 &&
+    for (
+      const range of
+        ts.getLeadingCommentRanges(bundle, statement.getFullStart()) ?? []
+    ) {
+      if (range.kind !== ts.SyntaxKind.SingleLineCommentTrivia) continue;
+      if (
+        bundle.slice(range.pos, range.end).trim() !==
+        "// eden-artifact-entry.mjs"
+      ) {
+        continue;
+      }
+      markerRanges.set(range.pos, { start: range.pos, end: range.end });
+    }
+  }
+  const entryStatements = sourceFile.statements.filter(
+    (statement) =>
+      ts.isVariableStatement(statement) &&
       statement.declarationList.declarations.some(
         (declaration) =>
           ts.isIdentifier(declaration.name) &&
           declaration.name.text === "edenTools",
-      )
-    ) {
-      entryBindingStart = statement.getStart(sourceFile);
-    }
-    if (
-      !statement.declarationList.declarations.some(
+      ),
+  );
+  const defaultStatements = sourceFile.statements.filter(
+    (statement) =>
+      ts.isVariableStatement(statement) &&
+      statement.declarationList.declarations.some(
         (declaration) =>
           ts.isIdentifier(declaration.name) &&
           declaration.name.text === "eden_artifact_entry_default",
-      )
-    ) {
-      continue;
-    }
-    defaultStart = statement.getStart(sourceFile);
-    break;
+      ),
+  );
+  if (
+    markerRanges.size !== 1 ||
+    entryStatements.length !== 1 ||
+    defaultStatements.length !== 1
+  ) {
+    return undefined;
   }
-  if (defaultStart < 0) return -1;
-  const markerPattern =
-    /(?:^|\r?\n)\/\/ eden-artifact-entry\.mjs[ \t]*(?=\r?\n|$)/gu;
-  let markerStart = -1;
-  for (const match of bundle.slice(0, defaultStart).matchAll(markerPattern)) {
-    markerStart =
-      (match.index ?? 0) + (match[0].startsWith("\n") ? 1 : 0);
+  const marker = [...markerRanges.values()][0] as {
+    start: number;
+    end: number;
+  };
+  const entryStatement = entryStatements[0] as ts.Statement;
+  const defaultStatement = defaultStatements[0] as ts.Statement;
+  const betweenMarkerAndEntry = bundle.slice(
+    marker.end,
+    entryStatement.getStart(sourceFile),
+  );
+  if (
+    !/^\r?\n(?:[ \t]*\r?\n)?$/u.test(betweenMarkerAndEntry) ||
+    entryStatement.getStart(sourceFile) <= marker.start ||
+    defaultStatement.getStart(sourceFile) <= entryStatement.getStart(sourceFile)
+  ) {
+    return undefined;
   }
-  return markerStart >= 0 && entryBindingStart >= 0 && markerStart < entryBindingStart
-    ? markerStart
-    : -1;
+  return {
+    markerStart: marker.start,
+    markerEnd: marker.end,
+    entryStart: entryStatement.getStart(sourceFile),
+    defaultStart: defaultStatement.getStart(sourceFile),
+  };
+}
+
+function generatedArtifactEntryStart(bundle: string): number {
+  return generatedArtifactEntryBoundary(bundle)?.markerStart ?? -1;
 }
 
 function attachGeneratedDependencyProvenance(
@@ -5775,7 +5865,19 @@ interface BundleShapeEnvironment {
     string,
     ts.Expression | "function" | "class"
   >;
-  readonly trustedSchemaFactoryBindings: ReadonlySet<string>;
+  readonly trustedSchemaFactoryBindings: ReadonlySet<ts.VariableDeclaration>;
+  readonly bindingDeclarations: ReadonlyMap<string, ts.Declaration>;
+  readonly valueDeclarationCounts: ReadonlyMap<string, number>;
+  readonly trustedGeneratedDependencyNamespaces: ReadonlySet<
+    ts.VariableDeclaration
+  >;
+  readonly trustedGeneratedExportHelpers: ReadonlySet<
+    ts.VariableDeclaration
+  >;
+  readonly generatedEntryBoundary: GeneratedArtifactEntryBoundary | undefined;
+  readonly hasVerifiedDependencyMarker: boolean;
+  readonly generatedExportHelperCandidateCount: number;
+  readonly generatedExportHelperDigest: string | undefined;
   readonly invalidGeneratedExportHelperUse: boolean;
   readonly invalidGeneratedMutation: boolean;
   readonly mutatedBindings: ReadonlySet<string>;
@@ -5870,9 +5972,21 @@ function isStandardSchemaFactoryCall(
   if (!ts.isPropertyAccessExpression(expression.expression)) return false;
   const target = expression.expression.expression;
   if (!ts.isIdentifier(target)) return false;
+  const trustedNamespaceDeclaration =
+    environment.bindingDeclarations.get(target.text);
+  if (
+    trustedNamespaceDeclaration === undefined ||
+    !ts.isVariableDeclaration(trustedNamespaceDeclaration) ||
+    environment.valueDeclarationCounts.get(target.text) !== 1 ||
+    environment.mutatedBindings.has(target.text)
+  ) {
+    return false;
+  }
   return (
     STANDARD_SCHEMA_FACTORY_NAMES.has(expression.expression.name.text) &&
-    environment.trustedSchemaFactoryBindings.has(target.text)
+    environment.trustedSchemaFactoryBindings.has(
+      trustedNamespaceDeclaration,
+    )
   );
 }
 
@@ -6303,6 +6417,9 @@ function bundleShapeEnvironment(
   sourceFile: ts.SourceFile,
 ): BundleShapeEnvironment {
   const bindings = new Map<string, ts.Expression | "function" | "class">();
+  const bindingDeclarations = new Map<string, ts.Declaration>();
+  const valueDeclarationCounts = new Map<string, number>();
+  const functionDeclarations = new Map<string, ts.FunctionLikeDeclaration>();
   const bindPattern = (
     pattern: ts.BindingName,
     initializer: ts.Expression,
@@ -6347,8 +6464,25 @@ function bundleShapeEnvironment(
   for (const statement of sourceFile.statements) {
     if (ts.isVariableStatement(statement)) {
       for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) {
+          bindingDeclarations.set(declaration.name.text, declaration);
+          valueDeclarationCounts.set(
+            declaration.name.text,
+            (valueDeclarationCounts.get(declaration.name.text) ?? 0) + 1,
+          );
+        }
         if (declaration.initializer !== undefined) {
           bindPattern(declaration.name, declaration.initializer);
+          if (
+            ts.isIdentifier(declaration.name) &&
+            ts.isFunctionLike(declaration.initializer) &&
+            !ts.isClassLike(declaration.initializer)
+          ) {
+            functionDeclarations.set(
+              declaration.name.text,
+              declaration.initializer,
+            );
+          }
         }
       }
     } else if (
@@ -6356,6 +6490,7 @@ function bundleShapeEnvironment(
       statement.name !== undefined
     ) {
       bindings.set(statement.name.text, "function");
+      functionDeclarations.set(statement.name.text, statement);
     } else if (
       ts.isClassDeclaration(statement) &&
       statement.name !== undefined
@@ -6363,16 +6498,29 @@ function bundleShapeEnvironment(
       bindings.set(statement.name.text, "class");
     }
   }
-  const trustedSchemaFactoryBindings = new Set<string>();
-  const trustedGeneratedExportHelpers = new Set<string>();
-  const trustedGeneratedDependencyNamespaces = new Set<string>();
+  const trustedSchemaFactoryBindings = new Set<ts.VariableDeclaration>();
+  const trustedGeneratedExportHelpers = new Set<ts.VariableDeclaration>();
+  const trustedGeneratedDependencyNamespaces = new Set<
+    ts.VariableDeclaration
+  >();
   const generatedDependencyProvenanceBinding =
     "edenVerifiedDependencyProvenance";
-  const entryStart = generatedArtifactEntryStart(sourceFile.text);
+  const generatedEntryBoundary = generatedArtifactEntryBoundary(
+    sourceFile.text,
+  );
+  const entryStart = generatedEntryBoundary?.markerStart ?? -1;
   const isBeforeGeneratedEntry = (node: ts.Node): boolean =>
     entryStart < 0 || node.getStart(sourceFile) < entryStart;
   const isGeneratedEntryNode = (node: ts.Node): boolean =>
-    entryStart >= 0 && node.getStart(sourceFile) >= entryStart;
+    generatedEntryBoundary !== undefined &&
+    node.getStart(sourceFile) >= generatedEntryBoundary.entryStart;
+  const generatedExportHelperName = "__export";
+  const generatedDependencyNamespaceNamesInSource = new Set(
+    generatedDependencyNamespaceCandidates(
+      sourceFile.text,
+      TRUSTED_ZOD_PACKAGE.root,
+    ),
+  );
   const provenanceDeclarations: ts.VariableDeclaration[] = [];
   for (const statement of sourceFile.statements) {
     if (!ts.isVariableStatement(statement)) continue;
@@ -6487,7 +6635,16 @@ function bundleShapeEnvironment(
       invalidGeneratedDependencyProvenance = true;
     } else {
       for (const namespace of namespaceValues) {
-        trustedGeneratedDependencyNamespaces.add(namespace);
+        const namespaceDeclaration = bindingDeclarations.get(namespace);
+        if (
+          namespaceDeclaration !== undefined &&
+          ts.isVariableDeclaration(namespaceDeclaration) &&
+          valueDeclarationCounts.get(namespace) === 1
+        ) {
+          trustedGeneratedDependencyNamespaces.add(namespaceDeclaration);
+        } else {
+          invalidGeneratedDependencyProvenance = true;
+        }
       }
     }
   }
@@ -6622,9 +6779,18 @@ function bundleShapeEnvironment(
           isGeneratedExportHelper(declaration),
       ),
   );
+  const generatedExportHelperDigest =
+    generatedExportHelper === undefined
+      ? undefined
+      : sha256(generatedExportHelper.getText(sourceFile).replace(/\r\n/gu, "\n"));
+  const hasVerifiedDependencyMarker = generatedDependencyHasPackageMarker(
+    sourceFile.text,
+    TRUSTED_ZOD_PACKAGE.root,
+  );
   const trustedGeneratedHelperRange =
     generatedExportHelper !== undefined &&
-    generatedExportHelperCandidateCount === 1
+    generatedExportHelperCandidateCount === 1 &&
+    generatedExportHelperDigest === TRUSTED_GENERATED_EXPORT_HELPER_DIGEST
       ? {
           start: generatedExportHelper.getStart(sourceFile),
           end: generatedExportHelper.getEnd(),
@@ -6632,9 +6798,17 @@ function bundleShapeEnvironment(
       : undefined;
   if (
     generatedExportHelper !== undefined &&
-    generatedExportHelperCandidateCount === 1
+    generatedExportHelperCandidateCount === 1 &&
+    generatedExportHelperDigest === TRUSTED_GENERATED_EXPORT_HELPER_DIGEST
   ) {
-    trustedGeneratedExportHelpers.add("__export");
+    const helperDeclaration = bindingDeclarations.get("__export");
+    if (
+      helperDeclaration !== undefined &&
+      ts.isVariableDeclaration(helperDeclaration) &&
+      valueDeclarationCounts.get("__export") === 1
+    ) {
+      trustedGeneratedExportHelpers.add(helperDeclaration);
+    }
   }
   for (const statement of sourceFile.statements) {
     function visit(node: ts.Node): void {
@@ -6642,7 +6816,15 @@ function bundleShapeEnvironment(
         ts.isCallExpression(node) &&
         ts.isIdentifier(node.expression) &&
         isBeforeGeneratedEntry(node) &&
-        trustedGeneratedExportHelpers.has(node.expression.text) &&
+        (() => {
+          const declaration = bindingDeclarations.get(node.expression.text);
+          return (
+            declaration !== undefined &&
+            ts.isVariableDeclaration(declaration) &&
+            valueDeclarationCounts.get(node.expression.text) === 1 &&
+            trustedGeneratedExportHelpers.has(declaration)
+          );
+        })() &&
         node.arguments.length === 2
       ) {
         const namespaceArgument = node.arguments[0];
@@ -6651,8 +6833,15 @@ function bundleShapeEnvironment(
           namespaceArgument !== undefined &&
           ts.isIdentifier(namespaceArgument) &&
           isBeforeGeneratedEntry(namespaceArgument) &&
-          bindings.get(namespaceArgument.text) !== undefined &&
-          trustedGeneratedDependencyNamespaces.has(namespaceArgument.text) &&
+          (() => {
+            const declaration = bindingDeclarations.get(namespaceArgument.text);
+            return (
+              declaration !== undefined &&
+              ts.isVariableDeclaration(declaration) &&
+              valueDeclarationCounts.get(namespaceArgument.text) === 1 &&
+              trustedGeneratedDependencyNamespaces.has(declaration)
+            );
+          })() &&
           exportArgument !== undefined &&
           ts.isObjectLiteralExpression(exportArgument)
         ) {
@@ -6683,7 +6872,15 @@ function bundleShapeEnvironment(
             }
           }
           if (hasFactory && hasObject && hasString) {
-            trustedSchemaFactoryBindings.add(namespaceArgument.text);
+            const namespaceDeclaration = bindingDeclarations.get(
+              namespaceArgument.text,
+            );
+            if (
+              namespaceDeclaration !== undefined &&
+              ts.isVariableDeclaration(namespaceDeclaration)
+            ) {
+              trustedSchemaFactoryBindings.add(namespaceDeclaration);
+            }
           }
         }
       }
@@ -6706,7 +6903,24 @@ function bundleShapeEnvironment(
       ts.isIdentifier(node.expression) &&
       node.expression.text === "__export" &&
       (!isBeforeGeneratedEntry(node) ||
-        !trustedGeneratedExportHelpers.has(node.expression.text))
+        (() => {
+          const declaration = bindingDeclarations.get(node.expression.text);
+          return (
+            declaration === undefined ||
+            !ts.isVariableDeclaration(declaration) ||
+            valueDeclarationCounts.get(node.expression.text) !== 1 ||
+            !trustedGeneratedExportHelpers.has(declaration)
+          );
+        })())
+    ) {
+      invalidGeneratedExportHelperUse = true;
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      isAssignmentOperator(node.operatorToken.kind) &&
+      ts.isIdentifier(node.left) &&
+      (node.left.text === generatedExportHelperName ||
+        generatedDependencyNamespaceNamesInSource.has(node.left.text))
     ) {
       invalidGeneratedExportHelperUse = true;
     }
@@ -6748,10 +6962,67 @@ function bundleShapeEnvironment(
     }
     return ts.isIdentifier(current) ? current.text : undefined;
   };
-  const mutationKind = (
+  const mutatedFunctionParameters = new Map<
+    ts.FunctionLikeDeclaration,
+    Set<number>
+  >();
+  const functionParameterIndex = (
+    node: ts.Node,
+    name: string,
+  ): {
+    readonly declaration: ts.FunctionLikeDeclaration;
+    readonly index: number;
+  } | undefined => {
+    let current: ts.Node | undefined = node;
+    while (current !== undefined && !ts.isSourceFile(current)) {
+      if (
+        ts.isFunctionDeclaration(current) ||
+        ts.isFunctionExpression(current) ||
+        ts.isArrowFunction(current) ||
+        ts.isMethodDeclaration(current) ||
+        ts.isGetAccessorDeclaration(current) ||
+        ts.isSetAccessorDeclaration(current) ||
+        ts.isConstructorDeclaration(current)
+      ) {
+        const index = current.parameters.findIndex(
+          (parameter) =>
+            ts.isIdentifier(parameter.name) && parameter.name.text === name,
+        );
+        if (index >= 0) {
+          return { declaration: current, index };
+        }
+        return undefined;
+      }
+      current = current.parent;
+    }
+    return undefined;
+  };
+  const noteFunctionParameterMutation = (
+    node: ts.Node,
+    root: string,
+  ): boolean => {
+    const parameter = functionParameterIndex(node, root);
+    if (parameter === undefined) return false;
+    const indexes =
+      mutatedFunctionParameters.get(parameter.declaration) ?? new Set<number>();
+    indexes.add(parameter.index);
+    mutatedFunctionParameters.set(parameter.declaration, indexes);
+    return true;
+  };
+  type MutationKind =
+    | "object-assign"
+    | "object-define-property"
+    | "reflect-set"
+    | "reflect-define-property"
+    | "reflect-apply";
+  interface MutationCallable {
+    readonly kind: MutationKind;
+    readonly boundArguments: readonly ts.Expression[];
+    readonly invocation?: "call" | "apply";
+  }
+  const unwrapMutationExpression = (
     expression: ts.Expression,
-    resolving: Set<string> = new Set(),
-  ): "object-assign" | "object-define-property" | "reflect-set" | "reflect-define-property" | "reflect-apply" | undefined => {
+  ): ts.Expression => {
     let current = expression;
     while (
       ts.isParenthesizedExpression(current) ||
@@ -6761,47 +7032,82 @@ function bundleShapeEnvironment(
     ) {
       current = current.expression;
     }
+    return current;
+  };
+  const directMutationKind = (
+    expression: ts.Expression,
+  ): MutationKind | undefined => {
+    const current = unwrapMutationExpression(expression);
+    if (
+      !ts.isPropertyAccessExpression(current) &&
+      !ts.isElementAccessExpression(current)
+    ) {
+      return undefined;
+    }
+    const propertyName = ts.isPropertyAccessExpression(current)
+      ? current.name.text
+      : current.argumentExpression !== undefined &&
+          ts.isStringLiteralLike(current.argumentExpression)
+        ? current.argumentExpression.text
+        : undefined;
+    if (propertyName === undefined || !ts.isIdentifier(current.expression)) {
+      return undefined;
+    }
+    const objectName = current.expression.text;
+    if (bindings.has(objectName)) return undefined;
+    if (objectName === "Object" && propertyName === "assign") {
+      return "object-assign";
+    }
+    if (objectName === "Object" && propertyName === "defineProperty") {
+      return "object-define-property";
+    }
+    if (objectName === "Reflect" && propertyName === "set") {
+      return "reflect-set";
+    }
+    if (objectName === "Reflect" && propertyName === "defineProperty") {
+      return "reflect-define-property";
+    }
+    if (objectName === "Reflect" && propertyName === "apply") {
+      return "reflect-apply";
+    }
+    return undefined;
+  };
+  const mutationCallable = (
+    expression: ts.Expression,
+    resolving: Set<string> = new Set(),
+  ): MutationCallable | undefined => {
+    const current = unwrapMutationExpression(expression);
     if (ts.isCallExpression(current)) {
-      const callee = current.expression;
+      const callee = unwrapMutationExpression(current.expression);
       if (
         ts.isPropertyAccessExpression(callee) &&
-        (callee.name.text === "bind" ||
-          callee.name.text === "call" ||
-          callee.name.text === "apply")
+        callee.name.text === "bind"
       ) {
-        return mutationKind(callee.expression, resolving);
+        const target = mutationCallable(callee.expression, resolving);
+        if (target === undefined) return undefined;
+        return {
+          kind: target.kind,
+          boundArguments: [
+            ...target.boundArguments,
+            ...current.arguments.slice(1),
+          ],
+        };
       }
     }
-    if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
-      const propertyName = ts.isPropertyAccessExpression(current)
-        ? current.name.text
-        : current.argumentExpression !== undefined &&
-            ts.isStringLiteralLike(current.argumentExpression)
-          ? current.argumentExpression.text
-          : undefined;
-      if (propertyName !== undefined && ts.isIdentifier(current.expression)) {
-        const objectName = current.expression.text;
-        if (!bindings.has(objectName)) {
-          if (objectName === "Object" && propertyName === "assign") {
-            return "object-assign";
-          }
-          if (objectName === "Object" && propertyName === "defineProperty") {
-            return "object-define-property";
-          }
-          if (objectName === "Reflect" && propertyName === "set") {
-            return "reflect-set";
-          }
-          if (
-            objectName === "Reflect" &&
-            propertyName === "defineProperty"
-          ) {
-            return "reflect-define-property";
-          }
-          if (objectName === "Reflect" && propertyName === "apply") {
-            return "reflect-apply";
-          }
-        }
-      }
+    if (
+      ts.isPropertyAccessExpression(current) &&
+      (current.name.text === "call" || current.name.text === "apply")
+    ) {
+      const target = mutationCallable(current.expression, resolving);
+      if (target === undefined) return undefined;
+      return {
+        ...target,
+        invocation: current.name.text,
+      };
+    }
+    const direct = directMutationKind(current);
+    if (direct !== undefined) {
+      return { kind: direct, boundArguments: [] };
     }
     if (!ts.isIdentifier(current) || resolving.has(current.text)) {
       return undefined;
@@ -6812,7 +7118,101 @@ function bundleShapeEnvironment(
     }
     resolving.add(current.text);
     try {
-      return mutationKind(binding, resolving);
+      return mutationCallable(binding, resolving);
+    } finally {
+      resolving.delete(current.text);
+    }
+  };
+  const mutationInvocationArguments = (
+    node: ts.CallExpression,
+  ): { readonly callable: MutationCallable; readonly arguments: readonly ts.Expression[] } | undefined => {
+    const callExpression = unwrapMutationExpression(node.expression);
+    if (
+      ts.isPropertyAccessExpression(callExpression) &&
+      (callExpression.name.text === "call" ||
+        callExpression.name.text === "apply")
+    ) {
+      const callable = mutationCallable(callExpression.expression);
+      if (callable === undefined) return undefined;
+      if (callExpression.name.text === "call") {
+        return {
+          callable,
+          arguments: [
+            ...callable.boundArguments,
+            ...node.arguments.slice(1),
+          ],
+        };
+      }
+      const argumentsList = node.arguments[1];
+      if (
+        argumentsList === undefined ||
+        !ts.isArrayLiteralExpression(argumentsList) ||
+        argumentsList.elements.some(ts.isSpreadElement)
+      ) {
+        return undefined;
+      }
+      return {
+        callable,
+        arguments: [
+          ...callable.boundArguments,
+          ...argumentsList.elements,
+        ],
+      };
+    }
+    const callable = mutationCallable(node.expression);
+    if (callable === undefined) return undefined;
+    if (callable.invocation === "call") {
+      return {
+        callable,
+        arguments: [
+          ...callable.boundArguments,
+          ...node.arguments.slice(1),
+        ],
+      };
+    }
+    if (callable.invocation === "apply") {
+      const argumentsList = node.arguments[1];
+      if (
+        argumentsList === undefined ||
+        !ts.isArrayLiteralExpression(argumentsList) ||
+        argumentsList.elements.some(ts.isSpreadElement)
+      ) {
+        return undefined;
+      }
+      return {
+        callable,
+        arguments: [
+          ...callable.boundArguments,
+          ...argumentsList.elements,
+        ],
+      };
+    }
+    return {
+      callable,
+      arguments: [...callable.boundArguments, ...node.arguments],
+    };
+  };
+  const functionDeclarationForExpression = (
+    expression: ts.Expression,
+    resolving: Set<string> = new Set(),
+  ): ts.FunctionLikeDeclaration | undefined => {
+    const current = unwrapMutationExpression(expression);
+    if (!ts.isIdentifier(current) || resolving.has(current.text)) {
+      return undefined;
+    }
+    const declaration = functionDeclarations.get(current.text);
+    if (declaration !== undefined) return declaration;
+    const binding = bindings.get(current.text);
+    if (
+      binding === undefined ||
+      typeof binding === "string" ||
+      ts.isFunctionLike(binding)
+    ) {
+      return undefined;
+    }
+    resolving.add(current.text);
+    try {
+      return functionDeclarationForExpression(binding, resolving);
     } finally {
       resolving.delete(current.text);
     }
@@ -6882,34 +7282,33 @@ function bundleShapeEnvironment(
     return (
       target !== undefined &&
       ts.isIdentifier(target) &&
-      trustedGeneratedDependencyNamespaces.has(target.text)
+      (() => {
+        const declaration = bindingDeclarations.get(target.text);
+        return (
+          declaration !== undefined &&
+          ts.isVariableDeclaration(declaration) &&
+          valueDeclarationCounts.get(target.text) === 1 &&
+          trustedGeneratedDependencyNamespaces.has(declaration)
+        );
+      })()
     );
   };
   const isFunctionParameterName = (name: string, node: ts.Node): boolean => {
-    let current: ts.Node | undefined = node;
-    while (current !== undefined && !ts.isSourceFile(current)) {
-      if (ts.isFunctionLike(current)) {
-        return current.parameters.some(
-          (parameter) =>
-            ts.isIdentifier(parameter.name) && parameter.name.text === name,
-        );
-      }
-      current = current.parent;
-    }
-    return false;
+    return functionParameterIndex(node, name) !== undefined;
   };
   const mutationTargets = (node: ts.CallExpression): ts.Expression[] => {
-    const kind = mutationKind(node.expression);
-    if (kind === "reflect-apply") {
-      const argumentsList = node.arguments[2];
+    const invocation = mutationInvocationArguments(node);
+    if (invocation === undefined) return [];
+    if (invocation.callable.kind === "reflect-apply") {
+      const argumentsList = invocation.arguments[2];
       return argumentsList !== undefined &&
         ts.isArrayLiteralExpression(argumentsList) &&
-        argumentsList.elements[0] !== undefined
+        argumentsList.elements[0] !== undefined &&
+        !ts.isSpreadElement(argumentsList.elements[0])
         ? [argumentsList.elements[0]]
         : [];
     }
-    if (kind === undefined) return [];
-    const target = node.arguments[0];
+    const target = invocation.arguments[0];
     return target === undefined ? [] : [target];
   };
   const markUnknownEntryMutation = (node: ts.Node): void => {
@@ -6935,10 +7334,12 @@ function bundleShapeEnvironment(
     if (ts.isBinaryExpression(node) && isAssignmentOperator(node.operatorToken.kind)) {
       const root = mutationRoot(node.left);
       if (root !== undefined) {
-        for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
-      }
-      if (isGeneratedEntryNode(node)) {
-        noteMutation();
+        if (isGeneratedEntryNode(node)) {
+          noteMutation();
+        }
+        if (!noteFunctionParameterMutation(node, root)) {
+          for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
+        }
       }
     } else if (
       (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
@@ -6947,10 +7348,12 @@ function bundleShapeEnvironment(
     ) {
       const root = mutationRoot(node.operand);
       if (root !== undefined) {
-        for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
-      }
-      if (isGeneratedEntryNode(node)) {
-        noteMutation();
+        if (isGeneratedEntryNode(node)) {
+          noteMutation();
+        }
+        if (!noteFunctionParameterMutation(node, root)) {
+          for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
+        }
       }
     } else if (ts.isNewExpression(node) && isGeneratedEntryNode(node)) {
       noteMutation();
@@ -6961,14 +7364,19 @@ function bundleShapeEnvironment(
         isTrustedDependencyGeneratedExportCall(node);
       if (
         targets.length > 0 &&
-        isGeneratedEntryNode(node) &&
         !isTrustedGeneratedHelperNode(node) &&
-        !isCompilerProvenanceNode(node)
+        !isCompilerProvenanceNode(node) &&
+        !isTrustedDependencySubtree(node) &&
+        !isTrustedDependencyMutation
       ) {
-        noteMutation();
         const root = mutationRoot(targets[0] as ts.Expression);
         if (root !== undefined) {
-          markBindingMutation(root);
+          if (isGeneratedEntryNode(node)) {
+            noteMutation();
+          }
+          if (!noteFunctionParameterMutation(node, root)) {
+            markBindingMutation(root);
+          }
         }
       }
       if (
@@ -6992,13 +7400,75 @@ function bundleShapeEnvironment(
     }
     ts.forEachChild(node, collectMutations);
   }
+  const propagateFunctionParameterMutations = (): void => {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      function visit(node: ts.Node): void {
+        if (ts.isCallExpression(node)) {
+          const declaration = functionDeclarationForExpression(node.expression);
+          const mutatedParameters =
+            declaration === undefined
+              ? undefined
+              : mutatedFunctionParameters.get(declaration);
+          if (mutatedParameters !== undefined) {
+            for (const index of mutatedParameters) {
+              const argument = node.arguments[index];
+              if (argument === undefined || ts.isSpreadElement(argument)) {
+                continue;
+              }
+              const root = mutationRoot(argument);
+              if (root === undefined) {
+                if (isGeneratedEntryNode(node)) noteMutation();
+                continue;
+              }
+              const callerParameter = functionParameterIndex(node, root);
+              if (callerParameter !== undefined) {
+                const indexes =
+                  mutatedFunctionParameters.get(callerParameter.declaration) ??
+                  new Set<number>();
+                if (!indexes.has(callerParameter.index)) {
+                  indexes.add(callerParameter.index);
+                  mutatedFunctionParameters.set(
+                    callerParameter.declaration,
+                    indexes,
+                  );
+                  changed = true;
+                }
+              } else {
+                const before = new Set(mutatedBindings);
+                markBindingMutation(root);
+                if (before.size !== mutatedBindings.size) changed = true;
+              }
+            }
+          }
+        }
+        ts.forEachChild(node, visit);
+      }
+      visit(sourceFile);
+    }
+  };
   collectMutations(sourceFile);
+  propagateFunctionParameterMutations();
   return {
     bindings,
     trustedSchemaFactoryBindings,
+    bindingDeclarations,
+    valueDeclarationCounts,
+    trustedGeneratedDependencyNamespaces,
+    trustedGeneratedExportHelpers,
+    generatedEntryBoundary,
+    hasVerifiedDependencyMarker,
+    generatedExportHelperCandidateCount,
+    generatedExportHelperDigest,
     invalidGeneratedExportHelperUse:
       invalidGeneratedExportHelperUse ||
-      invalidGeneratedDependencyProvenance,
+      invalidGeneratedDependencyProvenance ||
+      generatedEntryBoundary === undefined ||
+      (hasVerifiedDependencyMarker
+        ? generatedExportHelperCandidateCount !== 1 ||
+          generatedExportHelperDigest !== TRUSTED_GENERATED_EXPORT_HELPER_DIGEST
+        : generatedExportHelperCandidateCount !== 0),
     invalidGeneratedMutation,
     mutatedBindings,
   };
@@ -7007,9 +7477,32 @@ function bundleShapeEnvironment(
 function defaultBundleExpression(
   sourceFile: ts.SourceFile,
 ): ts.Expression | undefined {
+  const boundary = generatedArtifactEntryBoundary(sourceFile.text);
+  const defaultDeclarations = sourceFile.statements.flatMap((statement) =>
+    ts.isVariableStatement(statement)
+      ? statement.declarationList.declarations.filter(
+          (declaration) =>
+            ts.isIdentifier(declaration.name) &&
+            declaration.name.text === "eden_artifact_entry_default",
+        )
+      : [],
+  );
+  if (
+    boundary === undefined ||
+    defaultDeclarations.length !== 1 ||
+    defaultDeclarations[0]?.parent.parent.getStart(sourceFile) !==
+      boundary.defaultStart
+  ) {
+    return undefined;
+  }
+  const isOwnedTarget = (expression: ts.Expression): boolean =>
+    ts.isIdentifier(expression) &&
+    expression.text === "eden_artifact_entry_default";
   for (const statement of sourceFile.statements) {
     if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
-      return statement.expression;
+      return isOwnedTarget(statement.expression)
+        ? statement.expression
+        : undefined;
     }
     if (
       ts.isExportDeclaration(statement) &&
@@ -7020,7 +7513,8 @@ function defaultBundleExpression(
         (specifier) => specifier.name.text === "default",
       );
       if (defaultSpecifier !== undefined) {
-        return defaultSpecifier.propertyName ?? defaultSpecifier.name;
+        const target = defaultSpecifier.propertyName ?? defaultSpecifier.name;
+        return isOwnedTarget(target) ? target : undefined;
       }
     }
   }
@@ -7254,7 +7748,7 @@ function assertRuntimeBundleContract(
   if (environment.invalidGeneratedExportHelperUse) {
     artifactSchemaFailure(
       "agent-bundle.mjs",
-      "contains an unverified generated export helper declaration or use.",
+      `contains an unverified generated export helper declaration or use (boundary=${environment.generatedEntryBoundary === undefined ? "missing" : "present"}, dependency=${environment.hasVerifiedDependencyMarker ? "present" : "absent"}, candidates=${String(environment.generatedExportHelperCandidateCount)}, digest=${environment.generatedExportHelperDigest ?? "missing"}).`,
     );
   }
   if (environment.invalidGeneratedMutation) {
@@ -9004,6 +9498,14 @@ async function publishArtifacts(
     if (!currentExists) {
       const legacy = await readLegacyArtifactSet(outputDirectory);
       if (legacy !== undefined) {
+        assertPublishedArtifactCoherence(
+          legacy.artifacts.discovery,
+          legacy.artifacts.diagnostics,
+          legacy.artifacts.manifest,
+          legacy.artifacts.moduleMap,
+          legacy.artifacts.bundle,
+          legacy.artifacts.buildMetadata,
+        );
         const legacyDirectory = join(
           generationsDirectory,
           legacy.artifacts.buildMetadata.generationId,

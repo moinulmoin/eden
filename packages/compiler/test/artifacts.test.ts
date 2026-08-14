@@ -312,6 +312,29 @@ const closedBundleGrammarCases: readonly {
   readonly requiresZod?: boolean;
 }[] = [
   {
+    name: "missing compiler entry boundary",
+    mutate: (bundle: string) =>
+      bundle.replace("// eden-artifact-entry.mjs\n", ""),
+  },
+  {
+    name: "duplicate compiler entry boundary",
+    mutate: (bundle: string) =>
+      bundle.replace(
+        "// eden-artifact-entry.mjs\n",
+        "// eden-artifact-entry.mjs\n// eden-artifact-entry.mjs\n",
+      ),
+  },
+  {
+    name: "misplaced compiler entry boundary",
+    mutate: (bundle: string) =>
+      bundle
+        .replace("// eden-artifact-entry.mjs\n", "")
+        .replace(
+          "var agent2 = agent_default;",
+          "// eden-artifact-entry.mjs\nvar agent2 = agent_default;",
+        ),
+  },
+  {
     name: "unknown object spread",
     mutate: (bundle: string) =>
       replaceBundleDefault(
@@ -496,6 +519,76 @@ const forgedInputSchema = forged_exports.object({});
       ),
   },
   {
+    name: "reassigned authenticated generated namespace",
+    requiresZod: true,
+    mutate: (bundle: string) =>
+      bundle.replace(
+        "var greet_default = {",
+        `external_exports = {
+  object() {
+    return {
+      "~standard": {
+        version: 1,
+        vendor: "forged",
+        validate(value) { return { value }; }
+      }
+    };
+  }
+};
+var greet_default = {`,
+      ),
+  },
+  {
+    name: "redeclared authenticated generated namespace",
+    requiresZod: true,
+    mutate: (bundle: string) =>
+      bundle.replace(
+        "// eden-artifact-entry.mjs\n",
+        `var external_exports = {
+  object() {
+    return {
+      "~standard": {
+        version: 1,
+        vendor: "forged",
+        validate(value) { return { value }; }
+      }
+    };
+  }
+};
+// eden-artifact-entry.mjs
+`,
+      ),
+  },
+  {
+    name: "reassigned generated export helper",
+    requiresZod: true,
+    mutate: (bundle: string) =>
+      bundle.replace(
+        "// eden-artifact-entry.mjs\n",
+        `__export = () => {};
+// eden-artifact-entry.mjs
+`,
+      ),
+  },
+  {
+    name: "repointed valid default export",
+    mutate: (bundle: string) => {
+      const marker =
+        "var eden_artifact_entry_default = Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap });";
+      expect(bundle).toContain(marker);
+      return bundle
+        .replace(
+          marker,
+          `var forged_valid_default = Object.freeze({ agent, instructions, tools, toolSchemas, moduleMap });
+${marker}`,
+        )
+        .replace(
+          "eden_artifact_entry_default as default",
+          "forged_valid_default as default",
+        );
+    },
+  },
+  {
     name: "parameter-mediated artifact mutation",
     mutate: (bundle: string) =>
       replaceBundleDefault(
@@ -509,6 +602,22 @@ mutateArtifact(artifact);`,
       ),
   },
   {
+    name: "pre-entry parameter-mediated artifact mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+function mutateArtifact(value) {
+  value.agent = null;
+}
+mutateArtifact(artifact);
+`,
+        "artifact",
+      ),
+    ),
+  },
+  {
     name: "bound Object.assign artifact mutation",
     mutate: (bundle: string) =>
       replaceBundleDefault(
@@ -518,6 +627,33 @@ mutateArtifact(artifact);`,
 const assignArtifact = Object.assign.bind(Object);
 assignArtifact(artifact, { agent: null });`,
       ),
+  },
+  {
+    name: "Object.assign call alias artifact mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+Object.assign.call(null, artifact, { agent: null });
+`,
+      ),
+      "artifact",
+    ),
+  },
+  {
+    name: "Object.assign bound-argument artifact mutation",
+    mutate: (bundle: string) =>
+      replaceBundleDefault(
+        insertBeforeGeneratedEntry(
+          bundle,
+          `const artifact = { agent, instructions, tools, toolSchemas, moduleMap };
+const assignArtifact = Object.assign.bind(null, artifact);
+assignArtifact({ agent: null });
+`,
+      ),
+      "artifact",
+    ),
   },
   {
     name: "Reflect.apply Object.assign artifact mutation",
@@ -931,7 +1067,7 @@ describe("artifact generation", () => {
       const invalidContents = replaceBundleCoherently(
         contents,
         mutate(contents["agent-bundle.mjs"]),
-        true,
+        false,
       );
       await Promise.all(
         artifactNames.map((name) =>
@@ -969,7 +1105,7 @@ describe("artifact generation", () => {
       const invalidContents = replaceBundleCoherently(
         contents,
         mutate(contents["agent-bundle.mjs"]),
-        true,
+        false,
       );
 
       await rm(join(root, ".eden"), { recursive: true, force: true });
@@ -1053,7 +1189,7 @@ describe("artifact generation", () => {
       const invalidContents = replaceBundleCoherently(
         contents,
         mutate(contents["agent-bundle.mjs"]),
-        true,
+        false,
       );
       await Promise.all(
         artifactNames.map((name) =>
