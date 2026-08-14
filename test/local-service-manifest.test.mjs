@@ -149,6 +149,8 @@ function delay(milliseconds) {
 }
 
 async function waitForHealth(command, env, child) {
+  const identityReady = await child.identityReady;
+  if (identityReady !== true) return false;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null) return false;
@@ -250,6 +252,7 @@ test("executes the authoritative eden-local manifest lifecycle without disturbin
   const service = startShell(commands.start, env);
   let healthy = false;
   try {
+    await expect(service.identityReady).resolves.toBe(true);
     healthy = await waitForHealth(commands.healthcheck, env, service);
     expect(healthy).toBe(true);
     expect(sentinel.exitCode).toBeNull();
@@ -288,3 +291,58 @@ test("executes the authoritative eden-local manifest lifecycle without disturbin
     }
   }
 }, 180_000);
+
+test(
+  "repeats the authoritative manifest lifecycle without retaining reservations",
+  async () => {
+    expect(
+      missionManifestPath,
+      "Authoritative local-service evidence requires EDEN_SERVICES_MANIFEST (or FACTORY_RUNTIME_SETTINGS_PATH pointing beside services.yaml).",
+    ).toBeDefined();
+    const manifest = await readFile(missionManifestPath, "utf8");
+    const commands = manifestCommands(manifest);
+
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      const secret = `manifest-repeat-${Date.now()}-${cycle}-${Math.random().toString(16).slice(2)}`;
+      const env = {
+        ...process.env,
+        EDEN_BEARER_SECRET: secret,
+      };
+      const stopEnv = {
+        ...env,
+        EDEN_BEARER_SECRET: undefined,
+      };
+      const service = startShell(commands.start, env);
+      try {
+        await expect(service.identityReady).resolves.toBe(true);
+        await expect(waitForHealth(commands.healthcheck, env, service)).resolves.toBe(
+          true,
+        );
+        const stopped = await runShell(commands.stop, stopEnv);
+        expect(
+          stopped.ok,
+          `${stopped.stderr || stopped.stdout} error=${stopped.error ?? "none"} signal=${stopped.signal ?? "none"} cleanup=${stopped.cleanupVerified} cleanupFailure=${stopped.cleanupFailure ?? "none"}`,
+        ).toBe(true);
+        await expect(service.terminateOwned()).resolves.toBe(true);
+        await waitForExit(service);
+        expect(service.exitCode !== null || service.signalCode !== null).toBe(
+          true,
+        );
+        expect(ownedProcessReservationCount()).toBe(0);
+        await expect(portAvailable(8797)).resolves.toBe(true);
+        await expect(portAvailable(9297)).resolves.toBe(true);
+      } finally {
+        if (service.exitCode === null && service.signalCode === null) {
+          await runShell(commands.stop, stopEnv);
+        }
+        await service.terminateOwned();
+        await waitForExit(service);
+        expect(
+          ownedProcessReservationCount(),
+          JSON.stringify(ownedProcessReservationLabels()),
+        ).toBe(0);
+      }
+    }
+  },
+  180_000,
+);

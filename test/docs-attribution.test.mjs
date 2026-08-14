@@ -11,6 +11,7 @@ import {
   ownedProcessReservationLabels,
   runOwnedProcess,
   snapshotOwnedProcesses,
+  spawnOwnedProcess,
 } from "./owned-process.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -372,6 +373,200 @@ test("retries a transient root identity observation before cleanup", async () =>
   expectNoProcessReservations("transient identity observation");
 });
 
+test("waits for delayed marker and PGID proof before advertising startup", async () => {
+  let observations = 0;
+  const snapshot = () => {
+    const entries = snapshotOwnedProcesses();
+    if (entries === undefined) return entries;
+    const root = entries.find((entry) =>
+      entry.command.includes("eden-owned-startup-delayed-proof-"),
+    );
+    if (root === undefined) return entries;
+    observations += 1;
+    if (observations === 1) {
+      return entries.map((entry) =>
+        entry.pid === root.pid
+          ? { ...entry, command: "delayed-startup-marker" }
+          : entry,
+      );
+    }
+    if (observations === 2) {
+      return entries.map((entry) =>
+        entry.pid === root.pid
+          ? { ...entry, pgid: root.pgid + 1 }
+          : entry,
+      );
+    }
+    return entries;
+  };
+  const child = spawnOwnedProcess({
+    file: process.execPath,
+    args: ["-e", "setInterval(() => {}, 1000)"],
+    cwd: repositoryRoot,
+    label: "startup-delayed-proof",
+    snapshot,
+  });
+
+  try {
+    await expect(child.identityReady).resolves.toBe(true);
+    expect(observations).toBeGreaterThanOrEqual(3);
+    expect(ownedProcessReservationCount()).toBe(1);
+  } finally {
+    await expect(child.terminateOwned()).resolves.toBe(true);
+    await expect(child.identityReady).resolves.toBe(true);
+    expectNoProcessReservations("delayed startup proof");
+  }
+});
+
+test("retries one transient failed startup snapshot before advertising identity", async () => {
+  let failedSnapshot = false;
+  let snapshots = 0;
+  const snapshot = () => {
+    snapshots += 1;
+    if (!failedSnapshot) {
+      failedSnapshot = true;
+      return undefined;
+    }
+    return snapshotOwnedProcesses();
+  };
+  const child = spawnOwnedProcess({
+    file: process.execPath,
+    args: ["-e", "setInterval(() => {}, 1000)"],
+    cwd: repositoryRoot,
+    label: "startup-transient-snapshot",
+    snapshot,
+  });
+
+  try {
+    await expect(child.identityReady).resolves.toBe(true);
+    expect(snapshots).toBeGreaterThanOrEqual(2);
+    expect(ownedProcessReservationCount()).toBe(1);
+  } finally {
+    await expect(child.terminateOwned()).resolves.toBe(true);
+    expectNoProcessReservations("transient startup snapshot");
+  }
+});
+
+test(
+  "settles a natural early exit without missing-root identity",
+  async () => {
+    const child = spawnOwnedProcess({
+      file: process.execPath,
+      args: [
+        "-e",
+        [
+          'const { spawn } = require("node:child_process");',
+          'spawn(process.execPath, ["-e", "setTimeout(() => process.stdout.write(`tail`), 350)"], { stdio: ["ignore", "inherit", "ignore"] });',
+          "setTimeout(() => process.exit(0), 25);",
+        ].join("\n"),
+      ],
+      cwd: repositoryRoot,
+      label: "natural-early-exit",
+      snapshot: () => [],
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    try {
+      await expect(child.identityReady).resolves.toBe(false);
+      expect(child.closeObserved).toBe(false);
+      const termination = child.terminateOwned();
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 100));
+      expect(child.closeObserved).toBe(false);
+      expect(ownedProcessReservationCount()).toBe(1);
+      expect(ownedProcessReservationLabels()).toContainEqual(
+        expect.objectContaining({ failure: "missing-root-process" }),
+      );
+      await expect(termination).resolves.toBe(true);
+      expectNoProcessReservations("natural early exit");
+      expect(ownedProcessReservationLabels()).not.toContainEqual(
+        expect.objectContaining({ failure: "missing-root-identity" }),
+      );
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        await child.terminateOwned();
+      }
+      expectNoProcessReservations("natural early exit cleanup");
+    }
+  },
+  10_000,
+);
+
+test("releases a reservation after startup spawn failure", async () => {
+  const child = spawnOwnedProcess({
+    file: join(repositoryRoot, "missing-owned-startup-fixture"),
+    cwd: repositoryRoot,
+    label: "startup-spawn-failure",
+  });
+
+  try {
+    await expect(child.identityReady).resolves.toBe(false);
+    if (child.closeObserved !== true) {
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+    await expect(child.terminateOwned()).resolves.toBe(true);
+    expectNoProcessReservations("startup spawn failure");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      await child.terminateOwned();
+    }
+    expectNoProcessReservations("startup spawn failure cleanup");
+  }
+});
+
+test("waits for startup identity before terminating during observation", async () => {
+  let observations = 0;
+  const signals = [];
+  const snapshot = () => {
+    const entries = snapshotOwnedProcesses();
+    if (entries === undefined) return entries;
+    const root = entries.find((entry) =>
+      entry.command.includes("eden-owned-terminate-during-startup-"),
+    );
+    if (root === undefined) return entries;
+    observations += 1;
+    if (observations <= 2) {
+      return entries.map((entry) =>
+        entry.pid === root.pid
+          ? {
+              ...entry,
+              command:
+                observations === 1
+                  ? "startup-termination-marker-delay"
+                  : entry.command,
+              pgid: observations === 2 ? root.pgid + 1 : entry.pgid,
+            }
+          : entry,
+      );
+    }
+    return entries;
+  };
+  const child = spawnOwnedProcess({
+    file: process.execPath,
+    args: ["-e", "setInterval(() => {}, 1000)"],
+    cwd: repositoryRoot,
+    label: "terminate-during-startup",
+    snapshot,
+    sendSignal: (target, signal) => {
+      signals.push(signal);
+      return process.kill(target, signal);
+    },
+  });
+
+  try {
+    const termination = child.terminateOwned();
+    await expect(child.identityReady).resolves.toBe(true);
+    await expect(termination).resolves.toBe(true);
+    expect(observations).toBeGreaterThanOrEqual(3);
+    expect(signals).toContain("SIGTERM");
+    expectNoProcessReservations("termination during startup observation");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      await child.terminateOwned();
+    }
+    expectNoProcessReservations("termination during startup cleanup");
+  }
+});
+
 test("retries a root hidden once after SIGKILL before declaring cleanup", async () => {
   let hideRootOnNextSnapshot = false;
   let rootHidden = false;
@@ -388,8 +583,10 @@ test("retries a root hidden once after SIGKILL before declaring cleanup", async 
     if (hideRootOnNextSnapshot) {
       hideRootOnNextSnapshot = false;
       rootHidden = rootPid !== undefined;
+      if (rootHidden) snapshotsAfterHide += 1;
       return entries.filter((entry) => entry.pid !== rootPid);
     }
+    if (rootHidden) snapshotsAfterHide += 1;
     return entries;
   };
   const result = await runOwnedProcess({
@@ -610,20 +807,25 @@ test(
     },
   });
 
-  expect(result.ok).toBe(false);
-  expect(result.timedOut).toBe(true);
-  expect(result.cleanupVerified).toBe(false);
-  expect(result.unresolvedCleanup).toBe(true);
-  expect(result.cleanupFailure).toMatch(
-    /root-marker-mismatch|ownership-unverified|cleanup-unverified/u,
-  );
-  expect(signals).toEqual(["SIGTERM"]);
-  await expect(result.remainingPids()).resolves.toBeUndefined();
+  try {
+    expect(result.ok).toBe(false);
+    expect(result.timedOut).toBe(true);
+    expect(result.cleanupVerified).toBe(false);
+    expect(result.unresolvedCleanup).toBe(true);
+    expect(result.cleanupFailure).toMatch(
+      /root-marker-mismatch|ownership-unverified|cleanup-unverified|process-observation-failed/u,
+    );
+    expect(signals).toEqual(["SIGTERM"]);
+    await expect(result.remainingPids()).resolves.toBeUndefined();
 
-  replaceIdentity = false;
-  const cleanup = await result.retryCleanup();
-  expect(cleanup.cleanupVerified).toBe(true);
-  expect(cleanup.remainingPids).toEqual([]);
+    replaceIdentity = false;
+    const cleanup = await result.retryCleanup();
+    expect(cleanup.cleanupVerified).toBe(true);
+    expect(cleanup.remainingPids).toEqual([]);
+  } finally {
+    replaceIdentity = false;
+    await result.retryCleanup();
+  }
   },
   10_000,
 );

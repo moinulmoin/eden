@@ -114,6 +114,15 @@ const pinnedZodToolSource = `
 // cases remain well below this budget. Keep the timeout scoped to this exact
 // expensive assertion group rather than weakening the default for all tests.
 const PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS = 15_000;
+// The closed-bundle grammar matrix performs a fresh build and authoritative
+// validation for every mutation. In the full serial artifact suite, the
+// authenticated Zod cases measured up to 4.65s under load; keep the margin
+// local to these three assertion-preserving matrices.
+const CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS = 10_000;
+// This corruption matrix reuses a staged candidate while validating every
+// published field. Full serial measurements reached 1.64s; keep its budget
+// local rather than changing Vitest's default for unrelated compiler tests.
+const MALFORMED_PUBLISHED_ARTIFACT_TEST_TIMEOUT_MS = 10_000;
 
 async function createClosedGrammarProject(
   instructions: string,
@@ -1342,6 +1351,7 @@ describe("artifact generation", () => {
         ]),
       } satisfies Partial<EdenCompilerError>);
     },
+    CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS,
   );
 
   test.each(closedBundleGrammarCases)(
@@ -1389,6 +1399,7 @@ describe("artifact generation", () => {
         code: "ENOENT",
       });
     },
+    CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS,
   );
 
   test.each(closedBundleGrammarCases)(
@@ -1468,6 +1479,7 @@ describe("artifact generation", () => {
         previous.artifacts.buildMetadata.generationId,
       );
     },
+    CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS,
   );
 
   test("keeps a resolved generation stable when CURRENT flips during reads", async () => {
@@ -4798,7 +4810,7 @@ describe("artifact generation", () => {
         "utf8",
       );
     }
-  });
+  }, MALFORMED_PUBLISHED_ARTIFACT_TEST_TIMEOUT_MS);
 
   test("accepts valid warning and info diagnostics during migration and reuse", async () => {
     const root = await createProject({

@@ -40,6 +40,10 @@ import {
 } from "../src/index.js";
 
 const roots: string[] = [];
+// These four assertions exercise the real compiler-generation and watch
+// replacement path. Keep their measured margin local to the lifecycle tests;
+// readiness, cancellation, process, and global Vitest budgets stay unchanged.
+const DEV_WATCH_LIFECYCLE_TEST_TIMEOUT_MS = 30_000;
 
 async function createRoot(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));
@@ -196,7 +200,7 @@ describe("eden dev and deploy orchestration", () => {
 
     process.emit("SIGINT");
     await expect(devPromise).resolves.toBe(0);
-  });
+  }, DEV_WATCH_LIFECYCLE_TEST_TIMEOUT_MS);
 
   test("fails closed and cleans the child when the initial runtime exposes a wrong generation", async () => {
     const root = await createRoot("eden-cli-dev-initial-wrong-generation-");
@@ -1271,7 +1275,7 @@ export default greet;
     expect(await waitForDigestChange(root, initialDigest)).not.toBe(initialDigest);
     releases.forEach((release) => release());
     await expect(devPromise).resolves.toBe(0);
-  }, 10_000);
+  }, DEV_WATCH_LIFECYCLE_TEST_TIMEOUT_MS);
 
   test("updates the running Wrangler runtime when a watch generation succeeds", async () => {
     const root = await createRoot("eden-cli-dev-watch-runtime-swap-");
@@ -1413,7 +1417,7 @@ export default greet;
       releases.splice(0).forEach((release) => release());
       await expect(devPromise).resolves.toBe(0);
     }
-  }, 10_000);
+  }, DEV_WATCH_LIFECYCLE_TEST_TIMEOUT_MS);
 
   test("keeps the previous runtime files when runtime replacement fails", async () => {
     const root = await createRoot("eden-cli-dev-watch-runtime-fallback-");
@@ -1573,7 +1577,7 @@ export default greet;
       );
       expect(temporaryRuntimeFiles).toEqual([]);
     }
-  }, 10_000);
+  }, DEV_WATCH_LIFECYCLE_TEST_TIMEOUT_MS);
 
   test("distinguishes compatibility and Wrangler dry-run failures", async () => {
     const root = await createRoot("eden-cli-deploy-failures-");

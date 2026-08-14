@@ -102,6 +102,7 @@ function createReservation(label, options = {}) {
     knownIdentities: new Map(),
     identityAttempted: false,
     lastFailure: undefined,
+    naturalExitVerified: false,
   };
 }
 
@@ -202,6 +203,15 @@ function childHasClosed(reservation) {
   );
 }
 
+// An empty process snapshot is not evidence that a terminal root exited
+// naturally. Node must first report the root's close event (or spawn failure).
+function childHasObservedTerminalEvent(reservation) {
+  return (
+    reservation.closeObserved === true ||
+    reservation.spawnFailed === true
+  );
+}
+
 function processTree(entries, root) {
   const byParent = new Map();
   for (const entry of entries) {
@@ -219,6 +229,25 @@ function processTree(entries, root) {
   };
   visit(root);
   return owned;
+}
+
+function hasPotentialOwnedProcess(reservation, entries) {
+  const rootPid = reservation.child?.pid;
+  if (rootPid === undefined) return false;
+  if (
+    entries.some(
+      (entry) =>
+        entry.pid === rootPid ||
+        entry.ppid === rootPid ||
+        (process.platform === "win32"
+          ? entry.pid === reservation.groupId
+          : reservation.groupId !== undefined &&
+            entry.pgid === reservation.groupId),
+    )
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -240,6 +269,22 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
 
   const rootPid = reservation.child?.pid;
   if (rootPid === undefined) {
+    if (
+      allowTerminalRootGone &&
+      childIsTerminal(reservation) &&
+      childHasObservedTerminalEvent(reservation)
+    ) {
+      reservation.naturalExitVerified = true;
+      reservation.lastFailure = undefined;
+      return {
+        entries,
+        owned: [],
+        rootPresent: false,
+        terminalRoot: true,
+        verified: true,
+        failure: undefined,
+      };
+    }
     reservation.lastFailure = "missing-root-pid";
     return {
       entries,
@@ -251,7 +296,23 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
   }
   const root = entries.find((entry) => entry.pid === rootPid);
   if (root === undefined) {
-    if (allowTerminalRootGone && childIsTerminal(reservation)) {
+    if (
+      allowTerminalRootGone &&
+      childIsTerminal(reservation) &&
+      childHasObservedTerminalEvent(reservation)
+    ) {
+      if (!hasPotentialOwnedProcess(reservation, entries)) {
+        reservation.naturalExitVerified = true;
+        reservation.lastFailure = undefined;
+        return {
+          entries,
+          owned: [],
+          rootPresent: false,
+          terminalRoot: true,
+          verified: true,
+          failure: undefined,
+        };
+      }
       if (
         !reservation.identityObserved ||
         reservation.observationFailed ||
@@ -590,6 +651,14 @@ async function terminateOwnedTree(reservation) {
     }
     if (!identityEstablished) {
       const settled = await waitForOwnedTreeEmpty(reservation, KILL_GRACE_MS);
+      if (settled.verified && settled.terminalRoot === true) {
+        return {
+          verified: true,
+          failure: undefined,
+          lastSignal: undefined,
+          settled,
+        };
+      }
       return {
         verified: false,
         failure: settled.failure ?? "ownership-unverified",
@@ -688,8 +757,8 @@ async function verifyAndRelease(reservation, termination) {
   const cleanupVerified =
     (termination?.verified ?? true) &&
     settled.verified &&
-    !reservation.observationFailed &&
-    !reservation.identityMismatch &&
+    (reservation.naturalExitVerified ||
+      (!reservation.observationFailed && !reservation.identityMismatch)) &&
     (reservation.child === undefined ||
       reservation.child.pid === undefined ||
       childIsTerminal(reservation) ||
@@ -1021,10 +1090,10 @@ export async function runOwnedProcess({
     reservation.identityPromise = waitForOwnedIdentity(reservation);
     const ownershipEstablished = await reservation.identityPromise;
     if (!ownershipEstablished) {
-      spawnError = new Error(
-        "Owned process identity could not be verified; cleanup failed closed.",
-      );
       if (!childIsTerminal(reservation)) {
+        spawnError = new Error(
+          "Owned process identity could not be verified; cleanup failed closed.",
+        );
         await requestTermination("ownership");
       }
     }
@@ -1092,6 +1161,8 @@ export function spawnOwnedProcess({
     child.processIdentity = reservation.marker;
     child.closeObserved = false;
     reservation.identityPromise = waitForOwnedIdentity(reservation);
+    child.identityReady = reservation.identityPromise;
+    child.awaitIdentity = () => reservation.identityPromise;
     child.terminateOwned = () => {
       if (reservation.terminatePromise !== undefined) {
         return reservation.terminatePromise;
@@ -1124,7 +1195,9 @@ export function spawnOwnedProcess({
     child.once("close", () => {
       reservation.closeObserved = true;
       child.closeObserved = true;
-      void waitForOwnedTreeEmpty(reservation, KILL_GRACE_MS).then((empty) => {
+      void Promise.resolve(reservation.identityPromise).then(() =>
+        waitForOwnedTreeEmpty(reservation, KILL_GRACE_MS),
+      ).then((empty) => {
         if (empty.verified) {
           activeReservations.delete(reservation);
           return;
