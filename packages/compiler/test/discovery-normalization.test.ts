@@ -52,7 +52,7 @@ const standardSchemaTool = `
     "~standard": {
       version: 1,
       vendor: "fixture",
-      validate(value) {
+      validate(value: { name?: string }) {
         if (!value || typeof value !== "object" || typeof value.name !== "string") {
           return { issues: [{ message: "name must be a string", path: ["name"] }] };
         }
@@ -258,7 +258,7 @@ describe("project discovery", () => {
           "~standard": {
             version: 1,
             vendor: "async-fixture",
-            async validate(value) {
+            async validate(value: unknown) {
               await Promise.resolve();
               if (typeof value !== "string") {
                 return { issues: [{ message: "expected a string" }] };

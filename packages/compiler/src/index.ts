@@ -3631,15 +3631,15 @@ function semanticWorkerBindingDiagnostics(
 
   function isAnyOrUnknownType(expression: ts.Expression): boolean {
     const type = checker.getTypeAtLocation(expression);
-    if (type.aliasSymbol?.name === "Promise") {
-      const typeArguments = type.aliasTypeArguments;
-      return (
-        typeArguments !== undefined &&
-        typeArguments.length > 0 &&
-        isAnyOrUnknownTypeValue(typeArguments[0] as ts.Type)
-      );
-    }
-    return isAnyOrUnknownTypeValue(type);
+    if (containsUnresolvedPromiseCapability(type)) return true;
+    if (!isAnyOrUnknownTypeValue(type)) return false;
+    const promiseLike = typeSymbolCandidates(type).some(
+      (symbol) =>
+        symbol.name === "Promise" ||
+        symbol.name === "PromiseLike" ||
+        symbol.name === "Thenable",
+    );
+    return !promiseLike || typeArgumentsOf(type).length === 0;
   }
 
   function isAnyOrUnknownTypeValue(type: ts.Type): boolean {
@@ -3649,26 +3649,116 @@ function semanticWorkerBindingDiagnostics(
     );
   }
 
+  function typeArgumentsOf(type: ts.Type): readonly ts.Type[] {
+    const reference = type as ts.TypeReference;
+    const argumentsForType: ts.Type[] = [];
+    const append = (values: readonly ts.Type[] | undefined): void => {
+      if (values === undefined) return;
+      for (const value of values) {
+        if (!argumentsForType.includes(value)) argumentsForType.push(value);
+      }
+    };
+    append(type.aliasTypeArguments);
+    append(reference.typeArguments);
+    if ((type.flags & ts.TypeFlags.Object) !== 0) {
+      try {
+        append(checker.getTypeArguments(reference));
+      } catch {
+        // Some synthetic noLib types are not valid TypeReference values.
+      }
+    }
+    return argumentsForType;
+  }
+
+  function typeSymbolCandidates(type: ts.Type): readonly ts.Symbol[] {
+    const reference = type as ts.TypeReference;
+    const symbols: ts.Symbol[] = [];
+    const append = (symbol: ts.Symbol | undefined): void => {
+      if (symbol !== undefined && !symbols.includes(symbol)) {
+        symbols.push(symbol);
+      }
+    };
+    append(type.symbol);
+    append(reference.target?.symbol);
+    append(type.aliasSymbol);
+    if (
+      type.aliasSymbol !== undefined &&
+      (type.aliasSymbol.flags & ts.SymbolFlags.Alias) !== 0
+    ) {
+      append(checker.getAliasedSymbol(type.aliasSymbol));
+    }
+    return symbols;
+  }
+
+  function containsUnresolvedPromiseCapability(
+    type: ts.Type,
+    seenTypes: Set<ts.Type> = new Set(),
+  ): boolean {
+    if (seenTypes.has(type)) return false;
+    seenTypes.add(type);
+    if (type.isUnionOrIntersection()) {
+      return type.types.some((constituent) =>
+        containsUnresolvedPromiseCapability(constituent, seenTypes),
+      );
+    }
+    if ((type.flags & ts.TypeFlags.TypeParameter) !== 0) {
+      const constraint = checker.getBaseConstraintOfType(type);
+      if (
+        constraint !== undefined &&
+        containsUnresolvedPromiseCapability(constraint, seenTypes)
+      ) {
+        return true;
+      }
+    }
+    const symbols = typeSymbolCandidates(type);
+    const promiseLike = symbols.some(
+      (symbol) =>
+        symbol.name === "Promise" ||
+        symbol.name === "PromiseLike" ||
+        symbol.name === "Thenable",
+    );
+    if (!promiseLike) {
+      for (const symbol of symbols) {
+        if ((symbol.flags & ts.SymbolFlags.TypeAlias) === 0) continue;
+        const declared = checker.getDeclaredTypeOfSymbol(symbol);
+        if (
+          declared !== type &&
+          containsUnresolvedPromiseCapability(
+            declared,
+            new Set(seenTypes),
+          )
+        ) {
+          return true;
+        }
+      }
+    }
+    if (
+      promiseLike &&
+      typeArgumentsOf(type).some((argument) =>
+        isAnyOrUnknownTypeValue(argument) ||
+        containsUnresolvedPromiseCapability(argument, new Set(seenTypes)),
+      )
+    ) {
+      return true;
+    }
+    const apparent = checker.getApparentType(type);
+    if (apparent !== type && !seenTypes.has(apparent)) {
+      return containsUnresolvedPromiseCapability(apparent, seenTypes);
+    }
+    return false;
+  }
+
   function isAnyOrUnknownPromiseType(expression: ts.Expression): boolean {
-    const type = checker.getTypeAtLocation(expression);
-    if (type.aliasSymbol?.name !== "Promise") return false;
-    const typeArguments = type.aliasTypeArguments;
-    return (
-      typeArguments !== undefined &&
-      typeArguments.length > 0 &&
-      isAnyOrUnknownTypeValue(typeArguments[0] as ts.Type)
+    return containsUnresolvedPromiseCapability(
+      checker.getTypeAtLocation(expression),
     );
   }
 
-  function isExplicitAnyOrUnknownValueExpression(
+  function isUnresolvedAnyOrUnknownValueExpression(
     expression: ts.Expression,
   ): boolean {
     const current = unwrapExpression(expression);
     if (!ts.isIdentifier(current)) {
-      return false;
-    }
-    const type = checker.getTypeAtLocation(current);
-    if (type.aliasSymbol?.name === "Promise") {
       return false;
     }
     if (!isAnyOrUnknownType(current)) return false;
@@ -3676,27 +3766,16 @@ function semanticWorkerBindingDiagnostics(
     return (
       symbol?.declarations?.some(
         (declaration) => {
-          if (
-            (ts.isParameter(declaration) ||
-              ts.isVariableDeclaration(declaration)) &&
-            declaration.type !== undefined
-          ) {
+          if (ts.isParameter(declaration)) {
             return true;
+          }
+          if (ts.isVariableDeclaration(declaration)) {
+            return declaration.type !== undefined;
           }
           if (!ts.isBindingElement(declaration)) return false;
           const owner = declaration.parent.parent;
-          if (
-            !ts.isParameter(owner) &&
-            !ts.isVariableDeclaration(owner)
-          ) {
-            return false;
-          }
-          if (owner.type === undefined) return false;
-          const ownerType = checker.getTypeAtLocation(owner);
-          return (
-            ownerType.aliasSymbol?.name !== "Promise" &&
-            isAnyOrUnknownTypeValue(ownerType)
-          );
+          return ts.isParameter(owner) ||
+            (ts.isVariableDeclaration(owner) && owner.type !== undefined);
         },
       ) ?? false
     );
@@ -3798,52 +3877,72 @@ function semanticWorkerBindingDiagnostics(
     );
   }
 
-  const SAFE_INPUT_METHODS = new Set(["toUpperCase", "trim"]);
-  const SAFE_INPUT_PROPERTIES = new Set(["length"]);
+  const SAFE_TYPED_METHODS = new Set(["trim", "toUpperCase"]);
+  const SAFE_TYPED_PROPERTIES = new Set(["length"]);
 
-  function isParameterBackedExpression(
+  function propertyNameOf(
+    expression: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+  ): string | undefined {
+    return ts.isPropertyAccessExpression(expression)
+      ? expression.name.text
+      : propertyNameExpression(expression.argumentExpression);
+  }
+
+  function isTrustedZodCallbackParameter(
     expression: ts.Expression,
-    seenSymbols: Set<ts.Symbol> = new Set(),
   ): boolean {
     const current = unwrapExpression(expression);
-    if (ts.isPropertyAccessExpression(current)) {
-      return isParameterBackedExpression(current.expression, seenSymbols);
-    }
-    if (ts.isElementAccessExpression(current)) {
-      return isParameterBackedExpression(current.expression, seenSymbols);
-    }
     if (!ts.isIdentifier(current)) return false;
     const symbol = checker.getSymbolAtLocation(current);
-    if (symbol === undefined || seenSymbols.has(symbol)) return false;
-    seenSymbols.add(symbol);
-    return (symbol.declarations ?? []).some((declaration) =>
-      ts.isParameter(declaration),
-    );
+    if (symbol === undefined) return false;
+    return (symbol.declarations ?? []).some((declaration) => {
+      if (!ts.isParameter(declaration)) return false;
+      const functionLike = declaration.parent;
+      const call = functionLike.parent;
+      return (
+        (ts.isArrowFunction(functionLike) ||
+          ts.isFunctionExpression(functionLike)) &&
+        ts.isCallExpression(call) &&
+        call.arguments.some((argument) => argument === functionLike) &&
+        isTrustedZodCall(call)
+      );
+    });
   }
 
-  function isSafeInputMethodCall(expression: ts.Expression): boolean {
+  function isStaticallySafeMethodReceiver(
+    expression: ts.Expression,
+    seenExpressions: Set<ts.Expression> = new Set(),
+  ): boolean {
     const current = unwrapExpression(expression);
-    if (!ts.isCallExpression(current)) return false;
-    const callee = unwrapExpression(current.expression);
+    if (seenExpressions.has(current)) return false;
+    seenExpressions.add(current);
+    if (isTrustedZodCallbackParameter(current)) return true;
     if (
-      !ts.isPropertyAccessExpression(callee) &&
-      !ts.isElementAccessExpression(callee)
+      (ts.isPropertyAccessExpression(current) ||
+        ts.isElementAccessExpression(current)) &&
+      isTrustedZodCallbackParameter(current.expression)
     ) {
-      return false;
+      return true;
     }
-    const propertyName = ts.isPropertyAccessExpression(callee)
-      ? callee.name.text
-      : propertyNameExpression(callee.argumentExpression);
-    if (propertyName === undefined || !SAFE_INPUT_METHODS.has(propertyName)) {
-      return false;
+    if (!isAnyOrUnknownType(current)) return true;
+    if (ts.isCallExpression(current)) {
+      const callee = unwrapExpression(current.expression);
+      if (
+        (ts.isPropertyAccessExpression(callee) ||
+          ts.isElementAccessExpression(callee)) &&
+        SAFE_TYPED_METHODS.has(propertyNameOf(callee) ?? "") &&
+        isStaticallySafeMethodReceiver(
+          callee.expression,
+          new Set(seenExpressions),
+        )
+      ) {
+        return true;
+      }
     }
-    return (
-      isParameterBackedExpression(callee.expression) ||
-      isSafeInputMethodCall(callee.expression)
-    );
+    return false;
   }
 
-  function isSafeInputMethodPropertyAccess(
+  function isStaticallySafeCallablePropertyAccess(
     expression: ts.Expression,
   ): boolean {
     const current = unwrapExpression(expression);
@@ -3853,20 +3952,46 @@ function semanticWorkerBindingDiagnostics(
     ) {
       return false;
     }
-    const propertyName = ts.isPropertyAccessExpression(current)
-      ? current.name.text
-      : propertyNameExpression(current.argumentExpression);
-    if (
-      propertyName !== undefined &&
-      SAFE_INPUT_PROPERTIES.has(propertyName) &&
-      isSafeInputMethodCall(current.expression)
-    ) {
-      return true;
+    const receiver = current.expression;
+    if (!isAnyOrUnknownType(receiver)) return true;
+    const propertyName = propertyNameOf(current);
+    if (propertyName === undefined) return false;
+    if (SAFE_TYPED_PROPERTIES.has(propertyName)) {
+      return isStaticallySafeMethodReceiver(receiver);
     }
     return (
-      propertyName !== undefined &&
-      SAFE_INPUT_METHODS.has(propertyName) &&
-      isSafeInputMethodCall(current.expression)
+      SAFE_TYPED_METHODS.has(propertyName) &&
+      isStaticallySafeMethodReceiver(receiver)
+    );
+  }
+
+  function isStaticallySafeMethodCall(expression: ts.Expression): boolean {
+    const current = unwrapExpression(expression);
+    if (!ts.isCallExpression(current)) return false;
+    const callee = unwrapExpression(current.expression);
+    return (
+      (ts.isPropertyAccessExpression(callee) ||
+        ts.isElementAccessExpression(callee)) &&
+      SAFE_TYPED_METHODS.has(propertyNameOf(callee) ?? "") &&
+      isStaticallySafeMethodReceiver(callee.expression)
+    );
+  }
+
+  function isCallablePropertyUse(expression: ts.Expression): boolean {
+    const current = unwrapExpression(expression);
+    let parent = current.parent;
+    while (
+      parent !== undefined &&
+      (ts.isParenthesizedExpression(parent) ||
+        ts.isAsExpression(parent) ||
+        ts.isTypeAssertionExpression(parent) ||
+        ts.isNonNullExpression(parent))
+    ) {
+      parent = parent.parent;
+    }
+    return (
+      (ts.isCallExpression(parent) || ts.isNewExpression(parent)) &&
+      unwrapExpression(parent.expression) === current
     );
   }
 
@@ -4237,7 +4362,6 @@ function semanticWorkerBindingDiagnostics(
     }
     const receiver = current.expression;
     if (isTrustedZodCall(receiver)) return false;
-    if (isSafeInputMethodPropertyAccess(current)) return false;
     const unwrappedReceiver = unwrapExpression(receiver);
     if (
       ts.isCallExpression(unwrappedReceiver) &&
@@ -4253,6 +4377,7 @@ function semanticWorkerBindingDiagnostics(
     ) {
       return true;
     }
+    if (isStaticallySafeCallablePropertyAccess(current)) return false;
     if (!isCallResultExpression(receiver)) return false;
     return isAnyOrUnknownType(receiver);
   }
@@ -4752,7 +4877,7 @@ function semanticWorkerBindingDiagnostics(
         );
         if (value !== undefined) return value;
       }
-      if (isExplicitAnyOrUnknownValueExpression(current)) {
+      if (isUnresolvedAnyOrUnknownValueExpression(current)) {
         return { kind: "unresolved-value" };
       }
       return undefined;
@@ -4806,7 +4931,10 @@ function semanticWorkerBindingDiagnostics(
         return { kind: "unknown-callable" };
       }
       if (base?.kind === "unresolved-value") {
-        return { kind: "unknown-callable" };
+        if (isStaticallySafeCallablePropertyAccess(current)) {
+          return undefined;
+        }
+        return isCallablePropertyUse(current) ? { kind: "unknown-callable" } : base;
       }
       if (base?.kind === "callable") {
         return base.returns.reduce<AmbientValue | undefined>(
@@ -4910,7 +5038,7 @@ function semanticWorkerBindingDiagnostics(
         return { kind: "unknown-callable" };
       }
       if (base?.kind === "unresolved-value") {
-        return { kind: "unknown-callable" };
+        return isCallablePropertyUse(current) ? { kind: "unknown-callable" } : base;
       }
       if (base?.kind === "callable") {
         return base.returns.reduce<AmbientValue | undefined>(
@@ -5011,6 +5139,7 @@ function semanticWorkerBindingDiagnostics(
         if (expression === undefined) continue;
         const value = resolveAmbientValue(expression, seenSymbols);
         if (value?.kind === "dynamic-code") return value;
+        if (value?.kind === "unresolved-value") continue;
         if (value !== undefined) {
           return {
             kind: "dynamic-property",
@@ -5030,6 +5159,7 @@ function semanticWorkerBindingDiagnostics(
         if (ts.isOmittedExpression(element)) continue;
         const value = resolveAmbientValue(element, seenSymbols);
         if (value?.kind === "dynamic-code") return value;
+        if (value?.kind === "unresolved-value") continue;
         if (value !== undefined) {
           return {
             kind: "dynamic-property",
@@ -5060,7 +5190,7 @@ function semanticWorkerBindingDiagnostics(
       return { kind: "callable", returns };
     }
     if (ts.isCallExpression(current)) {
-      if (isSafeInputMethodCall(current)) return undefined;
+      if (isStaticallySafeMethodCall(current)) return undefined;
       if (isTrustedZodCall(current)) return undefined;
       if (isZodImportExpression(current.expression)) {
         if (isUnresolvedZodImportExpression(current.expression)) {
@@ -5581,6 +5711,7 @@ async function validateAuthoredWorkerSources(
     moduleResolution: ts.ModuleResolutionKind.Bundler,
     noLib: true,
     skipLibCheck: true,
+    strictNullChecks: true,
     target: ts.ScriptTarget.ES2022,
   };
   const host = ts.createCompilerHost(compilerOptions);

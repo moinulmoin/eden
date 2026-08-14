@@ -71,7 +71,7 @@ const toolSource = `
     "~standard": {
       version: 1,
       vendor: "fixture",
-      validate(value) {
+      validate(value: { name?: string }) {
         if (!value || typeof value !== "object" || typeof value.name !== "string") {
           return { issues: [{ message: "name must be a string" }] };
         }
@@ -2686,6 +2686,356 @@ describe("artifact generation", () => {
     const result = await buildProject({ projectRoot: root });
     expect(result.artifacts.manifest.tools).toEqual([
       expect.objectContaining({ name: "typed-awaited-callable" }),
+    ]);
+  });
+
+  test.each([
+    [
+      "ordinary Promise interface",
+      `
+        interface Promise<T> {
+          then<U>(onfulfilled: (value: T) => U): Promise<U>;
+        }
+        function get(): Promise<any> {
+          return {} as Promise<any>;
+        }
+        export default {
+          description: "Ordinary Promise symbols must retain unresolved capability.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const first = await get();
+            first.make();
+            return { value: input.name };
+          },
+        };
+      `,
+      "first.make();",
+    ],
+    [
+      "aliased Promise<unknown>",
+      `
+        interface Promise<T> {
+          then<U>(onfulfilled: (value: T) => U): Promise<U>;
+        }
+        type UnknownPromise = Promise<unknown>;
+        function get(): UnknownPromise {
+          return {} as UnknownPromise;
+        }
+        export default {
+          description: "Aliased Promise<unknown> values must retain unresolved capability.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const first = await get();
+            const hidden = first.make;
+            hidden();
+            return { value: input.name };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "union and nullable Promise<any>",
+      `
+        interface Promise<T> {
+          then<U>(onfulfilled: (value: T) => U): Promise<U>;
+        }
+        type AnyPromise = Promise<any>;
+        type MaybePromise = AnyPromise | null;
+        function get(): MaybePromise {
+          return {} as AnyPromise;
+        }
+        export default {
+          description: "Union and nullable Promise constituents must remain unresolved.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const first = await get();
+            const property = "make";
+            const hidden = first[property];
+            hidden();
+            return { value: input.name };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "intersection and generic Promise constraint",
+      `
+        interface Promise<T> {
+          then<U>(onfulfilled: (value: T) => U): Promise<U>;
+        }
+        type AnyPromise = Promise<any> & { marker: string };
+        function get<T extends Promise<any>>(): T {
+          return {} as T;
+        }
+        export default {
+          description: "Intersection and constrained Promise values must remain unresolved.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const first = await get<AnyPromise>();
+            const second = first.make;
+            second.next();
+            return { value: input.name };
+          },
+        };
+      `,
+      "second.next();",
+    ],
+    [
+      "dependency Promise<any>",
+      `
+        import { get } from "dependency-promise";
+        export default {
+          description: "Dependency Promise symbols must retain unresolved capability.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const first = (await get()) as import("dependency-promise").Promise<any>;
+            const hidden = first.make;
+            hidden();
+            return { value: input.name };
+          },
+        };
+      `,
+      "hidden();",
+      {
+        "node_modules/dependency-promise/package.json": JSON.stringify({
+          name: "dependency-promise",
+          version: "1.0.0",
+          type: "module",
+          types: "index.ts",
+          main: "index.ts",
+        }),
+        "node_modules/dependency-promise/index.ts": `
+          export interface Promise<T> {
+            then<U>(onfulfilled: (value: T) => U): Promise<U>;
+          }
+          export function get(): Promise<any> {
+            return {} as Promise<any>;
+          }
+        `,
+      },
+    ],
+    [
+      "implicit-any execute input direct property",
+      `
+        export default {
+          description: "Implicit-any execute inputs must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            input.make();
+            return { value: input.name };
+          },
+        };
+      `,
+      "input.make();",
+    ],
+    [
+      "implicit-any extracted callable property",
+      `
+        function read(source, fallback: string) {
+          const hidden = source.make;
+          hidden();
+          return fallback;
+        }
+        export default {
+          description: "Extracted implicit-any callable properties must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "implicit-any destructured callable property",
+      `
+        function read({ make }, fallback: string) {
+          make();
+          return fallback;
+        }
+        export default {
+          description: "Destructured implicit-any callable properties must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+      "make();",
+    ],
+    [
+      "implicit-any computed callable property",
+      `
+        function read(source, fallback: string) {
+          const property = "make";
+          source[property]();
+          return fallback;
+        }
+        export default {
+          description: "Computed implicit-any callable properties must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+      "source[property]();",
+    ],
+    [
+      "implicit-any chained callable property",
+      `
+        function read(source, fallback: string) {
+          const hidden = source.make.next;
+          hidden();
+          return fallback;
+        }
+        export default {
+          description: "Chained implicit-any callable properties must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "implicit-any higher-order callable property",
+      `
+        function read(source, fallback: string) {
+          const factory = source.make;
+          const hidden = factory();
+          hidden();
+          return fallback;
+        }
+        export default {
+          description: "Higher-order implicit-any callable properties must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "unsafe implicit-any trim",
+      `
+        export default {
+          description: "Name-only trim exemptions must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(source) {
+            return { value: source.trim() };
+          },
+        };
+      `,
+      "source.trim()",
+    ],
+    [
+      "unsafe explicit any toUpperCase",
+      `
+        export default {
+          description: "Name-only toUpperCase exemptions must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(source: any | unknown) {
+            return { value: source.toUpperCase() };
+          },
+        };
+      `,
+      "source.toUpperCase()",
+    ],
+  ])("rejects %s at the unresolved callable use", async (_name, source, marker, extraFiles) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Symbol-aware callable fixture\n",
+      "agent/tools/symbol-aware-callable.ts": source,
+      ...(extraFiles ?? {}),
+    });
+    const expectedLine =
+      _name === "dependency Promise<any>"
+        ? expect.any(Number)
+        : source.slice(0, source.indexOf(marker)).split("\n").length;
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/symbol-aware-callable.ts",
+          line: expectedLine,
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
+      "typed string parameter",
+      `
+        function read(source: string, fallback: string): string {
+          return source.trim().toUpperCase() || fallback;
+        }
+        export default {
+          description: "Statically typed strings remain safe.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input: { name: string }) {
+            return { value: read(input.name, "fallback") };
+          },
+        };
+      `,
+    ],
+    [
+      "narrowed unknown string",
+      `
+        function read(source: unknown, fallback: string): string {
+          if (typeof source !== "string") return fallback;
+          return source.trim().toUpperCase();
+        }
+        export default {
+          description: "Narrowed unknown strings remain safe.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input: { name: string }) {
+            return { value: read(input.name, "fallback") };
+          },
+        };
+      `,
+    ],
+    [
+      "typed schema property",
+      `
+        const inputSchema = {
+          "~standard": {
+            version: 1,
+            vendor: "fixture",
+            validate(value: { name?: string }) {
+              if (typeof value.name !== "string") {
+                return { issues: [{ message: "name must be a string" }] };
+              }
+              return { value: { name: value.name.trim().toUpperCase() } };
+            },
+          },
+        };
+        export default {
+          description: "Statically typed schema strings remain safe.",
+          inputSchema,
+          execute(input: { name: string }) {
+            return { value: input.name };
+          },
+        };
+      `,
+    ],
+  ])("accepts %s string methods", async (_name, source) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Safe string callable fixture\n",
+      "agent/tools/safe-string-callable.ts": source,
+    });
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "safe-string-callable" }),
     ]);
   });
 
