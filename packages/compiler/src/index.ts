@@ -2981,6 +2981,14 @@ function semanticWorkerBindingDiagnostics(
          */
         readonly kind: "call-result";
       }
+    | {
+        /**
+         * An explicitly any/unknown authored value whose concrete shape is
+         * unresolved. Keep this capability through aliases, properties, and
+         * calls rather than treating the value as an ordinary unknown.
+         */
+        readonly kind: "unresolved-value";
+      }
     | { readonly kind: "unknown-callable" };
 
   const ambientValues = new Map<ts.Symbol, AmbientValue>();
@@ -2999,6 +3007,22 @@ function semanticWorkerBindingDiagnostics(
     ts.forEachChild(node, collectAmbientCandidates);
   }
   collectAmbientCandidates(sourceFile);
+
+  function awaitedExpression(
+    expression: ts.Expression,
+  ): ts.AwaitExpression | undefined {
+    let current = expression;
+    while (
+      ts.isParenthesizedExpression(current) ||
+      ts.isAsExpression(current) ||
+      ts.isTypeAssertionExpression(current) ||
+      ts.isNonNullExpression(current) ||
+      ts.isSatisfiesExpression(current)
+    ) {
+      current = current.expression;
+    }
+    return ts.isAwaitExpression(current) ? current : undefined;
+  }
 
   function unwrapExpression(expression: ts.Expression): ts.Expression {
     let current = expression;
@@ -3606,10 +3630,75 @@ function semanticWorkerBindingDiagnostics(
   }
 
   function isAnyOrUnknownType(expression: ts.Expression): boolean {
-    const flags = checker.getTypeAtLocation(expression).flags;
+    const type = checker.getTypeAtLocation(expression);
+    if (type.aliasSymbol?.name === "Promise") {
+      const typeArguments = type.aliasTypeArguments;
+      return (
+        typeArguments !== undefined &&
+        typeArguments.length > 0 &&
+        isAnyOrUnknownTypeValue(typeArguments[0] as ts.Type)
+      );
+    }
+    return isAnyOrUnknownTypeValue(type);
+  }
+
+  function isAnyOrUnknownTypeValue(type: ts.Type): boolean {
     return (
-      (flags & ts.TypeFlags.Any) !== 0 ||
-      (flags & ts.TypeFlags.Unknown) !== 0
+      (type.flags & ts.TypeFlags.Any) !== 0 ||
+      (type.flags & ts.TypeFlags.Unknown) !== 0
+    );
+  }
+
+  function isAnyOrUnknownPromiseType(expression: ts.Expression): boolean {
+    const type = checker.getTypeAtLocation(expression);
+    if (type.aliasSymbol?.name !== "Promise") return false;
+    const typeArguments = type.aliasTypeArguments;
+    return (
+      typeArguments !== undefined &&
+      typeArguments.length > 0 &&
+      isAnyOrUnknownTypeValue(typeArguments[0] as ts.Type)
+    );
+  }
+
+  function isExplicitAnyOrUnknownValueExpression(
+    expression: ts.Expression,
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (!ts.isIdentifier(current)) {
+      return false;
+    }
+    const type = checker.getTypeAtLocation(current);
+    if (type.aliasSymbol?.name === "Promise") {
+      return false;
+    }
+    if (!isAnyOrUnknownType(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    return (
+      symbol?.declarations?.some(
+        (declaration) => {
+          if (
+            (ts.isParameter(declaration) ||
+              ts.isVariableDeclaration(declaration)) &&
+            declaration.type !== undefined
+          ) {
+            return true;
+          }
+          if (!ts.isBindingElement(declaration)) return false;
+          const owner = declaration.parent.parent;
+          if (
+            !ts.isParameter(owner) &&
+            !ts.isVariableDeclaration(owner)
+          ) {
+            return false;
+          }
+          if (owner.type === undefined) return false;
+          const ownerType = checker.getTypeAtLocation(owner);
+          return (
+            ownerType.aliasSymbol?.name !== "Promise" &&
+            isAnyOrUnknownTypeValue(ownerType)
+          );
+        },
+      ) ?? false
     );
   }
 
@@ -3617,6 +3706,14 @@ function semanticWorkerBindingDiagnostics(
     expression: ts.Expression,
     seenSymbols: Set<ts.Symbol> = new Set(),
   ): boolean {
+    const awaited = awaitedExpression(expression);
+    if (
+      awaited !== undefined &&
+      (isAnyOrUnknownPromiseType(awaited) ||
+        isAnyOrUnknownPromiseType(awaited.expression))
+    ) {
+      return true;
+    }
     const current = unwrapExpression(expression);
     if (ts.isCallExpression(current) || ts.isNewExpression(current)) {
       return isAnyOrUnknownType(current);
@@ -3648,6 +3745,7 @@ function semanticWorkerBindingDiagnostics(
     const known = ambientValues.get(symbol);
     if (
       known?.kind === "call-result" ||
+      known?.kind === "unresolved-value" ||
       known?.kind === "unknown-callable"
     ) {
       return true;
@@ -4150,6 +4248,7 @@ function semanticWorkerBindingDiagnostics(
     const receiverValue = resolveAmbientValue(receiver);
     if (
       receiverValue?.kind === "call-result" ||
+      receiverValue?.kind === "unresolved-value" ||
       receiverValue?.kind === "unknown-callable"
     ) {
       return true;
@@ -4233,7 +4332,7 @@ function semanticWorkerBindingDiagnostics(
         if (value !== undefined) return value;
       }
     }
-    const value = resolveAmbientValue(current, new Set(seenSymbols));
+    const value = resolveAmbientValue(source, new Set(seenSymbols));
     return value === undefined
       ? undefined
       : ambientPropertyValue(value, propertyName);
@@ -4439,6 +4538,12 @@ function semanticWorkerBindingDiagnostics(
         returns: [...left.returns, ...right.returns],
       };
     }
+    if (
+      left.kind === "unresolved-value" ||
+      right.kind === "unresolved-value"
+    ) {
+      return { kind: "unresolved-value" };
+    }
     if (left.kind === "unknown-callable" || right.kind === "unknown-callable") {
       return { kind: "unknown-callable" };
     }
@@ -4536,6 +4641,9 @@ function semanticWorkerBindingDiagnostics(
     if (value.kind === "call-result") {
       return { kind: "unknown-callable" };
     }
+    if (value.kind === "unresolved-value") {
+      return { kind: "unknown-callable" };
+    }
     if (value.kind === "global") {
       return {
         kind: "global",
@@ -4554,6 +4662,21 @@ function semanticWorkerBindingDiagnostics(
     expression: ts.Expression,
     seenSymbols: Set<ts.Symbol> = new Set(),
   ): AmbientValue | undefined {
+    const awaited = awaitedExpression(expression);
+    if (awaited !== undefined) {
+      const inner = resolveAmbientValue(
+        awaited.expression,
+        new Set(seenSymbols),
+      );
+      if (inner !== undefined) return inner;
+      if (
+        isAnyOrUnknownPromiseType(awaited) ||
+        isAnyOrUnknownPromiseType(awaited.expression)
+      ) {
+        return { kind: "call-result" };
+      }
+      return undefined;
+    }
     const current = unwrapExpression(expression);
     if (isConstructorIndirection(current)) {
       return { kind: "dynamic-code", name: "Function" };
@@ -4629,6 +4752,9 @@ function semanticWorkerBindingDiagnostics(
         );
         if (value !== undefined) return value;
       }
+      if (isExplicitAnyOrUnknownValueExpression(current)) {
+        return { kind: "unresolved-value" };
+      }
       return undefined;
     }
     if (ts.isPropertyAccessExpression(current)) {
@@ -4677,6 +4803,9 @@ function semanticWorkerBindingDiagnostics(
       }
       if (base?.kind === "unknown-callable") return base;
       if (base?.kind === "call-result") {
+        return { kind: "unknown-callable" };
+      }
+      if (base?.kind === "unresolved-value") {
         return { kind: "unknown-callable" };
       }
       if (base?.kind === "callable") {
@@ -4778,6 +4907,9 @@ function semanticWorkerBindingDiagnostics(
       }
       if (base?.kind === "unknown-callable") return base;
       if (base?.kind === "call-result") {
+        return { kind: "unknown-callable" };
+      }
+      if (base?.kind === "unresolved-value") {
         return { kind: "unknown-callable" };
       }
       if (base?.kind === "callable") {
@@ -4957,6 +5089,9 @@ function semanticWorkerBindingDiagnostics(
       if (callee?.kind === "call-result") {
         return { kind: "unknown-callable" };
       }
+      if (callee?.kind === "unresolved-value") {
+        return { kind: "unknown-callable" };
+      }
       if (callee?.kind === "callable") {
         return callee.returns.reduce<AmbientValue | undefined>(
           (resolved, value) => mergeAmbientValues(resolved, value),
@@ -4983,6 +5118,13 @@ function semanticWorkerBindingDiagnostics(
       for (const argument of current.arguments) {
         const value = resolveAmbientValue(argument, seenSymbols);
         if (value?.kind === "dynamic-code") return value;
+        if (
+          value?.kind === "call-result" ||
+          value?.kind === "unresolved-value" ||
+          value?.kind === "unknown-callable"
+        ) {
+          return value;
+        }
         if (value !== undefined) {
           return {
             kind: "dynamic-property",
@@ -5012,8 +5154,9 @@ function semanticWorkerBindingDiagnostics(
           return { kind: "unknown-callable" };
         }
         return (
-          isAnyOrUnknownType(current) &&
-          isAuthoredCallableExpression(current.expression)
+          (isAnyOrUnknownType(current) &&
+            isAuthoredCallableExpression(current.expression)) ||
+          isAnyOrUnknownPromiseType(current)
         )
           ? { kind: "call-result" }
           : undefined;
@@ -5031,9 +5174,19 @@ function semanticWorkerBindingDiagnostics(
       if (callee?.kind === "call-result") {
         return { kind: "unknown-callable" };
       }
+      if (callee?.kind === "unresolved-value") {
+        return { kind: "unknown-callable" };
+      }
       for (const argument of current.arguments ?? []) {
         const value = resolveAmbientValue(argument, seenSymbols);
         if (value?.kind === "dynamic-code") return value;
+        if (
+          value?.kind === "call-result" ||
+          value?.kind === "unresolved-value" ||
+          value?.kind === "unknown-callable"
+        ) {
+          return value;
+        }
         if (value !== undefined) {
           return {
             kind: "dynamic-property",
@@ -5211,10 +5364,15 @@ function semanticWorkerBindingDiagnostics(
     value: AmbientValue | undefined,
   ): void {
     if (value === undefined) return;
-    // A call-result is provenance, not itself an unsafe access. Preserve it
-    // for aliases and report only when a later property/call use remains
-    // unresolved.
-    if (value.kind === "call-result") return;
+    // Call-result and unresolved parameter values are provenance, not
+    // themselves unsafe accesses. Preserve them for aliases and report only
+    // when a later property/call use remains unresolved.
+    if (
+      value.kind === "call-result" ||
+      value.kind === "unresolved-value"
+    ) {
+      return;
+    }
     const location = semanticLocation(sourceFile, node);
     if (value.kind === "dynamic-code") {
       diagnostics.push(
@@ -5342,6 +5500,7 @@ function semanticWorkerBindingDiagnostics(
         calleeValue === undefined ||
         calleeValue.kind === "reflect-get" ||
         calleeValue.kind === "call-result" ||
+        calleeValue.kind === "unresolved-value" ||
         calleeValue.kind === "unknown-callable" ||
         calleeValue.kind === "callable"
       ) {

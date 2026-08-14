@@ -2408,6 +2408,34 @@ describe("artifact generation", () => {
     ]);
   });
 
+  test("accepts statically typed Promise and parameter callable results", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Typed awaited callable fixture\n",
+      "agent/tools/typed-awaited-callable.ts": `
+        function getText(): Promise<string> {
+          return Promise.resolve("safe");
+        }
+        function read(source: { make(): string }, fallback: string) {
+          return source.make() || fallback;
+        }
+        export default {
+          description: "Typed Promise and parameter callable results remain safe.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const awaited = (await getText()).trim();
+            return { value: read({ make: () => awaited }, input.name) };
+          },
+        };
+      `,
+    });
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "typed-awaited-callable" }),
+    ]);
+  });
+
   test.each([
     [
       "globalThis",
@@ -2632,6 +2660,196 @@ describe("artifact generation", () => {
           code: "MODULE_AMBIENT_BINDING",
           source: "agent/tools/unresolved-callable-chain.ts",
           line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [
+      "awaited Promise<any> property call",
+      `
+        function makeHelpers(): Promise<any> {
+          return Promise.resolve({});
+        }
+        export default {
+          description: "Promise<any> await provenance must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const hidden = (await makeHelpers()).make;
+            hidden();
+            return { value: input.name };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "awaited Promise<any> parameter property call",
+      `
+        async function read(source: Promise<any>, fallback: string) {
+          const first = await source;
+          first.make();
+          return fallback;
+        }
+        export default {
+          description: "Awaited Promise<any> parameters must retain callable provenance.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input as any, input.name) };
+          },
+        };
+      `,
+      "first.make();",
+    ],
+    [
+      "awaited Promise<unknown> computed property call",
+      `
+        function makeHelpers(): Promise<unknown> {
+          return Promise.resolve({});
+        }
+        export default {
+          description: "Promise<unknown> await provenance must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const property = "make";
+            const hidden = ((await makeHelpers()) as any)[property];
+            hidden();
+            return { value: input.name };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "awaited Promise<unknown> parameter extracted property call",
+      `
+        async function read(source: Promise<unknown>, fallback: string) {
+          const first = await source;
+          const hidden = (first as any)["make"];
+          hidden();
+          return fallback;
+        }
+        export default {
+          description: "Awaited Promise<unknown> parameters must retain callable provenance.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input as any, input.name) };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "awaited Promise<any> multi-hop property alias call",
+      `
+        function makeHelpers(): Promise<any> {
+          return Promise.resolve({});
+        }
+        export default {
+          description: "Awaited any multi-hop callable provenance must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          async execute(input) {
+            const first = await makeHelpers();
+            const second = first.make;
+            const third = second.next;
+            third();
+            return { value: input.name };
+          },
+        };
+      `,
+      "third();",
+    ],
+    [
+      "any parameter direct property call",
+      `
+        function read(source: any, fallback: string) {
+          source.make();
+          return fallback;
+        }
+        export default {
+          description: "Any parameter callable properties must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+      "source.make();",
+    ],
+    [
+      "unknown parameter direct computed property call",
+      `
+        function read(source: unknown, fallback: string) {
+          const property = "make";
+          (source as any)[property]();
+          return fallback;
+        }
+        export default {
+          description: "Unknown parameter computed callable properties must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+      "(source as any)[property]();",
+    ],
+    [
+      "unknown parameter extracted computed property call",
+      `
+        function read(source: unknown, fallback: string) {
+          const property = "make";
+          const hidden = (source as any)[property];
+          hidden();
+          return fallback;
+        }
+        export default {
+          description: "Unknown parameter callable aliases must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+      "hidden();",
+    ],
+    [
+      "unknown parameter multi-hop await property alias call",
+      `
+        async function read(source: unknown, fallback: string) {
+          const first = await Promise.resolve(source);
+          const second = (first as any).make;
+          const third = second.next;
+          third();
+          return fallback;
+        }
+        export default {
+          description: "Unknown parameter await/property aliases must fail closed.",
+          inputSchema: { "~standard": { version: 1, vendor: "fixture", validate(value) { return { value }; } } },
+          execute(input) {
+            return { value: read(input, input.name) };
+          },
+        };
+      `,
+      "third();",
+    ],
+  ])("rejects %s at the authored unsafe use", async (_name, source, marker) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Awaited and parameter callable provenance fixture\n",
+      "agent/tools/awaited-parameter-callable.ts": source,
+    });
+    const expectedLine =
+      source.slice(0, source.indexOf(marker)).split("\n").length;
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_AMBIENT_BINDING",
+          source: "agent/tools/awaited-parameter-callable.ts",
+          line: expectedLine,
           column: expect.any(Number),
         }),
       ]),
