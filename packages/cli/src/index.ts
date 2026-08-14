@@ -6993,6 +6993,13 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
   };
 }
 
+interface OwnedRemoteCommandOutcome {
+  readonly result: EdenCliRemoteCommandResult;
+  readonly leaseHeldUntilTerminal: boolean;
+  readonly waitForTerminal: () => Promise<void>;
+  readonly releaseLeaseAfterTerminal: () => Promise<void>;
+}
+
 function isDryRunHandle(
   value: unknown,
 ): value is EdenCliDryRunHandle {
@@ -7061,6 +7068,12 @@ async function runCompatibilityDryRun(
   if (isDryRunHandle(returned)) {
     if (ownedProcesses !== undefined && reservation !== undefined) {
       ownedProcesses.registerReservationProcess(reservation, returned.process);
+      ownedProcesses.trackLateResult(
+        returned.result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      );
     } else {
       ownedProcesses?.register(returned.process);
       reservation?.release();
@@ -7128,7 +7141,7 @@ async function runRemoteCommand(
   beforeStart?: () => void | Promise<void>,
   afterPreflight?: () => void | Promise<void>,
   acquireLease?: () => Promise<DeploymentLeaseHandle>,
-): Promise<EdenCliRemoteCommandResult> {
+): Promise<OwnedRemoteCommandOutcome> {
   if (!allowWhenStopping && ownedProcesses.isStopping()) {
     throw cliError({
       code: "DEPLOY_CANCELLED",
@@ -7183,6 +7196,11 @@ async function runRemoteCommand(
   if (isRemoteCommandHandle(returned)) {
     ownedProcesses.registerReservationProcess(reservation, returned.process);
     onStarted?.();
+    const terminal = Promise.allSettled([
+      returned.result,
+      returned.process.exited,
+    ]).then(() => undefined);
+    ownedProcesses.trackLateResult(terminal);
     try {
       if (allowWhenStopping) {
         const result = await Promise.race([
@@ -7199,9 +7217,19 @@ async function runRemoteCommand(
             );
           }),
         ]);
-        return result;
+        return {
+          result,
+          leaseHeldUntilTerminal: true,
+          waitForTerminal: async () => {
+            await terminal;
+          },
+          releaseLeaseAfterTerminal: async () => {
+            await terminal;
+            await lease?.release().catch(() => undefined);
+          },
+        };
       }
-      return await Promise.race([
+      const result = await Promise.race([
         returned.result,
         ownedProcesses.stopped.then((signal) => {
           throw cliError({
@@ -7211,14 +7239,19 @@ async function runRemoteCommand(
           });
         }),
       ]);
+      return {
+        result,
+        leaseHeldUntilTerminal: true,
+        waitForTerminal: async () => {
+          await terminal;
+        },
+        releaseLeaseAfterTerminal: async () => {
+          await terminal;
+          await lease?.release().catch(() => undefined);
+        },
+      };
     } finally {
       ownedProcesses.unregister(returned.process);
-      ownedProcesses.trackLateResult(
-        Promise.resolve(returned.process.exited).then(
-          () => lease?.release().then(() => undefined),
-          () => lease?.release().then(() => undefined),
-        ),
-      );
     }
   }
   let resolved: EdenCliRemoteCommandResult | EdenCliRemoteCommandHandle;
@@ -7236,21 +7269,14 @@ async function runRemoteCommand(
   } catch (error: unknown) {
     const lateSettlement = settleLateChildResult(
       Promise.resolve(returned),
-      undefined,
+      reservation,
       isRemoteCommandHandle,
       ownedProcesses,
     ).then(async () => {
       await lease?.release().catch(() => undefined);
     });
-    const boundedLateSettlement = Promise.race([
-      lateSettlement,
-      new Promise<void>((resolve) => {
-        setTimeout(resolve, REMOTE_RESULT_TIMEOUT_MS);
-      }),
-    ]);
-    reservation.release();
     onPossiblyStarted?.();
-    ownedProcesses.trackLateResult(boundedLateSettlement);
+    ownedProcesses.trackLateResult(lateSettlement);
     throw error;
   }
   if (isRemoteCommandHandle(resolved)) {
@@ -7258,22 +7284,24 @@ async function runRemoteCommand(
     ownedProcesses.register(resolved.process);
     const terminated = await ownedProcesses.terminate(resolved.process);
     onStarted?.();
-    if (terminated) {
-      await lease?.release().catch(() => undefined);
-    } else {
-      ownedProcesses.trackLateResult(
-        Promise.resolve(resolved.process.exited).then(
-          () => lease?.release().then(() => undefined),
-          () => lease?.release().then(() => undefined),
-        ),
-      );
-    }
+    const terminalResult = Promise.allSettled([
+      resolved.result,
+      resolved.process.exited,
+    ]).then(() => undefined);
+    ownedProcesses.trackLateResult(terminalResult);
     reservation.release();
     if (allowWhenStopping && terminated) {
+      await terminalResult;
+      await lease?.release().catch(() => undefined);
       return {
-        exitCode: 0,
-        stdout: "",
-        stderr: "",
+        result: {
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        },
+        leaseHeldUntilTerminal: false,
+        waitForTerminal: async () => undefined,
+        releaseLeaseAfterTerminal: async () => undefined,
       };
     }
     throw cliError({
@@ -7284,7 +7312,12 @@ async function runRemoteCommand(
   }
   reservation.release();
   onStarted?.();
-  return resolved;
+  return {
+    result: resolved,
+    leaseHeldUntilTerminal: false,
+    waitForTerminal: async () => undefined,
+    releaseLeaseAfterTerminal: async () => undefined,
+  };
 }
 
 async function runBoundedRemoteValidation(
@@ -7294,8 +7327,15 @@ async function runBoundedRemoteValidation(
   request: EdenCliRemoteValidationRequest,
   ownedProcesses: OwnedProcessRegistry,
 ): Promise<EdenCliRemoteValidationResult> {
+  const validationResult = Promise.resolve().then(() => validation(request));
+  ownedProcesses.trackLateResult(
+    validationResult.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
   return await Promise.race([
-    validation(request),
+    validationResult,
     ownedProcesses.stopped.then((signal) => {
       throw cliError({
         code: "DEPLOY_CANCELLED",
@@ -7311,6 +7351,7 @@ async function settleLateChildResult<T>(
   reservation: { readonly release: () => void } | undefined,
   isHandle: (value: unknown) => value is {
     readonly process: EdenCliProcess;
+    readonly result: PromiseLike<unknown>;
   },
   ownedProcesses?: OwnedProcessRegistry,
 ): Promise<void> {
@@ -7328,6 +7369,10 @@ async function settleLateChildResult<T>(
       ownedProcesses.register(resolved.process);
       await ownedProcesses.terminate(resolved.process);
     }
+    await Promise.allSettled([
+      resolved.result,
+      resolved.process.exited,
+    ]);
   }
   reservation?.release();
 }
@@ -7692,6 +7737,34 @@ function errorLines(error: unknown): readonly string[] {
       ? error.message
       : "The Eden command failed unexpectedly.",
   ];
+}
+
+function appendSecondaryDiagnostic(
+  error: unknown,
+  diagnostic: EdenDiagnostic,
+): unknown {
+  if (error instanceof EdenCliError) {
+    return new EdenCliError({
+      code: error.code,
+      message: error.message,
+      ...(error.source === undefined ? {} : { source: error.source }),
+      diagnostics: [...error.diagnostics, diagnostic],
+    });
+  }
+  if (error instanceof EdenCompilerError) {
+    return new EdenCliError({
+      code: "CLI_FAILED",
+      message: error.message,
+      diagnostics: [...error.diagnostics, diagnostic],
+    });
+  }
+  return new EdenCliError({
+    code: "CLI_FAILED",
+    message: error instanceof Error
+      ? error.message
+      : "The Eden command failed unexpectedly.",
+    diagnostics: [diagnostic],
+  });
 }
 
 interface ApprovedPort {
@@ -9333,13 +9406,22 @@ async function runDev(
     options.stopSignal?.removeEventListener("abort", stopOnInjectedSignal);
     const quiescent = await cleanup();
     if (!quiescent) {
-      const quiescenceError = cliError({
+      const quiescenceDiagnostic: EdenDiagnostic = {
         code: "DEV_QUIESCENCE_TIMEOUT",
         message:
           "Eden dev stopped without proving owned generation, publication, and child work quiescent; owned temporary state was retained.",
-      });
+        severity: "error",
+      };
       if (runError === undefined) {
-        runError = quiescenceError;
+        runError = cliError({
+          code: quiescenceDiagnostic.code,
+          message: quiescenceDiagnostic.message,
+        });
+      } else {
+        runError = appendSecondaryDiagnostic(
+          runError,
+          quiescenceDiagnostic,
+        );
       }
     }
   }
@@ -9736,7 +9818,7 @@ async function runDeploy(
     markStarted?: () => void,
   ): Promise<EdenCliRemoteCommandResult> => {
     let preflightCompleted = false;
-    const result = await runRemoteCommand(
+    const outcome = await runRemoteCommand(
       options,
       request,
       ownedValidationProcesses,
@@ -9764,6 +9846,8 @@ async function runDeploy(
         return deploymentLease;
       },
     );
+    await outcome.waitForTerminal();
+    await outcome.releaseLeaseAfterTerminal();
     if (!preflightCompleted) {
       throw cliError({
         code: "DEPLOYMENT_HANDOFF_INVALID",
@@ -9777,14 +9861,14 @@ async function runDeploy(
     if (completedLease !== undefined) {
       await completedLease.release().catch(() => undefined);
     }
-    return result;
+    return outcome.result;
   };
   const runOwnedRemoteCleanup = async (
     request: EdenCliRemoteCommandRequest,
   ): Promise<EdenCliRemoteCommandResult> => {
-    let result: EdenCliRemoteCommandResult;
+    let outcome: OwnedRemoteCommandOutcome;
     try {
-      result = await runRemoteCommand(
+      outcome = await runRemoteCommand(
         options,
         request,
         ownedValidationProcesses,
@@ -9800,21 +9884,29 @@ async function runDeploy(
       );
     } catch (error: unknown) {
       const pendingLease = deploymentLease;
-      deploymentLease = undefined;
-      if (pendingLease !== undefined) {
+      if (
+        pendingLease !== undefined &&
+        ownedValidationProcesses.isQuiescent()
+      ) {
+        deploymentLease = undefined;
         await pendingLease.release().catch(() => undefined);
       }
       throw error;
+    }
+    if (outcome.leaseHeldUntilTerminal) {
+      void outcome.releaseLeaseAfterTerminal().catch(() => undefined);
+    } else {
+      await outcome.releaseLeaseAfterTerminal();
     }
     if (!ownedValidationProcesses.isStopping()) {
       await assertDeploymentLockOwned(lock);
     }
     const completedLease = deploymentLease;
     deploymentLease = undefined;
-    if (completedLease !== undefined) {
+    if (completedLease !== undefined && !outcome.leaseHeldUntilTerminal) {
       await completedLease.release().catch(() => undefined);
     }
-    return result;
+    return outcome.result;
   };
   try {
     const compatibilityRequest: EdenCliDryRunRequest = {

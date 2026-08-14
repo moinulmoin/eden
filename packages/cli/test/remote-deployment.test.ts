@@ -1,6 +1,7 @@
 import {
   readFile,
   mkdtemp,
+  readdir,
   type EdenCliProcess,
   writeFile,
   rm,
@@ -12,11 +13,12 @@ import {
   join,
 } from "path";
 
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
   runEdenCli,
   type EdenCliDryRunRequest,
+  type EdenCliRemoteCommandHandle,
   type EdenCliRemoteCommandRequest,
   type EdenCliRemoteValidationRequest,
 } from "../src/index.js";
@@ -27,6 +29,16 @@ async function createRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "eden-cli-remote-"));
   roots.push(root);
   return root;
+}
+
+async function expectDeployLockRemoved(root: string): Promise<void> {
+  await vi.waitFor(
+    async () => {
+      await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    },
+    { timeout: 5_000 },
+  );
 }
 
 afterEach(async () => {
@@ -734,8 +746,10 @@ describe("eden remote deployment orchestration", () => {
     releaseCleanup?.();
     await expect(deployPromise).resolves.toBe(1);
     expect(commands.map((request) => request.kind)).toContain("secret-delete");
-    await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
-      .rejects.toMatchObject({ code: "ENOENT" });
+    await vi.waitFor(async () => {
+      await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    });
   }, 8_000);
 
   test("compensates after a Promise-returned remote handle may have mutated", async () => {
@@ -803,4 +817,290 @@ describe("eden remote deployment orchestration", () => {
     await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  test("retains stop-before-result ownership until a late remote rejection", async () => {
+    const root = await createRoot();
+    const stopController = new AbortController();
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    const errors: string[] = [];
+    const unhandled: unknown[] = [];
+    let rejectResult: ((reason?: unknown) => void) | undefined;
+    const result = new Promise<{
+      readonly exitCode: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    }>((_, reject) => {
+      rejectResult = reject;
+    });
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      await expect(
+        runEdenCli(["init", "--project", root], { cwd: root }),
+      ).resolves.toBe(0);
+      const deployPromise = runEdenCli(
+        [
+          "deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eden-stop-before-result",
+        ],
+        {
+          cwd: root,
+          stopSignal: stopController.signal,
+          stderr: (line) => errors.push(line),
+          dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+          remoteCommandRunner: (request) => {
+            commands.push(request);
+            if (request.kind === "secret-put") {
+              queueMicrotask(() => stopController.abort());
+              return result;
+            }
+            return { exitCode: 0, stdout: "", stderr: "" };
+          },
+          remoteBearerSecret: "stop-before-result-secret",
+        },
+      );
+
+      await expect(deployPromise).resolves.toBe(1);
+      expect(errors.join("\n")).toMatch(/cancel|remote/i);
+      expect(commands.map((request) => request.kind)).toEqual([
+        "secret-put",
+        "secret-delete",
+        "delete",
+      ]);
+      await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+        .resolves.toContain("eden.deploy.lock");
+
+      rejectResult?.(new Error("late remote rejection"));
+      await expectDeployLockRemoved(root);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+      rejectResult?.(new Error("late remote rejection cleanup"));
+    }
+  }, 12_000);
+
+  test("retains a remote lease when the result settles before child exit", async () => {
+    const root = await createRoot();
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    let releaseExit: (() => void) | undefined;
+    const childExited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseExit = () => resolve({ exitCode: 0, signal: null });
+    });
+    let sawLeaseBeforeExit = false;
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      runEdenCli(
+        [
+          "deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eden-result-before-exit",
+        ],
+        {
+          cwd: root,
+          remoteCommandRunner: (request) => {
+            commands.push(request);
+            if (request.kind === "secret-put") {
+              queueMicrotask(() => {
+                void readdir(root).then((entries) => {
+                  sawLeaseBeforeExit = entries.some((entry) =>
+                    entry.startsWith(".eden-deploy-lease-"),
+                  );
+                  releaseExit?.();
+                });
+              });
+              return {
+                process: {
+                  pid: 55_400,
+                  startIdentity: "result-before-exit",
+                  exited: childExited,
+                  async terminate() {
+                    releaseExit?.();
+                  },
+                },
+                result: Promise.resolve({
+                  exitCode: 0,
+                  stdout: "",
+                  stderr: "",
+                }),
+              };
+            }
+            return {
+              exitCode: 0,
+              stdout: request.kind === "deploy"
+                ? "https://eden-result-before-exit.example.workers.dev\n"
+                : "",
+              stderr: "",
+            };
+          },
+          remoteValidationRunner: async () => ({ ok: true }),
+          remoteBearerSecret: "result-before-exit-secret",
+        },
+      ),
+    ).resolves.toBe(0);
+
+    expect(sawLeaseBeforeExit).toBe(true);
+    expect(commands.map((request) => request.kind)).toEqual([
+      "secret-put",
+      "deploy",
+    ]);
+  });
+
+  test("retains exit-before-result ownership until the handle result settles", async () => {
+    const root = await createRoot();
+    const stopController = new AbortController();
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    let resolveRunner: ((value: EdenCliRemoteCommandHandle) => void) | undefined;
+    const runnerResult = new Promise<EdenCliRemoteCommandHandle>((resolve) => {
+      resolveRunner = resolve;
+    });
+    let terminateCount = 0;
+    let releaseLateResult: (() => void) | undefined;
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    const deployPromise = runEdenCli(
+      [
+        "deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-exit-before-result",
+      ],
+      {
+        cwd: root,
+        stopSignal: stopController.signal,
+        remoteCommandRunner: (request) => {
+          commands.push(request);
+          if (request.kind === "secret-put") {
+            queueMicrotask(() => stopController.abort());
+            return runnerResult;
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+        remoteBearerSecret: "exit-before-result-secret",
+      },
+    );
+
+    await expect(deployPromise).resolves.toBe(1);
+    expect(commands.map((request) => request.kind)).toEqual([
+      "secret-put",
+      "secret-delete",
+      "delete",
+    ]);
+    await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+      .resolves.toContain("eden.deploy.lock");
+
+    resolveRunner?.({
+      process: {
+        pid: 55_403,
+        startIdentity: "late-exit-before-result",
+        exited: Promise.resolve({ exitCode: 0, signal: null }),
+        async terminate() {
+          terminateCount += 1;
+        },
+      },
+      result: new Promise((resolve) => {
+        releaseLateResult = () =>
+          resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    });
+    await vi.waitFor(() => {
+      expect(terminateCount).toBeGreaterThan(0);
+    }, { timeout: 5_000 });
+    expect(terminateCount).toBeGreaterThan(0);
+    await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+      .resolves.toContain("eden.deploy.lock");
+    releaseLateResult?.();
+    await expectDeployLockRemoved(root);
+  }, 12_000);
+
+  test("retains a late child handle beyond the caller timeout before compensation finishes", async () => {
+    const root = await createRoot();
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    let resolveRunner: ((value: EdenCliRemoteCommandHandle) => void) | undefined;
+    const runnerResult = new Promise<EdenCliRemoteCommandHandle>((resolve) => {
+      resolveRunner = resolve;
+    });
+    let terminateCount = 0;
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    const deployPromise = runEdenCli(
+      [
+        "deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-late-child-after-timeout",
+      ],
+      {
+        cwd: root,
+        remoteCommandRunner: (request) => {
+          commands.push(request);
+          if (request.kind === "secret-put") return runnerResult;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+        remoteBearerSecret: "late-child-after-timeout-secret",
+      },
+    );
+
+    await expect(deployPromise).resolves.toBe(1);
+    await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+      .resolves.toContain("eden.deploy.lock");
+
+    let releaseExit: (() => void) | undefined;
+    const exited = new Promise<{
+      readonly exitCode: number;
+      readonly signal: null;
+    }>((resolve) => {
+      releaseExit = () => resolve({ exitCode: 0, signal: null });
+    });
+    resolveRunner?.({
+      process: {
+        pid: 55_402,
+        startIdentity: "late-child-after-timeout",
+        exited,
+        async terminate() {
+          terminateCount += 1;
+          releaseExit?.();
+        },
+      },
+      result: Promise.resolve({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+
+    await vi.waitFor(() => {
+      expect(terminateCount).toBeGreaterThan(0);
+    }, { timeout: 5_000 });
+    expect(terminateCount).toBeGreaterThan(0);
+    await expectDeployLockRemoved(root);
+    expect(commands.map((request) => request.kind)).toEqual([
+      "secret-put",
+      "secret-delete",
+      "delete",
+    ]);
+  }, 12_000);
 });

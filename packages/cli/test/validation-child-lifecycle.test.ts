@@ -239,11 +239,15 @@ describe("CLI validation child lifecycle", () => {
     }>((resolve) => {
       releaseExit = () => resolve({ exitCode: 0, signal: null });
     });
+    let releaseRemoteResult: (() => void) | undefined;
     const remoteResult = new Promise<{
       readonly exitCode: number;
       readonly stdout: string;
       readonly stderr: string;
-    }>(() => {});
+    }>((resolve) => {
+      releaseRemoteResult = () =>
+        resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
     const processHandle: EdenCliProcess = {
       pid: 44_004,
       startIdentity: "reserved-remote-spawn",
@@ -293,13 +297,14 @@ describe("CLI validation child lifecycle", () => {
       }),
     ]);
     expect(settledBeforeRelease).toBe(false);
+    await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
+      .resolves.toContain("eden.deploy.lock");
     releaseTermination?.();
+    releaseRemoteResult?.();
+    releaseExit?.();
     await expect(deployPromise).resolves.toBe(1);
     expect(signals).toContain("SIGTERM");
     expect(errors.join("\n")).toMatch(/cancel|signal|remote/i);
-    await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
-      .resolves.toContain("eden.deploy.lock");
-    releaseExit?.();
     await vi.waitFor(async () => {
       await expect(readFile(join(root, ".eden-deploy.lock"), "utf8"))
         .rejects.toMatchObject({ code: "ENOENT" });
@@ -553,6 +558,11 @@ describe("CLI validation child lifecycle", () => {
         releaseChild?.();
       },
     };
+    let releaseLateResult: (() => void) | undefined;
+    const lateChildResult = new Promise<EdenCliDryRunResult>((resolve) => {
+      releaseLateResult = () =>
+        resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
     let releaseHook: (() => void) | undefined;
     const hook = new Promise<void>((resolve) => {
       releaseHook = resolve;
@@ -576,9 +586,10 @@ describe("CLI validation child lifecycle", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     resolveLate!({
       process: child,
-      result: new Promise<EdenCliDryRunResult>(() => {}),
+      result: lateChildResult,
     });
     releaseHook?.();
+    releaseLateResult?.();
 
     await expect(buildPromise).resolves.toBe(0);
     expect(terminated).toBe(true);
@@ -654,6 +665,42 @@ describe("CLI validation child lifecycle", () => {
     expect(errors.join("\n")).toMatch(/GENERATION_WORK_TIMEOUT|failed closed/i);
     releaseHook?.();
     await new Promise((resolve) => setTimeout(resolve, 50));
+  }, 10_000);
+
+  test("exposes quiescence timeout as a secondary diagnostic beside a primary dev error", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const errors: string[] = [];
+    let releaseHook: (() => void) | undefined;
+    const hook = new Promise<void>((resolve) => {
+      releaseHook = resolve;
+    });
+    let hookStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      hookStarted = resolve;
+    });
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      stderr: (line) => errors.push(line),
+      buildPublicationHook: async (boundary) => {
+        if (boundary !== "before-canonical-prepare") return;
+        hookStarted?.();
+        await hook;
+      },
+      dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+
+    await started;
+    await expect(devPromise).resolves.toBe(1);
+    const joined = errors.join("\n");
+    expect(joined).toMatch(/GENERATION_WORK_TIMEOUT/);
+    expect(joined).toMatch(/DEV_QUIESCENCE_TIMEOUT/);
+    expect(joined.indexOf("GENERATION_WORK_TIMEOUT")).toBeLessThan(
+      joined.indexOf("DEV_QUIESCENCE_TIMEOUT"),
+    );
+    releaseHook?.();
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }, 10_000);
 
   test("fails closed when the initial compiler generation never settles", async () => {
