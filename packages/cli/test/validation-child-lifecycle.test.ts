@@ -1,5 +1,6 @@
 import {
   mkdtemp,
+  mkdir,
   readdir,
   readFile,
   rm,
@@ -13,6 +14,7 @@ import {
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { buildProject } from "@eden/compiler";
 import {
   runEdenCli,
   type EdenCliDryRunHandle,
@@ -688,6 +690,123 @@ describe("CLI validation child lifecycle", () => {
     expect(Date.now() - startedAt).toBeLessThan(4_000);
     expect(errors.join("\n")).toMatch(/quiescence|retained|generation/i);
   }, 10_000);
+
+  test("allows a normal compiler generation to exceed the cleanup budget", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const startedAt = Date.now();
+
+    await expect(
+      runEdenCli(["build", "--project", root], {
+        cwd: root,
+        buildProjectRunner: async (request) => {
+          await new Promise((resolve) => setTimeout(resolve, 1_100));
+          return buildProject(request);
+        },
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      }),
+    ).resolves.toBe(0);
+
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_000);
+  }, 15_000);
+
+  test("retains late initial-generation work and temporary ownership after stop", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const stopController = new AbortController();
+    let releaseGeneration: (() => void) | undefined;
+    let generationStarted: (() => void) | undefined;
+    const generationStartedPromise = new Promise<void>((resolve) => {
+      generationStarted = resolve;
+    });
+
+    const devPromise = runEdenCli(["dev", "--project", root], {
+      cwd: root,
+      stopSignal: stopController.signal,
+      buildProjectRunner: async (request) => {
+        await mkdir(request.outputDirectory, { recursive: true });
+        generationStarted?.();
+        return await new Promise((resolve, reject) => {
+          releaseGeneration = () => {
+            void buildProject(request).then(resolve, reject);
+          };
+        });
+      },
+      processRunner: {
+        spawn() {
+          throw new Error("the runtime must not spawn while generation is pending");
+        },
+      },
+      runtimeGenerationProof: async () => true,
+      dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+
+    await generationStartedPromise;
+    stopController.abort();
+    await expect(devPromise).resolves.toBe(1);
+
+    const retainedCandidates = (await readdir(root)).filter((entry) =>
+      entry.startsWith(".eden-build-candidate-"),
+    );
+    expect(retainedCandidates.length).toBeGreaterThan(0);
+
+    releaseGeneration?.();
+    await vi.waitFor(
+      async () => {
+        await expect(
+          readdir(root).then((entries) =>
+            entries.filter((entry) =>
+              entry.startsWith(".eden-build-candidate-"),
+            ),
+          ),
+        ).resolves.toEqual([]);
+      },
+      { timeout: 15_000 },
+    );
+  }, 20_000);
+
+  test("keeps publication timeout separate from compiler generation deadline", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const errors: string[] = [];
+    let publicationStarted: (() => void) | undefined;
+    const publicationStartedPromise = new Promise<void>((resolve) => {
+      publicationStarted = resolve;
+    });
+    let releasePublication: (() => void) | undefined;
+    const neverSettlingPublication = new Promise<void>((resolve) => {
+      releasePublication = resolve;
+    });
+    const startedAt = Date.now();
+
+    const buildPromise = runEdenCli(["build", "--project", root], {
+      cwd: root,
+      stderr: (line) => errors.push(line),
+      buildProjectRunner: async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 1_100));
+        return buildProject(request);
+      },
+      buildPublicationHook: async (boundary) => {
+        if (boundary === "before-canonical-prepare") {
+          publicationStarted?.();
+          await neverSettlingPublication;
+        }
+      },
+      dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+
+    const publicationReached = await Promise.race([
+      publicationStartedPromise.then(() => true),
+      new Promise<boolean>((resolve) =>
+        setTimeout(() => resolve(false), 3_000),
+      ),
+    ]);
+    expect(publicationReached).toBe(true);
+    await expect(buildPromise).resolves.toBe(1);
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
+    expect(errors.join("\n")).toMatch(/GENERATION_WORK_TIMEOUT|failed closed/i);
+    releasePublication?.();
+  }, 15_000);
 
   test("requires an explicit proof seam for an injected process runner", async () => {
     const root = await createRoot();
