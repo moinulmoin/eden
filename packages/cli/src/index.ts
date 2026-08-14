@@ -939,6 +939,8 @@ const INIT_LOCK_FILE = ".eden-init.lock";
 const DEPLOY_LOCK_FILE = ".eden-deploy.lock";
 const DEPLOY_LEASE_PATTERN =
   /^\.eden-deploy-lease-[0-9]+-[a-f0-9-]+$/u;
+const DEPLOY_LEASE_QUARANTINE_PATTERN =
+  /^\.eden-deploy-release-lease-[0-9]+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const DEPLOY_LOCK_QUARANTINE_PATTERN =
   /^\.eden-deploy-(?:stale-lock|release-lock)-[0-9]+-[a-f0-9-]+$/u;
 const INIT_PROVENANCE_DIRECTORY_PREFIX = ".eden-init-provenance-";
@@ -2931,6 +2933,121 @@ async function recoverDeploymentLeases(root: string): Promise<boolean> {
   return false;
 }
 
+async function recoverDeploymentLeaseQuarantines(
+  root: string,
+): Promise<boolean> {
+  const entries = await readdir(root, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!DEPLOY_LEASE_QUARANTINE_PATTERN.test(entry.name)) continue;
+    if (!entry.isFile()) {
+      throw cliError({
+        code: "DEPLOY_BUSY",
+        message:
+          "A deployment lease release residue is not a regular file and cannot be recovered safely.",
+        source: entry.name,
+      });
+    }
+    const quarantinePath = join(root, entry.name);
+    const observedDetails = await lstat(quarantinePath).catch(
+      () => undefined,
+    );
+    const observedSerialized = await readFile(
+      quarantinePath,
+      "utf8",
+    ).catch(() => undefined);
+    const state = await readDeploymentLockState(quarantinePath);
+    if (
+      observedDetails === undefined ||
+      !observedDetails.isFile() ||
+      observedDetails.isSymbolicLink() ||
+      observedSerialized === undefined ||
+      state === undefined
+    ) {
+      throw cliError({
+        code: "DEPLOY_BUSY",
+        message:
+          "A deployment lease release residue is present but its ownership identity could not be verified; the residue was retained.",
+        source: entry.name,
+      });
+    }
+    const observedStartedAt = await readProcessStartTime(state.pid);
+    const alive = isProcessAlive(state.pid);
+    if (
+      observedStartedAt === state.startedAt ||
+      (observedStartedAt === undefined && alive)
+    ) {
+      return true;
+    }
+    const disposalPath = join(
+      root,
+      uniqueTemporaryName("eden-deploy-release-lease"),
+    );
+    assertWithinRoot(
+      root,
+      disposalPath,
+      "The deployment lease release recovery path",
+    );
+    try {
+      await rename(quarantinePath, disposalPath);
+    } catch (error: unknown) {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") continue;
+      throw error;
+    }
+    const disposedDetails = await lstat(disposalPath).catch(
+      () => undefined,
+    );
+    const disposedSerialized = await readFile(
+      disposalPath,
+      "utf8",
+    ).catch(() => undefined);
+    const disposedState = await readDeploymentLockState(disposalPath);
+    if (
+      disposedDetails === undefined ||
+      !disposedDetails.isFile() ||
+      disposedDetails.isSymbolicLink() ||
+      disposedDetails.dev !== observedDetails.dev ||
+      disposedDetails.ino !== observedDetails.ino ||
+      disposedSerialized === undefined ||
+      disposedSerialized !== observedSerialized ||
+      disposedState?.pid !== state.pid ||
+      disposedState.startedAt !== state.startedAt ||
+      disposedState.token !== state.token
+    ) {
+      await link(disposalPath, quarantinePath).catch(() => undefined);
+      throw cliError({
+        code: "DEPLOY_BUSY",
+        message:
+          "A deployment lease release residue changed during identity-preserving recovery; both the residue and any replacement were retained.",
+        source: entry.name,
+      });
+    }
+    const finalDisposedDetails = await lstat(disposalPath).catch(
+      () => undefined,
+    );
+    const finalDisposedSerialized = await readFile(
+      disposalPath,
+      "utf8",
+    ).catch(() => undefined);
+    if (
+      finalDisposedDetails === undefined ||
+      finalDisposedDetails.dev !== observedDetails.dev ||
+      finalDisposedDetails.ino !== observedDetails.ino ||
+      finalDisposedSerialized !== disposedSerialized
+    ) {
+      await link(disposalPath, quarantinePath).catch(() => undefined);
+      throw cliError({
+        code: "DEPLOY_BUSY",
+        message:
+          "A deployment lease release residue changed before cleanup; the residue was retained.",
+        source: entry.name,
+      });
+    }
+    await rm(disposalPath, { force: false });
+  }
+  return false;
+}
+
 async function removeOwnedDeploymentLock(
   root: string,
   lock: DeploymentLockHandle,
@@ -3042,6 +3159,14 @@ async function acquireDeploymentLock(root: string): Promise<DeploymentLockHandle
       code: "DEPLOY_BUSY",
       message:
         "Another Eden deploy owns the selected project's cross-process lease; wait for it to finish before retrying.",
+      source: DEPLOY_LOCK_FILE,
+    });
+  }
+  if (await recoverDeploymentLeaseQuarantines(root)) {
+    throw cliError({
+      code: "DEPLOY_BUSY",
+      message:
+        "Another Eden deploy is releasing its cross-process lease; wait for it to finish before retrying.",
       source: DEPLOY_LOCK_FILE,
     });
   }
@@ -5179,8 +5304,91 @@ function createOwnedProcessRegistry(): OwnedProcessRegistry {
 interface OwnedRemoteCommandOutcome {
   readonly result: EdenCliRemoteCommandResult;
   readonly leaseHeldUntilTerminal: boolean;
+  /**
+   * This promise resolves only after the remote result is settled and the
+   * child exit observation fulfills. A rejected exit observation intentionally
+   * leaves it pending: rejection is not proof that the child is terminal.
+   */
+  readonly terminal: Promise<void>;
   readonly waitForTerminal: () => Promise<void>;
-  readonly releaseLeaseAfterTerminal: () => Promise<void>;
+  readonly releaseLeaseAfterTerminal: () => Promise<boolean>;
+}
+
+interface RemoteTerminalObservation {
+  readonly proof: Promise<boolean>;
+  readonly terminal: Promise<void>;
+}
+
+function observeRemoteTerminal(
+  result: PromiseLike<unknown>,
+  exited: PromiseLike<unknown>,
+): RemoteTerminalObservation {
+  const resultSettled = Promise.resolve(result).then(
+    () => true,
+    () => true,
+  );
+  const exitProven = Promise.resolve(exited).then(
+    () => true,
+    () => false,
+  );
+  const proof = Promise.all([resultSettled, exitProven]).then(
+    ([resultIsSettled, exitIsProven]) => resultIsSettled && exitIsProven,
+  );
+  const terminal = proof.then((proven) => {
+    if (proven) return;
+    // A rejected exit observation is unresolved ownership. Keep this
+    // barrier pending so compensation and local cleanup cannot proceed.
+    return new Promise<void>(() => {});
+  });
+  return { proof, terminal };
+}
+
+function observeRemoteResult(
+  result: PromiseLike<unknown>,
+): RemoteTerminalObservation {
+  const proof = Promise.resolve(result).then(
+    () => true,
+    () => true,
+  );
+  return {
+    proof,
+    terminal: proof.then(() => undefined),
+  };
+}
+
+function registerRemoteTerminalBarrier(
+  ownedProcesses: OwnedProcessRegistry,
+  barrier: Promise<void>,
+  register?: (barrier: Promise<void>) => void,
+): void {
+  ownedProcesses.trackLateResult(barrier);
+  register?.(barrier);
+}
+
+function retainUnsupportedHandle(
+  handle: EdenCliDryRunHandle | EdenCliRemoteCommandHandle,
+  reservation: { readonly release: () => void } | undefined,
+  ownedProcesses?: OwnedProcessRegistry,
+): void {
+  const observation = observeRemoteTerminal(
+    handle.result,
+    handle.process.exited,
+  );
+  if (ownedProcesses === undefined) {
+    void Promise.resolve()
+      .then(() => terminateOwnedProcess(handle.process, "SIGTERM"))
+      .catch(() => undefined);
+    void observation.terminal.then(() => {
+      reservation?.release();
+    });
+    return;
+  }
+  ownedProcesses.register(handle.process);
+  registerRemoteTerminalBarrier(ownedProcesses, observation.terminal);
+  void ownedProcesses.terminate(handle.process).catch(() => undefined);
+  void observation.terminal.then(() => {
+    reservation?.release();
+  });
 }
 
 function isDryRunHandle(
@@ -5297,13 +5505,7 @@ async function runCompatibilityDryRun(
     // It cannot be registered synchronously, so this shape is unsupported.
     // Give the returned owner one best-effort termination opportunity rather
     // than leaving an untracked child behind.
-    if (ownedProcesses !== undefined) {
-      ownedProcesses.register(resolved.process);
-      await ownedProcesses.terminate(resolved.process);
-    } else {
-      await terminateOwnedProcess(resolved.process, "SIGTERM");
-    }
-    reservation?.release();
+    retainUnsupportedHandle(resolved, reservation, ownedProcesses);
     throw cliError({
       code: "DRY_RUN_HANDLE_UNSUPPORTED",
       message:
@@ -5323,7 +5525,10 @@ async function runRemoteCommand(
   onPossiblyStarted?: () => void,
   beforeStart?: () => void | Promise<void>,
   afterPreflight?: () => void | Promise<void>,
-  acquireLease?: () => Promise<DeploymentLeaseHandle>,
+  acquireLease?: (
+    terminal: Promise<void>,
+  ) => Promise<DeploymentLeaseHandle>,
+  registerTerminal?: (barrier: Promise<void>) => void,
 ): Promise<OwnedRemoteCommandOutcome> {
   if (!allowWhenStopping && ownedProcesses.isStopping()) {
     throw cliError({
@@ -5334,9 +5539,13 @@ async function runRemoteCommand(
   }
   const runner = options.remoteCommandRunner ?? runDefaultRemoteCommand;
   const reservation = ownedProcesses.reserve();
+  let resolveOperationTerminal: (() => void) | undefined;
+  const operationTerminal = new Promise<void>((resolve) => {
+    resolveOperationTerminal = resolve;
+  });
+  let runnerInvoked = false;
   let returned: EdenCliRemoteCommandReturn;
   let lease: DeploymentLeaseHandle | undefined;
-  let runnerInvoked = false;
   try {
     await beforeStart?.();
     if (!allowWhenStopping && ownedProcesses.isStopping()) {
@@ -5354,7 +5563,14 @@ async function runRemoteCommand(
           "Eden deploy was cancelled during the remote runner handoff.",
       });
     }
-    lease = await acquireLease?.();
+    lease = await acquireLease?.(operationTerminal);
+    if (lease !== undefined) {
+      registerRemoteTerminalBarrier(
+        ownedProcesses,
+        operationTerminal,
+        registerTerminal,
+      );
+    }
     if (!allowWhenStopping && ownedProcesses.isStopping()) {
       throw cliError({
         code: "DEPLOY_CANCELLED",
@@ -5362,16 +5578,21 @@ async function runRemoteCommand(
           "Eden deploy was cancelled before the cross-process remote lease handoff completed.",
       });
     }
-    runnerInvoked = true;
     returned = reservation.start(
-      () => runner(request),
+      () => {
+        runnerInvoked = true;
+        return runner(request);
+      },
       allowWhenStopping,
     );
     onPossiblyStarted?.();
   } catch (error: unknown) {
     if (runnerInvoked) {
       onPossiblyStarted?.();
+      reservation.release();
+      throw error;
     }
+    resolveOperationTerminal?.();
     await lease?.release().catch(() => undefined);
     reservation.release();
     throw error;
@@ -5379,11 +5600,16 @@ async function runRemoteCommand(
   if (isRemoteCommandHandle(returned)) {
     ownedProcesses.registerReservationProcess(reservation, returned.process);
     onStarted?.();
-    const terminal = Promise.allSettled([
+    const observation = observeRemoteTerminal(
       returned.result,
       returned.process.exited,
-    ]).then(() => undefined);
-    ownedProcesses.trackLateResult(terminal);
+    );
+    void observation.terminal.then(() => resolveOperationTerminal?.());
+    registerRemoteTerminalBarrier(
+      ownedProcesses,
+      observation.terminal,
+      registerTerminal,
+    );
     try {
       if (allowWhenStopping) {
         const result = await Promise.race([
@@ -5403,12 +5629,13 @@ async function runRemoteCommand(
         return {
           result,
           leaseHeldUntilTerminal: true,
+          terminal: observation.terminal,
           waitForTerminal: async () => {
-            await terminal;
+            await waitForRemoteTerminal(observation);
           },
           releaseLeaseAfterTerminal: async () => {
-            await terminal;
-            await lease?.release().catch(() => undefined);
+            await observation.terminal;
+            return await lease?.release().catch(() => false) ?? true;
           },
         };
       }
@@ -5425,12 +5652,13 @@ async function runRemoteCommand(
       return {
         result,
         leaseHeldUntilTerminal: true,
+        terminal: observation.terminal,
         waitForTerminal: async () => {
-          await terminal;
+          await waitForRemoteTerminal(observation);
         },
         releaseLeaseAfterTerminal: async () => {
-          await terminal;
-          await lease?.release().catch(() => undefined);
+          await observation.terminal;
+          return await lease?.release().catch(() => false) ?? true;
         },
       };
     } finally {
@@ -5438,6 +5666,17 @@ async function runRemoteCommand(
     }
   }
   let resolved: EdenCliRemoteCommandResult | EdenCliRemoteCommandHandle;
+  const returnedTerminal = isPromiseLikeValue(returned)
+    ? observeRemoteTerminalReturn(returned, isRemoteCommandHandle)
+    : undefined;
+  if (returnedTerminal !== undefined) {
+    void returnedTerminal.terminal.then(() => resolveOperationTerminal?.());
+    registerRemoteTerminalBarrier(
+      ownedProcesses,
+      returnedTerminal.terminal,
+      registerTerminal,
+    );
+  }
   try {
     if (isPromiseLikeValue(returned)) {
       resolved = await raceOwnedResult(
@@ -5456,6 +5695,7 @@ async function runRemoteCommand(
       isRemoteCommandHandle,
       ownedProcesses,
     ).then(async () => {
+      await operationTerminal;
       await lease?.release().catch(() => undefined);
     });
     onPossiblyStarted?.();
@@ -5465,17 +5705,21 @@ async function runRemoteCommand(
   if (isRemoteCommandHandle(resolved)) {
     onPossiblyStarted?.();
     ownedProcesses.register(resolved.process);
-    const terminated = await ownedProcesses.terminate(resolved.process);
-    onStarted?.();
-    const terminalResult = Promise.allSettled([
+    const observation = observeRemoteTerminal(
       resolved.result,
       resolved.process.exited,
-    ]).then(() => undefined);
-    ownedProcesses.trackLateResult(terminalResult);
+    );
+    registerRemoteTerminalBarrier(
+      ownedProcesses,
+      observation.terminal,
+      registerTerminal,
+    );
+    const terminated = await ownedProcesses.terminate(resolved.process);
+    onStarted?.();
     reservation.release();
     if (allowWhenStopping && terminated) {
-      await terminalResult;
-      await lease?.release().catch(() => undefined);
+      await observation.terminal;
+      await lease?.release().catch(() => false);
       return {
         result: {
           exitCode: 0,
@@ -5483,8 +5727,9 @@ async function runRemoteCommand(
           stderr: "",
         },
         leaseHeldUntilTerminal: false,
+        terminal: observation.terminal,
         waitForTerminal: async () => undefined,
-        releaseLeaseAfterTerminal: async () => undefined,
+        releaseLeaseAfterTerminal: async () => true,
       };
     }
     throw cliError({
@@ -5493,14 +5738,61 @@ async function runRemoteCommand(
         "The remote command runner returned a cancellable handle through a promise; return the handle synchronously so it can be registered before awaiting.",
     });
   }
+  resolveOperationTerminal?.();
   reservation.release();
   onStarted?.();
   return {
     result: resolved,
     leaseHeldUntilTerminal: false,
+    terminal: returnedTerminal?.terminal ??
+      observeRemoteResult(Promise.resolve(resolved)).terminal,
     waitForTerminal: async () => undefined,
-    releaseLeaseAfterTerminal: async () => undefined,
+    releaseLeaseAfterTerminal: async () => true,
   };
+}
+
+function observeRemoteTerminalReturn(
+  returned: PromiseLike<unknown>,
+  isHandle: (value: unknown) => value is {
+    readonly process: EdenCliProcess;
+    readonly result: PromiseLike<unknown>;
+  },
+): RemoteTerminalObservation {
+  const observation = Promise.resolve(returned).then(
+    (resolved) => {
+      if (isHandle(resolved)) {
+        return observeRemoteTerminal(
+          resolved.result,
+          resolved.process.exited,
+        ).terminal;
+      }
+      return undefined;
+    },
+    () => undefined,
+  );
+  const proof = observation.then(() => true);
+  return {
+    proof,
+    terminal: proof.then(() => undefined),
+  };
+}
+
+async function waitForRemoteTerminal(
+  observation: RemoteTerminalObservation,
+): Promise<void> {
+  const proof = await Promise.race([
+    observation.proof,
+    new Promise<boolean>((resolve) => {
+      setTimeout(() => resolve(false), OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS);
+    }),
+  ]);
+  if (proof !== true) {
+    throw cliError({
+      code: "REMOTE_TERMINALITY_UNPROVEN",
+      message:
+        "The remote operation result or child exit could not be proven terminal; ownership and cleanup were retained.",
+    });
+  }
 }
 
 async function runBoundedRemoteValidation(
@@ -5546,16 +5838,18 @@ async function settleLateChildResult<T>(
     return;
   }
   if (isHandle(resolved)) {
+    const observation = observeRemoteTerminal(
+      resolved.result,
+      resolved.process.exited,
+    );
     if (ownedProcesses === undefined) {
       await terminateOwnedProcess(resolved.process, "SIGTERM");
     } else {
       ownedProcesses.register(resolved.process);
-      await ownedProcesses.terminate(resolved.process);
+      ownedProcesses.trackLateResult(observation.terminal);
+      void ownedProcesses.terminate(resolved.process).catch(() => undefined);
     }
-    await Promise.allSettled([
-      resolved.result,
-      resolved.process.exited,
-    ]);
+    await observation.terminal;
   }
   reservation?.release();
 }
@@ -7716,6 +8010,84 @@ async function runDeploy(
   const deploymentLeases = new Set<DeploymentLeaseHandle>();
   let deploymentLease: DeploymentLeaseHandle | undefined;
   let releaseDeploymentLockAfterQuiescence: (() => Promise<void>) | undefined;
+  const trackedLeaseReleases = new Map<
+    DeploymentLeaseHandle,
+    Promise<boolean>
+  >();
+  const deploymentLeaseTerminalBarriers = new Map<
+    DeploymentLeaseHandle,
+    Promise<void>
+  >();
+  const remoteTerminalBarriers = new Set<Promise<void>>();
+  const registerRemoteTerminal = (barrier: Promise<void>): void => {
+    const tracked = barrier.then(
+      () => {
+        remoteTerminalBarriers.delete(tracked);
+      },
+      () => {
+        // Terminal observations are deliberately non-rejecting. If a test or
+        // injected runner violates that invariant, retain the barrier.
+      },
+    );
+    remoteTerminalBarriers.add(tracked);
+  };
+  const retryTrackedLeaseRelease = (
+    lease: DeploymentLeaseHandle,
+    scheduleLockCleanup = true,
+  ): Promise<boolean> => {
+    const existing = trackedLeaseReleases.get(lease);
+    if (existing !== undefined) return existing;
+    const release = (async (): Promise<boolean> => {
+      const terminal = deploymentLeaseTerminalBarriers.get(lease);
+      if (terminal !== undefined) {
+        const terminalityProven = await Promise.race([
+          terminal.then(() => true, () => false),
+          new Promise<boolean>((resolveResult) => {
+            const timeout = setTimeout(
+              () => resolveResult(false),
+              CLEANUP_POLL_TIMEOUT_MS,
+            );
+            timeout.unref?.();
+          }),
+        ]);
+        if (!terminalityProven) return false;
+      }
+      while (true) {
+        const [leaseDetails, lockDetails] = await Promise.all([
+          lstat(lease.path).catch(() => undefined),
+          lstat(lease.lockPath).catch(() => undefined),
+        ]);
+        if (leaseDetails === undefined && lockDetails === undefined) {
+          return false;
+        }
+        const removed = await lease.release().catch(() => false);
+        if (removed) return true;
+        await new Promise<void>((resolveResult) => {
+          const retryTimer = setTimeout(resolveResult, 50);
+          retryTimer.unref?.();
+        });
+      }
+    })();
+    trackedLeaseReleases.set(lease, release);
+    ownedValidationProcesses.trackLateResult(
+      release.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    void release.then(() => {
+      trackedLeaseReleases.delete(lease);
+      if (
+        scheduleLockCleanup &&
+        releaseDeploymentLockAfterQuiescence !== undefined
+      ) {
+        void ownedValidationProcesses.deferCleanup(
+          releaseDeploymentLockAfterQuiescence,
+        );
+      }
+    });
+    return release;
+  };
   const assertDeploymentActive = (): void => {
     if (requestedSignal !== undefined) {
       throw cliError({
@@ -7738,11 +8110,22 @@ async function runDeploy(
     const trackedLease: DeploymentLeaseHandle = {
       ...rawLease,
       release: async () => {
-        deploymentLeases.delete(trackedLease);
-        if (deploymentLease === trackedLease) {
-          deploymentLease = undefined;
+        const releaseAttempt = rawLease.release().then(
+          (released) => released === true,
+          () => false,
+        );
+        ownedValidationProcesses.trackLateResult(
+          releaseAttempt.then(() => undefined),
+        );
+        const released = await releaseAttempt;
+        if (released) {
+          deploymentLeases.delete(trackedLease);
+          deploymentLeaseTerminalBarriers.delete(trackedLease);
+          if (deploymentLease === trackedLease) {
+            deploymentLease = undefined;
+          }
         }
-        return await rawLease.release();
+        return released;
       },
     };
     deploymentLeases.add(trackedLease);
@@ -8001,36 +8384,62 @@ async function runDeploy(
     markStarted?: () => void,
   ): Promise<EdenCliRemoteCommandResult> => {
     let preflightCompleted = false;
-    const outcome = await runRemoteCommand(
-      options,
-      request,
-      ownedValidationProcesses,
-      false,
-      markStarted,
-      markStarted,
-      async () => {
-        await options.deploymentBoundaryHook?.(
-          "before-remote-runner-invocation",
-        );
-        await assertDeploymentCandidateStable();
-      },
-      async () => {
-        await options.deploymentBoundaryHook?.(
-          "after-remote-runner-preflight",
-        );
-        await assertDeploymentCandidateStable();
-        preflightCompleted = true;
-      },
-      async () => {
-        deploymentLease = await acquireTrackedDeploymentLease();
-        await options.deploymentBoundaryHook?.("after-remote-final-read");
-        await assertDeploymentLockOwned(lock);
-        await assertDeploymentLeaseOwned(deploymentLease);
-        return deploymentLease;
-      },
-    );
+    let outcome: OwnedRemoteCommandOutcome;
+    try {
+      outcome = await runRemoteCommand(
+        options,
+        request,
+        ownedValidationProcesses,
+        false,
+        markStarted,
+        markStarted,
+        async () => {
+          await options.deploymentBoundaryHook?.(
+            "before-remote-runner-invocation",
+          );
+          await assertDeploymentCandidateStable();
+        },
+        async () => {
+          await options.deploymentBoundaryHook?.(
+            "after-remote-runner-preflight",
+          );
+          await assertDeploymentCandidateStable();
+          preflightCompleted = true;
+        },
+        async (terminal) => {
+          deploymentLease = await acquireTrackedDeploymentLease();
+          deploymentLeaseTerminalBarriers.set(
+            deploymentLease,
+            terminal,
+          );
+          await options.deploymentBoundaryHook?.("after-remote-final-read");
+          await assertDeploymentLockOwned(lock);
+          await assertDeploymentLeaseOwned(deploymentLease);
+          return deploymentLease;
+        },
+        registerRemoteTerminal,
+      );
+    } catch (error: unknown) {
+      const pendingLease = deploymentLease;
+      if (pendingLease !== undefined) {
+        void retryTrackedLeaseRelease(pendingLease);
+      }
+      throw error;
+    }
     await outcome.waitForTerminal();
-    await outcome.releaseLeaseAfterTerminal();
+    const releasedAfterTerminal = await outcome.releaseLeaseAfterTerminal();
+    if (!releasedAfterTerminal) {
+      const pendingLease = deploymentLease;
+      if (pendingLease !== undefined) {
+        void retryTrackedLeaseRelease(pendingLease);
+      }
+      throw cliError({
+        code: "DEPLOY_LEASE_RELEASE_UNPROVEN",
+        message:
+          "The remote operation became terminal, but its deployment lease could not be identity-preservingly released; local ownership residue was retained.",
+        source: DEPLOY_LOCK_FILE,
+      });
+    }
     if (!preflightCompleted) {
       throw cliError({
         code: "DEPLOYMENT_HANDOFF_INVALID",
@@ -8042,7 +8451,15 @@ async function runDeploy(
     const completedLease = deploymentLease;
     deploymentLease = undefined;
     if (completedLease !== undefined) {
-      await completedLease.release().catch(() => undefined);
+      const released = await retryTrackedLeaseRelease(completedLease);
+      if (!released) {
+        throw cliError({
+          code: "DEPLOY_LEASE_RELEASE_UNPROVEN",
+          message:
+            "The deployment lease could not be identity-preservingly released; local ownership residue was retained.",
+          source: DEPLOY_LOCK_FILE,
+        });
+      }
     }
     return outcome.result;
   };
@@ -8060,10 +8477,15 @@ async function runDeploy(
         undefined,
         () => assertDeploymentLockOwned(lock),
         undefined,
-        async () => {
+        async (terminal) => {
           deploymentLease = await acquireTrackedDeploymentLease();
+          deploymentLeaseTerminalBarriers.set(
+            deploymentLease,
+            terminal,
+          );
           return deploymentLease;
         },
+        registerRemoteTerminal,
       );
     } catch (error: unknown) {
       const pendingLease = deploymentLease;
@@ -8072,14 +8494,16 @@ async function runDeploy(
         ownedValidationProcesses.isQuiescent()
       ) {
         deploymentLease = undefined;
-        await pendingLease.release().catch(() => undefined);
+        await retryTrackedLeaseRelease(pendingLease);
       }
       throw error;
     }
-    if (outcome.leaseHeldUntilTerminal) {
-      void outcome.releaseLeaseAfterTerminal().catch(() => undefined);
-    } else {
-      await outcome.releaseLeaseAfterTerminal();
+    await outcome.waitForTerminal();
+    const released = await outcome.releaseLeaseAfterTerminal().catch(
+      () => false,
+    );
+    if (!released && deploymentLease !== undefined) {
+      void retryTrackedLeaseRelease(deploymentLease);
     }
     if (!ownedValidationProcesses.isStopping()) {
       await assertDeploymentLockOwned(lock);
@@ -8087,7 +8511,11 @@ async function runDeploy(
     const completedLease = deploymentLease;
     deploymentLease = undefined;
     if (completedLease !== undefined && !outcome.leaseHeldUntilTerminal) {
-      await completedLease.release().catch(() => undefined);
+      const released = await retryTrackedLeaseRelease(completedLease);
+      if (!released) {
+        // The bounded retry retained the lease; the final lock cleanup will
+        // report and preserve it rather than unlinking it by pathname.
+      }
     }
     return outcome.result;
   };
@@ -8256,14 +8684,30 @@ async function runDeploy(
     deploymentFailure = error;
     throw error;
   } finally {
+    const scheduleSerializedCompensation = async (
+      requests: readonly EdenCliRemoteCommandRequest[],
+    ): Promise<boolean> => {
+      let cleanupFailed = false;
+      for (const request of requests) {
+        while (remoteTerminalBarriers.size > 0) {
+          const barriers = [...remoteTerminalBarriers];
+          await Promise.all(barriers);
+        }
+        const result = await runOwnedRemoteCleanup(request).catch(
+          () => ({ exitCode: 1 }),
+        );
+        cleanupFailed ||= result.exitCode !== 0;
+      }
+      return cleanupFailed;
+    };
     if (
       deploymentFailure !== undefined &&
       requestedWorkerName !== undefined &&
       (secretProvisioned || deploymentAttempted)
     ) {
-      let cleanupFailed = false;
+      const compensationRequests: EdenCliRemoteCommandRequest[] = [];
       if (secretProvisioned) {
-        const removed = await runOwnedRemoteCleanup({
+        compensationRequests.push({
           kind: "secret-delete",
           cwd: root,
           args: [
@@ -8275,11 +8719,10 @@ async function runDeploy(
             "--config",
             temporaryConfig,
           ],
-        }).catch(() => ({ exitCode: 1 }));
-        cleanupFailed ||= removed.exitCode !== 0;
+        });
       }
       if (deploymentAttempted || secretProvisioned) {
-        const deleted = await runOwnedRemoteCleanup({
+        compensationRequests.push({
           kind: "delete",
           cwd: root,
           args: [
@@ -8291,10 +8734,23 @@ async function runDeploy(
             temporaryConfig,
             "--force",
           ],
-        }).catch(() => ({ exitCode: 1 }));
-        cleanupFailed ||= deleted.exitCode !== 0;
+        });
       }
-      if (cleanupFailed) {
+      const compensation = scheduleSerializedCompensation(compensationRequests);
+      const startedOrSettled = await Promise.race([
+        compensation.then(() => true),
+        new Promise<boolean>((resolveResult) => {
+          setTimeout(() => resolveResult(false), CLEANUP_POLL_TIMEOUT_MS);
+        }),
+      ]);
+      if (!startedOrSettled) {
+        ownedValidationProcesses.trackLateResult(
+          compensation.then(
+            () => undefined,
+            () => undefined,
+          ),
+        );
+      } else if (await compensation) {
         options.stderr?.(
           `REMOTE_CLEANUP_FAILED: Validation cleanup did not remove every owned ${environment} resource for Worker ${workerName}.`,
         );
@@ -8306,8 +8762,13 @@ async function runDeploy(
       CLEANUP_POLL_TIMEOUT_MS,
     );
     releaseDeploymentLockAfterQuiescence = async () => {
+      let leasesReleased = true;
       for (const lease of [...deploymentLeases]) {
-        await lease.release().catch(() => undefined);
+        const released = await retryTrackedLeaseRelease(lease, false);
+        leasesReleased &&= released;
+      }
+      if (!leasesReleased || deploymentLeases.size > 0) {
+        return;
       }
       deploymentLease = undefined;
       await rm(temporaryConfig, { force: true }).catch(() => undefined);
@@ -8319,7 +8780,7 @@ async function runDeploy(
         }).catch(() => undefined);
         deploymentArtifactSnapshotRoot = undefined;
       }
-      await lock.release().catch(() => undefined);
+      await lock.release().catch(() => false);
     };
     await ownedValidationProcesses.deferCleanup(releaseDeploymentLockAfterQuiescence);
   }

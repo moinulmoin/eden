@@ -183,6 +183,49 @@ describe("CLI validation child lifecycle", () => {
     expect(errors.join("\n")).toMatch(/unsupported|synchronous|handle/i);
   });
 
+  test("owns a late compatibility inner-result rejection without an unhandled rejection", async () => {
+    const root = await createRoot();
+    await initRoot(root);
+    const errors: string[] = [];
+    const unhandled: unknown[] = [];
+    let rejectInner: ((reason?: unknown) => void) | undefined;
+    const innerResult = new Promise<EdenCliDryRunResult>((_, reject) => {
+      rejectInner = reject;
+    });
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      const processHandle: EdenCliProcess = {
+        pid: 44_013,
+        startIdentity: "late-compatibility-inner-rejection",
+        exited: Promise.resolve({ exitCode: 0, signal: null }),
+        async terminate() {},
+      };
+      await expect(
+        runEdenCli(["build", "--project", root], {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+          dryRunRunner: async () =>
+            ({
+              process: processHandle,
+              result: innerResult,
+            }) as never,
+        }),
+      ).resolves.toBe(1);
+
+      rejectInner?.(new Error("late compatibility result rejection"));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(unhandled).toEqual([]);
+      expect(errors.join("\n")).toMatch(/unsupported|handle/i);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+      rejectInner?.(new Error("late compatibility result rejection cleanup"));
+    }
+  });
+
   test("races a never-settling compatibility result with cancellation", async () => {
     const root = await createRoot();
     await initRoot(root);
