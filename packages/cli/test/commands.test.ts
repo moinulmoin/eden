@@ -18,6 +18,7 @@ import {
   tmpdir,
 } from "os";
 import {
+  basename,
   join,
 } from "path";
 import { afterAll, describe, expect, test, vi } from "vitest";
@@ -41,6 +42,18 @@ async function sha256(path: string): Promise<string> {
   return createHash("sha256")
     .update(await readFile(path))
     .digest("hex");
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+async function initProvenanceDirectory(root: string): Promise<string> {
+  const canonicalRoot = await realpath(root);
+  return join(
+    canonicalRoot,
+    `.eden-init-provenance-${sha256Text(canonicalRoot).slice(0, 16)}`,
+  );
 }
 
 async function artifactHashes(root: string): Promise<Record<string, string>> {
@@ -182,6 +195,144 @@ describe("eden CLI project commands", () => {
     expect(await sha256(join(root, "agent.ts"))).toBe(before.candidate);
     await expect(stat(candidate)).rejects.toMatchObject({ code: "ENOENT" });
     expect(errors.join("")).toMatch(/empty|overwrite/i);
+  });
+
+  test("rejects precreated init provenance roots and keys without claiming them", async () => {
+    for (const withKey of [false, true]) {
+      const root = await createRoot(
+        `eden-cli-init-precreated-provenance-${withKey ? "key" : "root"}-`,
+      );
+      const provenance = await initProvenanceDirectory(root);
+      await mkdir(provenance);
+      if (withKey) {
+        await writeFile(join(provenance, "key"), Buffer.alloc(32));
+      }
+      const errors: string[] = [];
+
+      await expect(
+        runEdenCli(["init", "--project", root], {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+        }),
+      ).resolves.toBe(1);
+
+      await expect(readdir(root)).resolves.toEqual([basename(provenance)]);
+      expect(errors.join("\n")).toMatch(/pre-created|trust|provenance|ownership/i);
+    }
+  });
+
+  test("keeps link residue on an independent inode", async () => {
+    const root = await createRoot("eden-cli-init-independent-residue-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("seed incomplete scaffold");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+
+    const packagePath = join(root, "package.json");
+    const packageContents = await readFile(packagePath, "utf8");
+    const provenance = await initProvenanceDirectory(root);
+    const residueNames = (await readdir(provenance)).filter((entry) =>
+      entry.startsWith("link-residue-")
+    );
+    const matchingResidues = [];
+    for (const name of residueNames) {
+      const path = join(provenance, name);
+      if (await readFile(path, "utf8") === packageContents) {
+        matchingResidues.push(path);
+      }
+    }
+    expect(matchingResidues.length).toBeGreaterThan(0);
+    const packageIdentity = await stat(packagePath);
+    for (const residue of matchingResidues) {
+      const residueIdentity = await stat(residue);
+      expect(residueIdentity.dev === packageIdentity.dev &&
+        residueIdentity.ino === packageIdentity.ino).toBe(false);
+    }
+  });
+
+  test("fails closed on a tampered authenticated transition record", async () => {
+    const root = await createRoot("eden-cli-init-tampered-transition-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("seed incomplete scaffold");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    const provenance = await initProvenanceDirectory(root);
+    const transition = (await readdir(provenance)).find((entry) =>
+      entry.startsWith("transition-")
+    );
+    expect(transition).toBeDefined();
+    const transitionPath = join(provenance, transition as string);
+    const original = await readFile(transitionPath, "utf8");
+    await writeFile(transitionPath, `${original}tampered\n`, "utf8");
+
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+      }),
+    ).resolves.toBe(1);
+    await expect(readFile(transitionPath, "utf8"))
+      .resolves.toBe(`${original}tampered\n`);
+    await expect(stat(join(root, ".eden-init-incomplete.json")))
+      .resolves.toBeDefined();
+    expect(errors.join("\n")).toMatch(/malformed|authenticated|preserved/i);
+  });
+
+  test("preserves a user-visible rename instead of restoring the target", async () => {
+    const root = await createRoot("eden-cli-init-user-visible-rename-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("seed incomplete scaffold");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    const renamedPath = join(root, "package.user-renamed.json");
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        stderr: (line) => errors.push(line),
+        initPublicationHook: async (boundary, target) => {
+          if (
+            boundary === "after-init-link" &&
+            target?.endsWith("package.json") === true
+          ) {
+            await rename(target, renamedPath);
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    await expect(readFile(renamedPath, "utf8"))
+      .resolves.toContain('"eden-basic-agent"');
+    await expect(stat(join(root, "package.json")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(root, ".eden-init-incomplete.json")))
+      .resolves.toBeDefined();
+    expect(errors.join("\n")).toMatch(/renamed|preserved|target/i);
   });
 
   test.each([

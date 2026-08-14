@@ -324,6 +324,12 @@ export type EdenInitPublicationBoundary =
   | "after-target-validation"
   | "after-init-link"
   | "after-init-tombstone"
+  | "before-init-transition-intent"
+  | "after-init-transition-intent"
+  | "before-init-transition-outcome"
+  | "after-init-transition-outcome"
+  | "before-init-cleanup"
+  | "after-init-cleanup"
   | "before-init-destination-recheck"
   | "before-init-source-removal"
   | "before-target-publish"
@@ -973,6 +979,7 @@ type InitTransitionOutcome =
   | "destination-collision"
   | "destination-disappeared"
   | "destination-displaced"
+  | "destination-renamed"
   | "destination-disappeared-after-source-retirement"
   | "destination-displaced-after-source-retirement"
   | "reconciled"
@@ -983,7 +990,7 @@ type InitTransitionOutcome =
 
 interface InitTransitionRecord {
   readonly kind: "eden.init.transition";
-  readonly version: 1;
+  readonly version: 1 | 2;
   readonly root: string;
   readonly operation: InitTransitionOperation;
   readonly outcome: InitTransitionOutcome;
@@ -993,6 +1000,9 @@ interface InitTransitionRecord {
   readonly expectedDev: number;
   readonly expectedIno: number;
   readonly expectedDigest: string;
+  readonly residueDev?: number | undefined;
+  readonly residueIno?: number | undefined;
+  readonly residueDigest?: string | undefined;
   readonly observedDev: number | undefined;
   readonly observedIno: number | undefined;
   readonly observedDigest: string | undefined;
@@ -1027,6 +1037,555 @@ interface InitProvenanceRecord {
   readonly mac: string;
 }
 
+interface InitExternalTrustRecord {
+  readonly kind: "eden.init.external-trust";
+  readonly version: 1;
+  readonly root: string;
+  readonly provenanceName: string;
+  readonly provenanceDev: number;
+  readonly provenanceIno: number;
+  readonly token: string;
+  readonly rootKeyDigest: string;
+  readonly trustKeyDigest: string;
+  readonly mac: string;
+}
+
+const INIT_EXTERNAL_TRUST_DIRECTORY_NAME = ".eden-init-trust";
+
+function initExternalTrustDirectory(): string {
+  return join(tmpdir(), INIT_EXTERNAL_TRUST_DIRECTORY_NAME);
+}
+
+function initExternalTrustDescriptorPath(root: string): string {
+  return join(
+    initExternalTrustDirectory(),
+    `trust-${sha256(root)}.json`,
+  );
+}
+
+function initExternalTrustKeyPath(token: string): string {
+  return join(initExternalTrustDirectory(), `key-${token}`);
+}
+
+function initExternalTrustMessage(
+  root: string,
+  record: Omit<InitExternalTrustRecord, "mac">,
+): string {
+  return [
+    sha256(root),
+    record.kind,
+    String(record.version),
+    record.root,
+    record.provenanceName,
+    String(record.provenanceDev),
+    String(record.provenanceIno),
+    record.token,
+    record.rootKeyDigest,
+    record.trustKeyDigest,
+  ].join("\n");
+}
+
+function initExternalTrustMac(
+  key: Buffer,
+  root: string,
+  record: Omit<InitExternalTrustRecord, "mac">,
+): string {
+  return createHmac("sha256", key)
+    .update(initExternalTrustMessage(root, record))
+    .digest("hex");
+}
+
+function parseInitExternalTrustRecord(
+  value: unknown,
+): InitExternalTrustRecord | undefined {
+  if (
+    !isRecord(value) ||
+    value.kind !== "eden.init.external-trust" ||
+    value.version !== 1 ||
+    typeof value.root !== "string" ||
+    typeof value.provenanceName !== "string" ||
+    basename(value.provenanceName) !== value.provenanceName ||
+    typeof value.provenanceDev !== "number" ||
+    !Number.isSafeInteger(value.provenanceDev) ||
+    value.provenanceDev < 0 ||
+    typeof value.provenanceIno !== "number" ||
+    !Number.isSafeInteger(value.provenanceIno) ||
+    value.provenanceIno < 0 ||
+    typeof value.token !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value.token) ||
+    typeof value.rootKeyDigest !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(value.rootKeyDigest) ||
+    typeof value.trustKeyDigest !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(value.trustKeyDigest) ||
+    typeof value.mac !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(value.mac)
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "eden.init.external-trust",
+    version: 1,
+    root: value.root,
+    provenanceName: value.provenanceName,
+    provenanceDev: value.provenanceDev,
+    provenanceIno: value.provenanceIno,
+    token: value.token,
+    rootKeyDigest: value.rootKeyDigest,
+    trustKeyDigest: value.trustKeyDigest,
+    mac: value.mac,
+  };
+}
+
+async function findInitFileByObservation(
+  root: string,
+  expected: InitFileObservation,
+  excludedPaths: readonly string[],
+  additionalObservations: readonly InitFileObservation[] = [],
+): Promise<{
+  readonly path: string;
+  readonly observation: InitFileObservation;
+} | undefined> {
+  const excluded = new Set(excludedPaths.map((path) => resolve(path)));
+  const provenanceDirectory = resolve(initProvenancePaths(root).directory);
+  const acceptedObservations = [expected, ...additionalObservations];
+  const visit = async (
+    directory: string,
+  ): Promise<{
+    readonly path: string;
+    readonly observation: InitFileObservation;
+  } | undefined> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const candidate = join(directory, entry.name);
+      const resolvedCandidate = resolve(candidate);
+      if (
+        resolvedCandidate === provenanceDirectory ||
+        resolvedCandidate.startsWith(`${provenanceDirectory}/`) ||
+        excluded.has(resolvedCandidate) ||
+        entry.name === INIT_LOCK_FILE ||
+        entry.name === INIT_STATE_FILE ||
+        entry.name.startsWith(".eden-init-")
+      ) {
+        continue;
+      }
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        const nested = await visit(candidate);
+        if (nested !== undefined) return nested;
+        continue;
+      }
+      const observation = await readInitFileObservation(
+        candidate,
+        initTransitionName(root, candidate),
+      );
+      if (
+        observation !== undefined &&
+        acceptedObservations.some((candidate) =>
+          sameInitFileObservation(observation, candidate)
+        )
+      ) {
+        return { path: candidate, observation };
+      }
+    }
+    return undefined;
+  };
+  return visit(root);
+}
+
+async function readInitTransitionRecords(
+  root: string,
+): Promise<readonly InitTransitionRecord[]> {
+  const directory = initProvenancePaths(root).directory;
+  const entries = await readdir(directory);
+  const key = await readInitProvenanceKey(root);
+  if (key === undefined) {
+    throw initBusy(
+      "The Eden init transition records could not be authenticated; state was preserved.",
+      directory,
+    );
+  }
+  const records: InitTransitionRecord[] = [];
+  for (const entry of entries) {
+    if (!entry.startsWith("transition-") || !entry.endsWith(".json")) continue;
+    const path = join(directory, entry);
+    const observation = await readInitFileObservation(path, entry);
+    if (observation === undefined) continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(observation.serialized) as unknown;
+    } catch {
+      throw initBusy(
+        "The Eden init transition record was malformed; state was preserved.",
+        entry,
+      );
+    }
+    if (
+      !isRecord(value) ||
+      value.kind !== "eden.init.transition" ||
+      (value.version !== 1 && value.version !== 2) ||
+      typeof value.root !== "string" ||
+      value.root !== root ||
+      (value.operation !== "link" && value.operation !== "tombstone") ||
+      !isInitTransitionOutcome(value.outcome) ||
+      typeof value.sourceName !== "string" ||
+      !isSafeInitTransitionName(value.sourceName) ||
+      (value.destinationName !== undefined &&
+        (typeof value.destinationName !== "string" ||
+          !isSafeInitTransitionName(value.destinationName))) ||
+      (value.residueName !== undefined &&
+        (typeof value.residueName !== "string" ||
+          basename(value.residueName) !== value.residueName)) ||
+      typeof value.expectedDev !== "number" ||
+      !Number.isSafeInteger(value.expectedDev) ||
+      value.expectedDev < 0 ||
+      typeof value.expectedIno !== "number" ||
+      !Number.isSafeInteger(value.expectedIno) ||
+      value.expectedIno < 0 ||
+      typeof value.expectedDigest !== "string" ||
+      !/^[a-f0-9]{64}$/u.test(value.expectedDigest) ||
+      (value.residueDev !== undefined &&
+        (typeof value.residueDev !== "number" ||
+          !Number.isSafeInteger(value.residueDev) ||
+          value.residueDev < 0)) ||
+      (value.residueIno !== undefined &&
+        (typeof value.residueIno !== "number" ||
+          !Number.isSafeInteger(value.residueIno) ||
+          value.residueIno < 0)) ||
+      (value.residueDigest !== undefined &&
+        (typeof value.residueDigest !== "string" ||
+          !/^[a-f0-9]{64}$/u.test(value.residueDigest))) ||
+      (value.observedDev !== undefined && typeof value.observedDev !== "number") ||
+      (value.observedDev !== undefined &&
+        (!Number.isSafeInteger(value.observedDev) || value.observedDev < 0)) ||
+      (value.observedIno !== undefined &&
+        (typeof value.observedIno !== "number" ||
+          !Number.isSafeInteger(value.observedIno) ||
+          value.observedIno < 0)) ||
+      (value.observedDigest !== undefined &&
+        (typeof value.observedDigest !== "string" ||
+          !/^[a-f0-9]{64}$/u.test(value.observedDigest))) ||
+      typeof value.mac !== "string" ||
+      !/^[a-f0-9]{64}$/u.test(value.mac)
+    ) {
+      throw initBusy(
+        "The Eden init transition record was malformed; state was preserved.",
+        entry,
+      );
+    }
+    const record = value as unknown as InitTransitionRecord;
+    assertWithinRoot(
+      root,
+      join(root, record.sourceName),
+      "The init transition source",
+    );
+    if (record.destinationName !== undefined) {
+      assertWithinRoot(
+        root,
+        join(root, record.destinationName),
+        "The init transition destination",
+      );
+    }
+    if (record.residueName !== undefined) {
+      assertWithinRoot(
+        root,
+        join(initProvenancePaths(root).directory, record.residueName),
+        "The init transition residue",
+      );
+    }
+    const actualMac = Buffer.from(record.mac, "hex");
+    const expectedMac = Buffer.from(
+      initTransitionMac(key, root, record),
+      "hex",
+    );
+    if (
+      actualMac.length !== expectedMac.length ||
+      !timingSafeEqual(actualMac, expectedMac)
+    ) {
+      throw initBusy(
+        "The Eden init transition record was not authenticated by Eden; state was preserved.",
+        entry,
+      );
+    }
+    records.push(record);
+  }
+  return records;
+}
+
+function isInitTransitionOutcome(
+  value: unknown,
+): value is InitTransitionOutcome {
+  return [
+    "intent",
+    "linked",
+    "destination-collision",
+    "destination-disappeared",
+    "destination-displaced",
+    "destination-renamed",
+    "destination-disappeared-after-source-retirement",
+    "destination-displaced-after-source-retirement",
+    "reconciled",
+    "source-disappeared",
+    "retained",
+    "replaced",
+    "disappeared",
+  ].includes(value as InitTransitionOutcome);
+}
+
+function isSafeInitTransitionName(value: string): boolean {
+  return value.length > 0 &&
+    !isAbsolute(value) &&
+    !value.split(/[\\/]/u).some((part) => part === "..");
+}
+
+function sameInitTransition(
+  left: InitTransitionRecord,
+  right: InitTransitionRecord,
+): boolean {
+  return left.version === right.version &&
+    left.operation === right.operation &&
+    left.sourceName === right.sourceName &&
+    left.destinationName === right.destinationName &&
+    left.residueName === right.residueName &&
+    left.expectedDev === right.expectedDev &&
+    left.expectedIno === right.expectedIno &&
+    left.expectedDigest === right.expectedDigest &&
+    left.residueDev === right.residueDev &&
+    left.residueIno === right.residueIno &&
+    left.residueDigest === right.residueDigest;
+}
+
+function hasInitTransitionOutcome(
+  records: readonly InitTransitionRecord[],
+  intent: InitTransitionRecord,
+): boolean {
+  return records.some(
+    (record) =>
+      record.outcome !== "intent" &&
+      record.outcome !== "linked" &&
+      record.outcome !== "retained" &&
+      sameInitTransition(record, intent),
+  );
+}
+
+function isInitLockTransitionRecord(record: InitTransitionRecord): boolean {
+  return record.sourceName === INIT_LOCK_FILE ||
+    (record.destinationName !== undefined &&
+      INIT_LOCK_QUARANTINE_PATTERN.test(basename(record.destinationName)));
+}
+
+async function readInitTransitionResidue(
+  root: string,
+  record: InitTransitionRecord,
+): Promise<{
+  readonly path: string;
+  readonly observation: InitFileObservation;
+} | undefined> {
+  if (record.residueName === undefined) return undefined;
+  const path = join(initProvenancePaths(root).directory, record.residueName);
+  const observation = await readInitFileObservation(
+    path,
+    record.residueName,
+  );
+  if (observation === undefined) return undefined;
+  if (
+    sha256(observation.serialized) !==
+    (record.residueDigest ?? record.expectedDigest)
+  ) {
+    return undefined;
+  }
+  if (
+    record.residueDev !== undefined &&
+    record.residueIno !== undefined &&
+    (observation.identity.dev !== record.residueDev ||
+      observation.identity.ino !== record.residueIno)
+  ) {
+    return undefined;
+  }
+  return { path, observation };
+}
+
+async function restoreInitTransitionDestination(
+  destinationPath: string,
+  residue: {
+    readonly path: string;
+    readonly observation: InitFileObservation;
+  },
+): Promise<InitFileObservation> {
+  try {
+    await link(residue.path, destinationPath);
+  } catch (error: unknown) {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code !== "EEXIST") {
+      throw initBusy(
+        "The init ownership transition destination could not be reconciled; state was preserved.",
+        basename(destinationPath),
+      );
+    }
+  }
+  const restored = await readInitFileObservation(
+    destinationPath,
+    basename(destinationPath),
+  );
+  if (
+    restored === undefined ||
+    !sameInitFileObservation(restored, residue.observation)
+  ) {
+    throw initBusy(
+      "The init ownership transition destination changed during reconciliation; state was preserved.",
+      basename(destinationPath),
+    );
+  }
+  return restored;
+}
+
+async function reconcileInitTransitionRecords(root: string): Promise<void> {
+  const records = await readInitTransitionRecords(root);
+  for (const record of records) {
+    if (isInitLockTransitionRecord(record)) continue;
+    if (
+      record.outcome !== "intent" &&
+      record.outcome !== "linked" &&
+      record.outcome !== "retained"
+    ) {
+      continue;
+    }
+    if (hasInitTransitionOutcome(records, record)) {
+      continue;
+    }
+    const sourcePath = join(root, record.sourceName);
+    const destinationPath =
+      record.destinationName === undefined
+        ? undefined
+        : join(root, record.destinationName);
+    if (destinationPath === undefined) continue;
+    const source = await readInitFileObservation(
+      sourcePath,
+      record.sourceName,
+    );
+    const residue = await readInitTransitionResidue(root, record);
+    if (
+      record.version === 2 &&
+      record.residueName !== undefined &&
+      residue === undefined
+    ) {
+      continue;
+    }
+    let expectedSerialized: string | undefined;
+    const sourceIsExpected =
+      source !== undefined &&
+      sameInitFileIdentity(source.identity, {
+        dev: record.expectedDev,
+        ino: record.expectedIno,
+      }) &&
+      sha256(source.serialized) === record.expectedDigest;
+    if (sourceIsExpected) {
+      expectedSerialized = source.serialized;
+    } else if (residue !== undefined) {
+      expectedSerialized = residue.observation.serialized;
+    }
+    if (
+      expectedSerialized === undefined ||
+      sha256(expectedSerialized) !== record.expectedDigest
+    ) {
+      continue;
+    }
+    const destination = await readInitFileObservation(
+      destinationPath,
+      record.destinationName ?? basename(destinationPath),
+    );
+    const expectedObservation: InitFileObservation = {
+      identity: {
+        dev: record.expectedDev,
+        ino: record.expectedIno,
+      },
+      serialized: expectedSerialized,
+    };
+    if (destination !== undefined) {
+      if (sameInitDestinationObservation(
+        destination,
+        expectedObservation,
+        residue === undefined ? [] : [residue.observation],
+      )) {
+        await recordInitTransition(root, {
+          operation: record.operation,
+          outcome: "reconciled",
+          sourceName: record.sourceName,
+          destinationName: record.destinationName,
+          residueName: record.residueName,
+          expected: {
+            ...expectedObservation,
+          },
+          residue: residue?.observation,
+          observed: destination,
+        });
+        continue;
+      }
+      await recordInitTransition(root, {
+        operation: record.operation,
+        outcome: "destination-displaced",
+        sourceName: record.sourceName,
+        destinationName: record.destinationName,
+        residueName: record.residueName,
+        expected: {
+          ...expectedObservation,
+        },
+        residue: residue?.observation,
+        observed: destination,
+      });
+      throw initBusy(
+        "The init ownership transition destination changed before reconciliation; the replacement was preserved.",
+        record.destinationName ?? basename(destinationPath),
+      );
+    }
+    const renamed = await findInitFileByObservation(
+      root,
+      {
+        ...expectedObservation,
+      },
+      [sourcePath, destinationPath],
+      residue === undefined ? [] : [residue.observation],
+    );
+    if (renamed !== undefined) {
+      await recordInitTransition(root, {
+        operation: record.operation,
+        outcome: "destination-renamed",
+        sourceName: record.sourceName,
+        destinationName: record.destinationName,
+        residueName: record.residueName,
+        expected: {
+          ...expectedObservation,
+        },
+        residue: residue?.observation,
+        observed: renamed.observation,
+      });
+      throw initBusy(
+        "The init ownership transition destination was renamed; the user-visible target was preserved.",
+        initTransitionName(root, renamed.path),
+      );
+    }
+    const recoveryResidue = sourceIsExpected && source !== undefined
+      ? { path: sourcePath, observation: source }
+      : residue;
+    if (recoveryResidue === undefined) continue;
+    const restored = await restoreInitTransitionDestination(
+      destinationPath,
+      recoveryResidue,
+    );
+    await recordInitTransition(root, {
+      operation: record.operation,
+      outcome: "reconciled",
+      sourceName: record.sourceName,
+      destinationName: record.destinationName,
+      residueName: record.residueName,
+      expected: {
+        ...expectedObservation,
+      },
+      residue: residue?.observation,
+      observed: restored,
+    });
+  }
+}
+
 function sameInitFileIdentity(
   left: InitFileIdentity,
   right: InitFileIdentity,
@@ -1040,6 +1599,18 @@ function sameInitFileObservation(
 ): boolean {
   return sameInitFileIdentity(left.identity, right.identity) &&
     left.serialized === right.serialized;
+}
+
+function sameInitDestinationObservation(
+  observed: InitFileObservation | undefined,
+  expected: InitFileObservation,
+  residues: readonly InitFileObservation[],
+): boolean {
+  if (observed === undefined) return false;
+  if (sameInitFileObservation(observed, expected)) return true;
+  return residues.some((residue) =>
+    sameInitFileObservation(observed, residue)
+  );
 }
 
 function initProvenanceMessage(
@@ -1072,8 +1643,25 @@ function initTransitionMessage(
   root: string,
   record: Omit<InitTransitionRecord, "mac">,
 ): string {
+  if (record.version === 1) {
+    return [
+      sha256(root),
+      record.operation,
+      record.outcome,
+      record.sourceName,
+      record.destinationName ?? "",
+      record.residueName ?? "",
+      String(record.expectedDev),
+      String(record.expectedIno),
+      record.expectedDigest,
+      record.observedDev === undefined ? "" : String(record.observedDev),
+      record.observedIno === undefined ? "" : String(record.observedIno),
+      record.observedDigest ?? "",
+    ].join("\n");
+  }
   return [
     sha256(root),
+    String(record.version),
     record.operation,
     record.outcome,
     record.sourceName,
@@ -1082,6 +1670,9 @@ function initTransitionMessage(
     String(record.expectedDev),
     String(record.expectedIno),
     record.expectedDigest,
+    record.residueDev === undefined ? "" : String(record.residueDev),
+    record.residueIno === undefined ? "" : String(record.residueIno),
+    record.residueDigest ?? "",
     record.observedDev === undefined ? "" : String(record.observedDev),
     record.observedIno === undefined ? "" : String(record.observedIno),
     record.observedDigest ?? "",
@@ -1117,7 +1708,9 @@ async function recordInitTransition(
     readonly destinationName?: string | undefined;
     readonly residueName?: string | undefined;
     readonly expected: InitFileObservation;
+    readonly residue?: InitFileObservation | undefined;
     readonly observed?: InitFileObservation | undefined;
+    readonly hook?: EdenCliRunOptions["initPublicationHook"];
   },
 ): Promise<void> {
   const key = await readInitProvenanceKey(root);
@@ -1129,7 +1722,7 @@ async function recordInitTransition(
   }
   const recordWithoutMac: Omit<InitTransitionRecord, "mac"> = {
     kind: "eden.init.transition",
-    version: 1,
+    version: 2,
     root,
     operation: options.operation,
     outcome: options.outcome,
@@ -1139,6 +1732,12 @@ async function recordInitTransition(
     expectedDev: options.expected.identity.dev,
     expectedIno: options.expected.identity.ino,
     expectedDigest: sha256(options.expected.serialized),
+    residueDev: options.residue?.identity.dev,
+    residueIno: options.residue?.identity.ino,
+    residueDigest:
+      options.residue === undefined
+        ? undefined
+        : sha256(options.residue.serialized),
     observedDev: options.observed?.identity.dev,
     observedIno: options.observed?.identity.ino,
     observedDigest:
@@ -1153,6 +1752,7 @@ async function recordInitTransition(
   const path = initTransitionRecordPath(root, recordWithoutMac);
   assertWithinRoot(root, path, "The init transition record");
   const serialized = `${JSON.stringify(record)}\n`;
+  await options.hook?.("before-init-transition-outcome", path);
   try {
     await writeFile(path, serialized, {
       encoding: "utf8",
@@ -1183,6 +1783,27 @@ async function recordInitTransition(
       basename(path),
     );
   }
+  await options.hook?.("after-init-transition-outcome", path);
+}
+
+async function recordInitTransitionIntent(
+  root: string,
+  options: {
+    readonly operation: InitTransitionOperation;
+    readonly sourceName: string;
+    readonly destinationName?: string | undefined;
+    readonly residueName?: string | undefined;
+    readonly expected: InitFileObservation;
+    readonly residue?: InitFileObservation | undefined;
+    readonly hook?: EdenCliRunOptions["initPublicationHook"];
+  },
+): Promise<void> {
+  await options.hook?.("before-init-transition-intent", options.sourceName);
+  await recordInitTransition(root, {
+    ...options,
+    outcome: "intent",
+  });
+  await options.hook?.("after-init-transition-intent", options.sourceName);
 }
 
 function initProvenancePaths(root: string): {
@@ -1223,16 +1844,75 @@ async function readInitProvenanceKey(root: string): Promise<Buffer | undefined> 
       directory,
     );
   }
-  const existing = await readFile(keyPath).catch((error: unknown) => {
-    const code = error as NodeJS.ErrnoException;
-    if (code.code === "ENOENT") return undefined;
+  const trustDirectory = initExternalTrustDirectory();
+  const trustDirectoryDetails = await lstat(trustDirectory).catch(
+    (error: unknown) => {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") return undefined;
+      throw initBusy(
+        "The Eden init external trust directory could not be inspected safely; ownership state was preserved.",
+        trustDirectory,
+      );
+    },
+  );
+  if (
+    trustDirectoryDetails === undefined ||
+    !trustDirectoryDetails.isDirectory() ||
+    trustDirectoryDetails.isSymbolicLink()
+  ) {
     throw initBusy(
-      "The Eden init provenance key could not be read safely; ownership state was preserved.",
-      keyPath,
+      "The Eden init external trust directory was not a regular directory; ownership state was preserved.",
+      trustDirectory,
     );
-  });
-  if (existing === undefined) return undefined;
-  const details = await lstat(keyPath).catch((error: unknown) => {
+  }
+  const descriptorPath = initExternalTrustDescriptorPath(root);
+  const descriptorDetails = await lstat(descriptorPath).catch(
+    (error: unknown) => {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") return undefined;
+      throw initBusy(
+        "The Eden init external trust record could not be inspected safely; ownership state was preserved.",
+        descriptorPath,
+      );
+    },
+  );
+  if (
+    descriptorDetails === undefined ||
+    !descriptorDetails.isFile() ||
+    descriptorDetails.isSymbolicLink()
+  ) {
+    throw initBusy(
+      "The Eden init provenance directory was pre-created without Eden trust; ownership state was preserved.",
+      directory,
+    );
+  }
+  const descriptorContents = await readFile(descriptorPath, "utf8").catch(
+    (error: unknown) => {
+      const code = error as NodeJS.ErrnoException;
+      if (code.code === "ENOENT") return undefined;
+      throw initBusy(
+        "The Eden init external trust record could not be read safely; ownership state was preserved.",
+        descriptorPath,
+      );
+    },
+  );
+  if (descriptorContents === undefined) {
+    throw initBusy(
+      "The Eden init provenance directory was pre-created without Eden trust; ownership state was preserved.",
+      directory,
+    );
+  }
+  let descriptorValue: unknown;
+  try {
+    descriptorValue = JSON.parse(descriptorContents) as unknown;
+  } catch {
+    throw initBusy(
+      "The Eden init external trust record was malformed; ownership state was preserved.",
+      descriptorPath,
+    );
+  }
+  const trust = parseInitExternalTrustRecord(descriptorValue);
+  const rootKeyDetails = await lstat(keyPath).catch((error: unknown) => {
     const code = error as NodeJS.ErrnoException;
     if (code.code === "ENOENT") return undefined;
     throw initBusy(
@@ -1241,31 +1921,115 @@ async function readInitProvenanceKey(root: string): Promise<Buffer | undefined> 
     );
   });
   if (
-    details === undefined ||
-    !details.isFile() ||
-    details.isSymbolicLink()
+    rootKeyDetails === undefined ||
+    !rootKeyDetails.isFile() ||
+    rootKeyDetails.isSymbolicLink()
   ) {
     throw initBusy(
       "The Eden init provenance key was not a regular file; ownership state was preserved.",
       keyPath,
     );
   }
-  if (existing.length !== 32) {
+  const rootKey = await readFile(keyPath).catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw initBusy(
+      "The Eden init provenance key could not be read safely; ownership state was preserved.",
+      keyPath,
+    );
+  });
+  if (
+    trust === undefined ||
+    trust.root !== root ||
+    trust.provenanceName !== basename(directory) ||
+    trust.provenanceDev !== directoryDetails.dev ||
+    trust.provenanceIno !== directoryDetails.ino ||
+    rootKey === undefined ||
+    rootKey.length !== 32 ||
+    sha256(rootKey) !== trust.rootKeyDigest
+  ) {
+    throw initBusy(
+      "The Eden init external trust record did not authenticate this provenance directory; ownership state was preserved.",
+      descriptorPath,
+    );
+  }
+  const trustKeyPath = initExternalTrustKeyPath(trust.token);
+  const trustKeyDetails = await lstat(trustKeyPath).catch(
+    () => undefined,
+  );
+  const trustKey = trustKeyDetails === undefined ||
+      !trustKeyDetails.isFile() ||
+      trustKeyDetails.isSymbolicLink()
+    ? undefined
+    : await readFile(trustKeyPath).catch(() => undefined);
+  if (
+    trustKey === undefined ||
+    trustKey.length !== 32 ||
+    sha256(trustKey) !== trust.trustKeyDigest
+  ) {
+    throw initBusy(
+      "The Eden init external trust key was unavailable or malformed; ownership state was preserved.",
+      descriptorPath,
+    );
+  }
+  const actualTrustMac = Buffer.from(trust.mac, "hex");
+  const expectedTrustMac = Buffer.from(
+    initExternalTrustMac(trustKey, root, trust),
+    "hex",
+  );
+  if (
+    actualTrustMac.length !== expectedTrustMac.length ||
+    !timingSafeEqual(actualTrustMac, expectedTrustMac)
+  ) {
+    throw initBusy(
+      "The Eden init external trust record was not authenticated by Eden; ownership state was preserved.",
+      descriptorPath,
+    );
+  }
+  if (rootKey === undefined || rootKey.length !== 32) {
     throw initBusy(
       "The Eden init provenance key was malformed; ownership state was preserved.",
       keyPath,
     );
   }
-  return existing;
+  return rootKey;
 }
 
 async function ensureInitProvenanceKey(root: string): Promise<Buffer> {
   const { directory, keyPath } = initProvenancePaths(root);
+  const trustDirectory = initExternalTrustDirectory();
   try {
-    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await mkdir(trustDirectory, { recursive: true, mode: 0o700 });
   } catch {
     throw initBusy(
-      "The Eden init provenance directory could not be created safely; ownership state was preserved.",
+      "The Eden init external trust directory could not be created safely; ownership state was preserved.",
+      trustDirectory,
+    );
+  }
+  const trustDirectoryDetails = await lstat(trustDirectory).catch(() => {
+    throw initBusy(
+      "The Eden init external trust directory could not be inspected safely; ownership state was preserved.",
+      trustDirectory,
+    );
+  });
+  if (
+    !trustDirectoryDetails.isDirectory() ||
+    trustDirectoryDetails.isSymbolicLink()
+  ) {
+    throw initBusy(
+      "The Eden init external trust directory was not a regular directory; ownership state was preserved.",
+      trustDirectory,
+    );
+  }
+  let claimedDirectory = false;
+  try {
+    await mkdir(directory, { mode: 0o700 });
+    claimedDirectory = true;
+  } catch {
+    const existing = await readInitProvenanceKey(root);
+    if (existing !== undefined) return existing;
+    throw initBusy(
+      "The Eden init provenance directory was pre-created or could not be claimed safely; ownership state was preserved.",
       directory,
     );
   }
@@ -1289,10 +2053,38 @@ async function ensureInitProvenanceKey(root: string): Promise<Buffer> {
       directory,
     );
   }
-  const existing = await readInitProvenanceKey(root);
+  const existing = claimedDirectory
+    ? undefined
+    : await readInitProvenanceKey(root);
   if (existing !== undefined) return existing;
   const keyBytes = randomBytes(32);
+  const token = randomUUID();
+  const trustKey = randomBytes(32);
+  const trustWithoutMac: Omit<InitExternalTrustRecord, "mac"> = {
+    kind: "eden.init.external-trust",
+    version: 1,
+    root,
+    provenanceName: basename(directory),
+    provenanceDev: directoryDetails.dev,
+    provenanceIno: directoryDetails.ino,
+    token,
+    rootKeyDigest: sha256(keyBytes),
+    trustKeyDigest: sha256(trustKey),
+  };
+  const trust: InitExternalTrustRecord = {
+    ...trustWithoutMac,
+    mac: initExternalTrustMac(trustKey, root, trustWithoutMac),
+  };
   try {
+    await writeFile(initExternalTrustKeyPath(token), trustKey, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    await writeFile(
+      initExternalTrustDescriptorPath(root),
+      `${JSON.stringify(trust)}\n`,
+      { encoding: "utf8", mode: 0o600, flag: "wx" },
+    );
     await writeFile(keyPath, keyBytes, {
       mode: 0o600,
       flag: "wx",
@@ -1300,21 +2092,45 @@ async function ensureInitProvenanceKey(root: string): Promise<Buffer> {
     return keyBytes;
   } catch (error: unknown) {
     const code = error as NodeJS.ErrnoException;
-    if (code.code !== "EEXIST") {
-      throw initBusy(
-        "The Eden init provenance key could not be created safely; ownership state was preserved.",
-        keyPath,
-      );
+    if (code.code === "EEXIST") {
+      const raced = await readInitProvenanceKey(root);
+      if (raced !== undefined) return raced;
     }
-    const raced = await readInitProvenanceKey(root);
-    if (raced === undefined) {
-      throw initBusy(
-        "The Eden init provenance key was unavailable after concurrent creation; ownership state was preserved.",
-        keyPath,
-      );
-    }
-    return raced;
+    throw initBusy(
+      "The Eden init provenance trust could not be created safely; ownership state was preserved.",
+      keyPath,
+    );
   }
+}
+
+async function assertInitProvenanceRootClaimable(root: string): Promise<void> {
+  const { directory } = initProvenancePaths(root);
+  const details = await lstat(directory).catch((error: unknown) => {
+    const code = error as NodeJS.ErrnoException;
+    if (code.code === "ENOENT") return undefined;
+    throw initBusy(
+      "The Eden init provenance directory could not be inspected safely; ownership state was preserved.",
+      directory,
+    );
+  });
+  if (details === undefined) {
+    const descriptorPath = initExternalTrustDescriptorPath(root);
+    const descriptor = await lstat(descriptorPath).catch(() => undefined);
+    if (descriptor !== undefined) {
+      throw initBusy(
+        "The Eden init external trust record was pre-created without an Eden provenance root; ownership state was preserved.",
+        descriptorPath,
+      );
+    }
+    return;
+  }
+  if (!details.isDirectory() || details.isSymbolicLink()) {
+    throw initBusy(
+      "The Eden init provenance directory was pre-created unsafely; ownership state was preserved.",
+      directory,
+    );
+  }
+  await readInitProvenanceKey(root);
 }
 
 async function readInitFileObservation(
@@ -1825,7 +2641,10 @@ async function ensureInitLinkResidue(
   sourcePath: string,
   destinationPath: string,
   expected: InitFileObservation,
-): Promise<string | undefined> {
+): Promise<{
+  readonly path: string;
+  readonly observation: InitFileObservation;
+} | undefined> {
   const residuePath = initLinkResiduePath(
     root,
     sourcePath,
@@ -1837,13 +2656,19 @@ async function ensureInitLinkResidue(
     basename(residuePath),
   );
   if (existing !== undefined) {
-    if (!sameInitFileObservation(existing, expected)) {
+    if (existing.serialized !== expected.serialized) {
       throw initBusy(
         "The init link residue was replaced; its state was preserved.",
         basename(residuePath),
       );
     }
-    return residuePath;
+    if (sameInitFileIdentity(existing.identity, expected.identity)) {
+      throw initBusy(
+        "The init link residue was not independent from its source; state was preserved.",
+        basename(residuePath),
+      );
+    }
+    return { path: residuePath, observation: existing };
   }
 
   const source = await readInitFileObservation(
@@ -1858,7 +2683,11 @@ async function ensureInitLinkResidue(
     );
   }
   try {
-    await link(sourcePath, residuePath);
+    await writeFile(residuePath, expected.serialized, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
   } catch (error: unknown) {
     const code = error as NodeJS.ErrnoException;
     if (code.code === "EEXIST") {
@@ -1866,8 +2695,12 @@ async function ensureInitLinkResidue(
         residuePath,
         basename(residuePath),
       );
-      if (raced !== undefined && sameInitFileObservation(raced, expected)) {
-        return residuePath;
+      if (
+        raced !== undefined &&
+        raced.serialized === expected.serialized &&
+        !sameInitFileIdentity(raced.identity, expected.identity)
+      ) {
+        return { path: residuePath, observation: raced };
       }
     }
     if (code.code === "ENOENT") return undefined;
@@ -1886,13 +2719,19 @@ async function ensureInitLinkResidue(
       basename(residuePath),
     );
   }
-  if (!sameInitFileObservation(linked, expected)) {
+  if (linked.serialized !== expected.serialized) {
     throw initBusy(
       "The init link residue changed before it could be authenticated; its state was preserved.",
       basename(residuePath),
     );
   }
-  return residuePath;
+  if (sameInitFileIdentity(linked.identity, expected.identity)) {
+    throw initBusy(
+      "The init link residue was not independent from its source; state was preserved.",
+      basename(residuePath),
+    );
+  }
+  return { path: residuePath, observation: linked };
 }
 
 async function removeInitFileExact(
@@ -1902,6 +2741,7 @@ async function removeInitFileExact(
   source: string,
   hook?: EdenCliRunOptions["initPublicationHook"],
 ): Promise<boolean> {
+  await hook?.("before-init-cleanup", source);
   const tombstone = await renameInitFileToTombstone(
     root,
     path,
@@ -1916,8 +2756,11 @@ async function removeInitFileExact(
       operation: "tombstone",
       outcome: "retained",
       sourceName: source,
-      residueName: basename(tombstone.path),
+      residueName: tombstone.residuePath === undefined
+        ? undefined
+        : basename(tombstone.residuePath),
       expected,
+      residue: tombstone.residueObservation,
       observed: tombstone.observation,
     },
   );
@@ -1925,6 +2768,7 @@ async function removeInitFileExact(
   // by the already-observed inode handle. Keep the authenticated tombstone
   // and transition record as durable residue for later reconciliation rather
   // than risking deletion of a pathname replacement.
+  await hook?.("after-init-cleanup", tombstone.path);
   return true;
 }
 
@@ -1939,6 +2783,7 @@ async function renameInitFileToTombstone(
       readonly path: string;
       readonly observation: InitFileObservation;
       readonly residuePath: string | undefined;
+      readonly residueObservation: InitFileObservation | undefined;
     }
   | undefined
 > {
@@ -1969,6 +2814,14 @@ async function renameInitFileToTombstone(
         source,
       );
     }
+    await recordInitTransitionIntent(root, {
+      operation: "tombstone",
+      sourceName: source,
+      residueName: basename(originalResidue.path),
+      expected,
+      residue: originalResidue.observation,
+      hook,
+    });
     try {
       await rename(path, tombstone);
     } catch (error: unknown) {
@@ -1986,13 +2839,14 @@ async function renameInitFileToTombstone(
       return {
         path: tombstone,
         observation: moved,
-        residuePath: originalResidue,
+        residuePath: originalResidue.path,
+        residueObservation: originalResidue.observation,
       };
     }
 
     if (moved === undefined) {
       try {
-        await link(originalResidue, path);
+        await link(originalResidue.path, path);
       } catch (error: unknown) {
         const code = error as NodeJS.ErrnoException;
         if (code.code !== "EEXIST") {
@@ -2006,8 +2860,9 @@ async function renameInitFileToTombstone(
         operation: "tombstone",
         outcome: "disappeared",
         sourceName: source,
-        residueName: basename(originalResidue),
+        residueName: basename(originalResidue.path),
         expected,
+        residue: originalResidue.observation,
       });
       throw initBusy(
         "The init ownership record changed during removal; its state was preserved.",
@@ -2016,7 +2871,7 @@ async function renameInitFileToTombstone(
     }
 
     try {
-      await link(tombstone, path);
+      await link(originalResidue.path, path);
     } catch (error: unknown) {
       const code = error as NodeJS.ErrnoException;
       if (code.code !== "EEXIST") {
@@ -2030,8 +2885,9 @@ async function renameInitFileToTombstone(
       operation: "tombstone",
       outcome: "replaced",
       sourceName: source,
-      residueName: basename(originalResidue),
+      residueName: basename(originalResidue.path),
       expected,
+      residue: originalResidue.observation,
       observed: moved,
     });
     throw initBusy(
@@ -2080,10 +2936,15 @@ async function linkInitFileNoReplace(
   expected: InitFileObservation,
   source: string,
   hook?: EdenCliRunOptions["initPublicationHook"],
-): Promise<boolean> {
+): Promise<{
+  readonly residue: {
+    readonly path: string;
+    readonly observation: InitFileObservation;
+  };
+} | undefined> {
   const sourceObservation = await readInitFileObservation(sourcePath, source);
   if (sourceObservation === undefined) {
-    return false;
+    return undefined;
   }
   if (!sameInitFileObservation(sourceObservation, expected)) {
     throw initBusy(
@@ -2091,11 +2952,32 @@ async function linkInitFileNoReplace(
       source,
     );
   }
+  const residue = await ensureInitLinkResidue(
+    root,
+    sourcePath,
+    destinationPath,
+    expected,
+  );
+  if (residue === undefined) {
+    throw initBusy(
+      "The init ownership record disappeared before authenticated residue could be retained; state was preserved.",
+      source,
+    );
+  }
+  await recordInitTransitionIntent(root, {
+    operation: "link",
+    sourceName: initTransitionName(root, sourcePath),
+    destinationName: initTransitionName(root, destinationPath),
+    residueName: basename(residue.path),
+    expected,
+    residue: residue.observation,
+    hook,
+  });
   try {
     await link(sourcePath, destinationPath);
   } catch (error: unknown) {
     const code = error as NodeJS.ErrnoException;
-    if (code.code === "ENOENT") return false;
+    if (code.code === "ENOENT") return undefined;
     if (code.code === "EEXIST") {
       throw initBusy(
         "The init ownership transition destination already exists; its state was preserved.",
@@ -2107,19 +2989,14 @@ async function linkInitFileNoReplace(
       source,
     );
   }
-  const residuePath = await ensureInitLinkResidue(
-    root,
-    sourcePath,
-    destinationPath,
-    expected,
-  );
   await recordInitTransition(root, {
     operation: "link",
     outcome: "linked",
     sourceName: initTransitionName(root, sourcePath),
     destinationName: initTransitionName(root, destinationPath),
-    residueName: residuePath === undefined ? undefined : basename(residuePath),
+    residueName: basename(residue.path),
     expected,
+    residue: residue.observation,
   });
   await hook?.("after-init-link", destinationPath);
   const destinationObservation = await readInitFileObservation(
@@ -2128,66 +3005,59 @@ async function linkInitFileNoReplace(
   );
   if (
     destinationObservation === undefined ||
-    !sameInitFileObservation(destinationObservation, expected)
+    !sameInitDestinationObservation(
+      destinationObservation,
+      expected,
+      [residue.observation],
+    )
   ) {
     if (destinationObservation === undefined) {
-      if (residuePath === undefined) {
-        throw initBusy(
-          "The init ownership transition destination disappeared before authenticated residue could be retained; state was preserved.",
-          basename(destinationPath),
-        );
-      }
-      try {
-        await link(residuePath, destinationPath);
-      } catch (error: unknown) {
-        const code = error as NodeJS.ErrnoException;
-        if (code.code !== "EEXIST") {
-          throw initBusy(
-            "The init ownership transition destination disappeared and could not be reconciled; state was preserved.",
-            basename(destinationPath),
-          );
-        }
-      }
-      const reconciled = await readInitFileObservation(
-        destinationPath,
-        basename(destinationPath),
+      const renamed = await findInitFileByObservation(
+        root,
+        expected,
+        [sourcePath, destinationPath],
+        [residue.observation],
       );
-      if (
-        reconciled === undefined ||
-        !sameInitFileObservation(reconciled, expected)
-      ) {
+      if (renamed !== undefined) {
         await recordInitTransition(root, {
           operation: "link",
-          outcome: "destination-disappeared",
+          outcome: "destination-renamed",
           sourceName: initTransitionName(root, sourcePath),
           destinationName: initTransitionName(root, destinationPath),
-          residueName: basename(residuePath),
+          residueName: basename(residue.path),
           expected,
-          observed: reconciled,
+          residue: residue.observation,
+          observed: renamed.observation,
         });
         throw initBusy(
-          "The init ownership transition destination disappeared and could not be reconciled; state was preserved.",
-          basename(destinationPath),
+          "The init ownership transition destination was renamed; the user-visible target was preserved.",
+          initTransitionName(root, renamed.path),
         );
       }
+      const restored = await restoreInitTransitionDestination(
+        destinationPath,
+        residue,
+      );
       await recordInitTransition(root, {
         operation: "link",
         outcome: "reconciled",
         sourceName: initTransitionName(root, sourcePath),
         destinationName: initTransitionName(root, destinationPath),
-        residueName: basename(residuePath),
+        residueName: basename(residue.path),
         expected,
-        observed: reconciled,
+        residue: residue.observation,
+        observed: restored,
       });
-      return true;
+      return { residue };
     }
     await recordInitTransition(root, {
       operation: "link",
       outcome: "destination-displaced",
       sourceName: initTransitionName(root, sourcePath),
       destinationName: initTransitionName(root, destinationPath),
-      residueName: residuePath === undefined ? undefined : basename(residuePath),
+      residueName: basename(residue.path),
       expected,
+      residue: residue.observation,
       observed: destinationObservation,
     });
     throw initBusy(
@@ -2195,7 +3065,7 @@ async function linkInitFileNoReplace(
       basename(destinationPath),
     );
   }
-  return true;
+  return { residue };
 }
 
 async function moveInitFileNoReplace(
@@ -2214,14 +3084,18 @@ async function moveInitFileNoReplace(
     source,
     hook,
   );
-  if (!linked) return false;
+  if (linked === undefined) return false;
   const destinationObservation = await readInitFileObservation(
     destinationPath,
     basename(destinationPath),
   );
   if (
     destinationObservation === undefined ||
-    !sameInitFileObservation(destinationObservation, expected)
+    !sameInitDestinationObservation(
+      destinationObservation,
+      expected,
+      [linked.residue.observation],
+    )
   ) {
     throw initBusy(
       "The init ownership transition destination changed before source removal; both states were preserved.",
@@ -2235,7 +3109,11 @@ async function moveInitFileNoReplace(
   );
   if (
     destinationBeforeRemoval === undefined ||
-    !sameInitFileObservation(destinationBeforeRemoval, expected)
+    !sameInitDestinationObservation(
+      destinationBeforeRemoval,
+      expected,
+      [linked.residue.observation],
+    )
   ) {
     throw initBusy(
       "The init ownership transition destination changed before source removal; both states were preserved.",
@@ -2255,80 +3133,69 @@ async function moveInitFileNoReplace(
       source,
     );
   }
+  if (
+    tombstone.residuePath === undefined ||
+    tombstone.residueObservation === undefined
+  ) {
+    throw initBusy(
+      "The init ownership transition lost its authenticated residue during source retirement; state was preserved.",
+      basename(destinationPath),
+    );
+  }
+  const retirementResidue = {
+    path: tombstone.residuePath,
+    observation: tombstone.residueObservation,
+  };
+  const destinationAfterHook = await readInitFileObservation(
+    destinationPath,
+    basename(destinationPath),
+  );
+  if (destinationAfterHook === undefined) {
+    await restoreInitTransitionDestination(destinationPath, retirementResidue);
+  }
   const destinationAfterRemoval = await readInitFileObservation(
     destinationPath,
     basename(destinationPath),
   );
   if (
-    destinationAfterRemoval === undefined ||
-    !sameInitFileObservation(destinationAfterRemoval, expected)
+    !sameInitDestinationObservation(
+      destinationAfterRemoval,
+      expected,
+      [linked.residue.observation, retirementResidue.observation],
+    )
   ) {
     if (destinationAfterRemoval === undefined) {
-      const residuePath = tombstone.residuePath === undefined
-        ? tombstone.path
-        : tombstone.residuePath;
-      try {
-        await link(residuePath, destinationPath);
-      } catch (error: unknown) {
-        const code = error as NodeJS.ErrnoException;
-        if (code.code !== "EEXIST") {
-          await recordInitTransition(root, {
-            operation: "link",
-            outcome: "destination-disappeared-after-source-retirement",
-            sourceName: initTransitionName(root, sourcePath),
-            destinationName: initTransitionName(root, destinationPath),
-            residueName: basename(residuePath),
-            expected,
-            observed: undefined,
-          });
-          throw initBusy(
-            "The init ownership transition destination disappeared and could not be reconciled; state was preserved.",
-            basename(destinationPath),
-          );
-        }
-      }
-      const reconciled = await readInitFileObservation(
+      await restoreInitTransitionDestination(destinationPath, retirementResidue);
+      const restored = await readInitFileObservation(
         destinationPath,
         basename(destinationPath),
       );
-      if (
-        reconciled !== undefined &&
-        sameInitFileObservation(reconciled, expected)
-      ) {
+      if (sameInitDestinationObservation(
+        restored,
+        expected,
+        [linked.residue.observation, retirementResidue.observation],
+      )) {
         await recordInitTransition(root, {
           operation: "link",
           outcome: "reconciled",
           sourceName: initTransitionName(root, sourcePath),
           destinationName: initTransitionName(root, destinationPath),
-          residueName: basename(residuePath),
+          residueName: basename(linked.residue.path),
           expected,
-          observed: reconciled,
+          residue: linked.residue.observation,
+          observed: restored,
         });
         return true;
       }
-      await recordInitTransition(root, {
-        operation: "link",
-        outcome: "destination-disappeared-after-source-retirement",
-        sourceName: initTransitionName(root, sourcePath),
-        destinationName: initTransitionName(root, destinationPath),
-        residueName: basename(residuePath),
-        expected,
-        observed: reconciled,
-      });
-      throw initBusy(
-        "The init ownership transition destination disappeared and could not be reconciled; state was preserved.",
-        basename(destinationPath),
-      );
     }
     await recordInitTransition(root, {
       operation: "link",
       outcome: "destination-disappeared-after-source-retirement",
       sourceName: initTransitionName(root, sourcePath),
       destinationName: initTransitionName(root, destinationPath),
-      residueName: tombstone.residuePath === undefined
-        ? basename(tombstone.path)
-        : basename(tombstone.residuePath),
+      residueName: basename(linked.residue.path),
       expected,
+      residue: linked.residue.observation,
       observed: destinationAfterRemoval,
     });
     throw initBusy(
@@ -2341,10 +3208,9 @@ async function moveInitFileNoReplace(
     outcome: "reconciled",
     sourceName: initTransitionName(root, sourcePath),
     destinationName: initTransitionName(root, destinationPath),
-    residueName: tombstone.residuePath === undefined
-      ? basename(tombstone.path)
-      : basename(tombstone.residuePath),
+    residueName: basename(linked.residue.path),
     expected,
+    residue: linked.residue.observation,
     observed: destinationAfterRemoval,
   });
   return true;
@@ -2697,6 +3563,8 @@ async function writeScaffoldUnlocked(
   root: string,
   hook?: EdenCliRunOptions["initPublicationHook"],
 ): Promise<void> {
+  await assertInitProvenanceRootClaimable(root);
+  await reconcileInitTransitionRecords(root);
   const interrupted = await readInitState(root);
   if (interrupted !== undefined) {
     await resumeScaffold(root, interrupted, hook);
@@ -9222,6 +10090,7 @@ async function runInvocation(
   const root = await selectedProjectRoot(invocation, cwd);
   switch (invocation.command) {
     case "init":
+      await assertInitProvenanceRootClaimable(root);
       await writeScaffold(root, options.initPublicationHook);
       options.stdout?.(`Initialized Eden project in ${root}.`);
       return;

@@ -295,6 +295,39 @@ describe("CLI OS-crash publication recovery", () => {
     },
   );
 
+  test("reconciles an authenticated transition intent in a fresh process after SIGKILL", async () => {
+    const root = await createRoot("eden-cli-init-transition-intent-crash-");
+    await expect(
+      runEdenCli(["init", "--project", root], {
+        cwd: root,
+        initPublicationHook: async (boundary) => {
+          if (boundary === "after-state-write") {
+            throw new Error("seed incomplete scaffold");
+          }
+        },
+      }),
+    ).resolves.toBe(1);
+
+    const { child, readyPath } = startCrashChild(
+      "init",
+      root,
+      "after-init-transition-intent",
+    );
+    await waitForFile(readyPath, child);
+    await killWithSigkill(child);
+    await rm(readyPath, { force: true });
+
+    await expect(
+      runEdenCli(["init", "--project", root], { cwd: root }),
+    ).resolves.toBe(0);
+    await expect(
+      readFile(join(root, "package.json"), "utf8"),
+    ).resolves.toContain('"eden-basic-agent"');
+    await expect(
+      stat(join(root, ".eden-init-incomplete.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("preserves a replacement staged source after SIGKILL before source removal", async () => {
     const root = await createRoot("eden-cli-init-staged-source-os-race-");
     await expect(
