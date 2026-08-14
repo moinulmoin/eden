@@ -13,9 +13,12 @@ const workspacePackageDirectories = [
   "packages/cli",
   "examples/basic-agent",
 ];
-// Six package-local processes run serially; keep the larger budget scoped to
-// this portability regression instead of masking unrelated hangs globally.
-const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS = 120_000;
+// Six package-local processes run serially. The package-local assertion measured
+// 133.7s after the change, while the full file measured 161.7s including the
+// compiler filter's separate 42s assertion. A 240s budget leaves at least a
+// 78s margin while staying scoped to this portability regression instead of
+// masking unrelated hangs globally.
+const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS = 240_000;
 
 function runPnpm(args, cwd) {
   return new Promise((resolve) => {

@@ -2,6 +2,7 @@ import { access, readFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { dirname } from "node:path";
+import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { expect, test } from "vitest";
@@ -10,6 +11,17 @@ import { runEdenCli } from "../packages/cli/src/index.ts";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
+const wranglerEntrypoint = join(
+  repositoryRoot,
+  "node_modules",
+  "wrangler",
+  "bin",
+  "wrangler.js",
+);
+// The four pinned Wrangler help probes take about 1.9s without the pnpm
+// launcher and about 3.0s in Vitest. Keep the margin local to this expensive
+// assertion rather than increasing the global Vitest timeout.
+const WRANGLER_HELP_TEST_TIMEOUT_MS = 15_000;
 
 async function readRepositoryFile(relativePath) {
   return readFile(join(repositoryRoot, relativePath), "utf8");
@@ -154,42 +166,46 @@ test("retains the exact upstream Eve NOTICE block", async () => {
   expect(notice).toBe(expectedNotice);
 });
 
-test("targets every documented mutating Wrangler command explicitly", async () => {
-  const readme = await readRepositoryFile("README.md");
-  const commands = extractDocumentedWranglerCommands(readme);
-  expect(commands.length).toBeGreaterThan(0);
+test(
+  "targets every documented mutating Wrangler command explicitly",
+  async () => {
+    const readme = await readRepositoryFile("README.md");
+    const commands = extractDocumentedWranglerCommands(readme);
+    expect(commands.length).toBeGreaterThan(0);
 
-  const helpByCommand = new Map();
-  for (const command of ["deploy", "secret put", "secret delete", "delete"]) {
-    const commandParts = command.split(" ");
-    const result = await execFileAsync(
-      "corepack",
-      ["pnpm", "exec", "wrangler", ...commandParts, "--help"],
-      { cwd: repositoryRoot },
-    );
-    helpByCommand.set(command, `${result.stdout}\n${result.stderr}`);
-  }
-
-  for (const documented of commands) {
-    const tokens = tokensForCommand(documented);
-    const wranglerIndex = tokens.indexOf("wrangler");
-    const commandName = tokens[wranglerIndex + 1];
-    const commandKey =
-      commandName === "secret"
-        ? `secret ${tokens[wranglerIndex + 2]}`
-        : commandName;
-    const help = helpByCommand.get(commandKey);
-
-    expect(help, documented).toBeDefined();
-    if (commandKey === "delete") {
-      expect(help, documented).toContain("wrangler delete [name]");
-      expect(tokens, documented).toContain("--env");
-      expect(tokens[wranglerIndex + 2], documented).not.toMatch(/^--/u);
-    } else {
-      expect(help, documented).toContain(`wrangler ${commandKey}`);
-      expect(tokens, documented).toContain("--name");
-      expect(tokens[tokens.indexOf("--name") + 1], documented).not.toMatch(/^--/u);
-      expect(tokens, documented).not.toContain("--env");
+    const helpByCommand = new Map();
+    for (const command of ["deploy", "secret put", "secret delete", "delete"]) {
+      const commandParts = command.split(" ");
+      const result = await execFileAsync(
+        process.execPath,
+        [wranglerEntrypoint, ...commandParts, "--help"],
+        { cwd: repositoryRoot },
+      );
+      helpByCommand.set(command, `${result.stdout}\n${result.stderr}`);
     }
-  }
-});
+
+    for (const documented of commands) {
+      const tokens = tokensForCommand(documented);
+      const wranglerIndex = tokens.indexOf("wrangler");
+      const commandName = tokens[wranglerIndex + 1];
+      const commandKey =
+        commandName === "secret"
+          ? `secret ${tokens[wranglerIndex + 2]}`
+          : commandName;
+      const help = helpByCommand.get(commandKey);
+
+      expect(help, documented).toBeDefined();
+      if (commandKey === "delete") {
+        expect(help, documented).toContain("wrangler delete [name]");
+        expect(tokens, documented).toContain("--env");
+        expect(tokens[wranglerIndex + 2], documented).not.toMatch(/^--/u);
+      } else {
+        expect(help, documented).toContain(`wrangler ${commandKey}`);
+        expect(tokens, documented).toContain("--name");
+        expect(tokens[tokens.indexOf("--name") + 1], documented).not.toMatch(/^--/u);
+        expect(tokens, documented).not.toContain("--env");
+      }
+    }
+  },
+  WRANGLER_HELP_TEST_TIMEOUT_MS,
+);
