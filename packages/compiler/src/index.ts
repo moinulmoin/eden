@@ -2020,14 +2020,20 @@ function sourceImportPath(relativePath: string): string {
 function bundleEntrySource(
   normalized: EdenNormalizedProject,
   moduleMap: EdenModuleMap,
+  pinZodDependency: boolean,
 ): string {
   const agentImport = "edenAgent";
+  const verifiedZodModule = "z" + "od";
+  const dependencyPinImport = pinZodDependency
+    ? `import * as edenVerifiedZod from ${JSON.stringify(verifiedZodModule)};`
+    : "";
   const toolImports = normalized.tools.map((tool, index) => ({
     importName: `edenTool${index}`,
     path: sourceImportPath(tool.source.relativePath),
     tool,
   }));
   const imports = [
+    dependencyPinImport,
     `import ${agentImport} from ${JSON.stringify(sourceImportPath(normalized.discovery.agent.relativePath))};`,
     ...toolImports.map(
       ({ importName, path }) =>
@@ -2074,7 +2080,7 @@ function bundleEntrySource(
     .join(",\n    ");
   return `${imports}
 
-// eden-artifact-entry.mjs
+${pinZodDependency ? "Object.keys(edenVerifiedZod);\n\n" : ""}// eden-artifact-entry.mjs
 const edenTools = Object.freeze(Object.fromEntries([
     ${toolEntries}
   ]));
@@ -2376,9 +2382,9 @@ const TRUSTED_ZOD_PACKAGE = Object.freeze({
 });
 
 const TRUSTED_ZOD_GENERATED_DEPENDENCY_DIGEST =
-  "27dc003cd49baf8edbf0da0af36edb66e18c1ce66fa10667c5ba5b9c16bbf224";
+  "072b9e2a4cd87f2c259fc1719f5e3af5fa1406f418d3b9ea7a76b88fce1a8633";
 const TRUSTED_GENERATED_EXPORT_HELPER_DIGEST =
-  "8880c33da927f05af9f8b8f873eaf291c5c30dbd61d7d1268a09615c7c33da10";
+  "0bdee4dfdd9ee51f1e1b8a9accd8795047394e6331acd0d42aef3af5badfd870";
 
 function dependencyPackageRoot(relativePath: string): string | undefined {
   const segments = relativePath.split("/");
@@ -2527,7 +2533,49 @@ function generatedDependencyHasPackageMarker(
   );
 }
 
-function generatedDependencyContentDigest(
+function canonicalGeneratedIdentifier(name: string): string {
+  return name.replace(/([A-Za-z_$][\w$]*?)(?:2|[3-9]\d*)$/u, "$1");
+}
+
+function canonicalGeneratedJavaScript(source: string): string {
+  const sourceFile = ts.createSourceFile(
+    "generated-zod.mjs",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.JS,
+  );
+  const transformed = ts.transform(sourceFile, [
+    (context) => {
+      const visit: ts.Visitor = (node) => {
+        if (ts.isIdentifier(node)) {
+          const name = canonicalGeneratedIdentifier(node.text);
+          return name === node.text
+            ? node
+            : context.factory.createIdentifier(name);
+        }
+        if (
+          ts.isPropertyAssignment(node) &&
+          ts.isIdentifier(node.name) &&
+          ts.isIdentifier(node.initializer) &&
+          canonicalGeneratedIdentifier(node.name.text) ===
+            canonicalGeneratedIdentifier(node.initializer.text)
+        ) {
+          return context.factory.createShorthandPropertyAssignment(
+            canonicalGeneratedIdentifier(node.name.text),
+          );
+        }
+        return ts.visitEachChild(node, visit, context);
+      };
+      return (node) => ts.visitNode(node, visit) as ts.SourceFile;
+    },
+  ]);
+  return ts
+    .createPrinter({ newLine: ts.NewLineKind.LineFeed })
+    .printFile(transformed.transformed[0] as ts.SourceFile);
+}
+
+function generatedDependencyContent(
   bundle: string,
   packageRoot: string,
 ): string {
@@ -2544,7 +2592,15 @@ function generatedDependencyContentDigest(
     }
     if (inPackageSection) lines.push(line.text);
   }
-  return sha256(lines.join("\n"));
+  const source = lines.join("\n");
+  return canonicalGeneratedJavaScript(source);
+}
+
+function generatedDependencyContentDigest(
+  bundle: string,
+  packageRoot: string,
+): string {
+  return sha256(generatedDependencyContent(bundle, packageRoot));
 }
 
 function generatedDependencySectionRanges(
@@ -2671,7 +2727,9 @@ function generatedArtifactEntryBoundary(
     entryStatement.getStart(sourceFile),
   );
   if (
-    !/^\r?\n(?:[ \t]*\r?\n)?$/u.test(betweenMarkerAndEntry) ||
+    !/^\r?\n(?:Object\.keys\([A-Za-z_$][\w$]*_exports\d*\);\r?\n)?(?:[ \t]*\r?\n)?$/u.test(
+      betweenMarkerAndEntry,
+    ) ||
     entryStatement.getStart(sourceFile) <= marker.start ||
     defaultStatement.getStart(sourceFile) <= entryStatement.getStart(sourceFile)
   ) {
@@ -4000,16 +4058,23 @@ function semanticWorkerBindingDiagnostics(
     "array",
     "bigint",
     "boolean",
+    "codec",
     "catch",
     "date",
     "discriminatedUnion",
     "enum",
     "file",
+    "float32",
+    "float64",
     "function",
+    "int",
+    "int32",
+    "int64",
     "instanceof",
     "intersection",
     "json",
     "lazy",
+    "looseObject",
     "literal",
     "map",
     "nan",
@@ -4017,28 +4082,48 @@ function semanticWorkerBindingDiagnostics(
     "never",
     "null",
     "nullable",
+    "nullish",
     "number",
     "object",
     "promise",
+    "readonly",
     "record",
     "set",
+    "strictObject",
     "string",
     "symbol",
     "templateLiteral",
+    "uint32",
+    "uint64",
     "tuple",
     "undefined",
     "union",
     "unknown",
     "void",
+    "xor",
+    "optional",
+    "nonoptional",
+    "pipe",
+    "prefault",
+    "preprocess",
+    "transform",
   ]);
   const TRUSTED_ZOD_NAMESPACE_PROPERTIES = new Set([
     "coerce",
     "codec",
+    "iso",
+  ]);
+  const TRUSTED_ZOD_ISO_FACTORIES = new Set([
+    "date",
+    "datetime",
+    "duration",
+    "time",
   ]);
   const TRUSTED_ZOD_SCHEMA_METHODS = new Set([
     "and",
     "array",
     "base64",
+    "base64url",
     "brand",
     "catch",
     "check",
@@ -4050,6 +4135,7 @@ function semanticWorkerBindingDiagnostics(
     "describe",
     "email",
     "endsWith",
+    "exclude",
     "extend",
     "extract",
     "finite",
@@ -4058,26 +4144,42 @@ function semanticWorkerBindingDiagnostics(
     "includes",
     "int",
     "length",
+    "lowercase",
     "lt",
     "lte",
     "max",
+    "maxSize",
+    "merge",
     "min",
+    "minSize",
+    "multipleOf",
+    "nonempty",
+    "nonnegative",
     "nonoptional",
+    "nonpositive",
     "nullable",
     "nullish",
+    "omit",
     "optional",
     "or",
     "overwrite",
     "passthrough",
+    "partial",
+    "pick",
     "pipe",
-    "prefix",
+    "positive",
+    "prefault",
     "readonly",
     "regex",
     "refine",
     "refinement",
+    "required",
     "safe",
+    "size",
     "startsWith",
+    "step",
     "strict",
+    "strip",
     "superRefine",
     "transform",
     "trim",
@@ -4087,6 +4189,9 @@ function semanticWorkerBindingDiagnostics(
     "url",
     "uuid",
   ]);
+  const trustedZodCalleeExpressions = new Set<ts.Expression>();
+  const trustedZodCallExpressions = new Set<ts.Expression>();
+  const trustedZodExpressions = new Set<ts.Expression>();
   function zodPropertyName(
     expression: ts.PropertyAccessExpression | ts.ElementAccessExpression,
   ): string | undefined {
@@ -4128,8 +4233,29 @@ function semanticWorkerBindingDiagnostics(
     seenExpressions: Set<ts.Expression> = new Set(),
   ): boolean {
     const current = unwrapExpression(expression);
+    if (trustedZodCalleeExpressions.has(current)) return true;
+    const trusted = isTrustedZodSchemaCalleeUncached(
+      current,
+      seenExpressions,
+    );
+    if (trusted) trustedZodCalleeExpressions.add(current);
+    return trusted;
+  }
+
+  function isTrustedZodSchemaCalleeUncached(
+    expression: ts.Expression,
+    seenExpressions: Set<ts.Expression> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
     if (seenExpressions.has(current)) return false;
     seenExpressions.add(current);
+    if (ts.isIdentifier(current)) {
+      const importedName = trustedZodImportName(current);
+      return (
+        importedName !== undefined &&
+        TRUSTED_ZOD_ROOT_FACTORIES.has(importedName)
+      );
+    }
     if (
       !ts.isPropertyAccessExpression(current) &&
       !ts.isElementAccessExpression(current)
@@ -4152,6 +4278,14 @@ function semanticWorkerBindingDiagnostics(
     ) {
       return true;
     }
+    if (
+      ts.isPropertyAccessExpression(receiverExpression) &&
+      receiverExpression.name.text === "iso" &&
+      TRUSTED_ZOD_ISO_FACTORIES.has(propertyName) &&
+      isTrustedZodNamespaceExpression(receiverExpression)
+    ) {
+      return true;
+    }
     return (
       TRUSTED_ZOD_SCHEMA_METHODS.has(propertyName) &&
       isTrustedZodExpression(receiver)
@@ -4160,26 +4294,38 @@ function semanticWorkerBindingDiagnostics(
 
   function isTrustedZodCall(expression: ts.Expression): boolean {
     const current = unwrapExpression(expression);
+    if (trustedZodCallExpressions.has(current)) return true;
+    const trusted = isTrustedZodCallUncached(current);
+    if (trusted) trustedZodCallExpressions.add(current);
+    return trusted;
+  }
+
+  function isTrustedZodCallUncached(expression: ts.Expression): boolean {
+    const current = unwrapExpression(expression);
     return (
       ts.isCallExpression(current) &&
-      isTrustedZodSchemaCallee(current.expression)
+      isTrustedZodSchemaCallee(current.expression) &&
+      isSafeZodCallArguments(current)
     );
   }
 
   function isTrustedZodImportIdentifier(
     expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
   ): boolean {
     const current = unwrapExpression(expression);
     if (!ts.isIdentifier(current)) return false;
     const symbol = checker.getSymbolAtLocation(current);
-    if (symbol === undefined) return false;
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    seenSymbols.add(symbol);
     const symbols = [symbol];
     if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
       const aliased = checker.getAliasedSymbol(symbol);
       if (aliased !== symbol) symbols.push(aliased);
     }
-    return symbols.some((candidate) =>
-      (candidate.declarations ?? []).some((declaration) => {
+    return symbols.some((candidate) => {
+      if (
+        (candidate.declarations ?? []).some((declaration) => {
         if (
           !ts.isImportSpecifier(declaration) &&
           !ts.isNamespaceImport(declaration) &&
@@ -4216,22 +4362,39 @@ function semanticWorkerBindingDiagnostics(
             ),
           )
         );
-      }),
-    );
+        })
+      ) {
+        return true;
+      }
+      return (candidate.declarations ?? []).some(
+        (declaration) =>
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          isTrustedZodImportIdentifier(
+            declaration.initializer,
+            new Set(seenSymbols),
+          ),
+      );
+    });
   }
 
-  function isZodImportIdentifier(expression: ts.Expression): boolean {
+  function isZodImportIdentifier(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
     const current = unwrapExpression(expression);
     if (!ts.isIdentifier(current)) return false;
     const symbol = checker.getSymbolAtLocation(current);
-    if (symbol === undefined) return false;
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    seenSymbols.add(symbol);
     const symbols = [symbol];
     if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
       const aliased = checker.getAliasedSymbol(symbol);
       if (aliased !== symbol) symbols.push(aliased);
     }
-    return symbols.some((candidate) =>
-      (candidate.declarations ?? []).some((declaration) => {
+    return symbols.some((candidate) => {
+      if (
+        (candidate.declarations ?? []).some((declaration) => {
         const importDeclaration = ts.isImportSpecifier(declaration)
           ? declaration.parent.parent.parent
           : ts.isNamespaceImport(declaration)
@@ -4245,8 +4408,46 @@ function semanticWorkerBindingDiagnostics(
           ts.isStringLiteralLike(importDeclaration.moduleSpecifier) &&
           importDeclaration.moduleSpecifier.text === "zod"
         );
-      }),
-    );
+        })
+      ) {
+        return true;
+      }
+      return (candidate.declarations ?? []).some(
+        (declaration) =>
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          isZodImportIdentifier(
+            declaration.initializer,
+            new Set(seenSymbols),
+          ),
+      );
+    });
+  }
+
+  function trustedZodImportName(
+    expression: ts.Expression,
+  ): string | undefined {
+    const current = unwrapExpression(expression);
+    if (!ts.isIdentifier(current) || !isTrustedZodImportIdentifier(current)) {
+      return undefined;
+    }
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined) return undefined;
+    const symbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) symbols.push(aliased);
+    }
+    for (const candidate of symbols) {
+      for (const declaration of candidate.declarations ?? []) {
+        if (!ts.isImportSpecifier(declaration)) continue;
+        return (
+          declaration.propertyName?.text ??
+          declaration.name.text
+        );
+      }
+    }
+    return undefined;
   }
 
   function isUnresolvedZodImportExpression(
@@ -4322,6 +4523,17 @@ function semanticWorkerBindingDiagnostics(
     seenSymbols: Set<ts.Symbol> = new Set(),
   ): boolean {
     const current = unwrapExpression(expression);
+    if (trustedZodExpressions.has(current)) return true;
+    const trusted = isTrustedZodExpressionUncached(current, seenSymbols);
+    if (trusted) trustedZodExpressions.add(current);
+    return trusted;
+  }
+
+  function isTrustedZodExpressionUncached(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
     if (
       isTrustedZodCall(current) ||
       isTrustedZodSchemaCallee(current)
@@ -4347,6 +4559,808 @@ function semanticWorkerBindingDiagnostics(
             new Set(seenSymbols),
           ),
       ),
+    );
+  }
+
+  function isZodDerivedExpression(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (isZodImportExpression(current) || isTrustedZodCall(current)) {
+      return true;
+    }
+    if (
+      ts.isPropertyAccessExpression(current) ||
+      ts.isElementAccessExpression(current)
+    ) {
+      return isZodDerivedExpression(current.expression, seenSymbols);
+    }
+    if (!ts.isIdentifier(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    const symbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) symbols.push(aliased);
+    }
+    return symbols.some((candidate) =>
+      (candidate.declarations ?? []).some(
+        (declaration) =>
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          isZodDerivedExpression(
+            declaration.initializer,
+            new Set(seenSymbols),
+          ),
+      ),
+    );
+  }
+
+  function isSafeZodCallable(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isArrowFunction(current) || ts.isFunctionExpression(current)) {
+      return true;
+    }
+    if (isCallResultExpression(current) || isAnyOrUnknownType(current)) {
+      return false;
+    }
+    const declarations = callableDeclarations(current, seenSymbols);
+    return declarations.some(
+      (declaration) =>
+        ts.isFunctionDeclaration(declaration) ||
+        ts.isFunctionExpression(declaration) ||
+        ts.isArrowFunction(declaration) ||
+        ts.isMethodDeclaration(declaration) ||
+        ts.isGetAccessorDeclaration(declaration) ||
+        ts.isSetAccessorDeclaration(declaration) ||
+        (ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          (ts.isArrowFunction(declaration.initializer) ||
+            ts.isFunctionExpression(declaration.initializer))),
+    );
+  }
+
+  function isSafeZodStaticExpression(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isStringLiteralLike(current) || ts.isNumericLiteral(current)) {
+      return true;
+    }
+    if (
+      ts.isBigIntLiteral(current) ||
+      ts.isRegularExpressionLiteral(current) ||
+      current.kind === ts.SyntaxKind.TrueKeyword ||
+      current.kind === ts.SyntaxKind.FalseKeyword ||
+      current.kind === ts.SyntaxKind.NullKeyword ||
+      current.kind === ts.SyntaxKind.UndefinedKeyword
+    ) {
+      return true;
+    }
+    if (ts.isPrefixUnaryExpression(current)) {
+      return (
+        (current.operator === ts.SyntaxKind.PlusToken ||
+          current.operator === ts.SyntaxKind.MinusToken) &&
+        isSafeZodStaticExpression(current.operand, new Set(seenSymbols))
+      );
+    }
+    if (ts.isTemplateExpression(current)) {
+      return current.templateSpans.every((span) =>
+        isSafeZodStaticExpression(span.expression, new Set(seenSymbols)),
+      );
+    }
+    if (ts.isArrayLiteralExpression(current)) {
+      return current.elements.every(
+        (element) =>
+          !ts.isSpreadElement(element) &&
+          isSafeZodStaticExpression(element, new Set(seenSymbols)),
+      );
+    }
+    if (ts.isObjectLiteralExpression(current)) {
+      return current.properties.every((property) => {
+        if (
+          ts.isSpreadAssignment(property) ||
+          property.name === undefined ||
+          ts.isComputedPropertyName(property.name)
+        ) {
+          return false;
+        }
+        if (
+          ts.isMethodDeclaration(property)
+        ) {
+          return true;
+        }
+        if (
+          ts.isGetAccessorDeclaration(property) ||
+          ts.isSetAccessorDeclaration(property)
+        ) {
+          return false;
+        }
+        if (ts.isPropertyAssignment(property)) {
+          return isSafeZodStaticExpression(
+            property.initializer,
+            new Set(seenSymbols),
+          );
+        }
+        if (ts.isShorthandPropertyAssignment(property)) {
+          return isSafeZodStaticExpression(
+            property.name,
+            new Set(seenSymbols),
+          );
+        }
+        return false;
+      });
+    }
+    if (ts.isArrowFunction(current) || ts.isFunctionExpression(current)) {
+      return isSafeZodCallable(current);
+    }
+    if (ts.isClassExpression(current)) return true;
+    if (ts.isIdentifier(current)) {
+      if (current.text === "undefined") return true;
+      const symbol = checker.getSymbolAtLocation(current);
+      if (symbol === undefined || seenSymbols.has(symbol)) return false;
+      seenSymbols.add(symbol);
+      const symbols = [symbol];
+      if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        const aliased = checker.getAliasedSymbol(symbol);
+        if (aliased !== symbol) symbols.push(aliased);
+      }
+      return symbols.some((candidate) => {
+        if (
+          (candidate.declarations ?? []).some(
+            (declaration) =>
+              ts.isEnumDeclaration(declaration) ||
+              ts.isClassDeclaration(declaration) ||
+              ts.isFunctionDeclaration(declaration),
+          )
+        ) {
+          return true;
+        }
+        return (candidate.declarations ?? []).some(
+          (declaration) =>
+            ts.isVariableDeclaration(declaration) &&
+            declaration.initializer !== undefined &&
+            !isAnyOrUnknownType(current) &&
+            isSafeZodStaticExpression(
+              declaration.initializer,
+              new Set(seenSymbols),
+            ),
+        );
+      });
+    }
+    if (
+      ts.isPropertyAccessExpression(current) ||
+      ts.isElementAccessExpression(current)
+    ) {
+      const property = ts.isPropertyAccessExpression(current)
+        ? current.name
+        : current.argumentExpression;
+      const propertySymbol =
+        property === undefined
+          ? undefined
+          : checker.getSymbolAtLocation(property);
+      if (
+        propertySymbol?.declarations?.some(
+          (declaration) => ts.isEnumMember(declaration),
+        )
+      ) {
+        return true;
+      }
+      const declarations = objectPropertyDeclarations(
+        current.expression,
+        propertyNameExpression(property),
+      );
+      return declarations.some((declaration) => {
+        if (ts.isPropertyAssignment(declaration)) {
+          return isSafeZodStaticExpression(
+            declaration.initializer,
+            new Set(seenSymbols),
+          );
+        }
+        return false;
+      });
+    }
+    return false;
+  }
+
+  const safeZodSchemaSymbols = new Set<ts.Symbol>();
+
+  function isSafeZodSchemaExpression(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isCallExpression(current)) {
+      return isTrustedZodCall(current);
+    }
+    if (!ts.isIdentifier(current)) return false;
+    const symbol =
+      ts.isShorthandPropertyAssignment(current.parent)
+        ? checker.getShorthandAssignmentValueSymbol(current.parent) ??
+          checker.getSymbolAtLocation(current)
+        : checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    if (safeZodSchemaSymbols.has(symbol)) return true;
+    seenSymbols.add(symbol);
+    const symbols = [symbol];
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol);
+      if (aliased !== symbol) symbols.push(aliased);
+    }
+    const safe = symbols.some((candidate) =>
+      (candidate.declarations ?? []).some(
+        (declaration) =>
+          ts.isVariableDeclaration(declaration) &&
+          declaration.initializer !== undefined &&
+          isSafeZodSchemaExpression(
+            declaration.initializer,
+            new Set(seenSymbols),
+          ),
+      ),
+    );
+    if (safe) safeZodSchemaSymbols.add(symbol);
+    return safe;
+  }
+
+  function isSafeZodSchemaShape(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isIdentifier(current)) {
+      const symbol =
+        ts.isShorthandPropertyAssignment(current.parent)
+          ? checker.getShorthandAssignmentValueSymbol(current.parent) ??
+            checker.getSymbolAtLocation(current)
+          : checker.getSymbolAtLocation(current);
+      if (symbol === undefined || seenSymbols.has(symbol)) return false;
+      seenSymbols.add(symbol);
+      const symbols = [symbol];
+      if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        const aliased = checker.getAliasedSymbol(symbol);
+        if (aliased !== symbol) symbols.push(aliased);
+      }
+      return symbols.some((candidate) =>
+        (candidate.declarations ?? []).some(
+          (declaration) =>
+            ts.isVariableDeclaration(declaration) &&
+            declaration.initializer !== undefined &&
+            isSafeZodSchemaShape(
+              declaration.initializer,
+              new Set(seenSymbols),
+            ),
+        ),
+      );
+    }
+    if (!ts.isObjectLiteralExpression(current)) return false;
+    return current.properties.every((property) => {
+      if (
+        ts.isSpreadAssignment(property) ||
+        property.name === undefined ||
+        ts.isComputedPropertyName(property.name)
+      ) {
+        return false;
+      }
+      if (ts.isPropertyAssignment(property)) {
+        return isSafeZodSchemaExpression(
+          property.initializer,
+          new Set(seenSymbols),
+        );
+      }
+      if (ts.isShorthandPropertyAssignment(property)) {
+        return isSafeZodSchemaExpression(
+          property.name,
+          new Set(seenSymbols),
+        );
+      }
+      return false;
+    });
+  }
+
+  function isSafeZodMask(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isIdentifier(current)) {
+      const symbol = checker.getSymbolAtLocation(current);
+      if (symbol === undefined || seenSymbols.has(symbol)) return false;
+      seenSymbols.add(symbol);
+      if (isAnyOrUnknownType(current)) return false;
+      const symbols = [symbol];
+      if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        const aliased = checker.getAliasedSymbol(symbol);
+        if (aliased !== symbol) symbols.push(aliased);
+      }
+      return symbols.some((candidate) =>
+        (candidate.declarations ?? []).some(
+          (declaration) =>
+            ts.isVariableDeclaration(declaration) &&
+            declaration.initializer !== undefined &&
+            isSafeZodMask(declaration.initializer, new Set(seenSymbols)),
+        ),
+      );
+    }
+    if (!ts.isObjectLiteralExpression(current)) return false;
+    return current.properties.every((property) => {
+      if (
+        ts.isSpreadAssignment(property) ||
+        property.name === undefined ||
+        ts.isComputedPropertyName(property.name)
+      ) {
+        return false;
+      }
+      if (ts.isPropertyAssignment(property)) {
+        const value = unwrapExpression(property.initializer);
+        return (
+          value.kind === ts.SyntaxKind.TrueKeyword ||
+          value.kind === ts.SyntaxKind.FalseKeyword
+        );
+      }
+      if (ts.isShorthandPropertyAssignment(property)) {
+        return false;
+      }
+      return false;
+    });
+  }
+
+  function isSafeZodRegex(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isRegularExpressionLiteral(current)) return true;
+    if (!ts.isIdentifier(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    seenSymbols.add(symbol);
+    return (symbol.declarations ?? []).some(
+      (declaration) =>
+        ts.isVariableDeclaration(declaration) &&
+        declaration.initializer !== undefined &&
+        isSafeZodRegex(declaration.initializer, new Set(seenSymbols)),
+    );
+  }
+
+  function isSafeZodEnumValues(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isObjectLiteralExpression(current)) {
+      return (
+        current.properties.length > 0 &&
+        current.properties.every((property) => {
+          if (
+            ts.isSpreadAssignment(property) ||
+            property.name === undefined ||
+            ts.isComputedPropertyName(property.name)
+          ) {
+            return false;
+          }
+          return (
+            ts.isPropertyAssignment(property) &&
+            isSafeZodStaticExpression(
+              property.initializer,
+              new Set(seenSymbols),
+            )
+          );
+        })
+      );
+    }
+    if (ts.isIdentifier(current)) {
+      const symbol = checker.getSymbolAtLocation(current);
+      if (symbol === undefined || seenSymbols.has(symbol)) return false;
+      seenSymbols.add(symbol);
+      if (
+        symbol.declarations?.some((declaration) =>
+          ts.isEnumDeclaration(declaration),
+        )
+      ) {
+        return true;
+      }
+      const symbols = [symbol];
+      if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        const aliased = checker.getAliasedSymbol(symbol);
+        if (aliased !== symbol) symbols.push(aliased);
+      }
+      return symbols.some((candidate) =>
+        (candidate.declarations ?? []).some(
+          (declaration) =>
+            ts.isVariableDeclaration(declaration) &&
+            declaration.initializer !== undefined &&
+            isSafeZodEnumValues(
+              declaration.initializer,
+              new Set(seenSymbols),
+            ),
+        ),
+      );
+    }
+    if (!ts.isArrayLiteralExpression(current)) return false;
+    return (
+      current.elements.length > 0 &&
+      current.elements.every(
+        (element) =>
+          !ts.isSpreadElement(element) &&
+          ts.isStringLiteralLike(unwrapExpression(element)),
+      )
+    );
+  }
+
+  function isSafeZodClass(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isClassExpression(current)) return true;
+    if (!ts.isIdentifier(current)) return false;
+    const symbol = checker.getSymbolAtLocation(current);
+    if (symbol === undefined || seenSymbols.has(symbol)) return false;
+    seenSymbols.add(symbol);
+    return (symbol.declarations ?? []).some(
+      (declaration) =>
+        ts.isClassDeclaration(declaration) ||
+        ts.isFunctionDeclaration(declaration),
+    );
+  }
+
+  function isSafeZodOptions(
+    argumentsList: readonly ts.Expression[],
+    start = 0,
+  ): boolean {
+    return argumentsList
+      .slice(start)
+      .every((argument) => isSafeZodStaticExpression(argument));
+  }
+
+  function isSafeZodCallArguments(
+    expression: ts.CallExpression,
+  ): boolean {
+    const callee = unwrapExpression(expression.expression);
+    const directFactoryName = trustedZodImportName(callee);
+    const propertyName =
+      directFactoryName ??
+      (ts.isPropertyAccessExpression(callee) ||
+      ts.isElementAccessExpression(callee)
+        ? zodPropertyName(callee)
+        : undefined);
+    if (propertyName === undefined) return false;
+    const receiver =
+      ts.isPropertyAccessExpression(callee) ||
+      ts.isElementAccessExpression(callee)
+        ? unwrapExpression(callee.expression)
+        : undefined;
+    const isRootFactory =
+      directFactoryName !== undefined ||
+      (receiver !== undefined &&
+        ((ts.isIdentifier(receiver) &&
+          isTrustedZodImportIdentifier(receiver)) ||
+          isTrustedZodNamespaceExpression(receiver)));
+    if (isRootFactory) {
+      switch (propertyName) {
+        case "any":
+        case "boolean":
+        case "date":
+        case "datetime":
+        case "duration":
+        case "time":
+        case "file":
+        case "function":
+        case "nan":
+        case "never":
+        case "number":
+        case "string":
+        case "symbol":
+        case "unknown":
+        case "void":
+          return expression.arguments.length <= 1 &&
+            isSafeZodOptions(expression.arguments);
+        case "array":
+        case "set":
+        case "promise":
+          return (
+            expression.arguments.length >= 1 &&
+            expression.arguments.length <= 2 &&
+            isSafeZodSchemaExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 1)
+          );
+        case "map":
+        case "record":
+          return (
+            expression.arguments.length >= 2 &&
+            expression.arguments.length <= 3 &&
+            isSafeZodSchemaExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodSchemaExpression(expression.arguments[1] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 2)
+          );
+        case "bigint":
+        case "int":
+        case "int32":
+        case "int64":
+        case "uint32":
+        case "uint64":
+        case "float32":
+        case "float64":
+          return expression.arguments.length <= 1 &&
+            isSafeZodOptions(expression.arguments);
+        case "object":
+        case "strictObject":
+        case "looseObject":
+          return (
+            expression.arguments.length <= 2 &&
+            (expression.arguments[0] === undefined ||
+              isSafeZodSchemaShape(expression.arguments[0])) &&
+            isSafeZodOptions(expression.arguments, 1)
+          );
+        case "union":
+        case "xor":
+          return (
+            expression.arguments.length >= 1 &&
+            expression.arguments.length <= 2 &&
+            isSafeZodEnumSchemaList(expression.arguments[0] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 1)
+          );
+        case "tuple":
+          return (
+            expression.arguments.length >= 1 &&
+            expression.arguments.length <= 3 &&
+            isSafeZodEnumSchemaList(expression.arguments[0] as ts.Expression) &&
+            (expression.arguments[1] === undefined ||
+              isSafeZodSchemaExpression(expression.arguments[1])) &&
+            isSafeZodOptions(expression.arguments, 2)
+          );
+        case "intersection":
+          return (
+            expression.arguments.length === 2 &&
+            isSafeZodSchemaExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodSchemaExpression(expression.arguments[1] as ts.Expression)
+          );
+        case "instanceof":
+          return expression.arguments.length >= 1 &&
+            expression.arguments.length <= 2 &&
+            isSafeZodClass(expression.arguments[0] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 1);
+        case "discriminatedUnion":
+          return (
+            expression.arguments.length >= 2 &&
+            expression.arguments.length <= 3 &&
+            isSafeZodStaticExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodEnumSchemaList(expression.arguments[1] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 2)
+          );
+        case "enum":
+          return (
+            expression.arguments.length >= 1 &&
+            expression.arguments.length <= 2 &&
+            isSafeZodEnumValues(expression.arguments[0] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 1)
+          );
+        case "nativeEnum":
+          return (
+            expression.arguments.length >= 1 &&
+            expression.arguments.length <= 2 &&
+            isSafeZodEnumValues(expression.arguments[0] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 1)
+          );
+        case "literal":
+          return (
+            expression.arguments.length >= 1 &&
+            expression.arguments.length <= 2 &&
+            isSafeZodStaticExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 1)
+          );
+        case "lazy":
+          return expression.arguments.length === 1 &&
+            isSafeZodCallable(expression.arguments[0] as ts.Expression);
+        case "templateLiteral":
+          return expression.arguments.length >= 1 &&
+            expression.arguments.length <= 2 &&
+            isSafeZodStaticExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 1);
+        case "nullable":
+        case "nullish":
+        case "nonoptional":
+          return expression.arguments.length >= 1 &&
+            expression.arguments.length <= 2 &&
+            isSafeZodSchemaExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodOptions(expression.arguments, 1);
+        case "optional":
+          return expression.arguments.length === 1 &&
+            isSafeZodSchemaExpression(expression.arguments[0] as ts.Expression);
+        case "readonly":
+          return expression.arguments.length === 1 &&
+            isSafeZodSchemaExpression(expression.arguments[0] as ts.Expression);
+        case "pipe":
+          return expression.arguments.length === 2 &&
+            isSafeZodSchemaExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodSchemaExpression(expression.arguments[1] as ts.Expression);
+        case "preprocess":
+          return expression.arguments.length === 2 &&
+            isSafeZodCallable(expression.arguments[0] as ts.Expression) &&
+            isSafeZodSchemaExpression(expression.arguments[1] as ts.Expression);
+        case "transform":
+          return expression.arguments.length === 1 &&
+            isSafeZodCallable(expression.arguments[0] as ts.Expression);
+        case "catch":
+        case "default":
+        case "prefault":
+          return expression.arguments.length === 2 &&
+            isSafeZodSchemaExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodStaticExpression(expression.arguments[1] as ts.Expression);
+        case "codec":
+          return expression.arguments.length === 3 &&
+            isSafeZodSchemaExpression(expression.arguments[0] as ts.Expression) &&
+            isSafeZodSchemaExpression(expression.arguments[1] as ts.Expression) &&
+            isSafeZodStaticExpression(expression.arguments[2] as ts.Expression);
+        default:
+          return false;
+      }
+    }
+    if (receiver === undefined || !isTrustedZodExpression(receiver)) {
+      return false;
+    }
+    const args = expression.arguments;
+    const oneStatic = (index: number): boolean =>
+      args[index] !== undefined &&
+      isSafeZodStaticExpression(args[index] as ts.Expression);
+    const oneSchema = (index: number): boolean =>
+      args[index] !== undefined &&
+      isSafeZodSchemaExpression(args[index] as ts.Expression);
+    const oneCallback = (index: number): boolean =>
+      args[index] !== undefined &&
+      isSafeZodCallable(args[index] as ts.Expression);
+    switch (propertyName) {
+      case "and":
+      case "or":
+      case "pipe":
+        return args.length === 1 && oneSchema(0);
+      case "array":
+      case "nullable":
+      case "nullish":
+      case "optional":
+      case "passthrough":
+      case "readonly":
+      case "strict":
+      case "strip":
+      case "unwrap":
+        return args.length === 0;
+      case "nonoptional":
+        return args.length <= 1 && isSafeZodOptions(args);
+      case "brand":
+        return args.length <= 1 && isSafeZodOptions(args);
+      case "default":
+      case "prefault":
+      case "catch":
+        return args.length === 1 && oneStatic(0);
+      case "describe":
+        return args.length === 1 && ts.isStringLiteralLike(unwrapExpression(args[0] as ts.Expression));
+      case "extend":
+        return args.length === 1 && isSafeZodSchemaShape(args[0] as ts.Expression);
+      case "merge":
+        return args.length === 1 && oneSchema(0);
+      case "partial":
+      case "required":
+      case "pick":
+      case "omit":
+        return args.length <= 1 &&
+          (args.length === 0 || isSafeZodMask(args[0] as ts.Expression));
+      case "min":
+      case "max":
+      case "length":
+      case "gt":
+      case "gte":
+      case "lt":
+      case "lte":
+      case "multipleOf":
+      case "step":
+        return args.length >= 1 &&
+          args.length <= 2 &&
+          oneStatic(0) &&
+          isSafeZodOptions(args, 1);
+      case "nonempty":
+      case "finite":
+      case "int":
+      case "safe":
+      case "positive":
+      case "negative":
+      case "nonpositive":
+      case "nonnegative":
+      case "trim":
+      case "toLowerCase":
+      case "toUpperCase":
+      case "lowercase":
+      case "uppercase":
+      case "base64":
+      case "base64url":
+      case "cidr":
+      case "cuid":
+      case "cuid2":
+      case "datetime":
+      case "email":
+      case "url":
+      case "uuid":
+        return args.length <= 1 && isSafeZodOptions(args);
+      case "regex":
+        return args.length >= 1 &&
+          args.length <= 2 &&
+          isSafeZodRegex(args[0] as ts.Expression) &&
+          isSafeZodOptions(args, 1);
+      case "startsWith":
+      case "endsWith":
+      case "includes":
+        return args.length >= 1 &&
+          args.length <= 2 &&
+          ts.isStringLiteralLike(unwrapExpression(args[0] as ts.Expression)) &&
+          isSafeZodOptions(args, 1);
+      case "maxSize":
+      case "minSize":
+      case "size":
+        return args.length >= 1 &&
+          args.length <= 2 &&
+          oneStatic(0) &&
+          isSafeZodOptions(args, 1);
+      case "extract":
+      case "exclude":
+        return args.length >= 1 &&
+          args.length <= 2 &&
+          isSafeZodEnumValues(args[0] as ts.Expression) &&
+          isSafeZodOptions(args, 1);
+      case "refine":
+      case "superRefine":
+      case "transform":
+      case "overwrite":
+        return args.length >= 1 &&
+          args.length <= 2 &&
+          oneCallback(0) &&
+          isSafeZodOptions(args, 1);
+      case "check":
+      case "with":
+        return args.length > 0 &&
+          args.every((argument) => isSafeZodCallable(argument));
+      default:
+        return false;
+    }
+  }
+
+  function isSafeZodEnumSchemaList(
+    expression: ts.Expression,
+    seenSymbols: Set<ts.Symbol> = new Set(),
+  ): boolean {
+    const current = unwrapExpression(expression);
+    if (ts.isIdentifier(current)) {
+      const symbol = checker.getSymbolAtLocation(current);
+      if (symbol === undefined || seenSymbols.has(symbol)) return false;
+      seenSymbols.add(symbol);
+      const symbols = [symbol];
+      if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        const aliased = checker.getAliasedSymbol(symbol);
+        if (aliased !== symbol) symbols.push(aliased);
+      }
+      return symbols.some((candidate) =>
+        (candidate.declarations ?? []).some(
+          (declaration) =>
+            ts.isVariableDeclaration(declaration) &&
+            declaration.initializer !== undefined &&
+            isSafeZodEnumSchemaList(
+              declaration.initializer,
+              new Set(seenSymbols),
+            ),
+        ),
+      );
+    }
+    if (!ts.isArrayLiteralExpression(current)) return false;
+    return (
+      current.elements.length > 0 &&
+      current.elements.every(
+        (element) =>
+          !ts.isSpreadElement(element) &&
+          isSafeZodSchemaExpression(element),
+      )
     );
   }
 
@@ -5558,6 +6572,29 @@ function semanticWorkerBindingDiagnostics(
   }
 
   function visit(node: ts.Node): void {
+    if (ts.isCallExpression(node)) {
+      const callee = unwrapExpression(node.expression);
+      const zodImportCall =
+        isZodDerivedExpression(callee);
+      if (zodImportCall && !isTrustedZodCall(node)) {
+        const propertyName =
+          ts.isPropertyAccessExpression(callee) ||
+          ts.isElementAccessExpression(callee)
+            ? zodPropertyName(callee)
+            : undefined;
+        const location = semanticLocation(sourceFile, node);
+        diagnostics.push(
+          diagnostic(
+            "MODULE_ZOD_SCHEMA_UNSUPPORTED",
+            propertyName === undefined
+              ? "Zod calls must be statically analyzable supported schema construction."
+              : `Zod schema call "${propertyName}" is unsupported or has unresolved arguments; use an authenticated schema receiver and static construction values.`,
+            relativePath,
+            location,
+          ),
+        );
+      }
+    }
     if (ts.isBindingElement(node)) {
       const propertyName = bindingPropertyName(node);
       if (propertyName === "constructor") {
@@ -5859,7 +6896,11 @@ async function bundleProject(
   moduleMap: EdenModuleMap,
   verifiedZodDependency: boolean,
 ): Promise<string> {
-  const entry = bundleEntrySource(normalized, moduleMap);
+  const entry = bundleEntrySource(
+    normalized,
+    moduleMap,
+    verifiedZodDependency,
+  );
   let compatibilityIssue:
     | {
         readonly code: string;
@@ -5871,6 +6912,7 @@ async function bundleProject(
     const result = await build({
       absWorkingDir: normalized.projectRoot,
       bundle: true,
+      treeShaking: !verifiedZodDependency,
       charset: "utf8",
       format: "esm",
       logLevel: "silent",
@@ -6141,6 +7183,8 @@ type BundleShape =
   | { readonly kind: "string"; readonly value: string }
   | { readonly kind: "number"; readonly value: number }
   | { readonly kind: "boolean"; readonly value: boolean }
+  | { readonly kind: "bigint" }
+  | { readonly kind: "regexp" }
   | { readonly kind: "function" }
   | { readonly kind: "class" }
   | {
@@ -6164,6 +7208,7 @@ interface BundleShapeEnvironment {
   ) => ts.Declaration | undefined;
   readonly trustedSchemaFactoryBindings: ReadonlySet<ts.VariableDeclaration>;
   readonly trustedSchemaFactoryFunctionBindings: ReadonlySet<ts.Declaration>;
+  readonly trustedSchemaFactoryFunctionAliases: ReadonlyMap<string, string>;
   readonly bindingDeclarations: ReadonlyMap<string, ts.Declaration>;
   readonly valueDeclarationCounts: ReadonlyMap<string, number>;
   readonly trustedGeneratedDependencyNamespaces: ReadonlySet<
@@ -6184,47 +7229,139 @@ interface BundleShapeEnvironment {
 const STANDARD_SCHEMA_FACTORY_NAMES = new Set([
   "any",
   "array",
+  "bigint",
   "boolean",
   "catch",
-  "coerce",
+  "codec",
   "date",
-  "default",
   "discriminatedUnion",
   "enum",
+  "file",
+  "float32",
+  "float64",
+  "function",
+  "int",
+  "int32",
+  "int64",
   "intersection",
+  "instanceof",
+  "json",
   "lazy",
   "literal",
+  "looseObject",
+  "map",
+  "nan",
+  "nativeEnum",
   "never",
+  "null",
   "nullable",
+  "nullish",
   "number",
   "object",
   "optional",
   "pipe",
+  "prefault",
   "preprocess",
+  "promise",
+  "readonly",
+  "set",
+  "strictObject",
   "record",
+  "symbol",
   "string",
+  "templateLiteral",
   "transform",
+  "undefined",
   "tuple",
   "union",
+  "uint32",
+  "uint64",
+  "void",
+  "xor",
   "unknown",
 ]);
 
 const STANDARD_SCHEMA_COMPOSITION_METHOD_NAMES = new Set([
   "and",
+  "base64",
+  "base64url",
   "array",
   "brand",
   "catch",
+  "check",
+  "cidr",
+  "cuid",
+  "cuid2",
   "default",
+  "datetime",
+  "email",
+  "endsWith",
+  "exclude",
   "describe",
+  "extract",
+  "finite",
+  "gt",
+  "gte",
+  "includes",
+  "int",
+  "length",
+  "lowercase",
+  "lt",
+  "lte",
+  "max",
+  "maxSize",
+  "merge",
+  "min",
+  "minSize",
+  "multipleOf",
+  "nonempty",
+  "negative",
+  "nonnegative",
+  "nonoptional",
+  "nonpositive",
   "extend",
+  "nullish",
+  "omit",
   "nullable",
   "optional",
+  "partial",
+  "passthrough",
+  "pick",
   "or",
+  "positive",
+  "prefault",
   "pipe",
-  "preprocess",
+  "regex",
+  "refine",
+  "required",
+  "safe",
+  "size",
+  "startsWith",
+  "step",
+  "strict",
+  "strip",
+  "superRefine",
   "readonly",
+  "trim",
+  "toLowerCase",
+  "toUpperCase",
+  "uppercase",
+  "with",
+  "unwrap",
+  "url",
+  "uuid",
   "transform",
+  "overwrite",
+  "refinement",
 ]);
+const STANDARD_SCHEMA_NAMESPACE_NAMES = new Set(["coerce", "iso"]);
+const STANDARD_SCHEMA_ISO_FACTORY_NAMES = new Set([
+  "date",
+  "datetime",
+  "duration",
+  "time",
+]);
+
 
 function isAssignmentOperator(kind: ts.SyntaxKind): boolean {
   return (
@@ -6277,20 +7414,62 @@ function bundleShapeForIdentifier(
   if (resolving.has(declaration)) return { kind: "unknown" };
   resolving.add(declaration);
   try {
-    return bundleShapeForExpression(binding, environment, resolving);
+    const result = bundleShapeForExpression(binding, environment, resolving);
+    return result;
   } finally {
     resolving.delete(declaration);
   }
+}
+
+function unwrapBundleExpression(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (
+    ts.isParenthesizedExpression(current) ||
+    ts.isAsExpression(current) ||
+    ts.isTypeAssertionExpression(current) ||
+    ts.isNonNullExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return current;
 }
 
 function isStandardSchemaFactoryCall(
   expression: ts.CallExpression,
   environment: BundleShapeEnvironment,
 ): boolean {
-  if (!ts.isPropertyAccessExpression(expression.expression)) return false;
-  const target = expression.expression.expression;
-  if (!ts.isIdentifier(target)) return false;
-  const trustedNamespaceDeclaration = environment.declarationForIdentifier(target);
+  const callee = unwrapBundleExpression(expression.expression);
+  if (ts.isIdentifier(callee)) {
+    const exportedFactoryName =
+      environment.trustedSchemaFactoryFunctionAliases.get(callee.text);
+    if (exportedFactoryName === undefined) return false;
+    const declaration = environment.declarationForIdentifier(
+      callee,
+    );
+    if (
+      declaration !== undefined &&
+      environment.mutatedBindings.has(declaration)
+    ) {
+      return false;
+    }
+    return STANDARD_SCHEMA_FACTORY_NAMES.has(exportedFactoryName);
+  }
+  if (!ts.isPropertyAccessExpression(callee)) return false;
+  const target = callee.expression;
+  const namespaceRoot = (value: ts.Expression): ts.Identifier | undefined => {
+    if (ts.isIdentifier(value)) return value;
+    if (
+      ts.isPropertyAccessExpression(value) &&
+      STANDARD_SCHEMA_NAMESPACE_NAMES.has(value.name.text)
+    ) {
+      return namespaceRoot(value.expression);
+    }
+    return undefined;
+  };
+  const trustedNamespace = namespaceRoot(target);
+  if (trustedNamespace === undefined) return false;
+  const trustedNamespaceDeclaration =
+    environment.declarationForIdentifier(trustedNamespace);
   if (
     trustedNamespaceDeclaration === undefined ||
     !ts.isVariableDeclaration(trustedNamespaceDeclaration) ||
@@ -6298,14 +7477,20 @@ function isStandardSchemaFactoryCall(
   ) {
     return false;
   }
-  return (
-    STANDARD_SCHEMA_FACTORY_NAMES.has(expression.expression.name.text) &&
+  const factoryName = callee.name.text;
+  const trustedFactoryBinding =
     environment.trustedSchemaFactoryBindings.has(
       trustedNamespaceDeclaration,
     ) &&
     [...environment.trustedSchemaFactoryFunctionBindings].every(
       (declaration) => !environment.mutatedBindings.has(declaration),
-    )
+    );
+  if (!trustedFactoryBinding) return false;
+  if (STANDARD_SCHEMA_FACTORY_NAMES.has(factoryName)) return true;
+  return (
+    ts.isPropertyAccessExpression(target) &&
+    target.name.text === "iso" &&
+    STANDARD_SCHEMA_ISO_FACTORY_NAMES.has(factoryName)
   );
 }
 
@@ -6325,6 +7510,439 @@ function isObjectMemberCall(
   );
 }
 
+function bundleShapeIsStatic(
+  shape: BundleShape,
+): boolean {
+  switch (shape.kind) {
+    case "undefined":
+    case "null":
+    case "string":
+    case "number":
+    case "boolean":
+    case "bigint":
+    case "regexp":
+    case "function":
+    case "class":
+      return true;
+    case "array":
+      return shape.elements.every((element) => bundleShapeIsStatic(element));
+    case "record":
+      return [...shape.properties.values()].every((value) =>
+        bundleShapeIsStatic(value),
+      );
+    case "unknown":
+    case "schema-call":
+      return false;
+  }
+}
+
+function bundleShapeIsSchema(shape: BundleShape): boolean {
+  return shape.kind === "schema-call";
+}
+
+function bundleShapeIsSchemaShape(shape: BundleShape): boolean {
+  return (
+    shape.kind === "record" &&
+    [...shape.properties.values()].every((value) =>
+      bundleShapeIsSchema(value),
+    )
+  );
+}
+
+function bundleShapeIsSchemaList(shape: BundleShape): boolean {
+  return (
+    shape.kind === "array" &&
+    shape.elements.length > 0 &&
+    shape.elements.every((element) => bundleShapeIsSchema(element))
+  );
+}
+
+function bundleShapeIsSchemaTemplateParts(shape: BundleShape): boolean {
+  return (
+    shape.kind === "array" &&
+    shape.elements.length > 0 &&
+    shape.elements.every(
+      (element) =>
+        element.kind === "schema-call" ||
+        (element.kind === "string" && element.value.length > 0),
+    )
+  );
+}
+
+function bundleShapeIsEnumValues(shape: BundleShape): boolean {
+  if (shape.kind === "array") {
+    return (
+      shape.elements.length > 0 &&
+      shape.elements.every(
+        (element) =>
+          element.kind === "string" && element.value.length > 0,
+      )
+    );
+  }
+  return (
+    shape.kind === "record" &&
+    shape.properties.size > 0 &&
+    [...shape.properties.values()].every(
+      (value) =>
+        value.kind === "string" ||
+        value.kind === "number" ||
+        value.kind === "boolean",
+    )
+  );
+}
+
+function bundleShapeIsMask(shape: BundleShape): boolean {
+  return (
+    shape.kind === "record" &&
+    [...shape.properties.values()].every(
+      (value) => value.kind === "boolean",
+    )
+  );
+}
+
+function bundleShapeIsOptions(
+  argumentsList: readonly BundleShape[],
+  start = 0,
+): boolean {
+  return argumentsList
+    .slice(start)
+    .every((argument) => bundleShapeIsStatic(argument));
+}
+
+function bundleSchemaCallArgumentsSafe(
+  expression: ts.CallExpression,
+  environment: BundleShapeEnvironment,
+  resolving: Set<ts.Declaration>,
+): boolean {
+  const callee = unwrapBundleExpression(expression.expression);
+  const directFactory = ts.isIdentifier(callee);
+  if (!directFactory && !ts.isPropertyAccessExpression(callee)) return false;
+  const propertyName = ts.isIdentifier(callee)
+    ? environment.trustedSchemaFactoryFunctionAliases.get(callee.text)
+    : callee.name.text;
+  if (propertyName === undefined) return false;
+  const receiver = directFactory
+    ? undefined
+    : bundleShapeForExpression(
+        callee.expression,
+        environment,
+        resolving,
+      );
+  const argumentsList = expression.arguments.map((argument) =>
+    bundleShapeForExpression(argument, environment, resolving),
+  );
+  if (argumentsList.some((argument) => argument.kind === "unknown")) {
+    return false;
+  }
+  const rootFactory = isStandardSchemaFactoryCall(expression, environment);
+  if (rootFactory) {
+    const first = argumentsList[0];
+    switch (propertyName) {
+      case "any":
+      case "boolean":
+      case "date":
+      case "datetime":
+      case "duration":
+      case "file":
+      case "function":
+      case "nan":
+      case "never":
+      case "number":
+      case "string":
+      case "symbol":
+      case "unknown":
+      case "void":
+      case "bigint":
+      case "int":
+      case "int32":
+      case "int64":
+      case "uint32":
+      case "uint64":
+      case "float32":
+      case "float64":
+      case "time":
+        return argumentsList.length <= 1 && bundleShapeIsOptions(argumentsList);
+      case "null":
+      case "undefined":
+        return argumentsList.length <= 1 && bundleShapeIsOptions(argumentsList);
+      case "instanceof":
+        return (
+          argumentsList.length >= 1 &&
+          argumentsList.length <= 2 &&
+          argumentsList[0]?.kind === "class" &&
+          bundleShapeIsOptions(argumentsList, 1)
+        );
+      case "array":
+      case "set":
+      case "promise":
+        return (
+          argumentsList.length >= 1 &&
+          argumentsList.length <= 2 &&
+          first !== undefined &&
+          bundleShapeIsSchema(first) &&
+          bundleShapeIsOptions(argumentsList, 1)
+        );
+      case "map":
+      case "record":
+        return (
+          argumentsList.length >= 2 &&
+          argumentsList.length <= 3 &&
+          first !== undefined &&
+          argumentsList[1] !== undefined &&
+          bundleShapeIsSchema(first) &&
+          bundleShapeIsSchema(argumentsList[1]) &&
+          bundleShapeIsOptions(argumentsList, 2)
+        );
+      case "object":
+      case "strictObject":
+      case "looseObject":
+        return (
+          argumentsList.length <= 2 &&
+          (first === undefined || bundleShapeIsSchemaShape(first)) &&
+          bundleShapeIsOptions(argumentsList, 1)
+        );
+      case "union":
+      case "xor":
+        return (
+          argumentsList.length >= 1 &&
+          argumentsList.length <= 2 &&
+          first !== undefined &&
+          bundleShapeIsSchemaList(first) &&
+          bundleShapeIsOptions(argumentsList, 1)
+        );
+      case "tuple":
+        return (
+          argumentsList.length >= 1 &&
+          argumentsList.length <= 3 &&
+          first !== undefined &&
+          bundleShapeIsSchemaList(first) &&
+          (argumentsList[1] === undefined ||
+            bundleShapeIsSchema(argumentsList[1]) ||
+            bundleShapeIsStatic(argumentsList[1])) &&
+          bundleShapeIsOptions(argumentsList, 2)
+        );
+      case "intersection":
+        return (
+          argumentsList.length === 2 &&
+          bundleShapeIsSchema(argumentsList[0] as BundleShape) &&
+          bundleShapeIsSchema(argumentsList[1] as BundleShape)
+        );
+      case "discriminatedUnion":
+        return (
+          argumentsList.length >= 2 &&
+          argumentsList.length <= 3 &&
+          argumentsList[0]?.kind === "string" &&
+          bundleShapeIsSchemaList(argumentsList[1] as BundleShape) &&
+          bundleShapeIsOptions(argumentsList, 2)
+        );
+      case "enum":
+      case "nativeEnum":
+        return (
+          argumentsList.length >= 1 &&
+          argumentsList.length <= 2 &&
+          first !== undefined &&
+          bundleShapeIsEnumValues(first) &&
+          bundleShapeIsOptions(argumentsList, 1)
+        );
+      case "literal":
+        return (
+          argumentsList.length >= 1 &&
+          argumentsList.length <= 2 &&
+          first !== undefined &&
+          bundleShapeIsStatic(first) &&
+          bundleShapeIsOptions(argumentsList, 1)
+        );
+      case "lazy":
+        return (
+          argumentsList.length === 1 &&
+          argumentsList[0]?.kind === "function"
+        );
+      case "templateLiteral":
+        return (
+          argumentsList.length >= 1 &&
+          argumentsList.length <= 2 &&
+          first !== undefined &&
+          bundleShapeIsSchemaTemplateParts(first) &&
+          bundleShapeIsOptions(argumentsList, 1)
+        );
+      case "nullable":
+      case "optional":
+      case "nullish":
+      case "readonly":
+      case "nonoptional":
+        return (
+          argumentsList.length >= 1 &&
+          argumentsList.length <= 2 &&
+          first !== undefined &&
+          bundleShapeIsSchema(first) &&
+          bundleShapeIsOptions(argumentsList, 1)
+        );
+      case "pipe":
+        return (
+          argumentsList.length === 2 &&
+          bundleShapeIsSchema(argumentsList[0] as BundleShape) &&
+          bundleShapeIsSchema(argumentsList[1] as BundleShape)
+        );
+      case "preprocess":
+        return (
+          argumentsList.length === 2 &&
+          argumentsList[0]?.kind === "function" &&
+          bundleShapeIsSchema(argumentsList[1] as BundleShape)
+        );
+      case "transform":
+        return (
+          argumentsList.length === 1 &&
+          argumentsList[0]?.kind === "function"
+        );
+      case "catch":
+      case "default":
+      case "prefault":
+        return (
+          argumentsList.length === 2 &&
+          bundleShapeIsSchema(argumentsList[0] as BundleShape) &&
+          bundleShapeIsStatic(argumentsList[1] as BundleShape)
+        );
+      case "codec":
+        return (
+          argumentsList.length === 3 &&
+          bundleShapeIsSchema(argumentsList[0] as BundleShape) &&
+          bundleShapeIsSchema(argumentsList[1] as BundleShape) &&
+          bundleShapeIsStatic(argumentsList[2] as BundleShape)
+        );
+      default:
+        return false;
+    }
+  }
+  if (receiver === undefined || !bundleShapeIsSchema(receiver)) return false;
+  const first = argumentsList[0];
+  const oneStatic = (index: number): boolean =>
+    argumentsList[index] !== undefined &&
+    bundleShapeIsStatic(argumentsList[index] as BundleShape);
+  const oneSchema = (index: number): boolean =>
+    argumentsList[index] !== undefined &&
+    bundleShapeIsSchema(argumentsList[index] as BundleShape);
+  switch (propertyName) {
+    case "and":
+    case "or":
+    case "pipe":
+      return argumentsList.length === 1 && oneSchema(0);
+    case "array":
+    case "nullable":
+    case "nullish":
+    case "optional":
+    case "passthrough":
+    case "readonly":
+    case "strict":
+    case "strip":
+    case "unwrap":
+      return argumentsList.length === 0;
+    case "nonoptional":
+      return argumentsList.length <= 1 && bundleShapeIsOptions(argumentsList);
+    case "brand":
+      return argumentsList.length <= 1 && bundleShapeIsOptions(argumentsList);
+    case "default":
+    case "prefault":
+    case "catch":
+      return argumentsList.length === 1 && oneStatic(0);
+    case "describe":
+      return argumentsList.length === 1 && argumentsList[0]?.kind === "string";
+    case "extend":
+      return argumentsList.length === 1 && bundleShapeIsSchemaShape(first as BundleShape);
+    case "merge":
+      return argumentsList.length === 1 && oneSchema(0);
+    case "partial":
+    case "required":
+    case "pick":
+    case "omit":
+      return (
+        argumentsList.length <= 1 &&
+        (argumentsList.length === 0 ||
+          bundleShapeIsMask(argumentsList[0] as BundleShape))
+      );
+    case "min":
+    case "max":
+    case "length":
+    case "gt":
+    case "gte":
+    case "lt":
+    case "lte":
+    case "multipleOf":
+    case "step":
+      return (
+        argumentsList.length >= 1 &&
+        argumentsList.length <= 2 &&
+        oneStatic(0) &&
+        bundleShapeIsOptions(argumentsList, 1)
+      );
+    case "nonempty":
+    case "finite":
+    case "int":
+    case "safe":
+    case "positive":
+    case "negative":
+    case "nonpositive":
+    case "nonnegative":
+    case "trim":
+    case "toLowerCase":
+    case "toUpperCase":
+      return argumentsList.length <= 1 && bundleShapeIsOptions(argumentsList);
+    case "base64":
+    case "base64url":
+    case "cidr":
+    case "cuid":
+    case "cuid2":
+    case "datetime":
+    case "email":
+    case "lowercase":
+    case "uppercase":
+    case "url":
+    case "uuid":
+      return argumentsList.length <= 1 && bundleShapeIsOptions(argumentsList);
+    case "regex":
+      return (
+        argumentsList.length >= 1 &&
+        argumentsList.length <= 2 &&
+        argumentsList[0]?.kind === "regexp" &&
+        bundleShapeIsOptions(argumentsList, 1)
+      );
+    case "startsWith":
+    case "endsWith":
+    case "includes":
+      return (
+        argumentsList.length >= 1 &&
+        argumentsList.length <= 2 &&
+        argumentsList[0]?.kind === "string" &&
+        bundleShapeIsOptions(argumentsList, 1)
+      );
+    case "extract":
+    case "exclude":
+      return (
+        argumentsList.length >= 1 &&
+        argumentsList.length <= 2 &&
+        bundleShapeIsEnumValues(argumentsList[0] as BundleShape) &&
+        bundleShapeIsOptions(argumentsList, 1)
+      );
+    case "refine":
+    case "superRefine":
+    case "transform":
+    case "overwrite":
+      return (
+        argumentsList.length >= 1 &&
+        argumentsList.length <= 2 &&
+        argumentsList[0]?.kind === "function" &&
+        bundleShapeIsOptions(argumentsList, 1)
+      );
+    case "check":
+    case "with":
+      return (
+        argumentsList.length > 0 &&
+        argumentsList.every((argument) => argument.kind === "function")
+      );
+    default:
+      return false;
+  }
+}
+
 function bundleShapeTruthiness(
   shape: BundleShape,
 ): boolean | undefined {
@@ -6338,6 +7956,8 @@ function bundleShapeTruthiness(
       return Number.isNaN(shape.value) ? false : shape.value !== 0;
     case "boolean":
       return shape.value;
+    case "bigint":
+    case "regexp":
     case "function":
     case "class":
     case "record":
@@ -6375,6 +7995,12 @@ function bundleShapeForExpression(
   }
   if (ts.isNumericLiteral(expression)) {
     return { kind: "number", value: Number(expression.text) };
+  }
+  if (ts.isBigIntLiteral(expression)) {
+    return { kind: "bigint" };
+  }
+  if (ts.isRegularExpressionLiteral(expression)) {
+    return { kind: "regexp" };
   }
   if (ts.isTemplateExpression(expression)) {
     let value = expression.head.text;
@@ -6754,7 +8380,12 @@ function bundleShapeForExpression(
       return bundleRecordShape(properties);
     }
     if (isStandardSchemaFactoryCall(expression, environment)) {
-      return { kind: "schema-call" };
+      const safe = bundleSchemaCallArgumentsSafe(
+        expression,
+        environment,
+        resolving,
+      );
+      if (safe) return { kind: "schema-call" };
     }
     if (ts.isPropertyAccessExpression(expression.expression)) {
       const receiver = bundleShapeForExpression(
@@ -6768,7 +8399,12 @@ function bundleShapeForExpression(
           expression.expression.name.text,
         )
       ) {
-        return { kind: "schema-call" };
+        const safe = bundleSchemaCallArgumentsSafe(
+          expression,
+          environment,
+          resolving,
+        );
+        if (safe) return { kind: "schema-call" };
       }
     }
     return { kind: "unknown" };
@@ -6953,6 +8589,7 @@ function bundleShapeEnvironment(
   }
   const trustedSchemaFactoryBindings = new Set<ts.VariableDeclaration>();
   const trustedSchemaFactoryFunctionBindings = new Set<ts.Declaration>();
+  const trustedSchemaFactoryFunctionAliases = new Map<string, string>();
   const trustedGeneratedPropertyDefinerBindings = new Set<ts.Declaration>();
   const trustedGeneratedExportHelpers = new Set<ts.VariableDeclaration>();
   const trustedGeneratedDependencyNamespaces = new Set<
@@ -7266,7 +8903,11 @@ function bundleShapeEnvironment(
   const generatedExportHelperDigest =
     generatedExportHelper === undefined
       ? undefined
-      : sha256(generatedExportHelper.getText(sourceFile).replace(/\r\n/gu, "\n"));
+      : sha256(
+          canonicalGeneratedJavaScript(
+            generatedExportHelper.getText(sourceFile).replace(/\r\n/gu, "\n"),
+          ),
+        );
   const hasVerifiedDependencyMarker = generatedDependencyHasPackageMarker(
     sourceFile.text,
     TRUSTED_ZOD_PACKAGE.root,
@@ -7364,7 +9005,8 @@ function bundleShapeEnvironment(
               STANDARD_SCHEMA_FACTORY_NAMES.has(name) &&
               ts.isArrowFunction(property.initializer) &&
               ts.isIdentifier(property.initializer.body) &&
-              property.initializer.body.text === name
+              canonicalGeneratedIdentifier(property.initializer.body.text) ===
+                name
             ) {
               const factoryDeclaration = declarationForIdentifier(
                 property.initializer.body,
@@ -7376,6 +9018,10 @@ function bundleShapeEnvironment(
               ) {
                 hasFactory = true;
                 trustedSchemaFactoryFunctionBindings.add(factoryDeclaration);
+                trustedSchemaFactoryFunctionAliases.set(
+                  property.initializer.body.text,
+                  name,
+                );
               }
             }
           }
@@ -8248,6 +9894,7 @@ function bundleShapeEnvironment(
     declarationForIdentifier,
     trustedSchemaFactoryBindings,
     trustedSchemaFactoryFunctionBindings,
+    trustedSchemaFactoryFunctionAliases,
     bindingDeclarations,
     valueDeclarationCounts,
     trustedGeneratedDependencyNamespaces,

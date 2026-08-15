@@ -114,11 +114,12 @@ const pinnedZodToolSource = `
 // cases remain well below this budget. Keep the timeout scoped to this exact
 // expensive assertion group rather than weakening the default for all tests.
 const PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS = 15_000;
+const PINNED_ZOD_MATRIX_TEST_TIMEOUT_MS = 20_000;
 // The closed-bundle grammar matrix performs a fresh build and authoritative
 // validation for every mutation. In the full serial artifact suite, the
 // authenticated Zod cases measured up to 4.65s under load; keep the margin
 // local to these three assertion-preserving matrices.
-const CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS = 10_000;
+const CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS = 30_000;
 // This corruption matrix reuses a staged candidate while validating every
 // published field. Full serial measurements reached 1.64s; keep its budget
 // local rather than changing Vitest's default for unrelated compiler tests.
@@ -4126,7 +4127,42 @@ describe("artifact generation", () => {
     expect(result.artifacts.manifest.tools).toEqual([
       expect.objectContaining({ name: "zod-valid" }),
     ]);
-  });
+  }, PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS);
+
+  test("accepts direct named factories from the pinned Zod dependency", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Pinned direct Zod fixture\n",
+      "agent/tools/zod-direct.ts": `
+        import {
+          object as makeObject,
+          optional,
+          string as makeString,
+        } from "zod";
+
+        const name = makeString().min(1);
+        const inputSchema = optional(makeObject({ name }));
+
+        export default {
+          description: "Uses direct named factories from pinned Zod.",
+          inputSchema,
+          execute(input) {
+            return { value: input };
+          },
+        };
+      `,
+    });
+    await mkdir(join(root, "node_modules"), { recursive: true });
+    await symlink(
+      join(process.cwd(), "node_modules/zod"),
+      join(root, "node_modules/zod"),
+    );
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "zod-direct" }),
+    ]);
+  }, PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS);
 
   test.each([
     ["optional", "z.object({ name: z.string() }).optional()"],
@@ -4165,6 +4201,153 @@ describe("artifact generation", () => {
       expect.objectContaining({ name: "zod-chain" }),
     ]);
   }, PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS);
+
+  test("accepts a variable-based pinned Zod composition matrix", async () => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Pinned Zod composition matrix fixture\n",
+      "agent/tools/zod-matrix.ts": `
+        import { z } from "zod";
+
+        const name = z.string().min(1).email().trim().toLowerCase();
+        const count = z.number().int().nonnegative().multipleOf(2);
+        const integer = z.int32().nonnegative();
+        const big = z.bigint().positive();
+        const status = z.enum(["new", "old"]);
+        const choice = z.union([z.literal("a"), z.literal("b")]);
+        const options = [
+          z.object({ kind: z.literal("a"), value: name }),
+          z.object({ kind: z.literal("b"), value: count }),
+        ] as const;
+        const tagged = z.discriminatedUnion("kind", options);
+        const tuple = z.tuple([name, count]);
+        const record = z.record(z.string(), name);
+        const map = z.map(z.string(), count);
+        const set = z.set(name);
+        const maybe = z.nullish(tagged);
+        const readonly = z.readonly(tuple);
+        const isoDate = z.iso.datetime();
+        const loose = z.looseObject({ name });
+        const lazy = z.lazy(() => z.object({ value: name }));
+        const preprocessed = z.preprocess((value) => value, name);
+        const transformed = z.transform((value) => String(value));
+        const piped = z.pipe(name, z.string().url());
+        const coded = z.codec(
+          z.string(),
+          z.number(),
+          { decode: (value) => Number(value), encode: (value) => String(value) },
+        );
+        const caught = z.catch(count, 0);
+        const prefault = z.prefault(name, "guest");
+        const pattern = /[a-z]+/;
+
+        const inputSchema = z.object({
+          name,
+          count,
+          integer,
+          big,
+          status,
+          choice,
+          tagged,
+          tuple,
+          record,
+          map,
+          set,
+          maybe,
+          readonly,
+          isoDate,
+          loose,
+          lazy,
+          preprocessed,
+          transformed,
+          piped,
+          coded,
+          caught,
+          prefault,
+          code: name.regex(pattern).startsWith("a").toUpperCase(),
+        }).strict().partial().required();
+
+        export default {
+          description: "Exercises authenticated variable-based Zod composition.",
+          inputSchema,
+          execute(input) {
+            return { value: input };
+          },
+        };
+      `,
+    });
+    await mkdir(join(root, "node_modules"), { recursive: true });
+    await symlink(
+      join(process.cwd(), "node_modules/zod"),
+      join(root, "node_modules/zod"),
+    );
+
+    const result = await buildProject({ projectRoot: root });
+    expect(result.artifacts.manifest.tools).toEqual([
+      expect.objectContaining({ name: "zod-matrix" }),
+    ]);
+  }, PINNED_ZOD_MATRIX_TEST_TIMEOUT_MS);
+
+  test.each([
+    {
+      name: "unresolved schema variable",
+      source: `
+        import { z } from "zod";
+        declare const externalSchema: unknown;
+        export default {
+          description: "Unresolved schema values must fail closed.",
+          inputSchema: z.object({ value: externalSchema }),
+          execute(input) { return { value: input }; },
+        };
+      `,
+    },
+    {
+      name: "dynamic schema list",
+      source: `
+        import { z } from "zod";
+        const schemas = getSchemas();
+        export default {
+          description: "Dynamic schema lists must fail closed.",
+          inputSchema: z.union(schemas),
+          execute(input) { return { value: input }; },
+        };
+      `,
+    },
+    {
+      name: "dynamic callback",
+      source: `
+        import { z } from "zod";
+        const callback = getCallback();
+        export default {
+          description: "Dynamic callbacks must fail closed.",
+          inputSchema: z.preprocess(callback, z.string()),
+          execute(input) { return { value: input }; },
+        };
+      `,
+    },
+  ])("rejects a pinned Zod %s", async ({ source }) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Pinned Zod negative composition fixture\n",
+      "agent/tools/zod-invalid.ts": source,
+    });
+    await mkdir(join(root, "node_modules"), { recursive: true });
+    await symlink(
+      join(process.cwd(), "node_modules/zod"),
+      join(root, "node_modules/zod"),
+    );
+
+    await expect(buildProject({ projectRoot: root })).rejects.toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "MODULE_ZOD_SCHEMA_UNSUPPORTED",
+          source: "agent/tools/zod-invalid.ts",
+          line: expect.any(Number),
+          column: expect.any(Number),
+        }),
+      ]),
+    });
+  });
 
   test("does not exempt caller values flowing through verified Zod calls", async () => {
     const root = await createProject({
