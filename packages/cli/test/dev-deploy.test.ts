@@ -10,7 +10,7 @@ import {
   rm,
   writeFile,
 } from "fs/promises";
-import { statSync } from "fs";
+import { statSync, writeFileSync } from "fs";
 import { execFile, spawn } from "node:child_process";
 import {
   randomUUID,
@@ -35,6 +35,7 @@ import {
   runEdenCli,
   stopEdenDev,
   type EdenCliDryRunRequest,
+  type EdenCliProcessIdentity,
   type EdenCliProcess,
   type EdenCliProcessRequest,
 } from "../src/index.js";
@@ -98,6 +99,13 @@ async function waitForDigestChange(
   }
   return artifactDigest(root);
 }
+
+async function installFakePs(root: string): Promise<void> {
+  await writeFile(join(root, "ps"), "#!/bin/sh\nprintf '%s %s %s %s\\n' \"$PS_PID\" \"$PS_PGID\" \"$PS_LSTART\" \"$PS_COMMAND\"\n", { mode: 0o755 });
+  vi.stubEnv("PATH", `${root}:${process.env.PATH ?? ""}`);
+}
+
+function setFakePsIdentity(identity: EdenCliProcessIdentity): void { vi.stubEnv("PS_PID", String(identity.pid)); vi.stubEnv("PS_PGID", String(identity.pgid)); vi.stubEnv("PS_LSTART", identity.lstart); vi.stubEnv("PS_COMMAND", identity.marker); }
 
 afterEach(async () => {
   vi.unstubAllEnvs();
@@ -163,6 +171,7 @@ describe("eden dev and deploy orchestration", () => {
           });
           return {
             pid: 41_017,
+            identity: { marker: "initial-info-runtime", pid: 41_017, pgid: 41_017, lstart: "fixture" },
             startIdentity: "initial-info-runtime",
             ready,
             exited,
@@ -751,6 +760,7 @@ describe("eden dev and deploy orchestration", () => {
     await initRoot(root);
     const statePath = join(root, ".eden-dev-state.json");
     let observedToken: unknown;
+    await writeFile(statePath, JSON.stringify({ pid: 41_015, startedAt: "fixture-token-owner", token: "fixture-token", workerHost: EDEN_LOCAL_HOST, workerPort: EDEN_LOCAL_PORT, inspectorHost: EDEN_LOCAL_HOST, inspectorPort: EDEN_LOCAL_INSPECTOR_PORT }), "utf8");
     let release: (() => void) | undefined;
     const exited = new Promise<{
       readonly exitCode: number;
@@ -807,6 +817,34 @@ describe("eden dev and deploy orchestration", () => {
     await expect(readFile(statePath, "utf8")).resolves.toContain(
       "replacement-token",
     );
+  });
+
+  test("retains changed V2 state during token-safe removal", async () => {
+    const root = await createRoot("eden-cli-dev-v2-token-");
+    const statePath = join(root, ".eden-dev-state.json");
+    const identity: EdenCliProcessIdentity = { marker: "owned-marker", pid: 100, pgid: 200, lstart: "Mon Jan 1 00:00:00 2026" };
+    const state = (pid: number, token: string): string => JSON.stringify({ version: 2, ...identity, pid, token, workerHost: EDEN_LOCAL_HOST, workerPort: EDEN_LOCAL_PORT, inspectorHost: EDEN_LOCAL_HOST, inspectorPort: EDEN_LOCAL_INSPECTOR_PORT });
+    await writeFile(statePath, state(100, "owned-token"), "utf8");
+    const originalPath = process.env.PATH;
+    await installFakePs(root);
+    setFakePsIdentity(identity);
+    const kill = vi.spyOn(process, "kill");
+    kill.mockImplementation((pid, signal) => {
+      if (signal === "SIGTERM") {
+        setFakePsIdentity({ ...identity, pid: 101 });
+        writeFileSync(statePath, state(101, "replacement-token"));
+      }
+      return signal !== 0;
+    });
+    try {
+      await expect(stopEdenDev({ cwd: root, projectRoot: root })).resolves.toBe(0);
+      expect(kill).toHaveBeenCalledWith(-200, "SIGTERM");
+      expect(kill).not.toHaveBeenCalledWith(-200, "SIGKILL");
+      await expect(readFile(statePath, "utf8")).resolves.toContain("replacement-token");
+    } finally {
+      kill.mockRestore();
+      vi.stubEnv("PATH", originalPath);
+    }
   });
 
   test("stops startup before spawning when a signal arrives during the initial build", async () => {
@@ -887,6 +925,51 @@ describe("eden dev and deploy orchestration", () => {
     }
   });
 
+  for (const mismatch of ["marker", "pgid", "lstart"] as const) {
+    test(`retains V2 state without signaling on ${mismatch} mismatch`, async () => {
+      const root = await createRoot(`eden-cli-dev-state-${mismatch}-mismatch-`);
+      const identity = { marker: "owned-marker", pid: 100, pgid: 200, lstart: "Mon Jan 1 00:00:00 2026" };
+      await writeFile(join(root, ".eden-dev-state.json"), JSON.stringify({ version: 2, ...identity, token: "owned-token", workerHost: EDEN_LOCAL_HOST, workerPort: EDEN_LOCAL_PORT, inspectorHost: EDEN_LOCAL_HOST, inspectorPort: EDEN_LOCAL_INSPECTOR_PORT }), "utf8");
+      const originalPath = process.env.PATH;
+      const observed = { ...identity, [mismatch]: mismatch === "pgid" ? 201 : mismatch === "marker" ? "different-marker" : "Tue Jan 1 00:00:00 2026" };
+      await installFakePs(root);
+      setFakePsIdentity(observed as EdenCliProcessIdentity);
+      const kill = vi.spyOn(process, "kill");
+      try {
+        await expect(stopEdenDev({ cwd: root, projectRoot: root })).resolves.toBe(0);
+        expect(kill).not.toHaveBeenCalledWith(expect.anything(), expect.anything());
+        await expect(readFile(join(root, ".eden-dev-state.json"), "utf8")).resolves.toContain("owned-token");
+      } finally {
+        kill.mockRestore();
+        vi.stubEnv("PATH", originalPath);
+      }
+    });
+  }
+
+  test("signals the verified PGID and refuses SIGKILL after tuple change", async () => {
+    const root = await createRoot("eden-cli-dev-state-pgid-");
+    const identity = { marker: "owned-marker", pid: 100, pgid: 200, lstart: "Mon Jan 1 00:00:00 2026" };
+    await writeFile(join(root, ".eden-dev-state.json"), JSON.stringify({ version: 2, ...identity, token: "owned-token", workerHost: EDEN_LOCAL_HOST, workerPort: EDEN_LOCAL_PORT, inspectorHost: EDEN_LOCAL_HOST, inspectorPort: EDEN_LOCAL_INSPECTOR_PORT }), "utf8");
+    const originalPath = process.env.PATH;
+    await installFakePs(root);
+    setFakePsIdentity(identity);
+    const kill = vi.spyOn(process, "kill");
+    kill.mockImplementation((pid, signal) => {
+      if (signal === "SIGTERM") setFakePsIdentity({ ...identity, lstart: "Tue Jan 1 00:00:00 2026" });
+      return true;
+    });
+    try {
+      await expect(stopEdenDev({ cwd: root, projectRoot: root })).resolves.toBe(0);
+      expect(kill).toHaveBeenCalledWith(-200, "SIGTERM");
+      expect(kill).not.toHaveBeenCalledWith(-100, expect.anything());
+      expect(kill).not.toHaveBeenCalledWith(-200, "SIGKILL");
+      await expect(readFile(join(root, ".eden-dev-state.json"), "utf8")).resolves.toContain("owned-token");
+    } finally {
+      kill.mockRestore();
+      vi.stubEnv("PATH", originalPath);
+    }
+  });
+
   test("revalidates the owned identity before SIGTERM and SIGKILL escalation", async () => {
     const root = await createRoot("eden-cli-dev-stop-escalation-");
     const marker = `eden-stop-test-${randomUUID()}`;
@@ -905,20 +988,23 @@ describe("eden dev and deploy orchestration", () => {
     );
     const childPid = child.pid;
     expect(childPid).toBeGreaterThan(0);
-    let identity: string | undefined;
+    let identity: EdenCliProcessIdentity | undefined;
     for (let attempt = 0; attempt < 50 && identity === undefined; attempt += 1) {
-      identity = await new Promise<string | undefined>((resolve) => {
+      identity = await new Promise<typeof identity>((resolve) => {
         execFile(
           "ps",
-          ["-p", String(childPid), "-o", "command="],
+          ["-p", String(childPid), "-o", "pid=,pgid=,lstart=,command="],
           { encoding: "utf8" },
           (error, stdout) => {
             if (error !== null) {
               resolve(undefined);
               return;
             }
-            const value = String(stdout).trim().split(/\s+/u)[0] ?? "";
-            resolve(value.length === 0 ? undefined : value);
+            const match = /^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*?)\s*$/u.exec(String(stdout).trim());
+            const marker = match?.[4]?.split(/\s+/u)[0] ?? "";
+            resolve(match === null || marker.length === 0 ? undefined : {
+              marker, pid: Number(match[1]), pgid: Number(match[2]), lstart: match[3] ?? "",
+            });
           },
         );
       });
@@ -926,12 +1012,15 @@ describe("eden dev and deploy orchestration", () => {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
-    expect(identity).toContain(marker);
+    expect(identity?.marker).toContain(marker);
     await writeFile(
       join(root, ".eden-dev-state.json"),
       JSON.stringify({
-        pid: childPid,
-        startedAt: identity,
+        version: 2,
+        marker: identity?.marker,
+        pid: identity?.pid,
+        pgid: identity?.pgid,
+        lstart: identity?.lstart,
         token: "owned-stop-token",
         workerHost: EDEN_LOCAL_HOST,
         workerPort: EDEN_LOCAL_PORT,
@@ -941,6 +1030,7 @@ describe("eden dev and deploy orchestration", () => {
       "utf8",
     );
 
+    const kill = vi.spyOn(process, "kill");
     try {
       await expect(
         stopEdenDev({ cwd: root, projectRoot: root }),
@@ -953,7 +1043,10 @@ describe("eden dev and deploy orchestration", () => {
         child.once("exit", () => resolve());
       });
       expect(child.signalCode).toBe("SIGKILL");
+      expect(kill.mock.calls).toContainEqual([-identity?.pgid, "SIGTERM"]);
+      expect(kill.mock.calls).toContainEqual([-identity?.pgid, "SIGKILL"]);
     } finally {
+      kill.mockRestore();
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGKILL");
       }

@@ -190,6 +190,8 @@ export interface EdenCliProcessRequest {
   }[];
 }
 
+export type EdenCliProcessIdentity = { readonly marker: string; readonly pid: number; readonly pgid: number; readonly lstart: string; };
+
 export interface EdenCliProcessExit {
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
@@ -201,6 +203,7 @@ export interface EdenCliProcess {
    * A process-start identity captured by the process runner immediately after
    * spawn. PID alone is never sufficient to authorize cleanup.
    */
+  readonly identity?: EdenCliProcessIdentity | Promise<EdenCliProcessIdentity | undefined>;
   readonly startIdentity?: string | Promise<string | undefined>;
   readonly exited: Promise<EdenCliProcessExit>;
   readonly ready?: Promise<void>;
@@ -3762,13 +3765,18 @@ const DEV_STATE_FILE = ".eden-dev-state.json";
 
 interface DevState {
   readonly pid: number;
-  readonly startedAt: string;
+  readonly version?: 1 | 2; readonly marker?: string; readonly pgid?: number; readonly lstart?: string; readonly startedAt?: string;
   readonly token?: string;
   readonly workerHost: typeof EDEN_LOCAL_HOST;
   readonly workerPort: typeof EDEN_LOCAL_PORT;
   readonly inspectorHost: typeof EDEN_LOCAL_INSPECTOR_HOST;
   readonly inspectorPort: typeof EDEN_LOCAL_INSPECTOR_PORT;
 }
+
+type DevStateV2 = DevState & { readonly version: 2; readonly marker: string; readonly pgid: number; readonly lstart: string; readonly token: string; };
+type DevStateOwner = EdenCliProcessIdentity & { readonly token: string; readonly version: 2; };
+
+type ProcessObservation = { readonly pid: number; readonly pgid: number; readonly lstart: string; readonly command: string; };
 
 const PROCESS_IDENTITY_PREFIX = "eden-dev-process-";
 
@@ -3792,12 +3800,13 @@ function processCommandContainsMarker(
 
 function readProcessCommand(
   pid: number,
+  format = "command=",
 ): Promise<string | undefined> {
   if (process.platform === "win32") return Promise.resolve(undefined);
   return new Promise((resolveResult) => {
     execFile(
       "ps",
-      ["-p", String(pid), "-o", "command="],
+      ["-p", String(pid), "-o", format],
       {
         encoding: "utf8",
         env: scrubChildEnvironment(),
@@ -3811,6 +3820,19 @@ function readProcessCommand(
         resolveResult(command.length === 0 ? undefined : command);
       },
     );
+  });
+}
+
+function readProcessObservation(
+  pid: number,
+): Promise<ProcessObservation | undefined> {
+  return readProcessCommand(pid, "pid=,pgid=,lstart=,command=").then((output) => {
+    const m = output === undefined ? null :
+      /^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*?)\s*$/u.exec(output);
+    if (m === null) return;
+    const pid = Number(m[1]), pgid = Number(m[2]), lstart = m[3] ?? "", command = m[4] ?? "";
+    return Number.isSafeInteger(pid) && pid > 0 && Number.isSafeInteger(pgid) && pgid > 0 && lstart.length > 0 && command.length > 0
+      ? { pid, pgid, lstart, command } : undefined;
   });
 }
 
@@ -3838,18 +3860,27 @@ function readProcessStartTime(pid: number): Promise<string | undefined> {
 
 async function verifyProcessIdentity(
   pid: number,
-  expectedIdentity: string,
+  expectedIdentity: EdenCliProcessIdentity,
 ): Promise<boolean> {
-  if (
-    pid <= 0 ||
-    expectedIdentity.length === 0 ||
-    process.platform === "win32"
-  ) {
-    return false;
-  }
-  const command = await readProcessCommand(pid);
-  return command !== undefined &&
-    processCommandContainsMarker(command, expectedIdentity);
+  if (pid <= 0 || expectedIdentity.pgid <= 0 || expectedIdentity.marker.length === 0 ||
+    expectedIdentity.lstart.length === 0 || process.platform === "win32") return false;
+  const observed = await readProcessObservation(pid);
+  return observed !== undefined &&
+    observed.pid === pid &&
+    observed.pgid === expectedIdentity.pgid &&
+    observed.lstart === expectedIdentity.lstart &&
+    processCommandContainsMarker(observed.command, expectedIdentity.marker);
+}
+
+function isProcessIdentity(value: unknown): value is EdenCliProcessIdentity {
+  return isRecord(value) && typeof value.marker === "string" && value.marker.length > 0 && typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 0 && typeof value.pgid === "number" && Number.isSafeInteger(value.pgid) && value.pgid > 0 && typeof value.lstart === "string" && value.lstart.length > 0;
+}
+
+function identityFromDevState(state: DevStateV2): EdenCliProcessIdentity {
+  return { marker: state.marker, pid: state.pid, pgid: state.pgid, lstart: state.lstart };
+}
+function devStateOwner(identity: EdenCliProcessIdentity, token: string): DevStateOwner {
+  return { ...identity, token, version: 2 };
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -3864,14 +3895,13 @@ function isProcessAlive(pid: number): boolean {
 
 async function writeDevState(
   root: string,
-  pid: number,
-  startedAt: string,
+  identity: unknown,
 ): Promise<{ readonly path: string; readonly token: string }> {
-  if (startedAt.length === 0) {
+  if (!isProcessIdentity(identity)) {
     throw cliError({
       code: "DEV_PROCESS_IDENTITY_UNAVAILABLE",
       message:
-        "The Eden dev process start identity could not be verified; cleanup is disabled.",
+        "The Eden dev process identity could not be verified; cleanup is disabled.",
       source: DEV_STATE_FILE,
     });
   }
@@ -3879,41 +3909,16 @@ async function writeDevState(
   const existing = await lstat(statePath).catch(() => undefined);
   if (existing !== undefined) {
     const previous = await readDevState(root);
-    let alive = true;
-    if (previous !== undefined) {
-      alive = await verifyProcessIdentity(previous.pid, previous.startedAt);
-    }
-    if (alive) {
-      throw cliError({
-        code: "DEV_STATE_EXISTS",
-        message:
-          "An Eden dev process state file already exists; stop the owned process before starting another dev invocation.",
-        source: DEV_STATE_FILE,
-      });
-    }
-    if (previous?.token === undefined) {
-      throw cliError({
-        code: "DEV_STATE_INVALID",
-        message:
-          "The existing Eden dev process state has no ownership token and cannot be replaced safely.",
-        source: DEV_STATE_FILE,
-      });
-    }
-    const removed = await removeOwnedDevState(root, previous);
-    if (!removed) {
-      throw cliError({
-        code: "DEV_STATE_EXISTS",
-        message:
-          "The Eden dev process state changed while it was being replaced; retry without taking over the replacement process.",
-        source: DEV_STATE_FILE,
-      });
-    }
+    if (previous === undefined || previous.version !== 2) throw cliError({ code: "DEV_STATE_INVALID", message: "The existing Eden dev process state is legacy and cannot be replaced safely.", source: DEV_STATE_FILE });
+    const previousIdentity = identityFromDevState(previous as DevStateV2);
+    const alive = await verifyProcessIdentity(previousIdentity.pid, previousIdentity);
+    if (alive) throw cliError({ code: "DEV_STATE_EXISTS", message: "An Eden dev process state file already exists; stop the owned process before starting another dev invocation.", source: DEV_STATE_FILE });
+    const removed = await removeOwnedDevState(root, previous as DevStateOwner);
+    if (!removed) throw cliError({ code: "DEV_STATE_EXISTS", message: "The Eden dev process state changed while it was being replaced; retry without taking over the replacement process.", source: DEV_STATE_FILE });
   }
   const token = randomUUID();
-  const state: DevState = {
-    pid,
-    startedAt,
-    token,
+  const state: DevStateV2 = {
+    version: 2, marker: identity.marker, pid: identity.pid, pgid: identity.pgid, lstart: identity.lstart, token,
     workerHost: EDEN_LOCAL_HOST,
     workerPort: EDEN_LOCAL_PORT,
     inspectorHost: EDEN_LOCAL_INSPECTOR_HOST,
@@ -3946,14 +3951,12 @@ async function readDevState(root: string): Promise<DevState | undefined> {
     });
   }
   if (
-    typeof value !== "object" ||
-    value === null ||
-    Array.isArray(value) ||
+    !isRecord(value) ||
     Object.keys(value).some(
       (key) =>
         ![
-          "pid",
-          "startedAt",
+          "version", "marker", "pid",
+          "pgid", "lstart", "startedAt",
           "token",
           "workerHost",
           "workerPort",
@@ -3969,13 +3972,15 @@ async function readDevState(root: string): Promise<DevState | undefined> {
     });
   }
   const state = value as Partial<DevState>;
+  const version = state.version ?? 1;
+  const identity = isProcessIdentity({ marker: state.marker, pid: state.pid, pgid: state.pgid, lstart: state.lstart });
+  const legacy = version === 1 && typeof state.startedAt === "string" && state.startedAt.length > 0 &&
+    (state.token === undefined || (typeof state.token === "string" && state.token.length > 0));
   if (
     !Number.isSafeInteger(state.pid) ||
     (state.pid as number) <= 0 ||
-    typeof state.startedAt !== "string" ||
-    state.startedAt.length === 0 ||
-    (state.token !== undefined &&
-      (typeof state.token !== "string" || state.token.length === 0)) ||
+    (version !== 1 && version !== 2) ||
+    !(version === 1 ? legacy : identity && typeof state.token === "string" && state.token.length > 0) ||
     state.workerHost !== EDEN_LOCAL_HOST ||
     state.workerPort !== EDEN_LOCAL_PORT ||
     state.inspectorHost !== EDEN_LOCAL_INSPECTOR_HOST ||
@@ -3992,7 +3997,7 @@ async function readDevState(root: string): Promise<DevState | undefined> {
 
 async function removeOwnedDevState(
   root: string,
-  owner: Pick<DevState, "pid" | "startedAt" | "token">,
+  owner: DevStateOwner,
 ): Promise<boolean> {
   if (owner.token === undefined || owner.token.length === 0) return false;
   const statePath = await resolveContainedProjectPath(root, DEV_STATE_FILE);
@@ -4019,11 +4024,8 @@ async function removeOwnedDevState(
     } catch {
       value = undefined;
     }
-    matches =
-      isRecord(value) &&
-      value.pid === owner.pid &&
-      value.startedAt === owner.startedAt &&
-      value.token === owner.token;
+    matches = isRecord(value) && value.version === 2 && value.pid === owner.pid && value.marker === owner.marker &&
+      value.pgid === owner.pgid && value.lstart === owner.lstart && value.token === owner.token;
   }
   let restoreError: unknown;
   if (matches) {
@@ -4045,13 +4047,13 @@ async function removeOwnedDevState(
 
 async function signalOwnedProcess(
   pid: number,
-  expectedIdentity: string,
+  expectedIdentity: EdenCliProcessIdentity,
   signal: NodeJS.Signals,
 ): Promise<boolean> {
   if (!(await verifyProcessIdentity(pid, expectedIdentity))) return false;
   try {
     if (process.platform !== "win32") {
-      process.kill(-pid, signal);
+      process.kill(-expectedIdentity.pgid, signal);
     } else {
       process.kill(pid, signal);
     }
@@ -4065,14 +4067,14 @@ async function signalOwnedProcess(
 
 async function waitForProcessExit(
   pid: number,
-  expectedIdentity: string,
+  expectedIdentity: EdenCliProcessIdentity,
 ): Promise<boolean> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < 5_000) {
-    if (!(await verifyProcessIdentity(pid, expectedIdentity))) return true;
+    if (!(await verifyProcessIdentity(pid, expectedIdentity))) return !isProcessAlive(pid);
     await new Promise((resolveResult) => setTimeout(resolveResult, 50));
   }
-  return !(await verifyProcessIdentity(pid, expectedIdentity));
+  return !(await verifyProcessIdentity(pid, expectedIdentity)) && !isProcessAlive(pid);
 }
 
 async function waitForOwnedProcessExit(
@@ -4142,8 +4144,8 @@ async function terminateRuntimeChild(
   // The child remains owned until its exit promise proves a terminal state.
   const termination: boolean = await Promise.race<boolean>([
     Promise.resolve()
-      .then(() => process.terminate(signal))
-      .then(() => true, () => false),
+      .then(() => process.terminate(signal).then(() => true))
+      .then((value) => value, () => false),
     new Promise<boolean>((resolveResult) => {
       setTimeout(() => resolveResult(false), OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS);
     }),
@@ -4199,26 +4201,30 @@ export async function stopEdenDev(
     if (state.token === undefined) {
       return 0;
     }
-    if (!(await verifyProcessIdentity(state.pid, state.startedAt))) {
+    if (state.version !== 2) {
       return 0;
     }
+    const currentState = state as DevStateV2;
+    const identity = identityFromDevState(currentState);
+    if (!(await verifyProcessIdentity(identity.pid, identity))) return 0;
     const termSent = await signalOwnedProcess(
-      state.pid,
-      state.startedAt,
+      identity.pid,
+      identity,
       "SIGTERM",
     );
     if (!termSent) return 0;
     const exitedAfterTerm = await waitForProcessExit(
-      state.pid,
-      state.startedAt,
+      identity.pid,
+      identity,
     );
     if (!exitedAfterTerm) {
       const killSent = await signalOwnedProcess(
-        state.pid,
-        state.startedAt,
+        identity.pid,
+        identity,
         "SIGKILL",
       );
-      if (killSent && !(await waitForProcessExit(state.pid, state.startedAt))) {
+      if (!killSent) return 0;
+      if (killSent && !(await waitForProcessExit(identity.pid, identity))) {
         throw cliError({
           code: "DEV_STOP_TIMEOUT",
           message: "The owned Eden dev process did not exit after termination.",
@@ -4230,7 +4236,7 @@ export async function stopEdenDev(
     return 0;
   } finally {
     if (removeState) {
-      await removeOwnedDevState(root, state);
+      await removeOwnedDevState(root, state as DevStateOwner);
     }
   }
 }
@@ -4380,29 +4386,24 @@ function createDefaultProcessHandle(
           waitForTcpPort(port.host, port.port, RUNTIME_PROCESS_READY_TIMEOUT_MS)
         ),
       ).then(() => undefined);
-  const startIdentity = Promise.race([
-    waitForProcessIdentity(pid, processMarker),
+  const identity = Promise.race([
+    observeProcessIdentity(pid, processMarker),
     exited.then(() => undefined),
   ]);
   const signalOwnedChild = async (signal: NodeJS.Signals): Promise<boolean> => {
-    const expected = await resolveOwnedProcessIdentity(
-      {
-        pid,
-        startIdentity,
-        exited,
-        async terminate() {},
-      },
-      OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS,
-    );
+    const expected = await Promise.race([
+      identity,
+      new Promise<undefined>((resolveResult) => setTimeout(resolveResult, OWNED_PROCESS_SETTLEMENT_TIMEOUT_MS)),
+    ]);
     if (
-      expected === undefined ||
-      !(await verifyProcessIdentity(pid, expected))
+      !isProcessIdentity(expected) ||
+      !(await verifyProcessIdentity(expected.pid, expected))
     ) {
       return false;
     }
     try {
       if (process.platform !== "win32") {
-        process.kill(-pid, signal);
+        process.kill(-expected.pgid, signal);
       } else {
         child.kill(signal);
       }
@@ -4415,7 +4416,8 @@ function createDefaultProcessHandle(
   };
   return {
     pid,
-    startIdentity,
+    identity,
+    startIdentity: identity.then((value) => value?.marker),
     exited,
     ...(ready === undefined ? {} : { ready }),
     async terminate(signal = "SIGTERM") {
@@ -6354,14 +6356,17 @@ async function waitForApprovedPortsAvailable(
   });
 }
 
-async function waitForProcessIdentity(
+async function observeProcessIdentity(
   pid: number,
   marker: string,
   timeoutMs = 5_000,
-): Promise<string | undefined> {
+): Promise<EdenCliProcessIdentity | undefined> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (await verifyProcessIdentity(pid, marker)) return marker;
+    const observed = await readProcessObservation(pid);
+    if (observed !== undefined && processCommandContainsMarker(observed.command, marker)) {
+      return { marker, ...observed };
+    }
     await new Promise((resolveResult) => setTimeout(resolveResult, 25));
   }
   return undefined;
@@ -6661,7 +6666,7 @@ async function runDev(
   let rebuildPending = false;
   const rebuildTasks = new Set<Promise<void>>();
   let statePath: string | undefined;
-  let stateOwner: Pick<DevState, "pid" | "startedAt" | "token"> | undefined;
+  let stateOwner: DevStateOwner | undefined;
   let temporaryConfig: string | undefined;
   let runtimeEntryPath: string | undefined;
   let runtimeGeneration: RuntimeGeneration | undefined;
@@ -6691,6 +6696,7 @@ async function runDev(
     signalResolve = resolveResult;
   });
   const startupStopped = Symbol("eden.startup.stopped");
+  const usingDefaultProcessRunner = options.processRunner === undefined;
   const runner = options.processRunner ?? defaultProcessRunner();
   const ownedValidationProcesses = createOwnedProcessRegistry();
   const runtimePublicationHook = options.runtimePublicationHook;
@@ -6828,6 +6834,14 @@ async function runDev(
     const proof = verifyRuntimeGeneration(processHandle, generation);
     return await proof;
   };
+  const assertChildRunning = async (processHandle: EdenCliProcess): Promise<void> => {
+    if (!usingDefaultProcessRunner) return;
+    const terminal = await Promise.race([
+      processHandle.exited.then(() => true, () => true),
+      new Promise<boolean>((resolveResult) => setTimeout(() => resolveResult(false), 0)),
+    ]);
+    if (terminal) throw cliError({ code: "DEV_START_FAILED", message: "The Eden dev process exited before startup completed.", source: DEV_STATE_FILE });
+  };
   const verifyRuntimeGeneration = async (
     processHandle: EdenCliProcess | undefined,
     generation: RuntimeGeneration | undefined,
@@ -6882,7 +6896,7 @@ async function runDev(
           : ["--env-file", localSecretPath]),
       ],
       cwd: root,
-      processIdentity: basename(configPath),
+      processIdentity: `${PROCESS_IDENTITY_PREFIX}runtime-${randomUUID()}`,
       env: {
         EDEN_HOST: EDEN_LOCAL_HOST,
         EDEN_PORT: String(EDEN_LOCAL_PORT),
@@ -6963,6 +6977,9 @@ async function runDev(
           "The Eden dev process start identity could not be verified; no PID or process group was signaled.",
         source: DEV_STATE_FILE,
       });
+    }
+    if (usingDefaultProcessRunner && !isProcessIdentity(await Promise.resolve(processHandle.identity))) {
+      throw cliError({ code: "DEV_PROCESS_IDENTITY_UNAVAILABLE", message: "The default Eden dev process identity could not be verified before readiness.", source: DEV_STATE_FILE });
     }
     const readiness = processHandle.ready ?? Promise.resolve();
     void readiness.catch(() => undefined);
@@ -7136,6 +7153,7 @@ async function runDev(
               "The replacement Eden runtime did not prove the expected immutable generation.",
           });
         }
+        await assertChildRunning(replacement);
         if (stopped) {
           replacingRuntime = false;
           return;
@@ -7157,18 +7175,12 @@ async function runDev(
         runtimeArtifact = nextGeneration;
         temporaryConfig = nextRuntimeFiles.configPath;
         runtimeEntryPath = nextRuntimeFiles.entryPath;
-        if (stateOwner !== undefined) {
-          const writtenState = await writeDevState(
-            root,
-            replacement.pid,
-            replacementIdentity,
-          );
+        if (usingDefaultProcessRunner && stateOwner !== undefined) {
+          const replacementFullIdentity = await Promise.resolve(replacement.identity);
+          const writtenState = await writeDevState(root, replacementFullIdentity);
           statePath = writtenState.path;
-          stateOwner = {
-            pid: replacement.pid,
-            startedAt: replacementIdentity,
-            token: writtenState.token,
-          };
+          stateOwner = devStateOwner(replacementFullIdentity as EdenCliProcessIdentity, writtenState.token);
+          await assertChildRunning(replacement);
           if (stopped) {
             await removeOwnedDevState(root, stateOwner).catch(() => undefined);
             statePath = undefined;
@@ -7316,6 +7328,7 @@ async function runDev(
               });
             }
             if (!rollbackReady || stopped) return;
+            await assertChildRunning(rollback);
             const rollbackContents = await readRuntimeFileContents(
               rollbackFiles,
             );
@@ -7326,18 +7339,12 @@ async function runDev(
             temporaryConfig = rollbackFiles.configPath;
             runtimeEntryPath = rollbackFiles.entryPath;
             runtimeContents = rollbackContents;
-            if (stateOwner !== undefined) {
-              const rollbackState = await writeDevState(
-                root,
-                rollback.pid,
-                rollbackIdentity,
-              );
+            if (usingDefaultProcessRunner && stateOwner !== undefined) {
+              const rollbackFullIdentity = await Promise.resolve(rollback.identity);
+              const rollbackState = await writeDevState(root, rollbackFullIdentity);
               statePath = rollbackState.path;
-              stateOwner = {
-                pid: rollback.pid,
-                startedAt: rollbackIdentity,
-                token: rollbackState.token,
-              };
+              stateOwner = devStateOwner(rollbackFullIdentity as EdenCliProcessIdentity, rollbackState.token);
+              await assertChildRunning(rollback);
               if (stopped) {
                 await removeOwnedDevState(root, stateOwner).catch(() => undefined);
                 statePath = undefined;
@@ -7724,24 +7731,24 @@ async function runDev(
         });
       }
       if (stopped) return;
-      const writtenState = await writeDevState(
-        root,
-        initialChild.pid,
-        startIdentity,
-      );
-      statePath = writtenState.path;
-      stateOwner = {
-        pid: initialChild.pid,
-        startedAt: startIdentity,
-        token: writtenState.token,
-      };
+      await assertChildRunning(initialChild);
+      if (usingDefaultProcessRunner) {
+        const initialIdentity = await Promise.resolve(initialChild.identity);
+        const writtenState = await writeDevState(root, initialIdentity);
+        statePath = writtenState.path;
+        stateOwner = devStateOwner(initialIdentity as EdenCliProcessIdentity, writtenState.token);
+        await assertChildRunning(initialChild);
+      }
       if (stopped) {
-        await removeOwnedDevState(root, stateOwner).catch(() => undefined);
+        if (stateOwner !== undefined) {
+          await removeOwnedDevState(root, stateOwner).catch(() => undefined);
+        }
         statePath = undefined;
         stateOwner = undefined;
         return;
       }
       if (stopped) return;
+      await assertChildRunning(initialChild);
       startupComplete = true;
     } catch (error: unknown) {
       throw error instanceof EdenCliError
@@ -7753,6 +7760,8 @@ async function runDev(
               : "The local runtime could not be started.",
           });
     }
+    if (child === undefined) throw cliError({ code: "DEV_START_FAILED", message: "The Eden dev process exited before watcher startup.", source: DEV_STATE_FILE });
+    await assertChildRunning(child);
     watcher = watch(
       [
         join(root, "agent"),
@@ -7836,6 +7845,8 @@ async function runDev(
       return;
     }
 
+    if (child === undefined) throw cliError({ code: "DEV_START_FAILED", message: "The Eden dev process exited before ready output.", source: DEV_STATE_FILE });
+    await assertChildRunning(child);
     options.stdout?.(
       `Eden dev ready at http://${EDEN_LOCAL_HOST}:${EDEN_LOCAL_PORT} ` +
       `(inspector ${EDEN_LOCAL_INSPECTOR_HOST}:${EDEN_LOCAL_INSPECTOR_PORT}).`,

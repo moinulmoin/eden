@@ -139,7 +139,7 @@ function readProcessCommand(pid) {
 }
 
 async function ownedServiceAlive(service) {
-  if (service.exitCode !== null || service.pid === undefined) return false;
+  if (service.exitCode !== null || service.signalCode !== null || service.pid === undefined) return false;
   const command = await readProcessCommand(service.pid);
   return command?.includes(service.processIdentity) === true;
 }
@@ -285,7 +285,7 @@ test("executes the authoritative eden-local manifest lifecycle without disturbin
     }
     await service.terminateOwned();
     await waitForExit(service);
-    if (sentinel.exitCode === null) {
+    if (sentinel.exitCode === null && sentinel.signalCode === null) {
       sentinel.kill("SIGTERM");
       await waitForExit(sentinel);
     }

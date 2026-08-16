@@ -389,6 +389,27 @@ async function readJsonResponse(response) {
   return { response, body };
 }
 
+export async function readResponseBodyTextWithTimeout(response, timeoutMs = 5_000, signal) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError("readResponseBodyTextWithTimeout requires a positive timeout.");
+  const reader = response.body?.getReader(); if (reader === undefined) return "";
+  let timer, abort;
+  const stop = new Promise((_, reject) => {
+    abort = () => reject(abortError(signal));
+    signal?.addEventListener("abort", abort, { once: true });
+    timer = setTimeout(() => reject(new Error(`Response body read timeout after ${timeoutMs}ms.`)), timeoutMs);
+    if (signal?.aborted === true) abort();
+  });
+  try {
+    return await Promise.race([(async () => {
+        const decoder = new TextDecoder("utf-8", { fatal: true }); let text = "";
+        for (;;) { const next = await reader.read(); if (next.done) return text + decoder.decode(); text += decoder.decode(next.value, { stream: true }); }
+      })(), stop]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer); if (abort !== undefined) signal?.removeEventListener("abort", abort);
+    void reader.cancel().catch(() => undefined); reader.releaseLock();
+  }
+}
+
 function authorizationHeaders(secret, contentType = false) {
   return {
     authorization: `Bearer ${secret}`,
@@ -510,7 +531,7 @@ async function readCatchupUntilTerminal(
     if (response.status !== 200) {
       throw new Error(`Reconnect NDJSON stream failed with HTTP ${response.status}.`);
     }
-    for (const event of parseNdjson(await response.text())) {
+    for (const event of parseNdjson(await readResponseBodyTextWithTimeout(response, 5_000, signal))) {
       if (event.streamIndex <= cursor) {
         throw new Error("Reconnect returned an event at or before the saved cursor.");
       }
@@ -539,7 +560,7 @@ async function readNdjsonCatchup(sessionId, secret, startIndex, signal) {
   if (response.status !== 200) {
     throw new Error(`Reconnect NDJSON stream failed with HTTP ${response.status}.`);
   }
-  return parseNdjson(await response.text());
+  return parseNdjson(await readResponseBodyTextWithTimeout(response, 5_000, signal));
 }
 
 async function stateFileExists(projectRoot) {

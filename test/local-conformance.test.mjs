@@ -15,6 +15,7 @@ import {
   PUBLIC_FAILURE_CASES,
   PUBLIC_FAILURE_FIXTURE,
   readNdjsonWithIdleTimeout,
+  readResponseBodyTextWithTimeout,
   runLocalConformance,
   stopLocalRuntime,
 } from "../scripts/local-conformance.mjs";
@@ -89,6 +90,27 @@ test("rejects a stalled NDJSON reader at its per-read idle deadline", async () =
   );
 });
 
+test("cancels a stalled catch-up response body at its bounded deadline", async () => {
+  let cancelled = false;
+  const response = new globalThis.Response(new globalThis.ReadableStream({ pull: () => new Promise(() => {}), cancel: () => { cancelled = true; } }));
+  await expect(readResponseBodyTextWithTimeout(response, 25))
+    .rejects.toThrow(/body read timeout/iu);
+  expect(cancelled).toBe(true);
+});
+
+test("aborts and cancels a stalled catch-up body without unhandled rejection", async () => {
+  let cancelled = false; const unhandled = [];
+  const handler = (error) => unhandled.push(error); process.on("unhandledRejection", handler);
+  const response = new globalThis.Response(new globalThis.ReadableStream({ pull: () => new Promise(() => {}), cancel: () => { cancelled = true; } }));
+  const controller = new AbortController();
+  try {
+    const pending = readResponseBodyTextWithTimeout(response, 5_000, controller.signal);
+    controller.abort(new Error("body abort"));
+    await expect(pending).rejects.toThrow(/abort/iu); await delay(0);
+    expect(cancelled).toBe(true); expect(unhandled).toEqual([]);
+  } finally { process.off("unhandledRejection", handler); }
+});
+
 test("does not signal a residual state-file PID sentinel", async () => {
   const root = await mkdtemp(join(tmpdir(), "eden-local-conformance-state-"));
   const sentinel = (await import("node:child_process")).spawn(
@@ -103,6 +125,7 @@ test("does not signal a residual state-file PID sentinel", async () => {
     const cleanup = await stopLocalRuntime(root, { child: { terminateOwned: async () => true }, exited: Promise.resolve() }, 500);
     expect(cleanup.processStopped).toBe(false);
     expect(sentinel.exitCode).toBeNull();
+    expect(sentinel.signalCode).toBeNull();
   } finally {
     if (sentinel.exitCode === null && sentinel.signalCode === null) {
       sentinel.kill("SIGTERM");
@@ -182,7 +205,8 @@ test(
     const processesAfter = await readProcesses();
     const newOwnedRuntimeProcesses = [...processesAfter].filter(
       ([pid, processInfo]) =>
-        !processesBefore.has(pid) &&
+        (!processesBefore.has(pid) ||
+          processesBefore.get(pid).start !== processInfo.start) &&
         ownedGroups.has(processInfo.pgid) &&
         /(?:eden-local-conformance|eden-dev|workerd|esbuild|127\.0\.0\.1:(?:8797|9297))/iu.test(
           processInfo.command,
