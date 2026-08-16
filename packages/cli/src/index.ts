@@ -74,9 +74,20 @@ import type {
   EdenArtifactGeneration,
   EdenDiagnostic,
 } from "@eden/compiler";
-import { unstable_readConfig } from "wrangler";
 
 const require = createRequire(import.meta.url);
+
+type InternalConfigReadConfig = (
+  input: {
+    readonly config: string;
+    readonly env: "preview" | "production";
+  },
+  options: {
+    readonly hideWarnings: boolean;
+  },
+) => {
+  readonly name?: string;
+};
 
 export const EDEN_CLI_COMMANDS = [
   "init",
@@ -574,6 +585,32 @@ function cliError(options: CliErrorOptions): EdenCliError {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function loadInternalConfigReadConfig(): InternalConfigReadConfig {
+  let moduleValue: unknown;
+  try {
+    moduleValue = require("wrangler") as unknown;
+  } catch (error: unknown) {
+    const reason = error instanceof Error
+      ? error.message
+      : "the module could not be loaded";
+    throw cliError({
+      code: "WRANGLER_CONFIG_LOADER_UNAVAILABLE",
+      message: `The pinned configuration loader is unavailable: ${reason}.`,
+    });
+  }
+  if (
+    !isRecord(moduleValue) ||
+    typeof moduleValue.unstable_readConfig !== "function"
+  ) {
+    throw cliError({
+      code: "WRANGLER_CONFIG_LOADER_UNAVAILABLE",
+      message:
+        "The pinned configuration loader does not export unstable_readConfig.",
+    });
+  }
+  return moduleValue.unstable_readConfig as InternalConfigReadConfig;
 }
 
 function hasExactKeys(
@@ -7953,9 +7990,10 @@ async function readConfiguredWorkerName(
         flag: "wx",
       });
     }
-    let config: ReturnType<typeof unstable_readConfig>;
+    const readConfig = loadInternalConfigReadConfig();
+    let config: ReturnType<typeof readConfig>;
     try {
-      config = unstable_readConfig(
+      config = readConfig(
         { config: snapshotPath, env: environment },
         { hideWarnings: true },
       );
@@ -7966,7 +8004,7 @@ async function readConfiguredWorkerName(
       throw cliError({
         code: "PROJECT_CONFIG_INVALID",
         message:
-          `The selected Wrangler configuration could not be parsed for ${environment}: ${reason}. Fix the configuration syntax and retry.`,
+          `The selected deployment configuration could not be parsed for ${environment}: ${reason}. Fix the configuration syntax and retry.`,
         source: toPosixPath(relative(root, configPath)),
       });
     }
