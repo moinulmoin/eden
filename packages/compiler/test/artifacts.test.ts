@@ -4132,9 +4132,18 @@ describe("artifact generation", () => {
     ["optional", "z.object({ name: z.string() }).optional()"],
     ["nullable", "z.object({ name: z.string() }).nullable()"],
     [
+      "strict trim min",
+      "z.object({ name: z.string().trim().min(1) }).strict()",
+    ],
+    [
       "transform",
       'z.object({ name: z.string() }).transform((value) => ({ name: value.name.trim() }))',
     ],
+    [
+      "transform refine",
+      "z.string().transform(v => v.trim()).refine(v => v.length > 0)",
+    ],
+    ["nonempty max", "z.array(z.string()).nonempty().max(3)"],
     [
       "composed optional nullable transform",
       'z.object({ name: z.string() }).nullable().optional().transform((value) => value ?? { name: "fallback" })',

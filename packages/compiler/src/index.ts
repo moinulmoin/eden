@@ -4063,6 +4063,7 @@ function semanticWorkerBindingDiagnostics(
     "max",
     "min",
     "nonoptional",
+    "nonempty",
     "nullable",
     "nullish",
     "optional",
@@ -6217,13 +6218,19 @@ const STANDARD_SCHEMA_COMPOSITION_METHOD_NAMES = new Set([
   "default",
   "describe",
   "extend",
+  "max",
+  "min",
   "nullable",
+  "nonempty",
   "optional",
   "or",
   "pipe",
   "preprocess",
   "readonly",
+  "refine",
+  "strict",
   "transform",
+  "trim",
 ]);
 
 function isAssignmentOperator(kind: ts.SyntaxKind): boolean {
