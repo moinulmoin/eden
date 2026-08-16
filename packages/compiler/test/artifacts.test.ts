@@ -22,6 +22,7 @@ import {
   buildProject,
   createArtifactIdentity,
   readArtifactGeneration,
+  readArtifactGenerationAt,
 } from "../src/index.js";
 
 const temporaryRoots: string[] = [];
@@ -917,6 +918,46 @@ apply(assign, null, [artifact, { agent: null }]);`,
       ),
   },
   {
+    name: "pre-entry Object.setPrototypeOf schema mutation",
+    mutate: (bundle: string) =>
+      insertBeforeGeneratedEntry(
+        bundle,
+        "Object.setPrototypeOf(greet_default.inputSchema, null);",
+      ),
+  },
+  {
+    name: "pre-entry Reflect.setPrototypeOf schema mutation",
+    mutate: (bundle: string) =>
+      insertBeforeGeneratedEntry(
+        bundle,
+        "Reflect.setPrototypeOf(greet_default.inputSchema, null);",
+      ),
+  },
+  {
+    name: "pre-entry Object.setPrototypeOf.call.bind mutation",
+    mutate: (bundle: string) =>
+      insertBeforeGeneratedEntry(
+        bundle,
+        `function replaceSchema(schema) {
+  const call = Object.setPrototypeOf.call.bind(Object.setPrototypeOf);
+  call(null, schema, null);
+}
+replaceSchema(greet_default.inputSchema);`,
+      ),
+  },
+  {
+    name: "pre-entry Reflect.setPrototypeOf.apply.bind mutation",
+    mutate: (bundle: string) =>
+      insertBeforeGeneratedEntry(
+        bundle,
+        `function replaceSchema(schema) {
+  const apply = Reflect.setPrototypeOf.apply.bind(Reflect.setPrototypeOf);
+  apply(null, [schema, null]);
+}
+replaceSchema(greet_default.inputSchema);`,
+      ),
+  },
+  {
     name: "unresolved conditional artifact branch",
     mutate: (bundle: string) =>
       replaceBundleDefault(
@@ -1055,6 +1096,18 @@ const nonFiniteSchemas = Object.freeze(Object.fromEntries([
 ] as const;
 
 describe("artifact generation", () => {
+  test("ignores non-native setPrototypeOf calls", async () => {
+    const root = await createProject({ "agent/agent.ts": agentSource, "agent/instructions.md": "non-native mutation fixture\n", "agent/tools/greet.ts": toolSource });
+    await buildProject({ projectRoot: root });
+    const current = await readArtifactGeneration(join(root, ".eden"));
+    const contents = Object.fromEntries(await Promise.all(artifactNames.map(async (name) => [name, await readFile(join(current.directory, name), "utf8")] as const))) as Record<(typeof artifactNames)[number], string>;
+    const rewritten = replaceBundleCoherently(contents, insertBeforeGeneratedEntry(contents["agent-bundle.mjs"], "function ignored() { Foo.setPrototypeOf(inputSchema, null); globalThis.setPrototypeOf(inputSchema, null); }"), false);
+    const directory = join(root, ".eden", "generations", (JSON.parse(rewritten["build-metadata.json"]) as { generationId: string }).generationId);
+    await mkdir(directory);
+    await Promise.all(artifactNames.map((name) => writeFile(join(directory, name), rewritten[name], "utf8")));
+    await expect(readArtifactGenerationAt(root, directory)).resolves.toBeDefined();
+  });
+
   test("publishes one coherent generation and executes without the source tree", async () => {
     const root = await createProject({
       "agent/agent.ts": agentSource,
@@ -4151,6 +4204,11 @@ describe("artifact generation", () => {
       "transform refine",
       "z.string().transform(v => v.trim()).refine(v => v.length > 0)",
     ],
+    ["empty object", "z.object()"],
+    ["nested refine", "z.object({ name: z.string().refine(v => v.length > 0) })"],
+    ["root preprocess", "z.preprocess(v => v, z.string())"],
+    ["root transform", "z.transform(v => v)"],
+    ["email regex", "z.string().email().regex(/@/)"],
     ["nonempty max", "z.array(z.string()).nonempty().max(3)"],
     [
       "composed optional nullable transform",
@@ -4181,6 +4239,50 @@ describe("artifact generation", () => {
     expect(result.artifacts.manifest.tools).toEqual([
       expect.objectContaining({ name: "zod-chain" }),
     ]);
+  }, PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS);
+
+  test.each([
+    [
+      "property-derived any callback",
+      "const callback = ({} as any).callback;",
+      "z.string().refine(callback)",
+    ],
+    [
+      "unknown callback",
+      "const callback: unknown = ({} as any).callback;",
+      "z.string().refine(callback)",
+    ],
+    ["numeric callback", "const callback = 42;", "z.string().refine(callback)"],
+    ["nested direct invalid callback", "", "z.object({ name: z.string().refine(42) })"],
+    ["nested array invalid callback", "", "z.object({ xs: z.array(z.string().refine(42)) })"],
+    ["aliased nested array invalid callback", "const nested = z.array(z.string().refine(42));", "z.object({ xs: nested })"],
+    ["nested aliased invalid callback", "const nested = z.string().refine(42);", "z.object({ name: nested })"],
+  ])("rejects a pinned Zod %s", async (_name, declaration, schema) => {
+    const root = await createProject({
+      "agent/agent.ts": agentSource,
+      "agent/instructions.md": "Pinned Zod callback fixture\n",
+      "agent/tools/zod-callback.ts": `
+        import { z } from "zod";
+        ${declaration}
+        const inputSchema = ${schema};
+        export default {
+          description: "Rejects unsafe pinned Zod callbacks.",
+          inputSchema,
+          execute(input) {
+            return { value: input };
+          },
+        };
+      `,
+    });
+    await mkdir(join(root, "node_modules"), { recursive: true });
+    await symlink(
+      join(process.cwd(), "node_modules/zod"),
+      join(root, "node_modules/zod"),
+    );
+
+    await expect(buildProject({ projectRoot: root })).rejects.toBeInstanceOf(
+      EdenCompilerError,
+    );
   }, PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS);
 
   test("does not exempt caller values flowing through verified Zod calls", async () => {

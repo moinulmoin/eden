@@ -4020,11 +4020,13 @@ function semanticWorkerBindingDiagnostics(
     "number",
     "object",
     "promise",
+    "preprocess",
     "record",
     "set",
     "string",
     "symbol",
     "templateLiteral",
+    "transform",
     "tuple",
     "undefined",
     "union",
@@ -6217,6 +6219,7 @@ const STANDARD_SCHEMA_COMPOSITION_METHOD_NAMES = new Set([
   "catch",
   "default",
   "describe",
+  "email",
   "extend",
   "max",
   "min",
@@ -6226,12 +6229,15 @@ const STANDARD_SCHEMA_COMPOSITION_METHOD_NAMES = new Set([
   "or",
   "pipe",
   "preprocess",
+  "regex",
   "readonly",
   "refine",
   "strict",
   "transform",
   "trim",
 ]);
+
+const STANDARD_SCHEMA_CALLBACK_METHOD_NAMES = new Set(["lazy", "preprocess", "refine", "transform"]);
 
 function isAssignmentOperator(kind: ts.SyntaxKind): boolean {
   return (
@@ -6314,6 +6320,65 @@ function isStandardSchemaFactoryCall(
       (declaration) => !environment.mutatedBindings.has(declaration),
     )
   );
+}
+
+function hasSafeSchemaCallbacks(
+  expression: ts.CallExpression,
+  environment: BundleShapeEnvironment,
+  resolving: Set<ts.Declaration>,
+): boolean {
+  let remaining = 256;
+  const visit = (node: ts.Node): boolean => {
+    if (--remaining < 0 || ts.isFunctionLike(node) || ts.isClassLike(node))
+      return remaining >= 0;
+    if (ts.isIdentifier(node)) {
+      const declaration = environment.declarationForIdentifier(node);
+      const binding =
+        declaration === undefined
+          ? undefined
+          : environment.bindingExpressions.get(declaration);
+      if (
+        declaration !== undefined &&
+        binding !== undefined &&
+        typeof binding !== "string" &&
+        !resolving.has(declaration)
+      ) {
+        resolving.add(declaration);
+        const safe = visit(binding);
+        resolving.delete(declaration);
+        if (!safe) return false;
+      }
+    }
+    if (ts.isCallExpression(node)) {
+      const callee = ts.isPropertyAccessExpression(node.expression)
+        ? node.expression
+        : undefined;
+      const methodName = isStandardSchemaFactoryCall(node, environment)
+        ? callee?.name.text
+        : callee !== undefined &&
+            STANDARD_SCHEMA_COMPOSITION_METHOD_NAMES.has(callee.name.text) &&
+            bundleShapeForExpression(callee.expression, environment, resolving)
+              .kind === "schema-call"
+          ? callee.name.text
+          : undefined;
+      const callback = node.arguments[0];
+      if (
+        methodName !== undefined &&
+        STANDARD_SCHEMA_CALLBACK_METHOD_NAMES.has(methodName) &&
+        (callback === undefined ||
+          bundleShapeForExpression(callback, environment, resolving).kind !==
+            "function")
+      ) {
+        return false;
+      }
+    }
+    let safe = true;
+    ts.forEachChild(node, (child) => {
+      if (safe) safe = visit(child);
+    });
+    return safe;
+  };
+  return visit(expression);
 }
 
 function isObjectMemberCall(
@@ -6761,6 +6826,7 @@ function bundleShapeForExpression(
       return bundleRecordShape(properties);
     }
     if (isStandardSchemaFactoryCall(expression, environment)) {
+      if (!hasSafeSchemaCallbacks(expression, environment, resolving)) return { kind: "unknown" };
       return { kind: "schema-call" };
     }
     if (ts.isPropertyAccessExpression(expression.expression)) {
@@ -6775,6 +6841,7 @@ function bundleShapeForExpression(
           expression.expression.name.text,
         )
       ) {
+        if (!hasSafeSchemaCallbacks(expression, environment, resolving)) return { kind: "unknown" };
         return { kind: "schema-call" };
       }
     }
@@ -6958,6 +7025,11 @@ function bundleShapeEnvironment(
       }
     }
   }
+  const collectLocalBindings = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && node.initializer !== undefined) bindPattern(node.name, node.initializer);
+    ts.forEachChild(node, collectLocalBindings);
+  };
+  collectLocalBindings(sourceFile);
   const trustedSchemaFactoryBindings = new Set<ts.VariableDeclaration>();
   const trustedSchemaFactoryFunctionBindings = new Set<ts.Declaration>();
   const trustedGeneratedPropertyDefinerBindings = new Set<ts.Declaration>();
@@ -7445,16 +7517,17 @@ function bundleShapeEnvironment(
   ): Set<ts.Declaration> => {
     if (seen.has(declaration)) return new Set([declaration]);
     seen.add(declaration);
-    const binding = bindingExpressions.get(declaration);
-    if (binding === undefined || typeof binding === "string") {
+    const bindingExpression = bindingExpressions.get(declaration);
+    if (bindingExpression === undefined || typeof bindingExpression === "string") {
       return new Set([declaration]);
     }
+    const binding = unwrapMutationExpression(bindingExpression);
     if (!ts.isIdentifier(binding)) {
       if (
         ts.isPropertyAccessExpression(binding) ||
         ts.isElementAccessExpression(binding)
       ) {
-        const expression = binding.expression;
+        const expression = unwrapMutationExpression(binding.expression);
         if (ts.isIdentifier(expression)) {
           const target = declarationForIdentifier(expression);
           return target === undefined
@@ -7530,6 +7603,10 @@ function bundleShapeEnvironment(
     mutatedFunctionParameters.set(parameter.declaration, indexes);
     return true;
   };
+  const recordBindingMutation = (node: ts.Node | undefined, root: ts.Declaration): void => {
+    for (const binding of bindingRoots(root))
+      if (node === undefined || !noteFunctionParameterMutation(node, binding)) mutatedBindings.add(binding);
+  };
   type MutationKind =
     | "object-assign"
     | "object-define-property"
@@ -7541,9 +7618,7 @@ function bundleShapeEnvironment(
     readonly boundArguments: readonly ts.Expression[];
     readonly invocation?: "call" | "apply";
   }
-  const unwrapMutationExpression = (
-    expression: ts.Expression,
-  ): ts.Expression => {
+  function unwrapMutationExpression(expression: ts.Expression): ts.Expression {
     let current = expression;
     while (
       ts.isParenthesizedExpression(current) ||
@@ -7554,7 +7629,7 @@ function bundleShapeEnvironment(
       current = current.expression;
     }
     return current;
-  };
+  }
   const directMutationKind = (
     expression: ts.Expression,
   ): MutationKind | undefined => {
@@ -7587,6 +7662,7 @@ function bundleShapeEnvironment(
     if (objectName === "Reflect" && propertyName === "set") {
       return "reflect-set";
     }
+    if (propertyName === "setPrototypeOf" && (objectName === "Object" || objectName === "Reflect")) return objectName === "Object" ? "object-define-property" : "reflect-define-property";
     if (objectName === "Reflect" && propertyName === "defineProperty") {
       return "reflect-define-property";
     }
@@ -7601,6 +7677,7 @@ function bundleShapeEnvironment(
     "freeze",
     "fromEntries",
     "set",
+    "setPrototypeOf",
     "apply",
   ]);
   const isNativeMutationPropertyReference = (
@@ -7703,7 +7780,7 @@ function bundleShapeEnvironment(
         const target = mutationCallable(callee.expression, resolving);
         if (target === undefined) return undefined;
         return {
-          kind: target.kind,
+          ...target,
           boundArguments: [
             ...target.boundArguments,
             ...current.arguments.slice(1),
@@ -7944,9 +8021,6 @@ function bundleShapeEnvironment(
       argumentList.elements.some(ts.isSpreadElement)
     );
   };
-  const markBindingMutation = (root: ts.Declaration): void => {
-    for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
-  };
   const isUnshadowedObjectMemberCall = (
     expression: ts.Expression,
     propertyName: string,
@@ -8067,7 +8141,7 @@ function bundleShapeEnvironment(
     const root = ts.isIdentifier(callee)
       ? declarationForIdentifier(callee)
       : undefined;
-    if (root !== undefined) markBindingMutation(root);
+    if (root !== undefined) recordBindingMutation(undefined, root);
   };
   function collectMutations(node: ts.Node): void {
     if (
@@ -8097,9 +8171,7 @@ function bundleShapeEnvironment(
         if (isGeneratedEntryNode(node)) {
           noteMutation();
         }
-        if (!noteFunctionParameterMutation(node, root)) {
-          for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
-        }
+        recordBindingMutation(node, root);
       }
     } else if (
       (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
@@ -8111,9 +8183,7 @@ function bundleShapeEnvironment(
         if (isGeneratedEntryNode(node)) {
           noteMutation();
         }
-        if (!noteFunctionParameterMutation(node, root)) {
-          for (const binding of bindingRoots(root)) mutatedBindings.add(binding);
-        }
+        recordBindingMutation(node, root);
       }
     } else if (ts.isNewExpression(node) && isGeneratedEntryNode(node)) {
       noteMutation();
@@ -8160,9 +8230,7 @@ function bundleShapeEnvironment(
           if (isGeneratedEntryNode(node)) {
             noteMutation();
           }
-          if (!noteFunctionParameterMutation(node, root)) {
-            markBindingMutation(root);
-          }
+          recordBindingMutation(node, root);
         }
       }
       if (
@@ -8221,7 +8289,9 @@ function bundleShapeEnvironment(
                 if (isGeneratedEntryNode(node)) noteMutation();
                 continue;
               }
-              const callerParameter = functionParameterIndex(node, root);
+              const callerParameter = [...bindingRoots(root)]
+                .map((binding) => functionParameterIndex(node, binding))
+                .find((parameter) => parameter !== undefined);
               if (callerParameter !== undefined) {
                 const indexes =
                   mutatedFunctionParameters.get(callerParameter.declaration) ??
@@ -8236,7 +8306,7 @@ function bundleShapeEnvironment(
                 }
               } else {
                 const before = new Set(mutatedBindings);
-                markBindingMutation(root);
+                recordBindingMutation(undefined, root);
                 if (before.size !== mutatedBindings.size) changed = true;
               }
             }
