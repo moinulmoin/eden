@@ -335,6 +335,59 @@ test("waits for close before returning trailing descendant output", async () => 
   expectNoProcessReservations("close trailing output");
 });
 
+test("does not SIGKILL a same-group descendant after root exit", async () => {
+  let descendantObserved = false;
+  let descendantPid;
+  const signals = [];
+  const snapshot = () => {
+    const entries = snapshotOwnedProcesses();
+    if (entries === undefined) return entries;
+    const descendant = entries.find((entry) =>
+      entry.command.includes("eden-owned-term-descendant-child"),
+    );
+    if (descendant !== undefined) {
+      descendantObserved = true;
+      descendantPid ??= descendant.pid;
+    }
+    return entries;
+  };
+  let result;
+  try {
+    result = await runOwnedProcess({
+      file: process.execPath,
+      args: [
+        "-e",
+        [
+          'const { spawn } = await import("node:child_process");',
+        'const marker = "eden-owned-term-descendant-" + "child"; spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); process.on(\\"SIGUSR1\\", () => process.exit(0)); setTimeout(() => {}, 60000); /* " + marker + " */"], { stdio: "ignore" });',
+          'process.on("SIGTERM", () => process.exit(0));',
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+      ],
+      cwd: repositoryRoot,
+      timeoutMs: 2_000,
+      label: "term-descendant",
+      snapshot,
+      sendSignal: (target, signal) => {
+        signals.push(signal);
+        return process.kill(target, signal);
+      },
+    });
+
+    expect(descendantObserved).toBe(true); expect(descendantPid).toBeDefined();
+    expect(result.cleanupVerified).toBe(false);
+    expect(result.unresolvedCleanup).toBe(true);
+    expect(signals).toEqual(["SIGTERM"]);
+    process.kill(descendantPid, "SIGUSR1");
+    const cleanup = await result.retryCleanup();
+    expect(cleanup.cleanupVerified).toBe(true); expect(cleanup.unresolvedCleanup).toBe(false);
+    expectNoProcessReservations("same-group descendant");
+  } finally {
+    if (descendantPid !== undefined) try { process.kill(descendantPid, "SIGUSR1"); } catch { /* already exited */ }
+    if (result !== undefined && ownedProcessReservationCount() !== 0) await result.retryCleanup();
+  }
+}, 15_000);
+
 test("retries a transient root identity observation before cleanup", async () => {
   let injected = false;
   let observations = 0;
@@ -773,17 +826,27 @@ test(
 );
 
 test(
-  "refuses a replaced root identity before both termination escalations",
+  "keeps a replaced terminal root unresolved until identity is restored",
   async () => {
   let replaceIdentity = false;
   let replacementInjected = false;
+  let replacementRoot;
   const signals = [];
   const snapshot = () => {
     const entries = snapshotOwnedProcesses();
-    if (!replaceIdentity || entries === undefined) return entries;
+    if (entries === undefined) return entries;
+    const root = entries.find((entry) =>
+      entry.command.includes("eden-owned-wrangler-identity-replacement-"),
+    );
+    replacementRoot ??= root;
+    if (!replaceIdentity || replacementRoot === undefined) return entries;
     return entries.map((entry) =>
-      entry.command.includes("eden-owned-wrangler-identity-replacement-")
-        ? { ...entry, command: "unrelated-replacement-process" }
+      entry.pid === replacementRoot.pid
+        ? {
+            ...entry,
+            command: "unrelated-replacement-process",
+            state: "Z",
+          }
         : entry,
     );
   };

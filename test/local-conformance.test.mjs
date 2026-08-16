@@ -1,6 +1,6 @@
-/* global AbortController, AbortSignal, clearTimeout, setTimeout */
+/* global AbortController, AbortSignal, clearInterval, clearTimeout, process, setInterval, setTimeout */
 
-import { readdir, readFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -8,13 +8,15 @@ import { join } from "node:path";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
-import { ownedProcessReservationCount } from "./owned-process.mjs";
+import { ownedProcessReservationCount, ownedProcessReservationLabels } from "./owned-process.mjs";
 
 import {
   LOCAL_RECOVERY_FIXTURES,
   PUBLIC_FAILURE_CASES,
   PUBLIC_FAILURE_FIXTURE,
+  readNdjsonWithIdleTimeout,
   runLocalConformance,
+  stopLocalRuntime,
 } from "../scripts/local-conformance.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -46,7 +48,7 @@ function readProcesses() {
   return new Promise((resolve) => {
     execFile(
       "ps",
-      ["-axo", "pid=,command="],
+      ["-axo", "pid=,pgid=,lstart=,command="],
       { encoding: "utf8" },
       (error, stdout) => {
         if (error !== null) {
@@ -55,8 +57,8 @@ function readProcesses() {
         }
         const processes = new Map();
         for (const line of String(stdout).split(/\r?\n/u)) {
-          const match = line.match(/^\s*(\d+)\s+(.*?)\s*$/u);
-          if (match !== null) processes.set(Number(match[1]), match[2]);
+          const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*?)\s*$/u);
+          if (match !== null) processes.set(Number(match[1]), { pgid: Number(match[2]), start: match[3], command: match[4] });
         }
         resolve(processes);
       },
@@ -79,6 +81,36 @@ function portAvailable(port) {
     server.listen({ host: "127.0.0.1", port }, () => finish(true));
   });
 }
+
+test("rejects a stalled NDJSON reader at its per-read idle deadline", async () => {
+  const reader = { read: () => new Promise(() => {}) };
+  await expect(readNdjsonWithIdleTimeout(reader, 25)).rejects.toThrow(
+    /idle timeout/iu,
+  );
+});
+
+test("does not signal a residual state-file PID sentinel", async () => {
+  const root = await mkdtemp(join(tmpdir(), "eden-local-conformance-state-"));
+  const sentinel = (await import("node:child_process")).spawn(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore" },
+  );
+  try {
+    const sentinelInfo = (await readProcesses()).get(sentinel.pid);
+    expect(sentinelInfo?.start).toEqual(expect.any(String));
+    await writeFile(join(root, ".eden-dev-state.json"), JSON.stringify({ pid: sentinel.pid, startedAt: sentinelInfo.start }), "utf8");
+    const cleanup = await stopLocalRuntime(root, { child: { terminateOwned: async () => true }, exited: Promise.resolve() }, 500);
+    expect(cleanup.processStopped).toBe(false);
+    expect(sentinel.exitCode).toBeNull();
+  } finally {
+    if (sentinel.exitCode === null && sentinel.signalCode === null) {
+      sentinel.kill("SIGTERM");
+      await new Promise((resolve) => sentinel.once("close", resolve));
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("completes the clean-room local first-use flow and reconnects from a saved cursor", async ({ signal }) => {
   const result = await runLocalConformance({
@@ -125,6 +157,8 @@ test(
       () => controller.abort(new Error("shortened abort regression")),
       ABORT_REGRESSION_ABORT_MS,
     );
+    const ownedGroups = new Set();
+    const captureTimer = setInterval(() => ownedProcessReservationLabels().forEach(({ groupId }) => Number.isSafeInteger(groupId) && ownedGroups.add(groupId)), 25);
     let failure;
     try {
       await runLocalConformance({
@@ -136,6 +170,7 @@ test(
       failure = error;
     } finally {
       clearTimeout(abortTimer);
+      clearInterval(captureTimer);
     }
 
     expect(failure).toBeDefined();
@@ -146,10 +181,11 @@ test(
 
     const processesAfter = await readProcesses();
     const newOwnedRuntimeProcesses = [...processesAfter].filter(
-      ([pid, command]) =>
+      ([pid, processInfo]) =>
         !processesBefore.has(pid) &&
-        /(?:eden-local-conformance|eden-dev|127\.0\.0\.1:(?:8797|9297))/iu.test(
-          command,
+        ownedGroups.has(processInfo.pgid) &&
+        /(?:eden-local-conformance|eden-dev|workerd|esbuild|127\.0\.0\.1:(?:8797|9297))/iu.test(
+          processInfo.command,
         ),
     );
     expect(newOwnedRuntimeProcesses).toEqual([]);

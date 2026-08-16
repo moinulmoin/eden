@@ -1,7 +1,7 @@
 /* global AbortController, AbortSignal, TextDecoder, clearTimeout, fetch, process, setTimeout */
 
 import { createHash, randomUUID } from "node:crypto";
-import { execFile, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createConnection, createServer } from "node:net";
 import { accessSync, constants as fsConstants } from "node:fs";
 import {
@@ -346,52 +346,6 @@ function portAvailable(host, port, signal) {
   });
 }
 
-function processAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code !== "ESRCH";
-  }
-}
-
-function readProcessStartTime(pid) {
-  return new Promise((resolve) => {
-    execFile(
-      "ps",
-      ["-p", String(pid), "-o", "lstart="],
-      {
-        encoding: "utf8",
-        env: childEnvironment(),
-      },
-      (error, stdout) => {
-        if (error !== null) {
-          resolve(undefined);
-          return;
-        }
-        const startedAt = String(stdout).trim();
-        resolve(startedAt.length === 0 ? undefined : startedAt);
-      },
-    );
-  });
-}
-
-async function recordedProcessAlive(owner) {
-  if (!processAlive(owner.pid)) return false;
-  if (owner.startedAt === undefined) return false;
-  return await readProcessStartTime(owner.pid) === owner.startedAt;
-}
-
-async function waitForRecordedProcessExit(owner, timeoutMs = 5_000) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    if (!(await recordedProcessAlive(owner))) return true;
-    await delay(100);
-  }
-  return !(await recordedProcessAlive(owner));
-}
-
 async function waitForPortAvailability(host, port, timeoutMs = 5_000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -471,6 +425,20 @@ function parseNdjson(text) {
     .map((line) => JSON.parse(line));
 }
 
+export async function readNdjsonWithIdleTimeout(reader, timeoutMs = STREAM_TIMEOUT_MS) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError("readNdjsonWithIdleTimeout requires a positive timeout.");
+  }
+  let timer;
+  try {
+    return await Promise.race([reader.read(), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`NDJSON stream read idle timeout after ${timeoutMs}ms.`)), timeoutMs);
+    })]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function readInitialStream(sessionId, secret, expectedCount, signal) {
   const controller = new AbortController();
   const abort = () => controller.abort(signal?.reason);
@@ -496,7 +464,10 @@ async function readInitialStream(sessionId, secret, expectedCount, signal) {
     const deadline = Date.now() + STREAM_TIMEOUT_MS;
     while (Date.now() < deadline) {
       throwIfAborted(signal);
-      const next = await reader.read();
+      const next = await readNdjsonWithIdleTimeout(
+        reader,
+        Math.max(1, deadline - Date.now()),
+      );
       if (next.done) break;
       buffered += decoder.decode(next.value, { stream: true });
       const lines = buffered.split(/\r?\n/u);
@@ -571,28 +542,6 @@ async function readNdjsonCatchup(sessionId, secret, startIndex, signal) {
   return parseNdjson(await response.text());
 }
 
-async function readOwnedProcess(projectRoot) {
-  try {
-    const contents = await readFile(join(projectRoot, ".eden-dev-state.json"), "utf8");
-    const state = JSON.parse(contents);
-    if (
-      !Number.isSafeInteger(state.pid) ||
-      state.pid <= 0 ||
-      typeof state.startedAt !== "string" ||
-      state.startedAt.length === 0
-    ) {
-      return { invalid: true };
-    }
-    return {
-      pid: state.pid,
-      startedAt: state.startedAt,
-    };
-  } catch (error) {
-    if (error?.code === "ENOENT") return undefined;
-    return { invalid: true };
-  }
-}
-
 async function stateFileExists(projectRoot) {
   try {
     await stat(join(projectRoot, ".eden-dev-state.json"));
@@ -603,32 +552,12 @@ async function stateFileExists(projectRoot) {
   }
 }
 
-async function readOwnedProcessOrFailClosed(projectRoot) {
-  const ownedProcess = await readOwnedProcess(projectRoot);
-  if (ownedProcess !== undefined) return ownedProcess;
-  if (await stateFileExists(projectRoot)) return { invalid: true };
-  return undefined;
-}
-
 async function signalOwnedChild(devProcess, signal) {
   if (devProcess.child.terminateOwned === undefined) return false;
   return await devProcess.child.terminateOwned(signal);
 }
 
-async function terminateProcessGroup(owner, signal) {
-  if (!processAlive(owner.pid)) return true;
-  if (!(await recordedProcessAlive(owner))) {
-    return !processAlive(owner.pid);
-  }
-  try {
-    process.kill(-owner.pid, signal);
-    return true;
-  } catch (error) {
-    return error?.code === "ESRCH" && !processAlive(owner.pid);
-  }
-}
-
-async function stopLocalRuntime(projectRoot, devProcess, timeoutMs = 10_000) {
+export async function stopLocalRuntime(projectRoot, devProcess, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   let processStopped = true;
   let childExited = devProcess === undefined;
@@ -649,30 +578,10 @@ async function stopLocalRuntime(projectRoot, devProcess, timeoutMs = 10_000) {
     }
   }
 
-  const ownedProcess = await readOwnedProcessOrFailClosed(projectRoot);
-  if (ownedProcess?.invalid === true) {
-    processStopped = false;
-  } else if (ownedProcess !== undefined && processAlive(ownedProcess.pid)) {
-    if (!(await recordedProcessAlive(ownedProcess))) {
-      processStopped = false;
-    } else {
-      const termSent = await terminateProcessGroup(ownedProcess, "SIGTERM");
-      processStopped &&= termSent;
-      if (!(await waitForRecordedProcessExit(
-        ownedProcess,
-        remainingCleanupTime(deadline),
-      ))) {
-        const killSent = await terminateProcessGroup(ownedProcess, "SIGKILL");
-        processStopped &&= killSent;
-        if (!(await waitForRecordedProcessExit(
-          ownedProcess,
-          remainingCleanupTime(deadline),
-        ))) {
-          processStopped = false;
-        }
-      }
-    }
-  }
+  // The live owned handle is the only authority allowed to signal. A
+  // leftover state file is evidence of incomplete cleanup, never a fallback
+  // PID/start-time authorization to signal an unrelated process.
+  if (await stateFileExists(projectRoot)) processStopped = false;
   if (!childExited) processStopped = false;
 
   const workerPortFree = await waitForPortAvailability(
@@ -797,6 +706,9 @@ async function runLocalFirstUse(
 
   const devProcess = startDev(repositoryRoot, projectRoot, secret, signal);
   registerDevProcess(devProcess);
+  if (await devProcess.child.identityReady !== true) {
+    throw new Error("The local Eden Worker process identity was not verified.");
+  }
   await waitForLocalRuntime(secret, signal);
 
   const health = await readJsonResponse(

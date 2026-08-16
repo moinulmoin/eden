@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
 import {
   lstat,
   mkdtemp,
@@ -13,8 +12,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { join, relative } from "node:path";
-import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
 import type { EdenArtifactSet } from "@eden/definitions";
 
@@ -26,7 +25,9 @@ import {
 } from "../src/index.js";
 
 const temporaryRoots: string[] = [];
-const execFileAsync = promisify(execFile);
+const { runOwnedProcess } = createRequire(import.meta.url)(
+  "../../../test/owned-process.mjs",
+);
 const artifactNames = [
   "discovery.json",
   "diagnostics.json",
@@ -123,6 +124,7 @@ const CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS = 10_000;
 // published field. Full serial measurements reached 1.64s; keep its budget
 // local rather than changing Vitest's default for unrelated compiler tests.
 const MALFORMED_PUBLISHED_ARTIFACT_TEST_TIMEOUT_MS = 10_000;
+const WRANGLER_DRY_RUN_PROCESS_TIMEOUT_MS = 10_000;
 
 async function createClosedGrammarProject(
   instructions: string,
@@ -2097,7 +2099,7 @@ describe("artifact generation", () => {
 
   test(
     "passes a Wrangler dry-run with only generated Worker inputs",
-    async () => {
+    async ({ signal }) => {
       const root = await createProject({
         "agent/agent.ts": agentSource,
         "agent/instructions.md": "Wrangler fixture\n",
@@ -2110,16 +2112,22 @@ describe("artifact generation", () => {
       });
 
       await buildProject({ projectRoot: root });
-      const wranglerPath = join(
-        process.cwd(),
-        "node_modules/.bin/wrangler",
-      );
-      const result = await execFileAsync(
-        wranglerPath,
-        ["deploy", "--dry-run", "--config", join(root, "wrangler.jsonc")],
-        { cwd: root },
-      );
+      const result = await runOwnedProcess({
+        file: process.execPath,
+        args: [
+          join(process.cwd(), "node_modules", "wrangler", "bin", "wrangler.js"),
+          "deploy",
+          "--dry-run",
+          "--config",
+          join(root, "wrangler.jsonc"),
+        ],
+        cwd: root,
+        timeoutMs: WRANGLER_DRY_RUN_PROCESS_TIMEOUT_MS,
+        signal,
+        label: "compiler-wrangler-dry-run",
+      });
 
+      expect(result.ok, result.error?.message ?? result.stderr).toBe(true);
       expect(`${result.stdout}\n${result.stderr}`).toMatch(
         /Total Upload|dry-run|Successfully built/u,
       );

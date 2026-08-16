@@ -316,7 +316,8 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
       if (
         !reservation.identityObserved ||
         reservation.observationFailed ||
-        reservation.identityMismatch
+        reservation.identityMismatch ||
+        knownOwnedEntries(reservation, entries).length === 0
       ) {
         reservation.lastFailure = "missing-root-identity";
         return {
@@ -348,13 +349,14 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
   }
 
   const rootIsTerminal =
-    childIsTerminal(reservation) || root.state?.startsWith("Z") === true;
+    childIsTerminal(reservation) || root.state.startsWith("Z");
   const terminalRootIdentity =
     allowTerminalRootGone &&
     rootIsTerminal &&
     reservation.identityObserved &&
     !reservation.observationFailed &&
     !reservation.identityMismatch &&
+    root.command.includes(reservation.marker) &&
     root.pid === rootPid &&
     (process.platform === "win32" || root.pgid === reservation.groupId) &&
     root.start === reservation.startId;
@@ -365,7 +367,7 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
       entries,
       owned,
       rootPresent: true,
-      terminalRoot: true,
+      terminalRoot: rootIsTerminal,
       verified: true,
       failure: undefined,
     };
@@ -429,6 +431,7 @@ function observeOwnedTree(reservation, { allowTerminalRootGone = false } = {}) {
     entries,
     owned,
     rootPresent: true,
+    terminalRoot: childIsTerminal(reservation) || root.state.startsWith("Z"),
     verified: true,
     failure: undefined,
   };
@@ -551,26 +554,8 @@ async function signalOwnedTree(
         (entry) => entry.pid === reservation.child?.pid,
       );
       if (root === undefined) {
-        if (childHasExited(reservation)) {
-          if (
-            !observed.terminalRoot ||
-            observed.owned.length === 0 ||
-            reservation.groupId === undefined
-          ) {
-            return { sent: true, failure: undefined, signal };
-          }
-          let sent = false;
-          try {
-            sent =
-              reservation.sendSignal(-reservation.groupId, signal) === true;
-          } catch {
-            sent = false;
-          }
-          if (sent) return { sent: true, failure: undefined, signal };
-          lastFailure = "signal-failed";
-        } else {
-          lastFailure = "missing-root-process";
-        }
+        if (childHasExited(reservation) && observed.owned.length === 0) return { sent: true, failure: undefined, signal };
+        lastFailure = observed.failure ?? "missing-root-identity";
       } else {
         const target =
           process.platform === "win32" ? root.pid : -root.pgid;
@@ -604,21 +589,8 @@ async function signalOwnedTree(
     const root = observed.owned.find(
       (entry) => entry.pid === reservation.child?.pid,
     );
-    if (root === undefined && childHasExited(reservation)) {
-      if (
-        !observed.terminalRoot ||
-        observed.owned.length === 0 ||
-        reservation.groupId === undefined
-      ) {
-        return { sent: true, failure: undefined, signal };
-      }
-      try {
-        if (reservation.sendSignal(-reservation.groupId, signal) === true) {
-          return { sent: true, failure: undefined, signal };
-        }
-      } catch {
-        // The group may have disappeared between observation and signaling.
-      }
+    if (root === undefined && childHasExited(reservation) && observed.owned.length === 0) {
+      return { sent: true, failure: undefined, signal };
     }
   }
   persistObservationFailure(
@@ -1121,6 +1093,7 @@ export function ownedProcessReservationLabels() {
   return [...activeReservations].map((reservation) => ({
     label: reservation.label,
     pid: reservation.child?.pid,
+    groupId: reservation.groupId,
     failure: reservation.lastFailure,
     uncertain: reservation.uncertainTermination === true,
   }));
