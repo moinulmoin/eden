@@ -5801,14 +5801,18 @@ async function runBoundedRemoteValidation(
   ) => Promise<EdenCliRemoteValidationResult>,
   request: EdenCliRemoteValidationRequest,
   ownedProcesses: OwnedProcessRegistry,
+  mode: "read-only" | "mutating" = "read-only",
+  registerTerminal?: (barrier: Promise<void>) => void,
 ): Promise<EdenCliRemoteValidationResult> {
   const validationResult = Promise.resolve().then(() => validation(request));
-  ownedProcesses.trackLateResult(
-    validationResult.then(
-      () => undefined,
-      () => undefined,
-    ),
+  const terminal = validationResult.then(
+    () => undefined,
+    () => undefined,
   );
+  ownedProcesses.trackLateResult(terminal);
+  if (mode === "mutating") {
+    registerRemoteTerminalBarrier(ownedProcesses, terminal, registerTerminal);
+  }
   return await Promise.race([
     validationResult,
     ownedProcesses.stopped.then((signal) => {
@@ -8465,7 +8469,10 @@ async function runDeploy(
   };
   const runOwnedRemoteCleanup = async (
     request: EdenCliRemoteCommandRequest,
-  ): Promise<EdenCliRemoteCommandResult> => {
+  ): Promise<{
+    readonly result: EdenCliRemoteCommandResult;
+    readonly leaseReleaseFailed: boolean;
+  }> => {
     let outcome: OwnedRemoteCommandOutcome;
     try {
       outcome = await runRemoteCommand(
@@ -8502,6 +8509,7 @@ async function runDeploy(
     const released = await outcome.releaseLeaseAfterTerminal().catch(
       () => false,
     );
+    let leaseReleaseFailed = !released;
     if (!released && deploymentLease !== undefined) {
       void retryTrackedLeaseRelease(deploymentLease);
     }
@@ -8510,14 +8518,20 @@ async function runDeploy(
     }
     const completedLease = deploymentLease;
     deploymentLease = undefined;
-    if (completedLease !== undefined && !outcome.leaseHeldUntilTerminal) {
-      const released = await retryTrackedLeaseRelease(completedLease);
-      if (!released) {
-        // The bounded retry retained the lease; the final lock cleanup will
-        // report and preserve it rather than unlinking it by pathname.
+    if (
+      completedLease !== undefined &&
+      !outcome.leaseHeldUntilTerminal &&
+      released
+    ) {
+      const completedLeaseReleased = await completedLease.release().catch(
+        () => false,
+      );
+      leaseReleaseFailed ||= !completedLeaseReleased;
+      if (!completedLeaseReleased) {
+        void retryTrackedLeaseRelease(completedLease);
       }
     }
-    return outcome.result;
+    return { result: outcome.result, leaseReleaseFailed };
   };
   try {
     const compatibilityRequest: EdenCliDryRunRequest = {
@@ -8667,6 +8681,8 @@ async function runDeploy(
         expectedGeneration: runtimeGeneration,
       },
       ownedValidationProcesses,
+      "mutating",
+      registerRemoteTerminal,
     );
     await deployBoundary("after-remote-validation");
     if (!validation.ok) {
@@ -8682,27 +8698,31 @@ async function runDeploy(
     );
   } catch (error: unknown) {
     deploymentFailure = error;
-    throw error;
   } finally {
     const scheduleSerializedCompensation = async (
       requests: readonly EdenCliRemoteCommandRequest[],
-    ): Promise<boolean> => {
+    ): Promise<{
+      readonly cleanupFailed: boolean;
+      readonly leaseReleaseFailed: boolean;
+    }> => {
       let cleanupFailed = false;
+      let leaseReleaseFailed = false;
       for (const request of requests) {
         while (remoteTerminalBarriers.size > 0) {
           const barriers = [...remoteTerminalBarriers];
           await Promise.all(barriers);
         }
-        const result = await runOwnedRemoteCleanup(request).catch(
-          () => ({ exitCode: 1 }),
-        );
-        cleanupFailed ||= result.exitCode !== 0;
+        const outcome = await runOwnedRemoteCleanup(request).catch(() => ({
+          result: { exitCode: 1, stdout: "", stderr: "" },
+          leaseReleaseFailed: deploymentLeases.size > 0,
+        }));
+        cleanupFailed ||= outcome.result.exitCode !== 0;
+        leaseReleaseFailed ||= outcome.leaseReleaseFailed;
       }
-      return cleanupFailed;
+      return { cleanupFailed, leaseReleaseFailed };
     };
     if (
       deploymentFailure !== undefined &&
-      requestedWorkerName !== undefined &&
       (secretProvisioned || deploymentAttempted)
     ) {
       const compensationRequests: EdenCliRemoteCommandRequest[] = [];
@@ -8750,10 +8770,25 @@ async function runDeploy(
             () => undefined,
           ),
         );
-      } else if (await compensation) {
-        options.stderr?.(
-          `REMOTE_CLEANUP_FAILED: Validation cleanup did not remove every owned ${environment} resource for Worker ${workerName}.`,
-        );
+      } else {
+        const compensationResult = await compensation;
+        if (compensationResult.cleanupFailed) {
+          options.stderr?.(
+            `REMOTE_CLEANUP_FAILED: Validation cleanup did not remove every owned ${environment} resource for Worker ${workerName}.`,
+          );
+        }
+        if (compensationResult.leaseReleaseFailed) {
+          deploymentFailure = appendSecondaryDiagnostic(
+            deploymentFailure,
+            {
+              code: "REMOTE_CLEANUP_LEASE_RETAINED",
+              message:
+                `Remote cleanup could not release the deployment lease for Worker ${workerName}; inspect ${DEPLOY_LOCK_FILE} and .eden-deploy-lease-* residue before retrying.`,
+              source: DEPLOY_LOCK_FILE,
+              severity: "error",
+            },
+          );
+        }
       }
     }
     removeStopListeners();
@@ -8784,6 +8819,7 @@ async function runDeploy(
     };
     await ownedValidationProcesses.deferCleanup(releaseDeploymentLockAfterQuiescence);
   }
+  if (deploymentFailure !== undefined) throw deploymentFailure;
 }
 
 async function runBuild(

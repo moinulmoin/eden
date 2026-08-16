@@ -111,6 +111,38 @@ describe("eden remote deployment orchestration", () => {
     expect(validations[0]?.expectedGeneration.generationId).toMatch(/^gen_[a-f0-9]{64}$/u);
   });
 
+  test("uses the configured Worker name for secret and Worker compensation", async () => {
+    const root = await createRoot();
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    expect(await runEdenCli(["init", "--project", root], { cwd: root })).toBe(0);
+
+    await expect(
+      runEdenCli(["deploy", "--project", root, "--env", "preview"], {
+        cwd: root,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+        remoteCommandRunner: async (request) => {
+          commands.push(request);
+          return {
+            exitCode: request.kind === "deploy" ? 1 : 0,
+            stdout: "",
+            stderr: request.kind === "deploy" ? "deployment fixture failed" : "",
+          };
+        },
+        remoteBearerSecret: "configured-name-secret",
+      }),
+    ).resolves.toBe(1);
+
+    expect(commands.map((request) => request.kind)).toEqual([
+      "secret-put",
+      "deploy",
+      "secret-delete",
+      "delete",
+    ]);
+    expect(commands[0]?.args).toContain("eden-basic-agent-preview");
+    expect(commands[2]?.args).toContain("eden-basic-agent-preview");
+    expect(commands[3]?.args).toContain("eden-basic-agent-preview");
+  });
+
   test("reports remote validation failure instead of claiming deployment success", async () => {
     const root = await createRoot();
     const errors: string[] = [];
@@ -151,6 +183,61 @@ describe("eden remote deployment orchestration", () => {
     ]);
     expect(commands[2]?.args).not.toContain("--force");
   });
+
+  test("waits for pending mutating validation before compensation", async () => {
+    const root = await createRoot();
+    const stopController = new AbortController();
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    let validationStarted = false;
+    let releaseValidation: (() => void) | undefined;
+    const validationResult = new Promise<{ readonly ok: boolean }>((resolve) => {
+      releaseValidation = () => resolve({ ok: false });
+    });
+
+    expect(await runEdenCli(["init", "--project", root], { cwd: root })).toBe(0);
+    const deployPromise = runEdenCli(
+      ["deploy", "--project", root, "--name", "eden-pending-validation"],
+      {
+        cwd: root,
+        stopSignal: stopController.signal,
+        dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+        remoteCommandRunner: (request) => {
+          commands.push(request);
+          return {
+            exitCode: 0,
+            stdout: request.kind === "deploy"
+              ? "https://eden-pending-validation.example.workers.dev\n"
+              : "",
+            stderr: "",
+          };
+        },
+        remoteValidationRunner: async () => {
+          validationStarted = true;
+          queueMicrotask(() => stopController.abort());
+          return validationResult;
+        },
+        remoteBearerSecret: "pending-validation-secret",
+      },
+    );
+
+    await vi.waitFor(() => expect(validationStarted).toBe(true));
+    await expect(deployPromise).resolves.toBe(1);
+    expect(commands.map((request) => request.kind)).toEqual([
+      "secret-put",
+      "deploy",
+    ]);
+
+    releaseValidation?.();
+    await vi.waitFor(() => {
+      expect(commands.map((request) => request.kind)).toEqual([
+        "secret-put",
+        "deploy",
+        "secret-delete",
+        "delete",
+      ]);
+    });
+    await expectDeployLockRemoved(root);
+  }, 12_000);
 
   test("does not start a remote mutation after deployment ownership is replaced", async () => {
     const root = await createRoot();
@@ -1292,6 +1379,67 @@ describe("eden remote deployment orchestration", () => {
       expect(deleteStarted).toBe(true);
     });
     await expect(deployPromise).resolves.toBe(1);
+  }, 12_000);
+
+  test("preserves the primary error when compensation lease release fails", async () => {
+    const root = await createRoot();
+    const lockPath = join(root, ".eden-deploy.lock");
+    const commands: EdenCliRemoteCommandRequest[] = [];
+    const errors: string[] = [];
+    let tamperedLease = "";
+
+    expect(await runEdenCli(["init", "--project", root], { cwd: root })).toBe(0);
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--name", "eden-compensation-lease"],
+        {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+          dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+          remoteCommandRunner: async (request) => {
+            commands.push(request);
+            if (request.kind === "secret-delete") {
+              const lease = (await readdir(root)).find((entry) =>
+                entry.startsWith(".eden-deploy-lease-")
+              );
+              if (lease === undefined) throw new Error("missing cleanup lease");
+              tamperedLease = join(root, lease);
+              await rm(tamperedLease, { force: true });
+              await writeFile(tamperedLease, "replacement lease\n", "utf8");
+            }
+            return {
+              exitCode: request.kind === "deploy" ? 1 : 0,
+              stdout: "",
+              stderr: request.kind === "deploy"
+                ? "primary deployment failure"
+                : "",
+            };
+          },
+          remoteBearerSecret: "compensation-lease-secret",
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(commands.map((request) => request.kind)).toEqual([
+      "secret-put",
+      "deploy",
+      "secret-delete",
+      "delete",
+    ]);
+    expect(errors.join("\n")).toMatch(/REMOTE_DEPLOY_FAILED/u);
+    expect(errors.join("\n")).toMatch(/REMOTE_CLEANUP_LEASE_RETAINED/u);
+    expect(tamperedLease).not.toBe("");
+    await expect(readFile(tamperedLease, "utf8")).resolves.toBe(
+      "replacement lease\n",
+    );
+    await expect(readFile(lockPath, "utf8")).resolves.toContain(
+      "eden.deploy.lock",
+    );
+    await expect(readdir(root)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("eden-deploy-lease-"),
+      ]),
+    );
   }, 12_000);
 
   test("retains the lease and lock when identity-preserving lease release fails", async () => {
