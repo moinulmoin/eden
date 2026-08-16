@@ -1259,6 +1259,7 @@ export default {
     const spawned: EdenCliProcessRequest[] = [];
     const releases: Array<() => void> = [];
     const dryRuns: EdenCliDryRunRequest[] = [];
+    let coherent = false;
     const devPromise = runEdenCli(["dev", "--project", root], {
       cwd: root,
       processRunner: {
@@ -1294,8 +1295,15 @@ export default {
         dryRuns.push(request);
         return { exitCode: 0, stdout: "", stderr: "" };
       },
+      stdout: (line) => {
+        if (/^Eden dev generation gen_[a-f0-9]{64} is coherent\.$/u.test(line)) {
+          coherent = true;
+        }
+      },
     });
 
+    let testError: unknown;
+    try {
     await new Promise<void>((resolve) => {
       const check = (): void => {
         if (spawned.length > 0) {
@@ -1366,8 +1374,20 @@ export default greet;
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(dryRuns.length).toBeGreaterThanOrEqual(1);
     expect(await waitForDigestChange(root, initialDigest)).not.toBe(initialDigest);
-    releases.forEach((release) => release());
-    await expect(devPromise).resolves.toBe(0);
+      await vi.waitFor(() => expect(coherent).toBe(true), { timeout: 3_000 });
+    } catch (error: unknown) {
+      testError = error;
+    } finally {
+      releases.forEach((release) => release());
+    }
+    let devError: unknown;
+    try {
+      await expect(devPromise).resolves.toBe(0);
+    } catch (error: unknown) {
+      devError = error;
+    }
+    if (devError !== undefined) throw devError;
+    if (testError !== undefined) throw testError;
   }, DEV_WATCH_LIFECYCLE_TEST_TIMEOUT_MS);
 
   test("updates the running Wrangler runtime when a watch generation succeeds", async () => {
