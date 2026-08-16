@@ -150,6 +150,22 @@ Keep `--env` off these name-scoped secret commands intentionally. In Wrangler
 4.120, adding `--env` selects an environment-suffixed Worker rather than the
 exact unique Worker named by `--name`.
 
+Eden resolves the effective target with Wrangler 4.120's pinned
+`unstable_readConfig` parser from the immutable selected config snapshot.
+JSONC comments and trailing commas are supported, and Wrangler's environment
+overlay rules apply: preview may inherit and receive a preview suffix, while
+production may override the name. A configured name selects the target only;
+it is treated as shared and never grants destructive cleanup authority.
+
+Only an explicit, unique `--name` authorizes remote compensation. On failure,
+Eden may delete the provisioned secret, but it deletes the Worker only after a
+deployment was attempted. Configured/shared targets are preserved and report
+`REMOTE_CLEANUP_SKIPPED_UNOWNED` alongside the primary failure. If cleanup or
+its ownership lease cannot settle, Eden reports `REMOTE_CLEANUP_TIMEOUT` or
+`REMOTE_CLEANUP_LEASE_RETAINED` and retains the late operation, lock, and lease
+residue for manual inspection and cleanup. Invalid Wrangler syntax fails closed
+with actionable `PROJECT_CONFIG_INVALID`.
+
 ## Clean-room local validation
 
 The following walkthrough uses only the repository checkout and the approved

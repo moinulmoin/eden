@@ -74,6 +74,7 @@ import type {
   EdenArtifactGeneration,
   EdenDiagnostic,
 } from "@eden/compiler";
+import { unstable_readConfig } from "wrangler";
 
 const require = createRequire(import.meta.url);
 
@@ -536,8 +537,8 @@ export default greet;
 ] as const;
 
 const CONFIG_CANDIDATES = [
-  "wrangler.jsonc",
   "wrangler.json",
+  "wrangler.jsonc",
   "wrangler.toml",
 ] as const;
 
@@ -5905,10 +5906,21 @@ async function buildProjectFromCli(
   sourceFingerprint?: ProjectInputFingerprint,
   ownedProcesses?: OwnedProcessRegistry,
   generationTimeoutMs = GENERATION_WORK_TIMEOUT_MS,
+  workerName?: string,
+  configurationContents?: string,
 ): Promise<EdenArtifactGeneration | undefined> {
   const configuration = await readProjectConfiguration(root);
   const inputFingerprint =
     sourceFingerprint ?? await fingerprintProjectInputs(root, configuration);
+  const configuredWorkerName = environment === undefined
+    ? undefined
+    : await readConfiguredWorkerName(
+        root,
+        configuration.configPath,
+        environment,
+        configurationContents,
+      );
+  const effectiveWorkerName = workerName ?? configuredWorkerName;
   const canonicalOutput = await resolveContainedProjectPath(root, ".eden");
   const existingOutput = await lstat(canonicalOutput).catch(() => undefined);
   if (existingOutput?.isSymbolicLink() === true) {
@@ -5977,6 +5989,7 @@ async function buildProjectFromCli(
         ...(environment === undefined
           ? []
           : ["--env", environment]),
+        ...(effectiveWorkerName === undefined ? [] : ["--name", effectiveWorkerName]),
         "--config",
         temporaryConfig,
       ],
@@ -7911,47 +7924,49 @@ async function runDev(
 }
 
 async function readConfiguredWorkerName(
+  root: string,
   configPath: string,
   environment: "preview" | "production",
   sourceContents?: string,
 ): Promise<string | undefined> {
-  const source = sourceContents ?? await readFile(configPath, "utf8");
-  const extension = extname(configPath).toLowerCase();
-  if (extension !== ".toml") {
-    const withoutComments = source
-      .replace(/\/\*[\s\S]*?\*\//gu, "")
-      .replace(/^\s*\/\/.*$/gmu, "");
+  const snapshotPath = sourceContents === undefined
+    ? configPath
+    : join(
+        dirname(configPath),
+        `${uniqueTemporaryName("eden-config-snapshot")}${extname(configPath)}`,
+      );
+  try {
+    if (sourceContents !== undefined) {
+      await writeFile(snapshotPath, sourceContents, {
+        encoding: "utf8",
+        flag: "wx",
+      });
+    }
+    let config: ReturnType<typeof unstable_readConfig>;
     try {
-      const value = JSON.parse(withoutComments) as unknown;
-      if (isRecord(value)) {
-        const environments = isRecord(value.env) ? value.env : undefined;
-        const selected = environments?.[environment];
-        if (isRecord(selected) && typeof selected.name === "string") {
-          return parseWorkerNameValue(selected.name);
-        }
-        if (typeof value.name === "string") {
-          return parseWorkerNameValue(value.name);
-        }
-      }
-    } catch {
-      // The source-oriented fallback below preserves malformed config diagnostics.
+      config = unstable_readConfig(
+        { config: snapshotPath, env: environment },
+        { hideWarnings: true },
+      );
+    } catch (error: unknown) {
+      const reason = error instanceof Error
+        ? error.message
+        : "the parser returned an unknown error";
+      throw cliError({
+        code: "PROJECT_CONFIG_INVALID",
+        message:
+          `The selected Wrangler configuration could not be parsed for ${environment}: ${reason}. Fix the configuration syntax and retry.`,
+        source: toPosixPath(relative(root, configPath)),
+      });
+    }
+    return config.name === undefined
+      ? undefined
+      : parseWorkerNameValue(config.name);
+  } finally {
+    if (sourceContents !== undefined) {
+      await rm(snapshotPath, { force: true }).catch(() => undefined);
     }
   }
-
-  const section = extension === ".toml"
-    ? new RegExp(
-        `\\[env\\.${environment}\\]([\\s\\S]*?)(?=\\n\\s*\\[|$)`,
-        "u",
-      ).exec(source)?.[1]
-    : undefined;
-  const selectedName = section?.match(
-    /^\s*name\s*=\s*["']([^"']+)["']/mu,
-  )?.[1];
-  const topLevelName = source.match(
-    /^\s*name\s*=\s*["']([^"']+)["']/mu,
-  )?.[1];
-  const name = selectedName ?? topLevelName;
-  return name === undefined ? undefined : parseWorkerNameValue(name);
 }
 
 async function runDeploy(
@@ -8158,6 +8173,9 @@ async function runDeploy(
       environment,
       deploymentSnapshot.fingerprint,
       ownedValidationProcesses,
+      undefined,
+      requestedWorkerName,
+      deploymentSnapshot.configurationContents,
     );
     if (builtGeneration === undefined) {
       assertDeploymentActive();
@@ -8210,6 +8228,7 @@ async function runDeploy(
     );
     deploymentRuntimeContents = await readRuntimeFileContents(setupRuntimeFiles);
     const configuredWorkerName = await readConfiguredWorkerName(
+      root,
       configuration.configPath,
       environment,
       deploymentSnapshot.configurationContents,
@@ -8362,6 +8381,7 @@ async function runDeploy(
     await assertDeploymentLockOwned(lock);
   };
   const secret = options.remoteBearerSecret ?? process.env.EDEN_BEARER_SECRET;
+  const cleanupAuthorizedByExplicitName = requestedWorkerName !== undefined;
   let secretProvisioned = false;
   let deploymentAttempted = false;
   let deploymentUrl: string | undefined;
@@ -8543,6 +8563,8 @@ async function runDeploy(
         "--dry-run",
         "--env",
         environment,
+        "--name",
+        workerName,
         "--config",
         temporaryConfig,
       ],
@@ -8723,6 +8745,21 @@ async function runDeploy(
     };
     if (
       deploymentFailure !== undefined &&
+      (secretProvisioned || deploymentAttempted) &&
+      !cleanupAuthorizedByExplicitName
+    ) {
+      deploymentFailure = appendSecondaryDiagnostic(
+        deploymentFailure,
+        {
+          code: "REMOTE_CLEANUP_SKIPPED_UNOWNED",
+          message:
+            `Remote cleanup was skipped for configured/shared Worker ${workerName}; only an explicit unique --name authorizes destructive compensation.`,
+          source: workerName,
+          severity: "error",
+        },
+      );
+    } else if (
+      deploymentFailure !== undefined &&
       (secretProvisioned || deploymentAttempted)
     ) {
       const compensationRequests: EdenCliRemoteCommandRequest[] = [];
@@ -8741,7 +8778,7 @@ async function runDeploy(
           ],
         });
       }
-      if (deploymentAttempted || secretProvisioned) {
+      if (deploymentAttempted) {
         compensationRequests.push({
           kind: "delete",
           cwd: root,
@@ -8764,6 +8801,16 @@ async function runDeploy(
         }),
       ]);
       if (!startedOrSettled) {
+        deploymentFailure = appendSecondaryDiagnostic(
+          deploymentFailure,
+          {
+            code: "REMOTE_CLEANUP_TIMEOUT",
+            message:
+              `Remote cleanup did not settle within ${CLEANUP_POLL_TIMEOUT_MS}ms; the late remote operation, deployment lock, and lease were retained for manual cleanup.`,
+            source: workerName,
+            severity: "error",
+          },
+        );
         ownedValidationProcesses.trackLateResult(
           compensation.then(
             () => undefined,
