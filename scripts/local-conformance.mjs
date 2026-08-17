@@ -378,8 +378,8 @@ async function fetchWithTimeout(
   }
 }
 
-async function readJsonResponse(response) {
-  const text = await response.text();
+export async function readJsonResponse(response, timeoutMs = 5_000, signal) {
+  const text = await readResponseBodyTextWithTimeout(response, timeoutMs, signal);
   let body;
   try {
     body = JSON.parse(text);
@@ -427,6 +427,8 @@ async function waitForLocalRuntime(secret, signal) {
           await fetchWithTimeout(`${EDEN_BASE_URL}/eden/v1/health`, {
             headers: authorizationHeaders(secret),
           }, 5_000, signal),
+          5_000,
+          signal,
         );
         if (response.status === 200 && body?.status === "ok") return;
       } catch {
@@ -736,6 +738,8 @@ async function runLocalFirstUse(
     await fetchWithTimeout(`${EDEN_BASE_URL}/eden/v1/health`, {
       headers: authorizationHeaders(secret),
     }, 5_000, signal),
+    5_000,
+    signal,
   );
   if (health.response.status !== 200 || health.body?.status !== "ok") {
     throw new Error("Authenticated local health check failed.");
@@ -744,6 +748,8 @@ async function runLocalFirstUse(
 
   const unauthorized = await readJsonResponse(
     await fetchWithTimeout(`${EDEN_BASE_URL}/eden/v1/health`, {}, 5_000, signal),
+    5_000,
+    signal,
   );
   if (unauthorized.response.status !== 401 || JSON.stringify(unauthorized.body).includes(secret)) {
     throw new Error("Local health did not fail closed without the bearer.");
@@ -754,6 +760,8 @@ async function runLocalFirstUse(
     await fetchWithTimeout(`${EDEN_BASE_URL}/eden/v1/info`, {
       headers: authorizationHeaders(secret),
     }, 5_000, signal),
+    5_000,
+    signal,
   );
   if (
     info.response.status !== 200 ||
@@ -770,6 +778,8 @@ async function runLocalFirstUse(
       headers: authorizationHeaders(secret, true),
       body: "{}",
     }, 5_000, signal),
+    5_000,
+    signal,
   );
   const sessionId = session.body?.sessionId;
   if (
@@ -787,6 +797,8 @@ async function runLocalFirstUse(
       headers: authorizationHeaders(secret, true),
       body: JSON.stringify({ message: "Say hello to Eden." }),
     }, 5_000, signal),
+    5_000,
+    signal,
   );
   if (command.response.status !== 202 || command.body?.status !== "accepted") {
     throw new Error("Authenticated command acceptance failed.");

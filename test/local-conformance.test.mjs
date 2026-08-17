@@ -15,7 +15,7 @@ import {
   PUBLIC_FAILURE_CASES,
   PUBLIC_FAILURE_FIXTURE,
   readNdjsonWithIdleTimeout,
-  readResponseBodyTextWithTimeout,
+  readJsonResponse,
   runLocalConformance,
   stopLocalRuntime,
 } from "../scripts/local-conformance.mjs";
@@ -90,10 +90,10 @@ test("rejects a stalled NDJSON reader at its per-read idle deadline", async () =
   );
 });
 
-test("cancels a stalled catch-up response body at its bounded deadline", async () => {
+test("cancels a stalled JSON response body at its bounded deadline", async () => {
   let cancelled = false;
   const response = new globalThis.Response(new globalThis.ReadableStream({ pull: () => new Promise(() => {}), cancel: () => { cancelled = true; } }));
-  await expect(readResponseBodyTextWithTimeout(response, 25))
+  await expect(readJsonResponse(response, 25))
     .rejects.toThrow(/body read timeout/iu);
   expect(cancelled).toBe(true);
 });
@@ -104,7 +104,7 @@ test("aborts and cancels a stalled catch-up body without unhandled rejection", a
   const response = new globalThis.Response(new globalThis.ReadableStream({ pull: () => new Promise(() => {}), cancel: () => { cancelled = true; } }));
   const controller = new AbortController();
   try {
-    const pending = readResponseBodyTextWithTimeout(response, 5_000, controller.signal);
+    const pending = readJsonResponse(response, 5_000, controller.signal);
     controller.abort(new Error("body abort"));
     await expect(pending).rejects.toThrow(/abort/iu); await delay(0);
     expect(cancelled).toBe(true); expect(unhandled).toEqual([]);
