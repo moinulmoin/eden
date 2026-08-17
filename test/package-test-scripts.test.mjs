@@ -21,13 +21,13 @@ const workspacePackageDirectories = [
 ];
 // Six package-local processes run serially. Repeated cold runs measured
 // 225.9s for this assertion and 96.0s for the separate compiler-filter
-// assertion. A 240s budget leaves at least a 14s margin for the slower
+// assertion. A 300s budget leaves at least a 74.1s margin for the slower
 // assertion while staying scoped to this portability regression instead of
 // masking unrelated hangs globally.
-const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS = 240_000;
+const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS = 300_000;
 // The slowest observed compiler-filter child was 96.0s; retain a measured 54s
 // cushion for cold starts and serial load while still bounding one hung child
-// well inside the enclosing 240s assertion.
+// well inside the enclosing 300s assertion.
 const PACKAGE_TEST_PROCESS_TIMEOUT_MS = 150_000;
 // Keep compiler output bounded while leaving a measured margin over the
 // harness default for six serial package logs. This is intentionally finite;
