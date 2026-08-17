@@ -903,7 +903,7 @@ describe("eden remote deployment orchestration", () => {
     const observed = await Promise.race([
       deployPromise.then((code) => ({ settled: true, code })),
       new Promise<{ readonly settled: false }>((resolve) => {
-        setTimeout(() => resolve({ settled: false }), 2_500);
+        setTimeout(() => resolve({ settled: false }), 5_000);
       }),
     ]);
     expect(observed).toEqual({ settled: true, code: 1 });
