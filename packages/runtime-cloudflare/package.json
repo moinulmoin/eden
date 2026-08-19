@@ -13,6 +13,7 @@
   },
   "files": ["dist"],
   "dependencies": {
+    "@cloudflare/containers": "0.3.7",
     "@eden/definitions": "workspace:*",
     "ai": "7.0.58",
     "workers-ai-provider": "4.0.0"

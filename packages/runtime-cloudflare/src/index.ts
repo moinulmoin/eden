@@ -75,3 +75,39 @@ export function createRuntime(
 ): EdenRuntime {
   return { configuration, sessions };
 }
+
+export {
+  EVE_HOST_DEFAULTS,
+  EVE_HOST_OWNED_HEADERS,
+  EveHostContainer,
+  EveHostError,
+  createEveHostConfig,
+  createEveHostLifecycleObserver,
+  createEveHostProxy,
+  createEveHostWorker,
+  createEveReadinessGate,
+  createTrustedEveRequest,
+  generateEveHostWorkerSource,
+  resolveStableWorkersDevOrigin,
+} from "./eve-host.js";
+export type {
+  EveContainerTransport,
+  EveHostConfig,
+  EveHostConfigRequest,
+  EveHostContainerConfig,
+  EveHostContainerEnvironment,
+  EveHostErrorCode,
+  EveHostForwardingMetadata,
+  EveHostIdentity,
+  EveHostLifecycleEvent,
+  EveHostLifecycleObserver,
+  EveHostProxyOptions,
+  EveHostReadinessEvidence,
+  EveHostReadinessOptions,
+  EveReadinessGate,
+  EveHostWorkerEnvironment,
+  EveHostWorkerOptions,
+  EveHostWranglerConfig,
+  EveGeneratedWorkerSourceRequest,
+  StableWorkersDevOriginRequest,
+} from "./eve-host.js";
