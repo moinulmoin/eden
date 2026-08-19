@@ -90,6 +90,11 @@ export {
   eveHelpText,
   parseEveArguments,
 } from "./eve.js";
+export {
+  EvePackagingError,
+  buildEveProjectSnapshot,
+  createDockerEveProjectBuilder,
+} from "./eve-packaging.js";
 export type {
   EveCliCommand,
   EveCliEnvironment,
@@ -99,6 +104,24 @@ export type {
   EveCliRunner,
   ParsedEveInvocation,
 } from "./eve.js";
+export type {
+  EveNodeImage,
+  EvePackagingCheck,
+  EvePackagingCode,
+  EveProjectBuilder,
+  EveProjectBuilderRequest,
+  EveProjectBuilderResult,
+  EveProjectFile,
+  EveProjectImage,
+  EveProjectInputManifest,
+  EveProjectOutput,
+  EveProjectPackagingResult,
+  EveProjectRuntime,
+  EveProjectSnapshot,
+  EveProjectSnapshotOptions,
+  EveProjectToolchain,
+  EveRuntimeConfigExclusion,
+} from "./eve-packaging.js";
 
 const require = createRequire(import.meta.url);
 
