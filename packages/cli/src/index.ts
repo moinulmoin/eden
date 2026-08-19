@@ -95,6 +95,10 @@ export {
   buildEveProjectSnapshot,
   createDockerEveProjectBuilder,
 } from "./eve-packaging.js";
+export {
+  buildEveRuntimeImage,
+  validateEveHostRequirements,
+} from "./eve-runtime-image.js";
 export type {
   EveCliCommand,
   EveCliEnvironment,
@@ -123,6 +127,18 @@ export type {
   EveProjectToolchain,
   EveRuntimeConfigExclusion,
 } from "./eve-packaging.js";
+export type {
+  EveHostRequirements,
+  EveRuntimeClosure,
+  EveRuntimeClosureFile,
+  EveRuntimeCleanup,
+  EveRuntimeImage,
+  EveRuntimeImageMetadata,
+  EveRuntimeImageRequest,
+  EveRuntimeImageResult,
+  EveRuntimeNativeModule,
+  EveRuntimeStatus,
+} from "./eve-runtime-image.js";
 
 const require = createRequire(import.meta.url);
 
