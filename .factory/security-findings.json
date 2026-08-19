@@ -1,6 +1,6 @@
 {
-  "scan_id": "scan-2026-08-19-eve-packaging",
-  "scan_date": "2026-08-19T00:00:00Z",
+  "scan_id": "scan-2026-08-19-eve-packaging-worker",
+  "scan_date": "2026-08-19T18:20:00Z",
   "scan_type": "working",
   "commit_range": "main..working-tree",
   "pr_number": null,
@@ -22,6 +22,6 @@
       "DoS": 0,
       "ElevationOfPrivilege": 0
     },
-    "files_analyzed": 4
+    "files_analyzed": 3
   }
 }

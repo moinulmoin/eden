@@ -111,6 +111,7 @@ export type {
   EveProjectBuilder,
   EveProjectBuilderRequest,
   EveProjectBuilderResult,
+  EveProjectBuildCandidate,
   EveProjectFile,
   EveProjectImage,
   EveProjectInputManifest,

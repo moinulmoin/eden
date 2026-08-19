@@ -214,7 +214,27 @@ describe("Eve project snapshot/build boundary", () => {
       installCommand: ["corepack", "pnpm", "install", "--frozen-lockfile"],
       buildCommand: ["./node_modules/.bin/eve", "build"],
       platform: "linux/amd64",
+      buildContext: "immutable-snapshot",
     });
+  });
+
+  test("creates an Eden-owned generation under a missing external artifact parent", async () => {
+    const root = await createRoot("eden-eve-package-artifact-parent-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const { builder } = fakeBuilder(writeSuccessfulBuild);
+    const artifactRoot = join(artifacts, "deep", "nested", "generation-one");
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot,
+      builder,
+    });
+
+    expect(result.status).toBe("ready");
+    expect(result.snapshot?.path).toContain(
+      `${join("deep", "nested", "generation-one")}/container/snapshot`,
+    );
   });
 
   test.each([
@@ -280,6 +300,29 @@ describe("Eve project snapshot/build boundary", () => {
       expect(requests).toHaveLength(0);
     },
   );
+
+  test("reports an unsupported manager before requiring a pnpm lockfile", async () => {
+    const root = await createRoot("eden-eve-package-manager-no-lock-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root, {
+      packageManager: "npm@10.0.0",
+    });
+    await rm(join(root, "pnpm-lock.yaml"));
+    const { builder, requests } = fakeBuilder(writeSuccessfulBuild);
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "UNSUPPORTED_TOOLCHAIN",
+      deployable: false,
+    });
+    expect(requests).toHaveLength(0);
+  });
 
   test.each([
     ["symlinked lockfile", "symlink"],
@@ -349,6 +392,46 @@ describe("Eve project snapshot/build boundary", () => {
     expect(requests[0]?.snapshotRoot).toContain("generation-one");
   });
 
+  test("returns a typed build candidate before image assembly or health checks", async () => {
+    const root = await createRoot("eden-eve-package-candidate-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const requests: EveProjectBuilderRequest[] = [];
+    const builder: EveProjectBuilder = {
+      async build(request) {
+        requests.push(request);
+        await writeSuccessfulBuild(request);
+        return { eveVersion: "0.31.3" };
+      },
+    };
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "ready",
+      returnCode: "EVE_PACKAGE_READY",
+      deployable: true,
+      candidate: {
+        packageManagerVersion: "11.21.0",
+        eveVersion: "0.31.3",
+        buildCommand: ["./node_modules/.bin/eve", "build"],
+        generatedOutput: {
+          entrypointPath: ".output/server/index.mjs",
+          regularFile: true,
+        },
+      },
+      image: null,
+      runtime: null,
+      candidateImageId: null,
+      candidateImageRetainedLocally: false,
+    });
+    expect(requests).toHaveLength(1);
+  });
+
   test("rejects a global-only Eve executable and never produces a candidate", async () => {
     const root = await createRoot("eden-eve-package-global-");
     const artifacts = await createRoot("eden-eve-package-artifacts-");
@@ -380,6 +463,72 @@ describe("Eve project snapshot/build boundary", () => {
     expect(
       await readdir(join(artifacts, "generation-one")),
     ).not.toContain("candidate.json");
+  });
+
+  test("rejects an executable whose package is not Eve", async () => {
+    const root = await createRoot("eden-eve-package-wrong-cli-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const { builder } = fakeBuilder(async (request) => {
+      await writeSuccessfulBuild(request);
+      await writeFile(
+        join(request.snapshotRoot, "node_modules/eve/package.json"),
+        JSON.stringify({ name: "not-eve", version: "0.31.3", bin: "bin/eve.js" }),
+        "utf8",
+      );
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "DEPENDENCY_AMBIGUITY",
+      deployable: false,
+    });
+  });
+
+  test("rejects a project-local Eve link that escapes the snapshot", async () => {
+    const root = await createRoot("eden-eve-package-eve-escape-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const { builder } = fakeBuilder(async (request) => {
+      await mkdir(join(request.snapshotRoot, "node_modules/.bin"), {
+        recursive: true,
+      });
+      const outside = join(artifacts, "outside-eve");
+      await writeFile(outside, "#!/usr/bin/env node\n", {
+        encoding: "utf8",
+        mode: 0o755,
+      });
+      await symlink(
+        outside,
+        join(request.snapshotRoot, "node_modules/.bin/eve"),
+      );
+      await mkdir(join(request.snapshotRoot, ".output/server"), {
+        recursive: true,
+      });
+      await writeFile(
+        join(request.snapshotRoot, ".output/server/index.mjs"),
+        "export default {};\n",
+        "utf8",
+      );
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "DEPENDENCY_AMBIGUITY",
+      deployable: false,
+    });
   });
 
   test("captures an immutable snapshot without generated state or runtime env files", async () => {
@@ -444,6 +593,32 @@ describe("Eve project snapshot/build boundary", () => {
       runtimeConfig: {
         inputIdentity: "runtime-input-v1",
         variableNames: ["MODEL_API_KEY"],
+      },
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "SECRET_EXCLUSION_FAILED",
+      deployable: false,
+    });
+    expect(requests).toHaveLength(0);
+  });
+
+  test("requires a deployment-safety identity for an explicit environment file", async () => {
+    const root = await createRoot("eden-eve-package-env-identity-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const envFile = join(root, "runtime.env");
+    await writeFile(envFile, "RUNTIME_SECRET=opaque\n", "utf8");
+    const { builder, requests } = fakeBuilder(writeSuccessfulBuild);
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      runtimeConfig: {
+        envFilePath: envFile,
+        redactionRegistered: true,
       },
       builder,
     });
@@ -565,6 +740,33 @@ describe("Eve project snapshot/build boundary", () => {
     );
   });
 
+  test("fails closed when the builder adds an untracked authored-tree file", async () => {
+    const root = await createRoot("eden-eve-package-added-file-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const { builder } = fakeBuilder(async (request) => {
+      await writeSuccessfulBuild(request);
+      await writeFile(
+        join(request.snapshotRoot, "src/generated-config.ts"),
+        "export const generated = true;\n",
+        "utf8",
+      );
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "SOURCE_RACE",
+      deployable: false,
+      candidateImageId: null,
+    });
+  });
+
   test("generates a pinned Linux/amd64 multi-stage context without runtime values", async () => {
     const root = await createRoot("eden-eve-package-dockerfile-");
     const artifacts = await createRoot("eden-eve-package-artifacts-");
@@ -596,7 +798,9 @@ describe("Eve project snapshot/build boundary", () => {
     expect(dockerfile).toContain("corepack pnpm install --frozen-lockfile");
     expect(dockerfile).toContain("corepack pnpm prune --prod");
     expect(dockerfile).toContain("COPY --from=runtime-deps /workspace/node_modules /app/node_modules");
-    expect(dockerfile).toContain('ENTRYPOINT ["node", ".output/server/index.mjs"]');
+    expect(dockerfile).toContain(
+      'ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "8080"]',
+    );
     expect(dockerfile).not.toContain("MODEL_API_KEY");
     expect(result.secrets.redactionRegisteredBeforeChildren).toBe(true);
   });
@@ -681,6 +885,32 @@ describe("Eve project snapshot/build boundary", () => {
       returnCode: "UNSUPPORTED_EVE_OUTPUT",
       deployable: false,
       candidateImageId: null,
+    });
+  });
+
+  test("rejects an invalid generated Nitro entrypoint", async () => {
+    const root = await createRoot("eden-eve-package-invalid-output-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const { builder } = fakeBuilder(async (request) => {
+      await writeSuccessfulBuild(request);
+      await writeFile(
+        join(request.snapshotRoot, ".output/server/index.mjs"),
+        "export default {;\n",
+        "utf8",
+      );
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "UNSUPPORTED_EVE_OUTPUT",
+      deployable: false,
     });
   });
 
