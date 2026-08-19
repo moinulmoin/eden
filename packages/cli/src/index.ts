@@ -74,6 +74,31 @@ import type {
   EdenArtifactGeneration,
   EdenDiagnostic,
 } from "@eden/compiler";
+import {
+  EveCliError,
+  eveHelpText,
+  parseEveArguments,
+  type EveCliExecutionRequest,
+  type EveCliInvocation,
+  type ParsedEveInvocation,
+} from "./eve.js";
+
+export {
+  EVE_CLI_COMMANDS,
+  EVE_USAGE,
+  EveCliError,
+  eveHelpText,
+  parseEveArguments,
+} from "./eve.js";
+export type {
+  EveCliCommand,
+  EveCliEnvironment,
+  EveCliExecutionRequest,
+  EveCliHelp,
+  EveCliInvocation,
+  EveCliRunner,
+  ParsedEveInvocation,
+} from "./eve.js";
 
 const require = createRequire(import.meta.url);
 
@@ -283,6 +308,13 @@ export interface EdenCliRunOptions {
   readonly cwd?: string;
   readonly stdout?: (line: string) => void;
   readonly stderr?: (line: string) => void;
+  /**
+   * Eve execution is a separate control-plane seam. Native runners never
+   * receive an Eve invocation, and the default path fails closed.
+   */
+  readonly eveRunner?: (
+    request: EveCliExecutionRequest,
+  ) => void | Promise<void>;
   readonly initPublicationHook?: (
     boundary: EdenInitPublicationBoundary,
     target?: string,
@@ -563,12 +595,20 @@ Commands:
   build   Validate and build a Worker-safe Eden artifact
   dev     Run the local Eden Worker on 127.0.0.1:8797 (inspector 9297)
   deploy  Build, validate, and deploy a selected remote environment
+  eve     Host an existing Eve project through preflight, deploy, or destroy
 
 Options:
   --project <path>  Select the project root (defaults to the current directory)
   --env <name>      Select preview or production for deploy (defaults to preview)
   --name <name>     Select the deployed Worker name for deploy
   --help            Show this help
+
+Eve namespace:
+  eden eve --help
+  eden eve preflight --project <path> --env <preview|production> --name <name>
+  eden eve deploy --project <path> --env <preview|production> --name <name>
+  eden eve destroy --project <path> --env <preview|production> --name <name>
+  Eve requires explicit --project, --env, and --name selectors.
 `;
 
 function defaultStdout(line: string): void {
@@ -770,6 +810,38 @@ function parseArguments(
     ...(environment === undefined ? {} : { environment }),
     ...(workerName === undefined ? {} : { workerName }),
   };
+}
+
+async function selectedEveProjectRoot(
+  projectRoot: string,
+  cwd: string,
+): Promise<string> {
+  const lexicalPath = isAbsolute(projectRoot)
+    ? projectRoot
+    : resolve(cwd, projectRoot);
+  const details = await lstat(lexicalPath).catch(() => undefined);
+  if (
+    details === undefined ||
+    !details.isDirectory() ||
+    details.isSymbolicLink()
+  ) {
+    throw new EveCliError({
+      code: "EVE_PROJECT_ROOT_INVALID",
+      message:
+        "The selected Eve project root must be an existing, canonical directory.",
+      source: "project",
+    });
+  }
+  const canonical = await realpath(lexicalPath).catch(() => undefined);
+  if (canonical === undefined) {
+    throw new EveCliError({
+      code: "EVE_PROJECT_ROOT_INVALID",
+      message:
+        "The selected Eve project root could not be resolved canonically.",
+      source: "project",
+    });
+  }
+  return canonical;
 }
 
 async function selectedProjectRoot(
@@ -6241,6 +6313,18 @@ async function buildProjectFromCli(
 }
 
 function errorLines(error: unknown): readonly string[] {
+  if (error instanceof EveCliError) {
+    const source = error.source === undefined ? "" : ` [${error.source}]`;
+    return [
+      `${error.code}${source}: ${error.message}`,
+      ...error.diagnostics.map((diagnostic) => {
+        const diagnosticSource = diagnostic.source === undefined
+          ? ""
+          : ` [${diagnostic.source}]`;
+        return `${diagnostic.code}${diagnosticSource}: ${diagnostic.message}`;
+      }),
+    ];
+  }
   if (error instanceof EdenCompilerError) {
     const diagnostics = error.diagnostics.map((diagnostic) => {
       const source = diagnostic.source === undefined
@@ -8991,6 +9075,39 @@ async function runInvocation(
   }
 }
 
+async function runEveInvocation(
+  invocation: EveCliInvocation,
+  options: EdenCliRunOptions,
+): Promise<void> {
+  if (options.eveRunner === undefined) {
+    throw new EveCliError({
+      code: "EVE_EXECUTION_UNAVAILABLE",
+      message:
+        `The eve ${invocation.command} control-plane implementation is not available in this CLI build.`,
+    });
+  }
+  const cwd = options.cwd ?? process.cwd();
+  const projectRoot = await selectedEveProjectRoot(invocation.projectRoot, cwd);
+  try {
+    await options.eveRunner({
+      command: invocation.command,
+      cwd,
+      projectRoot,
+      environment: invocation.environment,
+      name: invocation.name,
+      ...(invocation.envFile === undefined
+        ? {}
+        : { envFile: invocation.envFile }),
+    });
+  } catch (error: unknown) {
+    if (error instanceof EveCliError) throw error;
+    throw new EveCliError({
+      code: "EVE_EXECUTION_FAILED",
+      message: `The eve ${invocation.command} operation failed.`,
+    });
+  }
+}
+
 export async function runEdenCli(
   args: readonly string[],
   options: EdenCliRunOptions = {},
@@ -8998,9 +9115,32 @@ export async function runEdenCli(
   const stdout = options.stdout ?? defaultStdout;
   const stderr = options.stderr ?? defaultStderr;
   try {
-    const parsed = parseArguments(args);
+    const parsed: ParsedInvocation | ParsedEveInvocation | "help" =
+      args[0] === "eve"
+        ? parseEveArguments(args)
+        : parseArguments(args);
     if (parsed === "help") {
       stdout(USAGE.trimEnd());
+      return 0;
+    }
+    if (
+      typeof parsed === "object" &&
+      "kind" in parsed &&
+      parsed.kind === "help"
+    ) {
+      stdout(eveHelpText(parsed.scope));
+      return 0;
+    }
+    if (
+      typeof parsed === "object" &&
+      "kind" in parsed &&
+      parsed.kind === "invocation"
+    ) {
+      await runEveInvocation(parsed, {
+        ...options,
+        stdout,
+        stderr,
+      });
       return 0;
     }
     await runInvocation(parsed, {
