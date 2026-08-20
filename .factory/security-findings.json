@@ -1,8 +1,8 @@
 {
-  "scan_id": "scan-2026-08-19-eve-generic-worker-proxy",
-  "scan_date": "2026-08-19T20:30:00Z",
-  "scan_type": "staged",
-  "commit_range": "main..staged",
+  "scan_id": "scan-2026-08-20-eve-runtime-config-secrets",
+  "scan_date": "2026-08-20T14:02:00Z",
+  "scan_type": "working",
+  "commit_range": "main..working",
   "pr_number": null,
   "threat_model_version": "1.0.0",
   "findings": [],
@@ -22,6 +22,6 @@
       "DoS": 0,
       "ElevationOfPrivilege": 0
     },
-    "files_analyzed": 5
+    "files_analyzed": 6
   }
 }

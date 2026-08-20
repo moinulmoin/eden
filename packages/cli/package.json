@@ -23,6 +23,7 @@
   },
   "scripts": {
     "build": "tsc -b",
+    "postbuild": "chmod 755 dist/index.js",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src --max-warnings 0",
     "test": "pnpm --dir ../.. exec vitest run packages/cli/test --passWithNoTests --maxWorkers=1"

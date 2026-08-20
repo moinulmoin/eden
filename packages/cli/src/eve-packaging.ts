@@ -17,6 +17,9 @@ import {
 import {
   promisify,
 } from "node:util";
+import type {
+  EveRuntimeInputIdentity,
+} from "./eve-runtime-config.js";
 import {
   basename,
   dirname,
@@ -53,8 +56,11 @@ export interface EveRuntimeConfigExclusion {
    * The deployment-safety seam owns this identity. It may represent the
    * explicit env file and parsed runtime configuration without exposing values.
    */
-  readonly inputIdentity?: string;
-  readonly readInputIdentity?: () => string | Promise<string>;
+  readonly inputIdentity?: string | EveRuntimeInputIdentity;
+  readonly readInputIdentity?: () =>
+    | string
+    | EveRuntimeInputIdentity
+    | Promise<string | EveRuntimeInputIdentity>;
   readonly variableNames?: readonly string[];
   readonly redactionRegistered?: boolean;
 }
@@ -1563,10 +1569,16 @@ function blockedResult(
 async function currentInputIdentity(
   runtimeConfig: EveRuntimeConfigExclusion | undefined,
 ): Promise<string | undefined> {
+  const token = (
+    value: string | EveRuntimeInputIdentity | undefined,
+  ): string | undefined => {
+    if (typeof value === "string") return value;
+    return value?.token;
+  };
   if (runtimeConfig?.readInputIdentity !== undefined) {
-    return await runtimeConfig.readInputIdentity();
+    return token(await runtimeConfig.readInputIdentity());
   }
-  return runtimeConfig?.inputIdentity;
+  return token(runtimeConfig?.inputIdentity);
 }
 
 async function sourceRaceErrorIfChanged(

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --
 
 import {
   createHash,
@@ -82,6 +82,10 @@ import {
   type EveCliInvocation,
   type ParsedEveInvocation,
 } from "./eve.js";
+import {
+  EveRuntimeConfigError,
+  redactEveRuntimeOutput,
+} from "./eve-runtime-config.js";
 
 export {
   EVE_CLI_COMMANDS,
@@ -95,6 +99,30 @@ export {
   buildEveProjectSnapshot,
   createDockerEveProjectBuilder,
 } from "./eve-packaging.js";
+export {
+  EVE_RESERVED_HOST_VARIABLES,
+  EVE_START_COMMAND,
+  EveRuntimeConfig,
+  EveRuntimeConfigError,
+  loadEveRuntimeConfig,
+  parseEveRuntimeConfig,
+  prepareEveRuntimeInjection,
+  readEveRuntimeConfig,
+  redactEveRuntimeOutput,
+} from "./eve-runtime-config.js";
+export type {
+  EveReservedHostVariable,
+  EveRuntimeConfigErrorCode,
+  EveRuntimeInjection,
+  EveRuntimeInjectionMode,
+  EveRuntimeInjectionOptions,
+  EveRuntimeInputIdentity,
+  EveRuntimeProtectedPutRequest,
+  EveRuntimeProtectedPutResult,
+  EveRuntimeProtectedStore,
+  EveStartProcessRequest,
+  RedactedRuntimeConfigSeam,
+} from "./eve-runtime-config.js";
 export {
   buildEveRuntimeImage,
   validateEveHostRequirements,
@@ -2550,7 +2578,7 @@ function shortOutput(value: string): string {
 }
 
 function redactOutput(value: string): string {
-  return shortOutput(value)
+  return redactEveRuntimeOutput(shortOutput(value)
     .replace(/Bearer\s+\S+/giu, "Bearer [redacted]")
     .replace(
       /(EDEN_BEARER_SECRET\s*[=:]\s*)\S+/giu,
@@ -2559,7 +2587,7 @@ function redactOutput(value: string): string {
     .replace(
       /((?:authorization|token|secret|password|api[_-]?key)\s*[:=]\s*)\S+/giu,
       "$1[redacted]",
-    );
+    ));
 }
 
 function sha256(value: string | Uint8Array): string {
@@ -6377,6 +6405,10 @@ function errorLines(error: unknown): readonly string[] {
       ...diagnostics,
     ];
   }
+  if (error instanceof EveRuntimeConfigError) {
+    const source = error.source === undefined ? "" : ` [${error.source}]`;
+    return [`${error.code}${source}: ${error.message}`];
+  }
   if (error instanceof EdenCliError) {
     const source = error.source === undefined ? "" : ` [${error.source}]`;
     return [
@@ -9140,7 +9172,12 @@ async function runEveInvocation(
         : { envFile: invocation.envFile }),
     });
   } catch (error: unknown) {
-    if (error instanceof EveCliError) throw error;
+    if (
+      error instanceof EveCliError ||
+      error instanceof EveRuntimeConfigError
+    ) {
+      throw error;
+    }
     throw new EveCliError({
       code: "EVE_EXECUTION_FAILED",
       message: `The eve ${invocation.command} operation failed.`,
@@ -9190,7 +9227,9 @@ export async function runEdenCli(
     });
     return 0;
   } catch (error: unknown) {
-    for (const line of errorLines(error)) stderr(line);
+    for (const line of errorLines(error)) {
+      stderr(redactEveRuntimeOutput(line));
+    }
     return 1;
   }
 }
