@@ -547,11 +547,19 @@ export const parseEveRuntimeConfig = readEveRuntimeConfig;
 export const loadEveRuntimeConfig = readEveRuntimeConfig;
 
 function validateProtectedPutResult(
-  result: EveRuntimeProtectedPutResult,
+  result: unknown,
 ): void {
   if (
-    !EVE_RUNTIME_METADATA_PATTERN.test(result.revision) ||
-    !EVE_RUNTIME_METADATA_PATTERN.test(result.handle)
+    typeof result !== "object" ||
+    result === null ||
+    typeof (result as { readonly revision?: unknown }).revision !== "string" ||
+    typeof (result as { readonly handle?: unknown }).handle !== "string" ||
+    !EVE_RUNTIME_METADATA_PATTERN.test(
+      (result as { readonly revision: string }).revision,
+    ) ||
+    !EVE_RUNTIME_METADATA_PATTERN.test(
+      (result as { readonly handle: string }).handle,
+    )
   ) {
     throw new EveRuntimeConfigError({
       code: "EVE_RUNTIME_PROTECTED_UPLOAD_FAILED",

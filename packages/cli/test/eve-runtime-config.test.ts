@@ -424,6 +424,27 @@ describe("Eve runtime configuration", () => {
     config.dispose();
   });
 
+  test("returns a typed failure for malformed protected-store metadata", async () => {
+    const root = await createRoot();
+    const envPath = await writeEnv(root, "OPAQUE_VALUE=value\n");
+    const config = await readEveRuntimeConfig(envPath);
+
+    await expect(
+      prepareEveRuntimeInjection(config, {
+        mode: "deploy",
+        targetId: "exact-target",
+        protectedStore: {
+          async put() {
+            return undefined as never;
+          },
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "EVE_RUNTIME_PROTECTED_UPLOAD_FAILED",
+    });
+    config.dispose();
+  });
+
   test("uses a Node-option-safe executable launcher for application env-file arguments", async () => {
     const source = await readFile(
       new URL("../src/index.ts", import.meta.url),
