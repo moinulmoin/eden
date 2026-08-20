@@ -2578,7 +2578,8 @@ function shortOutput(value: string): string {
 }
 
 function redactOutput(value: string): string {
-  return redactEveRuntimeOutput(shortOutput(value)
+  const fixedStringRedacted = redactEveRuntimeOutput(value);
+  return shortOutput(fixedStringRedacted
     .replace(/Bearer\s+\S+/giu, "Bearer [redacted]")
     .replace(
       /(EDEN_BEARER_SECRET\s*[=:]\s*)\S+/giu,

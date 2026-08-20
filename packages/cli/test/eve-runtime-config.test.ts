@@ -314,6 +314,41 @@ describe("Eve runtime configuration", () => {
     config.dispose();
   });
 
+  test("redacts typed protected-store failures before they leave the seam", async () => {
+    const root = await createRoot();
+    const marker = "protected-store-failure-marker-7d1f";
+    const envPath = await writeEnv(root, `OPAQUE_VALUE=${marker}\n`);
+    const config = await readEveRuntimeConfig(envPath);
+
+    let error: unknown;
+    try {
+      await prepareEveRuntimeInjection(config, {
+        mode: "deploy",
+        targetId: "exact-target",
+        protectedStore: {
+          async put() {
+            throw new EveRuntimeConfigError({
+              code: "EVE_RUNTIME_PROTECTED_UPLOAD_FAILED",
+              message: `protected store rejected ${marker}`,
+              source: marker,
+              variableName: marker,
+            });
+          },
+        },
+      });
+    } catch (caught: unknown) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(EveRuntimeConfigError);
+    expect(error).toMatchObject({
+      code: "EVE_RUNTIME_PROTECTED_UPLOAD_FAILED",
+    });
+    expect(String(error)).not.toContain(marker);
+    expect((error as EveRuntimeConfigError).source).not.toContain(marker);
+    expect((error as EveRuntimeConfigError).variableName).not.toContain(marker);
+    config.dispose();
+  });
+
   test("detects an explicit environment-file race before protected upload", async () => {
     const root = await createRoot();
     const envPath = await writeEnv(root, "OPAQUE_VALUE=before\n");
@@ -336,6 +371,56 @@ describe("Eve runtime configuration", () => {
       }),
     ).rejects.toMatchObject({ code: "EVE_ENV_FILE_RACE" });
     expect(storeCalled).toBe(false);
+    config.dispose();
+  });
+
+  test("detects an explicit environment-file race after protected upload", async () => {
+    const root = await createRoot();
+    const envPath = await writeEnv(root, "OPAQUE_VALUE=before\n");
+    const config = await readEveRuntimeConfig(envPath);
+    let storeCalled = false;
+    await expect(
+      prepareEveRuntimeInjection(config, {
+        mode: "deploy",
+        targetId: "exact-target",
+        protectedStore: {
+          async put() {
+            storeCalled = true;
+            await writeFile(envPath, "OPAQUE_VALUE=after\n");
+            return {
+              revision: "eve-runtime-revision-00000000-0000-4000-8000-000000000000",
+              handle: "eve-runtime-handle-00000000-0000-4000-8000-000000000000",
+            };
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "EVE_ENV_FILE_RACE" });
+    expect(storeCalled).toBe(true);
+    config.dispose();
+  });
+
+  test("rejects protected-store metadata containing a registered runtime value", async () => {
+    const root = await createRoot();
+    const marker = "metadata-runtime-marker-a832";
+    const envPath = await writeEnv(root, `OPAQUE_VALUE=${marker}\n`);
+    const config = await readEveRuntimeConfig(envPath);
+
+    await expect(
+      prepareEveRuntimeInjection(config, {
+        mode: "deploy",
+        targetId: "exact-target",
+        protectedStore: {
+          async put(request) {
+            return {
+              revision: `${request.revision}-${marker}`,
+              handle: "eve-runtime-handle-00000000-0000-4000-8000-000000000000",
+            };
+          },
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "EVE_RUNTIME_PROTECTED_UPLOAD_FAILED",
+    });
     config.dispose();
   });
 

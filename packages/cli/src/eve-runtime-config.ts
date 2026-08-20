@@ -561,6 +561,36 @@ function validateProtectedPutResult(
   }
 }
 
+function assertProtectedMetadataDoesNotContainRuntimeValues(
+  result: EveRuntimeProtectedPutResult,
+): void {
+  if (
+    redactEveRuntimeOutput(result.revision) !== result.revision ||
+    redactEveRuntimeOutput(result.handle) !== result.handle
+  ) {
+    throw new EveRuntimeConfigError({
+      code: "EVE_RUNTIME_PROTECTED_UPLOAD_FAILED",
+      message:
+        "The protected Eve runtime store returned value-bearing metadata.",
+    });
+  }
+}
+
+function redactRuntimeConfigError(
+  error: EveRuntimeConfigError,
+): EveRuntimeConfigError {
+  return new EveRuntimeConfigError({
+    code: error.code,
+    message: redactEveRuntimeOutput(error.message),
+    ...(error.source === undefined
+      ? {}
+      : { source: redactEveRuntimeOutput(error.source) }),
+    ...(error.variableName === undefined
+      ? {}
+      : { variableName: redactEveRuntimeOutput(error.variableName) }),
+  });
+}
+
 export async function prepareEveRuntimeInjection(
   config: EveRuntimeConfig,
   options: EveRuntimeInjectionOptions,
@@ -629,7 +659,9 @@ export async function prepareEveRuntimeInjection(
       }) as Promise<EveRuntimeProtectedPutResult>
     );
   } catch (error: unknown) {
-    if (error instanceof EveRuntimeConfigError) throw error;
+    if (error instanceof EveRuntimeConfigError) {
+      throw redactRuntimeConfigError(error);
+    }
     throw new EveRuntimeConfigError({
       code: "EVE_RUNTIME_PROTECTED_UPLOAD_FAILED",
       message:
@@ -637,6 +669,8 @@ export async function prepareEveRuntimeInjection(
     });
   }
   validateProtectedPutResult(stored);
+  assertProtectedMetadataDoesNotContainRuntimeValues(stored);
+  await config.revalidate();
   const protectedRevision = stored.revision;
   return {
     mode: options.mode,
