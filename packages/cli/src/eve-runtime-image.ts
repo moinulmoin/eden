@@ -99,7 +99,7 @@ export interface EveRuntimeNativeModule {
 }
 
 export interface EveRuntimeClosure {
-  readonly root: "/app/node_modules";
+  readonly root: "/workspace/node_modules";
   readonly outputDigest: string;
   readonly dependencyDigest: string;
   readonly digest: string;
@@ -793,7 +793,7 @@ export async function revalidateEveRuntimeCandidate(
 ): Promise<EveRuntimeClosure> {
   const closure = await validateCandidateClosure(candidate);
   return {
-    root: "/app/node_modules",
+    root: "/workspace/node_modules",
     outputDigest: closure.outputDigest,
     dependencyDigest: closure.dependencyDigest,
     digest: closure.digest,
@@ -1599,14 +1599,14 @@ export async function buildEveRuntimeImage(
       state.containerId,
       "sh",
       "-ceu",
-      "test -f /app/.output/server/index.mjs && test -x /app/node_modules/.bin/eve",
+      "test -f /workspace/.output/server/index.mjs && test -x /workspace/node_modules/.bin/eve",
     ]);
     await docker(state, [
       "exec",
       state.containerId,
       "sh",
       "-ceu",
-      "set -o noglob; status=0; for module in $(find /app/node_modules -type f -name '*.node'); do if ldd \"$module\" 2>&1 | grep -q 'not found'; then echo \"unloadable native module: $module\" >&2; status=1; fi; done; exit $status",
+      "set -o noglob; status=0; for module in $(find /workspace/node_modules -type f -name '*.node'); do if ldd \"$module\" 2>&1 | grep -q 'not found'; then echo \"unloadable native module: $module\" >&2; status=1; fi; done; exit $status",
     ]);
     await pollEveHealth(
       healthPort,
@@ -1704,7 +1704,7 @@ export async function buildEveRuntimeImage(
         : { publicOrigin: request.publicOrigin }),
       generatedOutput: request.candidate.generatedOutput,
       runtimeClosure: {
-        root: "/app/node_modules",
+        root: "/workspace/node_modules",
         outputDigest: closure.outputDigest,
         dependencyDigest: closure.dependencyDigest,
         digest: closure.digest,
