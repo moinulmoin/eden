@@ -947,6 +947,26 @@ function imageDigestFromReference(value: string): string | undefined {
   const match = /@sha256:([0-9a-f]{64})$/u.exec(value);
   return match === null ? undefined : `sha256:${match[1]}`;
 }
+function transportIdentityMatches(
+  expected: EveDeploymentIdentity,
+  observed: EveDeploymentIdentityProof | undefined,
+): boolean {
+  if (observed === undefined) return false;
+  const required: readonly (keyof EveDeploymentIdentity)[] = [
+    "deploymentId",
+    "generationId",
+    "stableWorkersDevOrigin",
+    "workerName",
+    "stableContainerInstanceName",
+  ];
+  if (!required.every((key) => observed[key] === expected[key])) {
+    return false;
+  }
+  return expected.runtimeRevisionHandle === undefined
+    ? observed.runtimeRevisionHandle === undefined
+    : observed.runtimeRevisionHandle === expected.runtimeRevisionHandle;
+}
+
 
 function identityMatches(
   expected: EveDeploymentIdentity,
@@ -1990,7 +2010,7 @@ async function runEveDeployment(
     : undefined;
   if (
     health.status === "failed" ||
-    !identityMatches(identity, observedHealthIdentity)
+    !transportIdentityMatches(identity, observedHealthIdentity)
   ) {
     if (
       publication.createdByAttempt === true &&
