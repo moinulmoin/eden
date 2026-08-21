@@ -1,15 +1,16 @@
 import {
+  lstat,
   mkdir,
   mkdtemp,
-  readFile,
   readdir,
+  readFile,
   realpath,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 
 import { afterEach, describe, expect, test } from "vitest";
 
@@ -1159,5 +1160,294 @@ describe("eden eve namespace", () => {
     expect(operations).toEqual(["publish"]);
     expect(errors.join("\n")).toContain("DEPLOY_INDETERMINATE");
     expect(errors.join("\n")).not.toContain("ambiguous cleanup");
+  });
+});
+
+describe("eden eve destroy", () => {
+  async function createDeployedFixture(): Promise<{
+    readonly root: string;
+    readonly generationRoot: string;
+  }> {
+    const root = await createRoot();
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({
+        name: "eve-destroy-fixture",
+        private: true,
+        packageManager: "pnpm@11.21.0",
+      }),
+      "utf8",
+    );
+    await writeFile(
+      join(root, "pnpm-lock.yaml"),
+      "lockfileVersion: '9.0'\n",
+      "utf8",
+    );
+    const generationRoot = join(
+      root,
+      ".eden",
+      "eve-deploy",
+      "generations",
+      "gen-destroy-1",
+    );
+    await mkdir(generationRoot, { recursive: true });
+    const targetRoot = join(
+      root,
+      ".eden",
+      "eve-deploy",
+      "targets",
+      "preview-eve-destroy-fixture",
+    );
+    await mkdir(targetRoot, { recursive: true });
+    await writeFile(
+      join(generationRoot, "deployment.json"),
+      JSON.stringify({
+        version: 1,
+        status: "deployed",
+        identity: {
+          projectId: "proj",
+          sourceDigest: `sha256:${"a".repeat(64)}`,
+          generationId: "gen-destroy-1",
+          deploymentId: "eve-deploy-test",
+          environment: "preview",
+          name: "eve-destroy-fixture",
+          accountId: "account-test",
+          workersDevSubdomain: "account",
+          stableWorkersDevOrigin:
+            "https://eve-destroy-fixture.account.workers.dev",
+          workerName: "eve-destroy-fixture",
+          containerApplicationName: "eve-destroy-fixture-container",
+          stableContainerInstanceName: "eve-destroy-fixture-instance",
+          containerImage: `registry.cloudflare.com/account-test/eden-eve@sha256:${"b".repeat(64)}`,
+          runtimeVariableNames: [],
+        },
+      }),
+      "utf8",
+    );
+    await symlink(
+      relative(targetRoot, generationRoot),
+      join(targetRoot, "CURRENT"),
+    );
+    return { root, generationRoot };
+  }
+
+  test("fails closed without a matching immutable deployed record", async () => {
+    const root = await createRoot();
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(
+        [
+          "eve",
+          "destroy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eve-destroy-fixture",
+        ],
+        {
+          cwd: root,
+          stderr: (line) => errors.push(line),
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(errors.join("\n")).toContain("EVE_DESTROY_RECORD_UNPROVEN");
+  });
+
+  test("is idempotent when the exact target is already absent", async () => {
+    const { root } = await createDeployedFixture();
+    const output: string[] = [];
+    let reads = 0;
+    await expect(
+      runEdenCli(
+        [
+          "eve",
+          "destroy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eve-destroy-fixture",
+        ],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            destroyCloudflareRead: async () => {
+              reads += 1;
+              return {
+                workerExists: false,
+                containerApplicationId: undefined,
+                accountId: "account-test",
+              };
+            },
+          },
+        },
+      ),
+    ).resolves.toBe(0);
+    expect(reads).toBe(1);
+    expect(output.join("\n")).toContain('"status":"absent"');
+  });
+
+  test("deletes only the recorded Worker and Container, verifies absence, then clears CURRENT", async () => {
+    const { root } = await createDeployedFixture();
+    const output: string[] = [];
+    const operations: string[] = [];
+    let exists = true;
+    let containerId: string | undefined = "container-123";
+    await expect(
+      runEdenCli(
+        [
+          "eve",
+          "destroy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eve-destroy-fixture",
+        ],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            destroyCloudflareRead: async () => ({
+              workerExists: exists,
+              ...(containerId === undefined
+                ? {}
+                : { containerApplicationId: containerId }),
+              accountId: "account-test",
+            }),
+            deleteWorker: async ({ name }) => {
+              operations.push(`worker:${name}`);
+              exists = false;
+              return "deleted";
+            },
+            deleteContainer: async ({ applicationId }) => {
+              operations.push(`container:${applicationId}`);
+              containerId = undefined;
+              return "deleted";
+            },
+          },
+        },
+      ),
+    ).resolves.toBe(0);
+    expect(operations).toEqual([
+      "worker:eve-destroy-fixture",
+      "container:container-123",
+    ]);
+    expect(output.join("\n")).toContain('"status":"destroyed"');
+    await expect(
+      lstat(
+        join(
+          root,
+          ".eden",
+          "eve-deploy",
+          "targets",
+          "preview-eve-destroy-fixture",
+          "CURRENT",
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      readFile(join(root, ".eden/eve-deploy/generations/gen-destroy-1/deployment.json"), "utf8"),
+    ).resolves.toContain("deployed");
+  });
+
+  test("returns indeterminate without clearing CURRENT when the Worker deletion is ambiguous", async () => {
+    const { root } = await createDeployedFixture();
+    const output: string[] = [];
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(
+        [
+          "eve",
+          "destroy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eve-destroy-fixture",
+        ],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          stderr: (line) => errors.push(line),
+          eveControlPlane: {
+            destroyCloudflareRead: async () => ({
+              workerExists: true,
+              containerApplicationId: undefined,
+              accountId: "account-test",
+            }),
+            deleteWorker: async () => "indeterminate",
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(output.join("\n")).toContain('"status":"indeterminate"');
+    expect(errors.join("\n")).toContain("EVE_DESTROY_INDETERMINATE");
+    await expect(
+      lstat(
+        join(
+          root,
+          ".eden",
+          "eve-deploy",
+          "targets",
+          "preview-eve-destroy-fixture",
+          "CURRENT",
+        ),
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  test("keeps CURRENT and fails when absence cannot be verified after deletion", async () => {
+    const { root } = await createDeployedFixture();
+    const output: string[] = [];
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(
+        [
+          "eve",
+          "destroy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eve-destroy-fixture",
+        ],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          stderr: (line) => errors.push(line),
+          eveControlPlane: {
+            destroyCloudflareRead: async () => ({
+              workerExists: true,
+              containerApplicationId: "container-9",
+              accountId: "account-test",
+            }),
+            deleteWorker: async () => "deleted",
+            deleteContainer: async () => "deleted",
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(output.join("\n")).toContain('"status":"failed"');
+    expect(errors.join("\n")).toContain("EVE_DESTROY_ABSENCE_UNPROVEN");
+    await expect(
+      lstat(
+        join(
+          root,
+          ".eden",
+          "eve-deploy",
+          "targets",
+          "preview-eve-destroy-fixture",
+          "CURRENT",
+        ),
+      ),
+    ).resolves.toBeDefined();
   });
 });

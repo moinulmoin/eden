@@ -329,12 +329,46 @@ export interface EvePreflightOptions {
   readonly afterPromotion?: () => void | Promise<void>;
   readonly retainRuntimeImage?: boolean;
   readonly stdout?: (line: string) => void;
+  /**
+   * Destroy seams. Defaults use only Wrangler reads/deletes plus the
+   * immutable local deployment record; tests may inject exact fakes.
+   */
+  readonly destroyCloudflareRead?: EveDestroyCloudflareReadRunner;
+  readonly deleteWorker?: EveWorkerDeleteRunner;
+  readonly deleteContainer?: EveContainerDeleteRunner;
 }
+
+export interface EveDestroyTargetRead {
+  readonly workerExists: boolean;
+  readonly containerApplicationId?: string;
+  readonly accountId?: string;
+}
+
+export type EveDestroyCloudflareReadRunner = (
+  request: EveDestroyCloudflareReadRequest,
+) => EveDestroyTargetRead | Promise<EveDestroyTargetRead>;
+
+export type EveWorkerDeleteRunner = (
+  request: { readonly name: string },
+) => "deleted" | "absent" | "indeterminate" | Promise<
+  "deleted" | "absent" | "indeterminate"
+>;
+
+export type EveContainerDeleteRunner = (
+  request: { readonly applicationId: string },
+) => "deleted" | "absent" | "indeterminate" | Promise<
+  "deleted" | "absent" | "indeterminate"
+>;
 
 export type EveRuntimeConfigLoader = (
   path: string,
   cwd: string,
 ) => EveRuntimeConfig | Promise<EveRuntimeConfig>;
+
+export interface EveDestroyCloudflareReadRequest {
+  readonly workerName: string;
+  readonly containerApplicationName: string;
+}
 
 const noRuntimeResourcesCleanup: EveRuntimeCleanup = Object.freeze({
   bootContainerId: null,
@@ -2672,5 +2706,403 @@ export async function runEveControlPlane(
   }
   if (failed) {
     throw primaryError;
+  }
+}
+
+export interface EveDestroyOutcome {
+  readonly ok: boolean;
+  readonly status: "destroyed" | "absent" | "failed" | "indeterminate";
+  readonly environment: EveCliEnvironment;
+  readonly name: string;
+  readonly checks: readonly EvePreflightCheck[];
+}
+
+interface EveDestroyRecord {
+  readonly identity: {
+    readonly workerName?: unknown;
+    readonly containerApplicationName?: unknown;
+    readonly stableContainerInstanceName?: unknown;
+    readonly accountId?: unknown;
+    readonly environment?: unknown;
+    readonly name?: unknown;
+  };
+}
+
+type VerifiedEveDestroyIdentity = {
+  readonly workerName: string;
+  readonly containerApplicationName: string;
+  readonly stableContainerInstanceName: string;
+  readonly accountId: string;
+  readonly environment: string;
+  readonly name: string;
+};
+
+async function readEveDestroyRecord(
+  projectRoot: string,
+  environment: EveCliEnvironment,
+  name: string,
+): Promise<
+  | {
+    readonly recordPath: string;
+    readonly generationRoot: string;
+    readonly identity: VerifiedEveDestroyIdentity;
+  }
+  | undefined
+> {
+  const targetsRoot = join(
+    projectRoot,
+    ".eden",
+    "eve-deploy",
+    "targets",
+    `${environment}-${name}`,
+  );
+  const current = await lstat(join(targetsRoot, "CURRENT")).catch(
+    () => undefined,
+  );
+  if (current === undefined || !current.isSymbolicLink()) return undefined;
+  const generationRoot = await realpath(join(targetsRoot, "CURRENT")).catch(
+    () => undefined,
+  );
+  if (generationRoot === undefined) return undefined;
+  const recordPath = join(generationRoot, "deployment.json");
+  let raw: string;
+  try {
+    raw = await readFile(recordPath, "utf8");
+  } catch {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const record = parsed as EveDestroyRecord & { readonly status?: unknown };
+  if (record.status !== "deployed") return undefined;
+  const identity = record.identity ?? {};
+  const required = [
+    "workerName",
+    "containerApplicationName",
+    "stableContainerInstanceName",
+    "accountId",
+    "environment",
+    "name",
+  ] as const;
+  for (const key of required) {
+    if (typeof identity[key] !== "string" || identity[key].length === 0) {
+      return undefined;
+    }
+  }
+  if (
+    identity.environment !== environment ||
+    identity.name !== name
+  ) {
+    return undefined;
+  }
+  return {
+    recordPath,
+    generationRoot,
+    identity: identity as VerifiedEveDestroyIdentity,
+  };
+}
+
+async function defaultDestroyTargetRead(
+  request: EveDestroyCloudflareReadRequest,
+): Promise<EveDestroyTargetRead> {
+  const account = await readWranglerJson(["whoami", "--json"]);
+  const deployments = await readWranglerJson([
+    "deployments",
+    "list",
+    "--name",
+    request.workerName,
+    "--json",
+  ]);
+  const containers = await readWranglerJson([
+    "containers",
+    "list",
+    "--json",
+    "--per-page",
+    "100",
+  ]);
+  const accountId = authenticatedAccountId(account.value);
+  const workerExists = !deployments.failed &&
+    (exactDeploymentEntries(deployments.value)?.length ?? 0) > 0;
+  const entries = exactContainerEntries(
+    containers.value,
+    request.containerApplicationName,
+  );
+  const firstContainer = entries === undefined ? undefined : entries[0];
+  return {
+    workerExists,
+    ...(firstContainer === undefined
+      ? {}
+      : { containerApplicationId: firstContainer.id }),
+    ...(accountId === undefined ? {} : { accountId }),
+  };
+}
+
+async function defaultWorkerDelete(
+  request: { readonly name: string },
+): Promise<"deleted" | "absent" | "indeterminate"> {
+  const result = await runWranglerWithInput(
+    ["delete", "--name", request.name, "--force"],
+    process.cwd(),
+    "y\n",
+  );
+  if (result.exitCode === 0) return "deleted";
+  if (/(?:does not exist|not found|10007)/iu.test(result.stderr)) {
+    return "absent";
+  }
+  return "indeterminate";
+}
+
+async function defaultContainerDelete(
+  request: { readonly applicationId: string },
+): Promise<"deleted" | "absent" | "indeterminate"> {
+  const result = await runWranglerWithInput(
+    ["containers", "delete", request.applicationId, "--force"],
+    process.cwd(),
+  );
+  if (result.exitCode === 0) return "deleted";
+  if (/(?:does not exist|not found|not supported|10007)/iu.test(result.stderr)) {
+    return "absent";
+  }
+  return "indeterminate";
+}
+
+async function verifyEveAbsence(
+  request: EveDestroyCloudflareReadRequest,
+  options: EvePreflightOptions,
+): Promise<boolean> {
+  const reader = options.destroyCloudflareRead ?? defaultDestroyTargetRead;
+  const observed = await reader({
+    workerName: request.workerName,
+    containerApplicationName: request.containerApplicationName,
+  });
+  return !observed.workerExists &&
+    observed.containerApplicationId === undefined;
+}
+
+export async function runEveDestroy(
+  request: EveCliExecutionRequest,
+  options: EvePreflightOptions = {},
+): Promise<void> {
+  const checks: EvePreflightCheck[] = [];
+  const emit = (outcome: EveDestroyOutcome): void => {
+    (options.stdout ?? (() => undefined))(
+      redactEveRuntimeOutput(JSON.stringify(outcome)),
+    );
+  };
+  const fail = (code: string, message: string): never => {
+    throw new EveCliError({ code, message, source: "eve destroy" });
+  };
+
+  const lock = await acquireEveTargetLock(
+    request.projectRoot,
+    request.environment,
+    request.name,
+  );
+  try {
+    const found = await readEveDestroyRecord(
+      request.projectRoot,
+      request.environment,
+      request.name,
+    );
+    if (found === undefined) {
+      fail(
+        "EVE_DESTROY_RECORD_UNPROVEN",
+        "No immutable deployed record matched the exact target; destroy refuses to guess or broaden cleanup.",
+      );
+    }
+    const record = found as NonNullable<typeof found>;
+    const expectedWorker: string = record.identity.workerName;
+    const expectedContainer: string = record.identity.containerApplicationName;
+    if (
+      expectedWorker !== request.name ||
+      typeof record.identity.accountId !== "string"
+    ) {
+      fail(
+        "EVE_DESTROY_RECORD_MISMATCH",
+        "The immutable deployment record does not match the selected target.",
+      );
+    }
+    checks.push(
+      check(
+        "VAL-LIFE-006-RECORD",
+        "passed",
+        "The immutable deployment record matched the exact target selectors.",
+      ),
+    );
+
+    const reader = options.destroyCloudflareRead ?? defaultDestroyTargetRead;
+    const before = await reader({
+      workerName: expectedWorker,
+      containerApplicationName: expectedContainer,
+    });
+    if (
+      before.accountId !== record.identity.accountId
+    ) {
+      fail(
+        "EVE_DESTROY_OWNERSHIP_UNPROVEN",
+        "The authenticated account does not own the recorded deployment account.",
+      );
+    }
+    if (!before.workerExists && before.containerApplicationId === undefined) {
+      emit({
+        ok: true,
+        status: "absent",
+        environment: request.environment,
+        name: request.name,
+        checks: [
+          ...checks,
+          check(
+            "VAL-LIFE-006",
+            "passed",
+            "The exact target is already absent; destroy is idempotent without touching siblings.",
+          ),
+        ],
+      });
+      return;
+    }
+
+    const deleteWorker = options.deleteWorker ?? defaultWorkerDelete;
+    if (before.workerExists) {
+      const workerResult = await deleteWorker({ name: expectedWorker });
+      if (workerResult === "indeterminate") {
+        emit({
+          ok: false,
+          status: "indeterminate",
+          environment: request.environment,
+          name: request.name,
+          checks: [
+            ...checks,
+            check(
+              "VAL-LIFE-006",
+              "failed",
+              "The exact Worker deletion did not complete with a terminal result; no broad cleanup was attempted.",
+              "Inspect the retained deployment record and Cloudflare inventory, then retry the exact target.",
+            ),
+          ],
+        });
+        fail("EVE_DESTROY_INDETERMINATE", "The Worker deletion outcome was indeterminate.");
+      }
+      checks.push(
+        check(
+          "VAL-LIFE-006-WORKER",
+          "passed",
+          workerResult === "deleted"
+            ? "The exact owned Worker was deleted."
+            : "The exact Worker was already absent.",
+        ),
+      );
+    }
+
+    const deleteContainer = options.deleteContainer ?? defaultContainerDelete;
+    if (before.containerApplicationId !== undefined) {
+      const containerResult = await deleteContainer({
+        applicationId: before.containerApplicationId,
+      });
+      if (containerResult === "indeterminate") {
+        emit({
+          ok: false,
+          status: "indeterminate",
+          environment: request.environment,
+          name: request.name,
+          checks: [
+            ...checks,
+            check(
+              "VAL-LIFE-006",
+              "failed",
+              "The exact Container application deletion did not complete with a terminal result; no broad cleanup was attempted.",
+              "Inspect the retained deployment record and Cloudflare inventory, then retry the exact target.",
+            ),
+          ],
+        });
+        fail(
+          "EVE_DESTROY_INDETERMINATE",
+          "The Container deletion outcome was indeterminate.",
+        );
+      }
+      checks.push(
+        check(
+          "VAL-LIFE-006-CONTAINER",
+          "passed",
+          containerResult === "deleted"
+            ? "The exact owned Container application was deleted."
+            : "The exact Container application was already absent.",
+        ),
+      );
+    }
+
+    const absent = await verifyEveAbsence(
+      {
+        workerName: expectedWorker,
+        containerApplicationName: expectedContainer,
+      },
+      options,
+    );
+    if (!absent) {
+      emit({
+        ok: false,
+        status: "failed",
+        environment: request.environment,
+        name: request.name,
+        checks: [
+          ...checks,
+          check(
+            "VAL-LIFE-006",
+            "failed",
+            "Bounded absence verification failed; CURRENT remains unchanged and no broad delete was attempted.",
+            "Inspect the exact target inventory, then retry destroy after the provider state settles.",
+          ),
+        ],
+      });
+      fail(
+        "EVE_DESTROY_ABSENCE_UNPROVEN",
+        "The exact target could not be proven absent after deletion.",
+      );
+    }
+    checks.push(
+      check(
+        "VAL-LIFE-006",
+        "passed",
+        "Exact absence was verified; clearing this target's CURRENT pointer only.",
+      ),
+    );
+
+    const currentPath = join(
+      request.projectRoot,
+      ".eden",
+      "eve-deploy",
+      "targets",
+      `${request.environment}-${request.name}`,
+      "CURRENT",
+    );
+    await rm(currentPath, { force: true });
+    const gone = await lstat(currentPath).catch(() => undefined);
+    if (gone !== undefined) {
+      fail(
+        "EVE_DESTROY_POINTER_UNCLEARED",
+        "The target CURRENT pointer could not be cleared after verified absence.",
+      );
+    }
+    emit({
+      ok: true,
+      status: "destroyed",
+      environment: request.environment,
+      name: request.name,
+      checks,
+    });
+  } finally {
+    const released = await releaseEveTargetLock(lock);
+    if (!released) {
+      throw new EveCliError({
+        code: "EVE_DEPLOY_LOCK_RELEASE_UNPROVEN",
+        message:
+          "The Eve destroy lock could not be released with exact ownership proof; local residue was retained.",
+        source: "deployment-lock",
+      });
+    }
   }
 }

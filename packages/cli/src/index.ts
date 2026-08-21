@@ -89,6 +89,7 @@ import {
 } from "./eve-runtime-config.js";
 import {
   runEveControlPlane,
+  runEveDestroy,
   type EvePreflightOptions,
 } from "./eve-control-plane.js";
 
@@ -177,12 +178,14 @@ export type {
 export {
   DEFAULT_EVE_NODE_IMAGE,
   runEveControlPlane,
+  runEveDestroy,
 } from "./eve-control-plane.js";
 export type {
   EveCloudflareReadRequest,
   EveCloudflareReadResult,
   EveCloudflareReadRunner,
   EveCloudflareTargetState,
+  EveContainerDeleteRunner,
   EveDeploymentCompensationRequest,
   EveDeploymentCompensationRunner,
   EveDeploymentHealthRequest,
@@ -195,6 +198,10 @@ export type {
   EveDeploymentPublicationResult,
   EveDeploymentPublicationRunner,
   EveDeploymentStatus,
+  EveDestroyCloudflareReadRequest,
+  EveDestroyCloudflareReadRunner,
+  EveDestroyOutcome,
+  EveDestroyTargetRead,
   EveImagePublicationRequest,
   EveImagePublicationResult,
   EveImagePublicationRunner,
@@ -207,6 +214,7 @@ export type {
   EvePreflightRuntimeRunner,
   EvePreflightRuntimeRunnerRequest,
   EveRuntimeConfigLoader,
+  EveWorkerDeleteRunner,
 } from "./eve-control-plane.js";
 
 const require = createRequire(import.meta.url);
@@ -9222,11 +9230,11 @@ async function runEveInvocation(
       });
       return;
     }
-    throw new EveCliError({
-      code: "EVE_EXECUTION_UNAVAILABLE",
-      message:
-        `The eve ${invocation.command} control-plane implementation is not available in this CLI build.`,
+    await runEveDestroy(request, {
+      ...options.eveControlPlane,
+      ...(options.stdout === undefined ? {} : { stdout: options.stdout }),
     });
+    return;
   }
   try {
     await options.eveRunner(request);
