@@ -1,10 +1,32 @@
+import { resolve } from "node:path";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      "cloudflare:workers": resolve(
+        import.meta.dirname,
+        "test/cloudflare-workers-stub.ts",
+      ),
+    },
+  },
   test: {
     projects: [
       {
+        resolve: {
+          alias: {
+            "cloudflare:workers": resolve(
+              import.meta.dirname,
+              "test/cloudflare-workers-stub.ts",
+            ),
+          },
+        },
         test: {
+          server: {
+            deps: {
+              inline: ["@cloudflare/containers"],
+            },
+          },
           name: "node",
           include: [
             "test/**/*.test.mjs",

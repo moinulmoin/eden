@@ -114,6 +114,7 @@ export interface EveHostIdentity {
 }
 
 export interface EveHostConfigRequest extends EveHostIdentity {
+  readonly accountId?: string;
   readonly stableWorkersDevOrigin: string;
   readonly containerImage: string;
   readonly containerImageBuildContext?: string;
@@ -122,6 +123,7 @@ export interface EveHostConfigRequest extends EveHostIdentity {
 }
 
 export interface EveHostWranglerConfig {
+  readonly account_id?: string;
   readonly name: string;
   readonly main: string;
   readonly compatibility_date: string;
@@ -300,6 +302,9 @@ export function createEveHostConfig(
   } as const;
   return {
     worker: {
+      ...(request.accountId === undefined
+        ? {}
+        : { account_id: request.accountId }),
       name: request.workerName,
       main: "worker.ts",
       compatibility_date: EVE_HOST_DEFAULTS.compatibilityDate,

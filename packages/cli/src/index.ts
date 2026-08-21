@@ -84,8 +84,13 @@ import {
 } from "./eve.js";
 import {
   EveRuntimeConfigError,
+  readEveRuntimeConfig,
   redactEveRuntimeOutput,
 } from "./eve-runtime-config.js";
+import {
+  runEveControlPlane,
+  type EvePreflightOptions,
+} from "./eve-control-plane.js";
 
 export {
   EVE_CLI_COMMANDS,
@@ -98,6 +103,7 @@ export {
   EvePackagingError,
   buildEveProjectSnapshot,
   createDockerEveProjectBuilder,
+  revalidateEveProjectCandidateInputs,
 } from "./eve-packaging.js";
 export {
   EVE_RESERVED_HOST_VARIABLES,
@@ -125,6 +131,7 @@ export type {
 } from "./eve-runtime-config.js";
 export {
   buildEveRuntimeImage,
+  revalidateEveRuntimeCandidate,
   validateEveHostRequirements,
 } from "./eve-runtime-image.js";
 export type {
@@ -167,6 +174,40 @@ export type {
   EveRuntimeNativeModule,
   EveRuntimeStatus,
 } from "./eve-runtime-image.js";
+export {
+  DEFAULT_EVE_NODE_IMAGE,
+  runEveControlPlane,
+} from "./eve-control-plane.js";
+export type {
+  EveCloudflareReadRequest,
+  EveCloudflareReadResult,
+  EveCloudflareReadRunner,
+  EveCloudflareTargetState,
+  EveDeploymentCompensationRequest,
+  EveDeploymentCompensationRunner,
+  EveDeploymentHealthRequest,
+  EveDeploymentHealthResult,
+  EveDeploymentHealthRunner,
+  EveDeploymentIdentity,
+  EveDeploymentIdentityProof,
+  EveDeploymentMetadata,
+  EveDeploymentPublicationRequest,
+  EveDeploymentPublicationResult,
+  EveDeploymentPublicationRunner,
+  EveDeploymentStatus,
+  EveImagePublicationRequest,
+  EveImagePublicationResult,
+  EveImagePublicationRunner,
+  EvePreflightCandidate,
+  EvePreflightCheck,
+  EvePreflightCheckStatus,
+  EvePreflightOptions,
+  EvePreflightResult,
+  EvePreflightRuntimeEvidence,
+  EvePreflightRuntimeRunner,
+  EvePreflightRuntimeRunnerRequest,
+  EveRuntimeConfigLoader,
+} from "./eve-control-plane.js";
 
 const require = createRequire(import.meta.url);
 
@@ -383,6 +424,11 @@ export interface EdenCliRunOptions {
   readonly eveRunner?: (
     request: EveCliExecutionRequest,
   ) => void | Promise<void>;
+  /**
+   * Finite local control-plane seams for the built-in Eve preflight path.
+   * Runtime values and Cloudflare mutations never cross this option boundary.
+   */
+  readonly eveControlPlane?: EvePreflightOptions;
   readonly initPublicationHook?: (
     boundary: EdenInitPublicationBoundary,
     target?: string,
@@ -9152,26 +9198,38 @@ async function runEveInvocation(
   invocation: EveCliInvocation,
   options: EdenCliRunOptions,
 ): Promise<void> {
+  const cwd = options.cwd ?? process.cwd();
+  const projectRoot = await selectedEveProjectRoot(invocation.projectRoot, cwd);
+  const request: EveCliExecutionRequest = {
+    command: invocation.command,
+    cwd,
+    projectRoot,
+    environment: invocation.environment,
+    name: invocation.name,
+    ...(invocation.envFile === undefined
+      ? {}
+      : { envFile: invocation.envFile }),
+  };
   if (options.eveRunner === undefined) {
+    if (invocation.command === "preflight" || invocation.command === "deploy") {
+      const runtimeConfigLoader = options.eveControlPlane?.runtimeConfigLoader ??
+        ((path: string, configCwd: string) =>
+          readEveRuntimeConfig(path, { cwd: configCwd }));
+      await runEveControlPlane(request, {
+        ...options.eveControlPlane,
+        runtimeConfigLoader,
+        ...(options.stdout === undefined ? {} : { stdout: options.stdout }),
+      });
+      return;
+    }
     throw new EveCliError({
       code: "EVE_EXECUTION_UNAVAILABLE",
       message:
         `The eve ${invocation.command} control-plane implementation is not available in this CLI build.`,
     });
   }
-  const cwd = options.cwd ?? process.cwd();
-  const projectRoot = await selectedEveProjectRoot(invocation.projectRoot, cwd);
   try {
-    await options.eveRunner({
-      command: invocation.command,
-      cwd,
-      projectRoot,
-      environment: invocation.environment,
-      name: invocation.name,
-      ...(invocation.envFile === undefined
-        ? {}
-        : { envFile: invocation.envFile }),
-    });
+    await options.eveRunner(request);
   } catch (error: unknown) {
     if (
       error instanceof EveCliError ||

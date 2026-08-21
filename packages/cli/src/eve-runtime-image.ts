@@ -3,6 +3,7 @@ import {
 } from "node:crypto";
 import {
   execFile,
+  spawn,
 } from "node:child_process";
 import {
   cp,
@@ -16,6 +17,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import {
+  dirname,
   join,
   relative,
   resolve,
@@ -32,6 +34,9 @@ import {
   type EveProjectBuildCandidate,
   type EveProjectOutput,
 } from "./eve-packaging.js";
+import type {
+  EveRuntimeInjection,
+} from "./eve-runtime-config.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -119,6 +124,7 @@ export interface EveRuntimeImageMetadata {
   readonly launchCommand: typeof START_COMMAND;
   readonly workingDirectory: "/app";
   readonly hostEnvironment: typeof HOST_ENVIRONMENT;
+  readonly publicOrigin?: string;
   readonly generatedOutput: EveProjectOutput;
 }
 
@@ -153,6 +159,13 @@ export interface EveRuntimeImageRequest {
     init?: RequestInit,
   ) => Promise<Response>;
   readonly hostRequirements?: EveHostRequirements;
+  readonly publicOrigin?: string;
+  readonly runtimeInjection?: EveRuntimeInjection;
+  /**
+   * Preflight must remove its disposable runtime image after health proof.
+   * Deploy may retain the exact image for the publication handoff.
+   */
+  readonly retainImage?: boolean;
 }
 
 export interface EveRuntimeImageResult {
@@ -213,6 +226,58 @@ function isWithin(root: string, candidate: string): boolean {
 
 function safeRelativePath(root: string, candidate: string): string {
   return relative(root, candidate).split("\\").join("/");
+}
+
+async function assertFreshOwnedFilePath(
+  path: string,
+  root: string,
+  subject: string,
+): Promise<string> {
+  const canonicalRoot = await realpath(root).catch(() => undefined);
+  const canonicalParent = await realpath(dirname(path)).catch(() => undefined);
+  const existing = await lstat(path).catch(() => undefined);
+  if (
+    canonicalRoot === undefined ||
+    canonicalParent === undefined ||
+    !isWithin(canonicalRoot, resolve(canonicalParent)) ||
+    existing !== undefined
+  ) {
+    throw packagingError(
+      "ROOT_INVALID",
+      subject,
+      "An Eden-owned generated path was missing a regular parent or was already occupied.",
+      "Create a fresh Eden-owned generation and retry without following symbolic links.",
+    );
+  }
+  return canonicalParent;
+}
+
+async function verifyOwnedFilePath(
+  path: string,
+  root: string,
+  expectedParent: string,
+  subject: string,
+): Promise<void> {
+  const canonicalRoot = await realpath(root).catch(() => undefined);
+  const canonicalParent = await realpath(dirname(path)).catch(() => undefined);
+  const details = await lstat(path).catch(() => undefined);
+  const canonicalPath = await realpath(path).catch(() => undefined);
+  if (
+    canonicalRoot === undefined ||
+    canonicalParent !== expectedParent ||
+    details === undefined ||
+    !details.isFile() ||
+    details.isSymbolicLink() ||
+    canonicalPath === undefined ||
+    !isWithin(canonicalRoot, resolve(canonicalPath))
+  ) {
+    throw packagingError(
+      "SOURCE_RACE",
+      subject,
+      "An Eden-owned generated path changed or escaped during creation.",
+      "Discard the mixed-generation candidate and retry from a clean Eden-owned generation.",
+    );
+  }
 }
 
 function imageReference(nodeImage: EveNodeImage): string {
@@ -313,10 +378,32 @@ export function validateEveHostRequirements(
   }
 }
 
-async function readRegularFile(path: string): Promise<{
+async function readRegularFile(
+  path: string,
+  containmentRoot?: string,
+): Promise<{
   readonly bytes: Buffer;
   readonly sha256: string;
 }> {
+  const canonicalRoot = containmentRoot === undefined
+    ? undefined
+    : await realpath(containmentRoot).catch(() => undefined);
+  const parentBefore = containmentRoot === undefined
+    ? undefined
+    : await realpath(dirname(path)).catch(() => undefined);
+  if (
+    containmentRoot !== undefined &&
+    (canonicalRoot === undefined ||
+      parentBefore === undefined ||
+      !isWithin(canonicalRoot, resolve(parentBefore)))
+  ) {
+    throw packagingError(
+      "RUNTIME_CLOSURE_INCOMPLETE",
+      safeRelativePath(containmentRoot ?? dirname(path), path),
+      "The candidate runtime file parent escaped its immutable runtime root.",
+      "Regenerate the immutable Eve candidate with regular runtime files inside the snapshot.",
+    );
+  }
   const details = await lstat(path).catch(() => undefined);
   if (details === undefined || !details.isFile() || details.isSymbolicLink()) {
     throw packagingError(
@@ -327,6 +414,22 @@ async function readRegularFile(path: string): Promise<{
     );
   }
   const bytes = await readFile(path);
+  const secondRead = await readFile(path).catch(() => undefined);
+  const parentAfter = containmentRoot === undefined
+    ? undefined
+    : await realpath(dirname(path)).catch(() => undefined);
+  if (
+    secondRead === undefined ||
+    !bytes.equals(secondRead) ||
+    (containmentRoot !== undefined && parentAfter !== parentBefore)
+  ) {
+    throw packagingError(
+      "SOURCE_RACE",
+      safeRelativePath(containmentRoot ?? dirname(path), path),
+      "The candidate runtime file parent changed during validation.",
+      "Discard the mixed-generation runtime candidate and rebuild from quiescent inputs.",
+    );
+  }
   return { bytes, sha256: sha256(bytes) };
 }
 
@@ -339,14 +442,44 @@ async function captureRuntimeTree(
   readonly nativeModules: readonly EveRuntimeNativeModule[];
   readonly digest: string;
 }> {
+  const canonicalRoot = await realpath(root).catch(() => undefined);
+  const canonicalSnapshotRoot = await realpath(snapshotRoot).catch(() => undefined);
+  if (
+    canonicalRoot === undefined ||
+    canonicalSnapshotRoot === undefined ||
+    !isWithin(canonicalSnapshotRoot, resolve(canonicalRoot))
+  ) {
+    throw packagingError(
+      "RUNTIME_CLOSURE_INCOMPLETE",
+      safeRelativePath(snapshotRoot, root),
+      "The candidate runtime closure root is missing or escapes the immutable snapshot.",
+      "Regenerate the immutable Eve candidate with regular runtime roots inside the snapshot.",
+    );
+  }
   const files: EveRuntimeClosureFile[] = [];
   const nativeModules: EveRuntimeNativeModule[] = [];
   const visit = async (directory: string): Promise<void> => {
+    const directoryDetails = await lstat(directory).catch(() => undefined);
+    const directoryCanonical = await realpath(directory).catch(() => undefined);
+    if (
+      directoryDetails === undefined ||
+      !directoryDetails.isDirectory() ||
+      directoryDetails.isSymbolicLink() ||
+      directoryCanonical === undefined ||
+      !isWithin(canonicalSnapshotRoot, resolve(directoryCanonical))
+    ) {
+      throw packagingError(
+        "RUNTIME_CLOSURE_INCOMPLETE",
+        safeRelativePath(canonicalSnapshotRoot, directory),
+        "The candidate runtime closure directory escaped or changed during validation.",
+        "Regenerate the immutable Eve candidate with regular runtime directories inside the snapshot.",
+      );
+    }
     const entries = await readdir(directory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
       const candidate = join(directory, entry.name);
-      const relativePath = safeRelativePath(snapshotRoot, candidate);
+      const relativePath = safeRelativePath(canonicalSnapshotRoot, candidate);
       if (FORBIDDEN_RUNTIME_NAMES.has(entry.name) ||
         entry.name.startsWith(".env") ||
         entry.name.endsWith(".pem") ||
@@ -362,15 +495,37 @@ async function captureRuntimeTree(
         const resolved = await realpath(candidate).catch(() => undefined);
         if (
           resolved === undefined ||
-          !isWithin(snapshotRoot, resolve(resolved))
+          !isWithin(canonicalRoot, resolve(resolved))
         ) {
           throw packagingError(
             "RUNTIME_CLOSURE_INCOMPLETE",
             relativePath,
-            "The candidate runtime closure contains a symbolic link that escapes the immutable snapshot.",
-            "Materialize the Eve output and dependencies inside the immutable candidate before image assembly.",
+            "The candidate runtime closure contains a symbolic link that escapes its runtime root.",
+            "Materialize the Eve output and dependencies inside the immutable runtime closure before image assembly.",
           );
         }
+        const targetParts = safeRelativePath(canonicalRoot, resolve(resolved))
+          .split("/");
+        if (
+          targetParts.some((part) =>
+            FORBIDDEN_RUNTIME_NAMES.has(part) ||
+            part.startsWith(".env") ||
+            part.endsWith(".pem") ||
+            part.endsWith(".key")
+          )
+        ) {
+          throw packagingError(
+            "SECRET_EXCLUSION_FAILED",
+            relativePath,
+            "The candidate runtime closure contains a symbolic link to credential or environment material.",
+            "Remove links to credential material from the project dependency/output closure and rebuild the candidate.",
+          );
+        }
+        await validateRuntimeTargetTree(
+          resolve(resolved),
+          canonicalRoot,
+          new Set<string>(),
+        );
         files.push({
           path: relativePath,
           sha256: `link:${await readlink(candidate)}`,
@@ -391,7 +546,10 @@ async function captureRuntimeTree(
           "Regenerate the Eve candidate with regular runtime files only.",
         );
       }
-      const { bytes, sha256: digest } = await readRegularFile(candidate);
+      const { bytes, sha256: digest } = await readRegularFile(
+        candidate,
+        canonicalRoot,
+      );
       files.push({
         path: relativePath,
         sha256: digest,
@@ -429,7 +587,7 @@ async function captureRuntimeTree(
       }
     }
   };
-  await visit(root);
+  await visit(canonicalRoot);
   files.sort((left, right) => left.path.localeCompare(right.path));
   nativeModules.sort((left, right) => left.path.localeCompare(right.path));
   return {
@@ -441,6 +599,63 @@ async function captureRuntimeTree(
       nativeModules,
     })),
   };
+}
+
+async function validateRuntimeTargetTree(
+  path: string,
+  root: string,
+  visited: Set<string>,
+): Promise<void> {
+  const details = await lstat(path).catch(() => undefined);
+  const canonical = await realpath(path).catch(() => undefined);
+  if (
+    details === undefined ||
+    canonical === undefined ||
+    !isWithin(root, resolve(canonical))
+  ) {
+    throw packagingError(
+      "RUNTIME_CLOSURE_INCOMPLETE",
+      safeRelativePath(root, path),
+      "A runtime closure link target is missing or escapes its runtime root.",
+      "Materialize the Eve output and dependencies inside the immutable runtime closure before image assembly.",
+    );
+  }
+  const canonicalPath = resolve(canonical);
+  if (visited.has(canonicalPath)) return;
+  visited.add(canonicalPath);
+  const targetName = canonicalPath.split("/").at(-1) ?? "";
+  if (
+    FORBIDDEN_RUNTIME_NAMES.has(targetName) ||
+    targetName.startsWith(".env") ||
+    targetName.endsWith(".pem") ||
+    targetName.endsWith(".key")
+  ) {
+    throw packagingError(
+      "SECRET_EXCLUSION_FAILED",
+      safeRelativePath(root, path),
+      "A runtime closure link target is credential or environment material.",
+      "Remove credential material from the project dependency/output closure and rebuild the candidate.",
+    );
+  }
+  if (details.isDirectory()) {
+    const entries = await readdir(path, { withFileTypes: true });
+    for (const entry of entries) {
+      await validateRuntimeTargetTree(
+        join(path, entry.name),
+        root,
+        visited,
+      );
+    }
+    return;
+  }
+  if (!details.isFile() && !details.isSymbolicLink()) {
+    throw packagingError(
+      "RUNTIME_CLOSURE_INCOMPLETE",
+      safeRelativePath(root, path),
+      "A runtime closure link target is not a regular file or directory.",
+      "Regenerate the immutable Eve candidate with regular runtime files only.",
+    );
+  }
 }
 
 async function validateCandidateClosure(
@@ -540,7 +755,7 @@ async function validateCandidateClosure(
     captureRuntimeTree(outputRoot, snapshotRoot, "output"),
     captureRuntimeTree(dependenciesRoot, snapshotRoot, "dependencies"),
   ]);
-  const entrypointBytes = await readRegularFile(entrypoint);
+  const entrypointBytes = await readRegularFile(entrypoint, snapshotRoot);
   const candidateOutputDigest = sha256(jsonBytes(
     output.files.map((file) => ({
       relativePath: file.path,
@@ -572,6 +787,22 @@ async function validateCandidateClosure(
   };
 }
 
+export async function revalidateEveRuntimeCandidate(
+  candidate: EveProjectBuildCandidate,
+): Promise<EveRuntimeClosure> {
+  const closure = await validateCandidateClosure(candidate);
+  return {
+    root: "/app/node_modules",
+    outputDigest: closure.outputDigest,
+    dependencyDigest: closure.dependencyDigest,
+    digest: closure.digest,
+    files: closure.files,
+    nativeModules: closure.nativeModules,
+    eveStartClosureRetained: true,
+    builderOnlyMaterialExcluded: true,
+  };
+}
+
 async function writeRuntimeContext(
   candidate: EveProjectBuildCandidate,
   nodeImage: EveNodeImage,
@@ -591,18 +822,60 @@ async function writeRuntimeContext(
       "Create a fresh immutable Eve generation before assembling a runtime image.",
     );
   }
-  await mkdir(runtimeContextPath, { recursive: true });
+  const runtimeContextParent = await assertFreshOwnedFilePath(
+    runtimeContextPath,
+    candidate.generationRoot,
+    "runtime-context",
+  );
+  await mkdir(runtimeContextPath);
+  const runtimeContextDetails = await lstat(runtimeContextPath).catch(() => undefined);
+  const runtimeContextCanonical = await realpath(runtimeContextPath).catch(() => undefined);
+  if (
+    runtimeContextDetails === undefined ||
+    !runtimeContextDetails.isDirectory() ||
+    runtimeContextDetails.isSymbolicLink() ||
+    runtimeContextCanonical === undefined ||
+    !isWithin(runtimeContextParent, resolve(runtimeContextCanonical))
+  ) {
+    throw packagingError(
+      "ROOT_INVALID",
+      "runtime-context",
+      "The Eden-owned runtime context could not be created as a regular contained directory.",
+      "Create a fresh immutable Eve generation before assembling a runtime image.",
+    );
+  }
   try {
     await cp(
       join(candidate.snapshotRoot, ".output"),
       join(runtimeContextPath, ".output"),
-      { recursive: true, dereference: true },
+      { recursive: true },
     );
     await cp(
       join(candidate.snapshotRoot, "node_modules"),
       join(runtimeContextPath, "node_modules"),
-      { recursive: true, dereference: true },
+      { recursive: true },
     );
+    const copiedOutput = await captureRuntimeTree(
+      join(runtimeContextPath, ".output"),
+      runtimeContextPath,
+      "output",
+    );
+    const copiedDependencies = await captureRuntimeTree(
+      join(runtimeContextPath, "node_modules"),
+      runtimeContextPath,
+      "dependencies",
+    );
+    if (
+      copiedOutput.digest !== closure.outputDigest ||
+      copiedDependencies.digest !== closure.dependencyDigest
+    ) {
+      throw packagingError(
+        "SOURCE_RACE",
+        "runtime context",
+        "The copied runtime context does not match the validated immutable closure.",
+        "Discard the mixed-generation runtime context and rebuild from a quiescent candidate.",
+      );
+    }
     const dockerfile = `# syntax=docker/dockerfile:1
 FROM --platform=linux/amd64 ${imageReference(nodeImage)} AS candidate
 WORKDIR /candidate
@@ -627,11 +900,39 @@ ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "
 !node_modules
 !node_modules/**
 `;
-    await writeFile(dockerfilePath, dockerfile, { encoding: "utf8", mode: 0o600 });
-    await writeFile(join(runtimeContextPath, ".dockerignore"), dockerignore, {
+    const dockerfileParent = await assertFreshOwnedFilePath(
+      dockerfilePath,
+      candidate.generationRoot,
+      "runtime Dockerfile",
+    );
+    await writeFile(dockerfilePath, dockerfile, {
+      flag: "wx",
       encoding: "utf8",
       mode: 0o600,
     });
+    await verifyOwnedFilePath(
+      dockerfilePath,
+      candidate.generationRoot,
+      dockerfileParent,
+      "runtime Dockerfile",
+    );
+    const dockerignorePath = join(runtimeContextPath, ".dockerignore");
+    const dockerignoreParent = await assertFreshOwnedFilePath(
+      dockerignorePath,
+      candidate.generationRoot,
+      "runtime .dockerignore",
+    );
+    await writeFile(dockerignorePath, dockerignore, {
+      flag: "wx",
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await verifyOwnedFilePath(
+      dockerignorePath,
+      candidate.generationRoot,
+      dockerignoreParent,
+      "runtime .dockerignore",
+    );
     if (dockerfile.includes("RUNTIME_SECRET") || closure.files.some((file) =>
       file.path.includes(".env") || file.path.includes(".npmrc")
     )) {
@@ -644,8 +945,65 @@ ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "
     }
     return { runtimeContextPath, dockerfilePath };
   } catch (error: unknown) {
-    await rm(runtimeContextPath, { recursive: true, force: true }).catch(() => undefined);
+    if (
+      !(await removeOwnedRuntimeContext(
+        runtimeContextPath,
+        candidate.generationRoot,
+      ))
+    ) {
+      throw packagingError(
+        "CLEANUP_UNVERIFIED",
+        "runtime context",
+        "The owned runtime context could not be removed with exact containment proof.",
+        "Inspect only the recorded runtime context path; no broad filesystem cleanup was attempted.",
+      );
+    }
     throw error;
+  }
+}
+
+async function removeOwnedRuntimeContext(
+  runtimeContextPath: string,
+  generationRoot: string,
+): Promise<boolean> {
+  let details: Awaited<ReturnType<typeof lstat>> | undefined;
+  try {
+    details = await lstat(runtimeContextPath);
+  } catch (error: unknown) {
+    return typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      (error as { readonly code?: unknown }).code === "ENOENT";
+  }
+  if (details === undefined) return true;
+  if (!details.isDirectory() || details.isSymbolicLink()) return false;
+  let canonical: string;
+  let canonicalGenerationRoot: string;
+  try {
+    canonical = await realpath(runtimeContextPath);
+    canonicalGenerationRoot = await realpath(generationRoot);
+  } catch {
+    return false;
+  }
+  if (
+    canonical === undefined ||
+    !isWithin(resolve(canonicalGenerationRoot), resolve(canonical))
+  ) {
+    return false;
+  }
+  try {
+    await rm(runtimeContextPath, { recursive: true, force: false });
+  } catch {
+    return false;
+  }
+  try {
+    await lstat(runtimeContextPath);
+    return false;
+  } catch (error: unknown) {
+    return typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      (error as { readonly code?: unknown }).code === "ENOENT";
   }
 }
 
@@ -671,6 +1029,50 @@ async function docker(
     cwd: state.generationRoot,
     maxBuffer: options.maxBuffer ?? 4 * 1024 * 1024,
   });
+}
+
+async function dockerWithInput(
+  state: DockerState,
+  args: readonly string[],
+  input: string,
+): Promise<{ readonly stdout: string; readonly stderr: string }> {
+  return new Promise((resolveResult, rejectResult) => {
+    const child = spawn(state.command, [...args], {
+      cwd: state.generationRoot,
+      env: state.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", rejectResult);
+    child.once("close", (code) => {
+      if (code === 0) {
+        resolveResult({ stdout, stderr });
+      } else {
+        const error = new Error(stderr || "The Docker operation failed.");
+        Object.assign(error, { stdout, stderr, code });
+        rejectResult(error);
+      }
+    });
+    child.stdin.end(input);
+  });
+}
+
+function runtimeContainerEnvironment(
+  request: EveRuntimeImageRequest,
+): Readonly<Record<string, string>> {
+  return {
+    ...HOST_ENVIRONMENT,
+    ...(request.publicOrigin === undefined
+      ? {}
+      : { WORKFLOW_LOCAL_BASE_URL: request.publicOrigin }),
+  };
 }
 
 function validateHealthPort(port: number): void {
@@ -824,13 +1226,26 @@ async function removeOwnedContainer(
   await docker(state, ["rm", "--force", state.containerId]).catch(() => {
     verified = false;
   });
-  const remaining = await docker(state, [
-    "container",
-    "inspect",
-    state.containerId,
-    "--format",
-    "{{.Id}}",
-  ]).catch(() => undefined);
+  let remaining: { readonly stdout: string } | undefined;
+  try {
+    remaining = await docker(state, [
+      "container",
+      "inspect",
+      state.containerId,
+      "--format",
+      "{{.Id}}",
+    ]);
+  } catch (error: unknown) {
+    const stderr = typeof error === "object" &&
+        error !== null &&
+        "stderr" in error &&
+        typeof (error as { readonly stderr?: unknown }).stderr === "string"
+      ? (error as { readonly stderr: string }).stderr
+      : "";
+    if (!/(?:no such|not found|does not exist)/iu.test(stderr)) {
+      verified = false;
+    }
+  }
   if (remaining !== undefined && remaining.stdout.trim().length > 0) {
     verified = false;
   }
@@ -846,13 +1261,26 @@ async function removeOwnedImage(
   await docker(state, ["image", "rm", "--force", state.imageId]).catch(() => {
     verified = false;
   });
-  const remaining = await docker(state, [
-    "image",
-    "inspect",
-    state.imageId,
-    "--format",
-    "{{.Id}}",
-  ]).catch(() => undefined);
+  let remaining: { readonly stdout: string } | undefined;
+  try {
+    remaining = await docker(state, [
+      "image",
+      "inspect",
+      state.imageId,
+      "--format",
+      "{{.Id}}",
+    ]);
+  } catch (error: unknown) {
+    const stderr = typeof error === "object" &&
+        error !== null &&
+        "stderr" in error &&
+        typeof (error as { readonly stderr?: unknown }).stderr === "string"
+      ? (error as { readonly stderr: string }).stderr
+      : "";
+    if (!/(?:no such|not found|does not exist)/iu.test(stderr)) {
+      verified = false;
+    }
+  }
   if (remaining !== undefined && remaining.stdout.trim().length > 0) {
     verified = false;
   }
@@ -966,6 +1394,7 @@ export async function buildEveRuntimeImage(
   const healthPort = request.healthPort;
   const timeoutMs = request.healthTimeoutMs ?? 30_000;
   const pollIntervalMs = request.healthPollIntervalMs ?? 100;
+  const retainImage = request.retainImage ?? true;
   const writtenPaths: string[] = [];
   let imageIdentity: "exact" | "indeterminate" = "indeterminate";
   let imageRetained = false;
@@ -1017,6 +1446,27 @@ export async function buildEveRuntimeImage(
       state.imageLabel,
       context.runtimeContextPath,
     ]);
+    const postBuildOutput = await captureRuntimeTree(
+      join(context.runtimeContextPath, ".output"),
+      context.runtimeContextPath,
+      "output",
+    );
+    const postBuildDependencies = await captureRuntimeTree(
+      join(context.runtimeContextPath, "node_modules"),
+      context.runtimeContextPath,
+      "dependencies",
+    );
+    if (
+      postBuildOutput.digest !== closure.outputDigest ||
+      postBuildDependencies.digest !== closure.dependencyDigest
+    ) {
+      throw packagingError(
+        "SOURCE_RACE",
+        "runtime context",
+        "The runtime context changed while the immutable Linux/amd64 image was being built.",
+        "Discard the mixed-generation runtime image and rebuild from a quiescent candidate.",
+      );
+    }
     state.imageId = await recoverImageIdentity(state);
     if (state.imageId === undefined) {
       throw packagingError(
@@ -1029,7 +1479,14 @@ export async function buildEveRuntimeImage(
     imageIdentity = "exact";
     await validateImageMetadata(state, state.imageId);
     const containerName = `eden-eve-boot-${request.candidate.generationId}`;
-    const boot = await docker(state, [
+    const runtimeEnvironment = request.runtimeInjection === undefined
+      ? runtimeContainerEnvironment(request)
+      : await request.runtimeInjection.runLocal({
+        cwd: request.candidate.generationRoot,
+        hostEnvironment: runtimeContainerEnvironment(request),
+        run: (startRequest) => startRequest.env,
+      });
+    const bootArgs = [
       "run",
       "--detach",
       "--name",
@@ -1038,18 +1495,23 @@ export async function buildEveRuntimeImage(
       state.imageLabel,
       "--publish",
       `${healthPort}:${INTERNAL_PORT}`,
-      "--env",
-      "HOST=0.0.0.0",
-      "--env",
-      "NITRO_HOST=0.0.0.0",
-      "--env",
-      "PORT=8080",
-      "--env",
-      "NITRO_PORT=8080",
-      "--env",
-      "NODE_ENV=production",
+      ...(request.runtimeInjection === undefined
+        ? Object.entries(runtimeEnvironment).flatMap(([name, value]) => [
+          "--env",
+          `${name}=${value}`,
+        ])
+        : ["--env-file", "-"]),
       state.imageId,
-    ]);
+    ] as const;
+    const boot = request.runtimeInjection === undefined
+      ? await docker(state, bootArgs)
+      : await dockerWithInput(
+        state,
+        bootArgs,
+        `${Object.entries(runtimeEnvironment)
+          .map(([name, value]) => `${name}=${value}`)
+          .join("\n")}\n`,
+      );
     state.containerId = boot.stdout.trim();
     bootContainerId = state.containerId;
     if (state.containerId.length === 0) {
@@ -1110,8 +1572,8 @@ export async function buildEveRuntimeImage(
       "-ceu",
       "test -z \"$(find /app -type f \\( -name '.env*' -o -name '.npmrc' -o -name '.pnpmrc' -o -name '*.pem' -o -name '*.key' -o -name 'credentials.json' -o -name 'service-account.json' \\) -print -quit)\"",
     ]);
-    imageRetained = true;
-    state.imageRetained = true;
+    imageRetained = retainImage;
+    state.imageRetained = retainImage;
     containerRemoved = await removeOwnedContainer(state);
     state.containerId = undefined;
     cleanupVerified = containerRemoved;
@@ -1123,7 +1585,29 @@ export async function buildEveRuntimeImage(
         "Inspect only the recorded boot-container identity; no broad Docker cleanup was attempted.",
       );
     }
-    await rm(context.runtimeContextPath, { recursive: true, force: true });
+    if (!imageRetained) {
+      cleanupVerified = (await removeOwnedImage(state)) && cleanupVerified;
+      if (!cleanupVerified) {
+        throw packagingError(
+          "CLEANUP_UNVERIFIED",
+          "runtime image",
+          "The disposable Eve runtime image could not be removed and verified absent.",
+          "Inspect only the recorded runtime image identity; no broad Docker cleanup was attempted.",
+        );
+      }
+    }
+    const contextRemoved = await removeOwnedRuntimeContext(
+      context.runtimeContextPath,
+      request.candidate.generationRoot,
+    );
+    if (!contextRemoved) {
+      throw packagingError(
+        "CLEANUP_UNVERIFIED",
+        "runtime context",
+        "The owned runtime context could not be removed with exact containment proof.",
+        "Inspect only the recorded runtime context path; no broad filesystem cleanup was attempted.",
+      );
+    }
     runtimeContextPath = undefined;
     const runtimeManifestPath = join(request.candidate.generationRoot, "runtime-image-manifest.json");
     await writeFile(runtimeManifestPath, `${JSON.stringify({
@@ -1133,6 +1617,9 @@ export async function buildEveRuntimeImage(
       imageId: state.imageId,
       imageDigest: state.imageId,
       launchCommand: START_COMMAND,
+      ...(request.publicOrigin === undefined
+        ? {}
+        : { publicOrigin: request.publicOrigin }),
       applicationArtifact: request.candidate.generatedOutput.entrypointPath,
       runtimeClosure: closure,
       health: {
@@ -1142,7 +1629,7 @@ export async function buildEveRuntimeImage(
       },
       hostEnvironment: HOST_ENVIRONMENT,
       durableLocalFilesystemClaim: false,
-    })}\n`, { encoding: "utf8", mode: 0o600 });
+    })}\n`, { flag: "wx", encoding: "utf8", mode: 0o600 });
     writtenPaths.push(runtimeManifestPath, state.imageIdPath);
     const image: EveRuntimeImage = {
       dockerfilePath: context.dockerfilePath,
@@ -1156,6 +1643,9 @@ export async function buildEveRuntimeImage(
       launchCommand: START_COMMAND,
       workingDirectory: "/app",
       hostEnvironment: HOST_ENVIRONMENT,
+      ...(request.publicOrigin === undefined
+        ? {}
+        : { publicOrigin: request.publicOrigin }),
       generatedOutput: request.candidate.generatedOutput,
       runtimeClosure: {
         root: "/app/node_modules",
@@ -1199,7 +1689,7 @@ export async function buildEveRuntimeImage(
           id: "VAL-BUILD-005",
           status: "pass",
           subject: "runtime image",
-          reason: "The retained image reports Linux/amd64 and contains the generated Eve output and runtime closure.",
+          reason: "The runtime image reports Linux/amd64 and contains the generated Eve output and runtime closure.",
           remediation: null,
         },
         {
@@ -1218,15 +1708,17 @@ export async function buildEveRuntimeImage(
         },
       ],
       candidateImageId: state.imageId,
-      candidateImageRetainedLocally: true,
+      candidateImageRetainedLocally: imageRetained,
       writtenPaths,
       error: null,
     };
   } catch (error: unknown) {
     if (runtimeContextPath !== undefined) {
-      await rm(runtimeContextPath, { recursive: true, force: true }).catch(() => {
-        cleanupVerified = false;
-      });
+      const contextRemoved = await removeOwnedRuntimeContext(
+        runtimeContextPath,
+        request.candidate.generationRoot,
+      );
+      cleanupVerified = contextRemoved && cleanupVerified;
       runtimeContextPath = undefined;
     }
     if (state.containerId !== undefined) {

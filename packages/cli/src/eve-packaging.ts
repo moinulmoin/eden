@@ -471,7 +471,29 @@ function isPathExcluded(
   return { excluded: false, category: undefined };
 }
 
-async function readStableFile(path: string): Promise<StableFile> {
+async function readStableFile(
+  path: string,
+  containmentRoot?: string,
+): Promise<StableFile> {
+  const canonicalRoot = containmentRoot === undefined
+    ? undefined
+    : await realpath(containmentRoot).catch(() => undefined);
+  const parentBefore = containmentRoot === undefined
+    ? undefined
+    : await realpath(dirname(path)).catch(() => undefined);
+  if (
+    containmentRoot !== undefined &&
+    (canonicalRoot === undefined ||
+      parentBefore === undefined ||
+      !isWithin(canonicalRoot, resolve(parentBefore)))
+  ) {
+    throw new EvePackagingError({
+      code: "SOURCE_RACE",
+      subject: safeRelativePath(containmentRoot ?? dirname(path), path),
+      reason: "The observed file parent escaped its Eden-owned containment root.",
+      remediation: "Retry only after the selected source tree is quiescent.",
+    });
+  }
   const before = await lstat(path).catch(() => undefined);
   if (
     before === undefined ||
@@ -488,6 +510,9 @@ async function readStableFile(path: string): Promise<StableFile> {
   const bytes = await readFile(path);
   const secondRead = await readFile(path).catch(() => undefined);
   const after = await lstat(path).catch(() => undefined);
+  const parentAfter = containmentRoot === undefined
+    ? undefined
+    : await realpath(dirname(path)).catch(() => undefined);
   if (
     secondRead === undefined ||
     !bytes.equals(secondRead) ||
@@ -497,7 +522,8 @@ async function readStableFile(path: string): Promise<StableFile> {
     after.dev !== before.dev ||
     after.ino !== before.ino ||
     after.size !== before.size ||
-    after.mode !== before.mode
+    after.mode !== before.mode ||
+    (containmentRoot !== undefined && parentAfter !== parentBefore)
   ) {
     throw new EvePackagingError({
       code: "SOURCE_RACE",
@@ -533,6 +559,22 @@ async function captureInputs(
   const excludedRelativePaths: string[] = [];
 
   const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
+    const directoryDetails = await lstat(directory).catch(() => undefined);
+    const canonicalDirectory = await realpath(directory).catch(() => undefined);
+    if (
+      directoryDetails === undefined ||
+      !directoryDetails.isDirectory() ||
+      directoryDetails.isSymbolicLink() ||
+      canonicalDirectory === undefined ||
+      !isWithin(root, resolve(canonicalDirectory))
+    ) {
+      throw new EvePackagingError({
+        code: "SOURCE_RACE",
+        subject: relativeDirectory || ".",
+        reason: "The selected Eve source directory was replaced or escaped while it was being observed.",
+        remediation: "Retry only after the selected project tree is quiescent.",
+      });
+    }
     const entries = await readdir(directory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
@@ -578,7 +620,7 @@ async function captureInputs(
       }
       let stable: StableFile;
       try {
-        stable = await readStableFile(candidate);
+        stable = await readStableFile(candidate, root);
       } catch (error: unknown) {
         if (
           relativePath === "pnpm-lock.yaml" &&
@@ -947,7 +989,25 @@ async function createGenerationRoot(
       remediation: "Create a new generation directory and preserve the prior generation.",
     });
   }
+  const parentBeforeCreate = await realpath(canonicalParent).catch(() => undefined);
+  if (parentBeforeCreate !== canonicalParent) {
+    throw new EvePackagingError({
+      code: "ROOT_INVALID",
+      subject: "artifactRoot",
+      reason: "The Eden-owned artifact parent changed before generation creation.",
+      remediation: "Use a stable regular artifact parent and retry.",
+    });
+  }
   await mkdir(canonicalGenerationRoot);
+  const parentAfterCreate = await realpath(canonicalParent).catch(() => undefined);
+  if (parentAfterCreate !== canonicalParent) {
+    throw new EvePackagingError({
+      code: "ROOT_INVALID",
+      subject: "artifactRoot",
+      reason: "The Eden-owned artifact parent changed during generation creation.",
+      remediation: "Use a stable regular artifact parent and retry.",
+    });
+  }
   const created = await lstat(canonicalGenerationRoot).catch(() => undefined);
   if (
     created === undefined ||
@@ -964,16 +1024,116 @@ async function createGenerationRoot(
   return canonicalGenerationRoot;
 }
 
+async function ensureSnapshotDirectory(
+  snapshotRoot: string,
+  directory: string,
+): Promise<void> {
+  const relativeDirectory = safeRelativePath(snapshotRoot, resolve(directory));
+  if (
+    relativeDirectory === ".." ||
+    relativeDirectory.startsWith("../") ||
+    relativeDirectory.includes("/../")
+  ) {
+    throw new EvePackagingError({
+      code: "SOURCE_RACE",
+      subject: relativeDirectory,
+      reason: "The immutable Eve snapshot directory escaped its Eden-owned root.",
+      remediation: "Discard the mixed-generation candidate and retry from a clean snapshot.",
+    });
+  }
+  const rootDetails = await lstat(snapshotRoot).catch(() => undefined);
+  const rootCanonical = await realpath(snapshotRoot).catch(() => undefined);
+  if (
+    rootDetails === undefined ||
+    !rootDetails.isDirectory() ||
+    rootDetails.isSymbolicLink() ||
+    rootCanonical === undefined ||
+    !isWithin(snapshotRoot, resolve(rootCanonical))
+  ) {
+    throw new EvePackagingError({
+      code: "SOURCE_RACE",
+      subject: ".",
+      reason: "The immutable Eve snapshot root was replaced or escaped during creation.",
+      remediation: "Discard the mixed-generation candidate and retry from a clean snapshot.",
+    });
+  }
+  let current = snapshotRoot;
+  let currentCanonical = rootCanonical;
+  for (const part of relativeDirectory.split("/").filter(Boolean)) {
+    const currentObserved = await realpath(current).catch(() => undefined);
+    if (currentObserved !== currentCanonical) {
+      throw new EvePackagingError({
+        code: "SOURCE_RACE",
+        subject: safeRelativePath(snapshotRoot, current),
+        reason: "The immutable Eve snapshot parent was replaced during creation.",
+        remediation: "Discard the mixed-generation candidate and retry from a clean snapshot.",
+      });
+    }
+    const next = join(current, part);
+    const expectedCanonical = join(currentCanonical, part);
+    const existing = await lstat(next).catch(() => undefined);
+    if (existing === undefined) {
+      await mkdir(next);
+    }
+    const details = await lstat(next).catch(() => undefined);
+    const canonical = await realpath(next).catch(() => undefined);
+    if (
+      details === undefined ||
+      !details.isDirectory() ||
+      details.isSymbolicLink() ||
+      canonical === undefined ||
+      canonical !== expectedCanonical ||
+      !isWithin(rootCanonical, resolve(canonical))
+    ) {
+      throw new EvePackagingError({
+        code: "SOURCE_RACE",
+        subject: safeRelativePath(snapshotRoot, next),
+        reason: "The immutable Eve snapshot directory was replaced or escaped during creation.",
+        remediation: "Discard the mixed-generation candidate and retry from a clean snapshot.",
+      });
+    }
+    current = next;
+    currentCanonical = canonical;
+  }
+}
+
 async function copySnapshot(
   snapshotRoot: string,
   inputs: CapturedInputs,
 ): Promise<void> {
   for (const file of inputs.files) {
     const destination = join(snapshotRoot, file.relativePath);
-    await mkdir(dirname(destination), { recursive: true });
-    await writeFile(destination, file.bytes, { mode: file.mode });
+    const parent = dirname(destination);
+    await ensureSnapshotDirectory(snapshotRoot, parent);
+    const canonicalRoot = await realpath(snapshotRoot).catch(() => undefined);
+    const canonicalParent = await realpath(parent).catch(() => undefined);
+    if (
+      canonicalRoot === undefined ||
+      canonicalParent === undefined ||
+      !isWithin(canonicalRoot, resolve(canonicalParent))
+    ) {
+      throw new EvePackagingError({
+        code: "SOURCE_RACE",
+        subject: file.relativePath,
+        reason: "The immutable Eve snapshot parent could not be proven contained before writing.",
+        remediation: "Discard the mixed-generation candidate and retry from a clean snapshot.",
+      });
+    }
+    await writeFile(destination, file.bytes, {
+      flag: "wx",
+      mode: file.mode,
+    });
+    const afterParent = await realpath(parent).catch(() => undefined);
+    if (afterParent !== canonicalParent) {
+      throw new EvePackagingError({
+        code: "SOURCE_RACE",
+        subject: file.relativePath,
+        reason: "The immutable Eve snapshot parent changed during writing.",
+        remediation: "Discard the mixed-generation candidate and retry from a clean snapshot.",
+      });
+    }
     await chmod(destination, file.mode).catch(() => undefined);
-    const copied = await readStableFile(destination);
+    const copied = await readStableFile(destination, snapshotRoot);
     if (copied.sha256 !== file.sha256 || copied.bytes.byteLength !== file.byteLength) {
       throw new EvePackagingError({
         code: "SOURCE_RACE",
@@ -992,6 +1152,22 @@ async function verifySnapshotInputs(
   const generatedRoots = new Set([".dockerignore", ".output", "node_modules"]);
   const observedInputPaths: string[] = [];
   const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
+    const directoryDetails = await lstat(directory).catch(() => undefined);
+    const directoryCanonical = await realpath(directory).catch(() => undefined);
+    if (
+      directoryDetails === undefined ||
+      !directoryDetails.isDirectory() ||
+      directoryDetails.isSymbolicLink() ||
+      directoryCanonical === undefined ||
+      !isWithin(snapshotRoot, resolve(directoryCanonical))
+    ) {
+      throw new EvePackagingError({
+        code: "SOURCE_RACE",
+        subject: relativeDirectory || ".",
+        reason: "The immutable Eve snapshot directory escaped or changed during verification.",
+        remediation: "Discard the mixed-generation candidate and retry from quiescent source bytes.",
+      });
+    }
     const entries = await readdir(directory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
@@ -1034,7 +1210,10 @@ async function verifySnapshotInputs(
   }
   for (const file of inputs.files) {
     try {
-      const observed = await readStableFile(join(snapshotRoot, file.relativePath));
+      const observed = await readStableFile(
+        join(snapshotRoot, file.relativePath),
+        snapshotRoot,
+      );
       if (
         observed.sha256 !== file.sha256 ||
         observed.bytes.byteLength !== file.byteLength ||
@@ -1065,6 +1244,22 @@ async function verifySnapshotInputs(
 async function snapshotDigest(snapshotRoot: string): Promise<string> {
   const files: Array<{ readonly relativePath: string; readonly sha256: string; readonly byteLength: number }> = [];
   const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
+    const directoryDetails = await lstat(directory).catch(() => undefined);
+    const directoryCanonical = await realpath(directory).catch(() => undefined);
+    if (
+      directoryDetails === undefined ||
+      !directoryDetails.isDirectory() ||
+      directoryDetails.isSymbolicLink() ||
+      directoryCanonical === undefined ||
+      !isWithin(snapshotRoot, resolve(directoryCanonical))
+    ) {
+      throw new EvePackagingError({
+        code: "SOURCE_RACE",
+        subject: relativeDirectory || ".",
+        reason: "The immutable Eve snapshot directory escaped or changed during digest capture.",
+        remediation: "Discard the mixed-generation candidate and retry from a clean project snapshot.",
+      });
+    }
     const entries = await readdir(directory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
@@ -1104,7 +1299,7 @@ async function snapshotDigest(snapshotRoot: string): Promise<string> {
           remediation: "Discard the candidate and retry from a regular-file project tree.",
         });
       }
-      const stable = await readStableFile(candidate);
+      const stable = await readStableFile(candidate, snapshotRoot);
       files.push({
         relativePath,
         sha256: stable.sha256,
@@ -1118,6 +1313,7 @@ async function snapshotDigest(snapshotRoot: string): Promise<string> {
 
 async function writeJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, jsonBytes(value), {
+    flag: "wx",
     encoding: "utf8",
     mode: 0o600,
   });
@@ -1182,10 +1378,12 @@ ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "
 *.key
 `;
   await writeFile(options.dockerfilePath, dockerfile, {
+    flag: "wx",
     encoding: "utf8",
     mode: 0o600,
   });
   await writeFile(join(options.snapshotRoot, ".dockerignore"), dockerignore, {
+    flag: "wx",
     encoding: "utf8",
     mode: 0o600,
   });
@@ -1276,7 +1474,7 @@ async function scanGeneratedOutput(
     subject: string,
   ): Promise<StableFile> => {
     try {
-      return await readStableFile(path);
+      return await readStableFile(path, snapshotRoot);
     } catch {
       throw new EvePackagingError({
         code: "UNSUPPORTED_EVE_OUTPUT",
@@ -1319,6 +1517,22 @@ async function scanGeneratedOutput(
   }
   const files: Array<{ readonly relativePath: string; readonly sha256: string; readonly byteLength: number }> = [];
   const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
+    const directoryDetails = await lstat(directory).catch(() => undefined);
+    const directoryCanonical = await realpath(directory).catch(() => undefined);
+    if (
+      directoryDetails === undefined ||
+      !directoryDetails.isDirectory() ||
+      directoryDetails.isSymbolicLink() ||
+      directoryCanonical === undefined ||
+      !isWithin(snapshotRoot, resolve(directoryCanonical))
+    ) {
+      throw new EvePackagingError({
+        code: "UNSUPPORTED_EVE_OUTPUT",
+        subject: `.output/${relativeDirectory}`,
+        reason: "Generated Eve output escaped or changed during validation.",
+        remediation: "Regenerate output as regular files inside the immutable build snapshot.",
+      });
+    }
     const entries = await readdir(directory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
@@ -1404,6 +1618,22 @@ async function assertGeneratedTreesExcludeSecrets(
     join(snapshotRoot, ".output"),
   ];
   const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
+    const directoryDetails = await lstat(directory).catch(() => undefined);
+    const directoryCanonical = await realpath(directory).catch(() => undefined);
+    if (
+      directoryDetails === undefined ||
+      !directoryDetails.isDirectory() ||
+      directoryDetails.isSymbolicLink() ||
+      directoryCanonical === undefined ||
+      !isWithin(snapshotRoot, resolve(directoryCanonical))
+    ) {
+      throw new EvePackagingError({
+        code: "SECRET_EXCLUSION_FAILED",
+        subject: relativeDirectory,
+        reason: "The generated Eve runtime closure escaped or changed during secret validation.",
+        remediation: "Regenerate dependencies and output inside the immutable project snapshot.",
+      });
+    }
     const entries = await readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
       const relativePath = relativeDirectory.length === 0
@@ -1874,7 +2104,10 @@ export async function buildEveProjectSnapshot(
       return blockedResult(cleanupError ?? afterBuildRace, { writtenPaths });
     }
 
-    const snapshotLockfile = await readStableFile(join(snapshotRoot, "pnpm-lock.yaml"));
+    const snapshotLockfile = await readStableFile(
+      join(snapshotRoot, "pnpm-lock.yaml"),
+      snapshotRoot,
+    );
     if (
       snapshotLockfile.sha256 !== contract.lockfileSha256 ||
       !snapshotLockfile.bytes.equals(contract.lockfileBytes)
@@ -2101,6 +2334,141 @@ export async function buildEveProjectSnapshot(
   }
 }
 
+export async function revalidateEveProjectCandidateInputs(
+  candidate: EveProjectBuildCandidate,
+  runtimeConfig?: EveRuntimeConfigExclusion,
+): Promise<void> {
+  const fail = (): never => {
+    throw new EvePackagingError({
+      code: "SOURCE_RACE",
+      subject: "project inputs",
+      reason:
+        "The selected Eve source, lockfile, configuration, or explicit environment identity changed after the candidate was built.",
+      remediation:
+        "Discard the stale candidate and retry only after all selected inputs are quiescent.",
+    });
+  };
+  let manifestValue: unknown;
+  try {
+    manifestValue = JSON.parse(
+      await readFile(candidate.inputManifestPath, "utf8"),
+    ) as unknown;
+  } catch {
+    fail();
+  }
+  if (
+    typeof manifestValue !== "object" ||
+    manifestValue === null ||
+    Array.isArray(manifestValue)
+  ) {
+    fail();
+  }
+  const manifest = manifestValue as {
+    readonly requestedRoot?: unknown;
+    readonly canonicalRoot?: unknown;
+    readonly sourceDigest?: unknown;
+    readonly packageJsonSha256?: unknown;
+    readonly lockfileSha256?: unknown;
+    readonly runtimeConfigInputIdentity?: unknown;
+  };
+  if (
+    typeof manifest.requestedRoot !== "string" ||
+    typeof manifest.canonicalRoot !== "string" ||
+    typeof manifest.sourceDigest !== "string" ||
+    typeof manifest.packageJsonSha256 !== "string" ||
+    typeof manifest.lockfileSha256 !== "string"
+  ) {
+    fail();
+  }
+  const requestedRoot = manifest.requestedRoot as string;
+  const canonicalRoot = manifest.canonicalRoot as string;
+  const sourceDigest = manifest.sourceDigest as string;
+  const packageJsonSha256 = manifest.packageJsonSha256 as string;
+  const lockfileSha256 = manifest.lockfileSha256 as string;
+  const requestedDetails = await lstat(requestedRoot).catch(() => undefined);
+  const requestedCanonical = await realpath(requestedRoot).catch(() => undefined);
+  if (
+    requestedDetails === undefined ||
+    !requestedDetails.isDirectory() ||
+    requestedDetails.isSymbolicLink() ||
+    requestedCanonical !== canonicalRoot
+  ) {
+    fail();
+  }
+  const latestIdentity = await currentInputIdentity(runtimeConfig).catch(() =>
+    undefined
+  );
+  const expectedIdentity = candidate.runtimeConfigInputIdentity;
+  if (
+    latestIdentity !== expectedIdentity ||
+    (typeof manifest.runtimeConfigInputIdentity === "string" &&
+      latestIdentity !== manifest.runtimeConfigInputIdentity)
+  ) {
+    fail();
+  }
+  let latest: CapturedInputs | undefined;
+  try {
+    latest = await captureInputs(
+      canonicalRoot,
+      runtimeConfig,
+      resolve(candidate.generationRoot),
+      latestIdentity,
+      requestedRoot,
+    );
+  } catch {
+    fail();
+  }
+  const observedLatest = latest ?? fail();
+  const packageFile = observedLatest.files.find((file) => file.relativePath === "package.json");
+  const lockfile = observedLatest.files.find((file) => file.relativePath === "pnpm-lock.yaml");
+  if (
+    packageFile === undefined ||
+    lockfile === undefined ||
+    packageFile.sha256 !== candidate.packageJsonSha256 ||
+    packageFile.sha256 !== packageJsonSha256 ||
+    lockfile.sha256 !== candidate.lockfileSha256 ||
+    lockfile.sha256 !== lockfileSha256 ||
+    observedLatest.sourceDigest !== candidate.sourceDigest ||
+    observedLatest.sourceDigest !== sourceDigest
+  ) {
+    fail();
+  }
+  let latestSnapshotDigest: string | undefined;
+  try {
+    latestSnapshotDigest = await snapshotDigest(candidate.snapshotRoot);
+  } catch {
+    fail();
+  }
+  if (
+    latestSnapshotDigest === undefined ||
+    latestSnapshotDigest !== candidate.snapshotDigest
+  ) {
+    fail();
+  }
+}
+
+async function dockerIdentityAbsent(
+  dockerCommand: string,
+  args: readonly string[],
+  options: {
+    readonly env: NodeJS.ProcessEnv;
+    readonly cwd: string;
+  },
+): Promise<boolean> {
+  try {
+    const result = await execFileAsync(dockerCommand, [...args], options);
+    return result.stdout.trim().length === 0;
+  } catch (error: unknown) {
+    const stderr = typeof error === "object" &&
+        error !== null &&
+        "stderr" in error &&
+        typeof (error as { readonly stderr?: unknown }).stderr === "string"
+      ? (error as { readonly stderr: string }).stderr
+      : "";
+    return /(?:no such|not found|does not exist)/iu.test(stderr);
+  }
+}
+
 export function createDockerEveProjectBuilder(options: {
   readonly nodeImage: EveNodeImage;
   readonly dockerCommand?: string;
@@ -2141,12 +2509,12 @@ export function createDockerEveProjectBuilder(options: {
           ).catch(() => {
             cleanupFailed = true;
           });
-          const remainingContainer = await execFileAsync(
+          const containerAbsent = await dockerIdentityAbsent(
             dockerCommand,
             ["container", "inspect", containerId, "--format", "{{.Id}}"],
             { env: safeEnv, cwd: request.generationRoot },
-          ).catch(() => undefined);
-          if (remainingContainer !== undefined && remainingContainer.stdout.trim().length > 0) {
+          );
+          if (!containerAbsent) {
             cleanupFailed = true;
           }
         }
@@ -2160,12 +2528,12 @@ export function createDockerEveProjectBuilder(options: {
           ).catch(() => {
             cleanupFailed = true;
           });
-          const remainingImage = await execFileAsync(
+          const imageAbsent = await dockerIdentityAbsent(
             dockerCommand,
             ["image", "inspect", builtImageId, "--format", "{{.Id}}"],
             { env: safeEnv, cwd: request.generationRoot },
-          ).catch(() => undefined);
-          if (remainingImage !== undefined && remainingImage.stdout.trim().length > 0) {
+          );
+          if (!imageAbsent) {
             cleanupFailed = true;
           }
         }

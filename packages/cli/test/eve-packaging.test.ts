@@ -135,7 +135,10 @@ else if (args[0] === "build") {
   const iidfile = args[args.indexOf("--iidfile") + 1];
   fs.writeFileSync(iidfile, "sha256:${"2".repeat(64)}\\n");
 } else if (args[0] === "image" && args[1] === "inspect") {
-  if (fs.existsSync(removedMarker)) process.exitCode = 1;
+  if (fs.existsSync(removedMarker)) {
+    process.stderr.write("No such object: image\\n");
+    process.exitCode = 1;
+  }
   else process.stdout.write("sha256:${"2".repeat(64)} linux amd64\\n");
 } else if (args[0] === "image" && args[1] === "rm") {
   fs.writeFileSync(removedMarker, "removed\\n");
@@ -163,6 +166,7 @@ else if (args[0] === "build") {
     fs.symlinkSync("../eve/bin/eve.js", path.join(destination, ".bin/eve"));
   }
 } else if (args[0] === "container" && args[1] === "inspect") {
+  process.stderr.write("No such object: container\\n");
   process.exitCode = 1;
 }
 `,

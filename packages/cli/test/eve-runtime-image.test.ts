@@ -128,7 +128,10 @@ if (args[0] === "version") {
     fs.writeFileSync(iidfile, imageId + "\\n");
   }
 } else if (args[0] === "image" && args[1] === "inspect") {
-  if (fs.existsSync(removedImage)) process.exitCode = 1;
+  if (fs.existsSync(removedImage)) {
+    process.stderr.write("No such object: image\\n");
+    process.exitCode = 1;
+  }
   else {
     const format = args[args.indexOf("--format") + 1] ?? "";
     if (format.includes(".Config.Entrypoint")) {
@@ -149,7 +152,10 @@ if (args[0] === "version") {
   process.stdout.write("boot-container-1\\n");
 } else if (args[0] === "inspect") {
   const format = args[args.indexOf("--format") + 1] ?? "";
-  if (fs.existsSync(removedContainer)) process.exitCode = 1;
+  if (fs.existsSync(removedContainer)) {
+    process.stderr.write("No such object: container\\n");
+    process.exitCode = 1;
+  }
   else if (format.includes(".Config.Entrypoint")) {
     process.stdout.write(JSON.stringify(["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "8080"]) + "\\n");
   } else if (format.includes(".Config.WorkingDir")) {
@@ -176,7 +182,10 @@ if (args[0] === "version") {
   fs.writeFileSync(removedContainer, "removed\\n");
 } else if (args[0] === "container" && args[1] === "inspect") {
   if (!fs.existsSync(removedContainer)) process.stdout.write("boot-container-1\\n");
-  else process.exitCode = 1;
+  else {
+    process.stderr.write("No such object: container\\n");
+    process.exitCode = 1;
+  }
 }
 `,
     { encoding: "utf8", mode: 0o700 },
@@ -342,6 +351,55 @@ describe("Eve runtime image boundary", () => {
     await expect(
       readFile(join(candidate.generationRoot, "container/runtime-context")),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("removes the disposable runtime image when retention is disabled", async () => {
+    const root = await createRoot("eden-eve-runtime-image-disposable-");
+    const candidate = await writeCandidate(root);
+    const fakeDocker = await writeFakeDocker(root);
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+      healthPort: 4313,
+      retainImage: false,
+      fetchHealth: async () => new Response(
+        JSON.stringify({ status: "ready" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "ready",
+      candidateImageRetainedLocally: false,
+      cleanup: {
+        bootContainerRemoved: true,
+        imageIdentity: "exact",
+        imageRetained: false,
+        verified: true,
+      },
+    });
+    const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(dockerArgs.some((args) =>
+      args[0] === "image" && args[1] === "rm"
+    )).toBe(true);
   });
 
   test("fails when the real Eve health route never reports ready", async () => {
