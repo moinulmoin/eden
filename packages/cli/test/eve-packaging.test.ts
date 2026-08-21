@@ -800,7 +800,9 @@ describe("Eve project snapshot/build boundary", () => {
     );
     expect(dockerfile).toContain("FROM --platform=linux/amd64 node:24.17.0-bookworm-slim@");
     expect(dockerfile).toContain("corepack pnpm install --frozen-lockfile");
-    expect(dockerfile).toContain("corepack pnpm prune --prod");
+    expect(dockerfile).toContain(
+      "corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted",
+    );
     expect(dockerfile).toContain("COPY --from=runtime-deps /workspace/node_modules /app/node_modules");
     expect(dockerfile).toContain(
       'ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "8080"]',

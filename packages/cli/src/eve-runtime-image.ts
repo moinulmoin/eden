@@ -1553,7 +1553,7 @@ export async function buildEveRuntimeImage(
       state.containerId,
       "sh",
       "-ceu",
-      "set -o noglob; for module in $(find /app/node_modules -type f -name '*.node'); do ldd \"$module\" 2>&1 | grep -q 'not found' && exit 1; done",
+      "set -o noglob; status=0; for module in $(find /app/node_modules -type f -name '*.node'); do if ldd \"$module\" 2>&1 | grep -q 'not found'; then echo \"unloadable native module: $module\" >&2; status=1; fi; done; exit $status",
     ]);
     await pollEveHealth(
       healthPort,
@@ -1766,10 +1766,16 @@ export async function buildEveRuntimeImage(
       }
       return blockedResult(request.candidate, error, cleanup, writtenPaths);
     }
+    const stderrText =
+      typeof (error as { readonly stderr?: unknown }).stderr === "string"
+        ? (error as { readonly stderr?: unknown }).stderr as string
+        : "";
     const fallback = packagingError(
       "DOCKER_PLATFORM_BLOCKED",
       "runtime image",
-      "The Linux/amd64 Eve runtime image could not be built or inspected safely.",
+      error instanceof Error && error.message.length > 0
+        ? `The Linux/amd64 Eve runtime image could not be built or inspected safely: ${[error.message, stderrText].join(" ").trim().slice(0, 600)}`
+        : "The Linux/amd64 Eve runtime image could not be built or inspected safely.",
       "Retry with Docker/OrbStack BuildKit and preserve the exact candidate inputs.",
     );
     return blockedResult(request.candidate, fallback, cleanup, writtenPaths);

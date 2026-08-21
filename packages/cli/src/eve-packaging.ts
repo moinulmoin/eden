@@ -1346,17 +1346,15 @@ RUN corepack enable \\
   && corepack prepare pnpm@${options.packageManagerVersion} --activate \\
   && test "$(corepack pnpm --version)" = "${options.packageManagerVersion}" \\
   && test "$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)" = "${options.lockfileSha256}" \\
-  && corepack pnpm install --frozen-lockfile
+  && corepack pnpm install --frozen-lockfile --config.node-linker=hoisted
 RUN test "$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)" = "${options.lockfileSha256}"
 COPY . ./
 RUN test -x ./node_modules/.bin/eve \\
   && ./node_modules/.bin/eve build
 
 FROM builder AS runtime-deps
-RUN corepack pnpm prune --prod \\
-  && cp -rL node_modules node_modules-materialized \\
-  && rm -rf node_modules \\
-  && mv node_modules-materialized node_modules
+RUN rm -rf node_modules \\
+  && corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted
 
 FROM --platform=linux/amd64 ${image} AS runtime
 WORKDIR /app
