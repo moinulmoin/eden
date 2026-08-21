@@ -1353,7 +1353,10 @@ RUN test -x ./node_modules/.bin/eve \\
   && ./node_modules/.bin/eve build
 
 FROM builder AS runtime-deps
-RUN corepack pnpm prune --prod
+RUN corepack pnpm prune --prod \\
+  && cp -rL node_modules node_modules-materialized \\
+  && rm -rf node_modules \\
+  && mv node_modules-materialized node_modules
 
 FROM --platform=linux/amd64 ${image} AS runtime
 WORKDIR /app
