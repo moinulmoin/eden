@@ -59,7 +59,17 @@ async function writeCandidate(root: string): Promise<EveRuntimeImageRequest["can
     "#!/usr/bin/env node\n",
     { encoding: "utf8", mode: 0o755 },
   );
-  await chmod(join(snapshotRoot, "node_modules/.bin/eve"), 0o755);
+  await mkdir(join(snapshotRoot, "agent/tools"), { recursive: true });
+  await writeFile(
+    join(snapshotRoot, "agent/agent.ts"),
+    "export default {};\n",
+    "utf8",
+  );
+  await writeFile(
+    join(snapshotRoot, "package.json"),
+    JSON.stringify({ name: "eve-fixture", private: true }),
+    "utf8",
+  );
 
   const entrypoint = await readFile(
     join(snapshotRoot, ".output/server/index.mjs"),
@@ -137,7 +147,7 @@ if (args[0] === "version") {
     if (format.includes(".Config.Entrypoint")) {
       process.stdout.write(JSON.stringify(["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "8080"]) + "\\n");
     } else if (format.includes(".Config.WorkingDir")) {
-      process.stdout.write("/app\\n");
+      process.stdout.write("/workspace\\n");
     } else if (format.includes(".Config.Env")) {
       process.stdout.write(JSON.stringify(["HOST=0.0.0.0", "NITRO_HOST=0.0.0.0", "PORT=8080", "NITRO_PORT=8080", "NODE_ENV=production"]) + "\\n");
     } else {
@@ -159,7 +169,7 @@ if (args[0] === "version") {
   else if (format.includes(".Config.Entrypoint")) {
     process.stdout.write(JSON.stringify(["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "8080"]) + "\\n");
   } else if (format.includes(".Config.WorkingDir")) {
-    process.stdout.write("/app\\n");
+    process.stdout.write("/workspace\\n");
   } else if (format.includes(".Config.Env")) {
     process.stdout.write(JSON.stringify(["HOST=0.0.0.0", "NITRO_HOST=0.0.0.0", "PORT=8080", "NITRO_PORT=8080", "NODE_ENV=production"]) + "\\n");
   } else if (format.includes(".Config.Labels")) {

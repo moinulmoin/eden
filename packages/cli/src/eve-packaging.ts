@@ -1354,7 +1354,8 @@ RUN test -x ./node_modules/.bin/eve \\
 
 FROM builder AS runtime-deps
 RUN rm -rf node_modules \\
-  && corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted
+  && corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted \\
+  && for l in node_modules/.bin/*; do t=$(readlink "$l") || continue; case "$t" in /*) ln -sfn "$(realpath --relative-to=node_modules/.bin "$t")" "$l" ;; esac; done
 
 FROM --platform=linux/amd64 ${image} AS runtime
 WORKDIR /app

@@ -14,6 +14,7 @@ import {
   readdir,
   realpath,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import {
@@ -122,7 +123,7 @@ export interface EveRuntimeImageMetadata {
   readonly imageReference: string;
   readonly imageDigest: string;
   readonly launchCommand: typeof START_COMMAND;
-  readonly workingDirectory: "/app";
+  readonly workingDirectory: "/workspace";
   readonly hostEnvironment: typeof HOST_ENVIRONMENT;
   readonly publicOrigin?: string;
   readonly generatedOutput: EveProjectOutput;
@@ -803,6 +804,42 @@ export async function revalidateEveRuntimeCandidate(
   };
 }
 
+/**
+ * Node's recursive fs.cp rewrites relative symbolic links into absolute links
+ * that point back at the source tree. Map any copied absolute link onto the
+ * equivalent path inside the runtime context so the copied closure stays
+ * self-contained.
+ */
+async function rewriteContextLinks(
+  sourceRoot: string,
+  contextRoot: string,
+): Promise<void> {
+  const walk = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true })
+      .catch(() => []);
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await walk(path);
+        continue;
+      }
+      if (!entry.isSymbolicLink()) continue;
+      const text = await readlink(path).catch(() => undefined);
+      if (text === undefined || !text.startsWith("/")) continue;
+      const mapped = join(
+        contextRoot,
+        relative(resolve(sourceRoot), resolve(text)),
+      );
+      if (resolve(mapped) === resolve(text)) continue;
+      const mappedDetails = await lstat(mapped).catch(() => undefined);
+      if (mappedDetails === undefined) continue;
+      await rm(path, { force: true });
+      await symlink(relative(dirname(path), mapped), path);
+    }
+  };
+  await walk(contextRoot);
+}
+
 async function writeRuntimeContext(
   candidate: EveProjectBuildCandidate,
   nodeImage: EveNodeImage,
@@ -855,6 +892,23 @@ async function writeRuntimeContext(
       join(runtimeContextPath, "node_modules"),
       { recursive: true },
     );
+    await cp(
+      join(candidate.snapshotRoot, "agent"),
+      join(runtimeContextPath, "agent"),
+      { recursive: true },
+    );
+    await cp(
+      join(candidate.snapshotRoot, "package.json"),
+      join(runtimeContextPath, "package.json"),
+    );
+    await rewriteContextLinks(
+      join(candidate.snapshotRoot, "node_modules"),
+      join(runtimeContextPath, "node_modules"),
+    );
+    await rewriteContextLinks(
+      join(candidate.snapshotRoot, ".output"),
+      join(runtimeContextPath, ".output"),
+    );
     const copiedOutput = await captureRuntimeTree(
       join(runtimeContextPath, ".output"),
       runtimeContextPath,
@@ -878,28 +932,27 @@ async function writeRuntimeContext(
     }
     const dockerfile = `# syntax=docker/dockerfile:1
 FROM --platform=linux/amd64 ${imageReference(nodeImage)} AS candidate
-WORKDIR /candidate
-COPY .output /candidate/.output
-COPY node_modules /candidate/node_modules
+WORKDIR /workspace
+COPY .output /workspace/.output
+COPY node_modules /workspace/node_modules
+COPY agent /workspace/agent
+COPY package.json /workspace/package.json
 
 FROM --platform=linux/amd64 ${imageReference(nodeImage)} AS runtime
-WORKDIR /app
+WORKDIR /workspace
 ENV HOST=0.0.0.0 \\
     NITRO_HOST=0.0.0.0 \\
     PORT=8080 \\
     NITRO_PORT=8080 \\
     NODE_ENV=production
-COPY --from=candidate /candidate/.output /app/.output
-COPY --from=candidate /candidate/node_modules /app/node_modules
+COPY --from=candidate /workspace/.output /workspace/.output
+COPY --from=candidate /workspace/node_modules /workspace/node_modules
+COPY --from=candidate /workspace/agent /workspace/agent
+COPY --from=candidate /workspace/package.json /workspace/package.json
 EXPOSE 8080
 ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "8080"]
 `;
-    const dockerignore = `*
-!.output
-!.output/**
-!node_modules
-!node_modules/**
-`;
+    const dockerignore = "";
     const dockerfileParent = await assertFreshOwnedFilePath(
       dockerfilePath,
       candidate.generationRoot,
@@ -1168,12 +1221,12 @@ async function validateImageMetadata(
     "--format",
     "{{.Config.WorkingDir}}",
   ]);
-  if (workingDirectory.stdout.trim() !== "/app") {
+  if (workingDirectory.stdout.trim() !== "/workspace") {
     throw packagingError(
       "UNSUPPORTED_EVE_OUTPUT",
       "Container working directory",
-      "The runtime image does not use /app as its self-contained working directory.",
-      "Build the runtime image with the generated Eve output and start closure under /app.",
+      "The runtime image does not use /workspace as its self-contained working directory.",
+      "Build the runtime image with the generated Eve output and start closure under /workspace.",
     );
   }
   const environment = await docker(state, [
@@ -1644,7 +1697,7 @@ export async function buildEveRuntimeImage(
       imageReference: state.imageId,
       imageDigest: state.imageId,
       launchCommand: START_COMMAND,
-      workingDirectory: "/app",
+      workingDirectory: "/workspace",
       hostEnvironment: HOST_ENVIRONMENT,
       ...(request.publicOrigin === undefined
         ? {}
