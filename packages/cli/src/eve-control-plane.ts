@@ -11,9 +11,10 @@ import {
   relative,
 } from "node:path";
 import {
-  mkdir,
   lstat,
+  mkdir,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -2803,12 +2804,92 @@ async function readEveDestroyRecord(
   const current = await lstat(join(targetsRoot, "CURRENT")).catch(
     () => undefined,
   );
-  if (current === undefined || !current.isSymbolicLink()) return undefined;
+  if (current === undefined || !current.isSymbolicLink()) {
+    return readEveDestroyRecordFromGenerations(
+      projectRoot,
+      environment,
+      name,
+    );
+  }
   const generationRoot = await realpath(join(targetsRoot, "CURRENT")).catch(
     () => undefined,
   );
-  if (generationRoot === undefined) return undefined;
-  const recordPath = join(generationRoot, "deployment.json");
+  if (generationRoot === undefined) {
+    return readEveDestroyRecordFromGenerations(
+      projectRoot,
+      environment,
+      name,
+    );
+  }
+  const parsed = await parseEveDestroyRecord(
+    join(generationRoot, "deployment.json"),
+    environment,
+    name,
+  );
+  return parsed === undefined
+    ? undefined
+    : { ...parsed, generationRoot };
+}
+
+async function readEveDestroyRecordFromGenerations(
+  projectRoot: string,
+  environment: EveCliEnvironment,
+  name: string,
+): Promise<
+  | {
+    readonly recordPath: string;
+    readonly generationRoot: string;
+    readonly identity: VerifiedEveDestroyIdentity;
+  }
+  | undefined
+> {
+  const generationsRoot = join(
+    projectRoot,
+    ".eden",
+    "eve-deploy",
+    "generations",
+  );
+  const entries = await readdir(generationsRoot).catch(() => []);
+  const withRecords: {
+    readonly generationRoot: string;
+    readonly modifiedAt: number;
+  }[] = [];
+  for (const entry of entries) {
+    const generationRoot = join(generationsRoot, entry);
+    const details = await lstat(generationRoot).catch(() => undefined);
+    if (details === undefined || !details.isDirectory()) continue;
+    const recordDetails = await lstat(
+      join(generationRoot, "deployment.json"),
+    ).catch(() => undefined);
+    if (recordDetails !== undefined && recordDetails.isFile()) {
+      withRecords.push({
+        generationRoot,
+        modifiedAt: recordDetails.mtimeMs,
+      });
+    }
+  }
+  withRecords.sort((left, right) => right.modifiedAt - left.modifiedAt);
+  for (const { generationRoot } of withRecords) {
+    const parsed = await parseEveDestroyRecord(
+      join(generationRoot, "deployment.json"),
+      environment,
+      name,
+    );
+    if (parsed !== undefined) {
+      return { ...parsed, generationRoot };
+    }
+  }
+  return undefined;
+}
+
+async function parseEveDestroyRecord(
+  recordPath: string,
+  environment: EveCliEnvironment,
+  name: string,
+): Promise<{
+  readonly recordPath: string;
+  readonly identity: VerifiedEveDestroyIdentity;
+} | undefined> {
   let raw: string;
   try {
     raw = await readFile(recordPath, "utf8");
@@ -2823,7 +2904,9 @@ async function readEveDestroyRecord(
   }
   if (typeof parsed !== "object" || parsed === null) return undefined;
   const record = parsed as EveDestroyRecord & { readonly status?: unknown };
-  if (record.status !== "deployed") return undefined;
+  if (record.status !== undefined && typeof record.status !== "string") {
+    return undefined;
+  }
   const identity = record.identity ?? {};
   const required = [
     "workerName",
@@ -2838,15 +2921,11 @@ async function readEveDestroyRecord(
       return undefined;
     }
   }
-  if (
-    identity.environment !== environment ||
-    identity.name !== name
-  ) {
+  if (identity.environment !== environment || identity.name !== name) {
     return undefined;
   }
   return {
     recordPath,
-    generationRoot,
     identity: identity as VerifiedEveDestroyIdentity,
   };
 }
@@ -2905,7 +2984,7 @@ async function defaultContainerDelete(
   request: { readonly applicationId: string },
 ): Promise<"deleted" | "absent" | "indeterminate"> {
   const result = await runWranglerWithInput(
-    ["containers", "delete", request.applicationId, "--force"],
+    ["containers", "delete", request.applicationId],
     process.cwd(),
   );
   if (result.exitCode === 0) return "deleted";
