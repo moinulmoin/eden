@@ -28,7 +28,7 @@ async function createRoot(): Promise<string> {
 
 async function initRoot(root: string): Promise<void> {
   await expect(
-    runEdenCli(["init", "--project", root], { cwd: root }),
+    runEdenCli(["agent", "init", "--project", root], { cwd: root }),
   ).resolves.toBe(0);
 }
 
@@ -69,7 +69,7 @@ export default agent;
     );
 
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -78,7 +78,7 @@ export default agent;
 
     const errors: string[] = [];
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => {
@@ -111,15 +111,12 @@ export default agent;
 
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-identity-binding",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-identity-binding",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -214,15 +211,12 @@ export default greet;
 
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-selected-dependency",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-selected-dependency",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -304,15 +298,12 @@ export default agent;
 
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-authored-temporary",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-authored-temporary",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -355,7 +346,7 @@ export default agent;
 
     await initRoot(root);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -373,15 +364,12 @@ export default agent;
 
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-candidate-bound",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-candidate-bound",],
         {
           cwd: root,
           dryRunRunner: async () => {
@@ -431,15 +419,12 @@ export default agent;
     await initRoot(root);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-secret-boundary",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-secret-boundary",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -484,15 +469,12 @@ export default agent;
     await initRoot(root);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-lock-release",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-lock-release",],
         {
           cwd: root,
           dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -527,30 +509,24 @@ export default agent;
     await initRoot(root);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-concurrent-lock",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-concurrent-lock",],
         {
           cwd: root,
           dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
           remoteCommandRunner: async (request) => {
             if (request.kind === "secret-put") {
               concurrentExit = await runEdenCli(
-                [
-                  "deploy",
-                  "--project",
-                  root,
-                  "--env",
-                  "preview",
-                  "--name",
-                  "eden-concurrent-lock",
-                ],
+                ["agent", "deploy", "--project",
+                root,
+                "--env",
+                "preview",
+                "--name",
+                "eden-concurrent-lock",],
                 {
                   cwd: root,
                   dryRunRunner: async () => ({

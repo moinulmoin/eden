@@ -228,7 +228,7 @@ test("executes the authoritative eden-local manifest lifecycle without disturbin
   ).toBeDefined();
   const manifest = await readFile(missionManifestPath, "utf8");
   const commands = manifestCommands(manifest);
-  expect(commands.start).toContain("packages/cli/dist/index.js dev");
+  expect(commands.start).toContain("packages/cli/dist/index.js agent dev");
   expect(commands.start).toContain("EDEN_PORT=8797");
   expect(commands.start).toContain("EDEN_INSPECTOR_PORT=9297");
   expect(commands.stop).toContain("stopEdenDev");

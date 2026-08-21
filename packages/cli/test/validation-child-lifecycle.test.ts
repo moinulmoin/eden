@@ -33,7 +33,7 @@ async function createRoot(): Promise<string> {
 
 async function initRoot(root: string): Promise<void> {
   await expect(
-    runEdenCli(["init", "--project", root], { cwd: root }),
+    runEdenCli(["agent", "init", "--project", root], { cwd: root }),
   ).resolves.toBe(0);
 }
 
@@ -56,7 +56,7 @@ describe("CLI validation child lifecycle", () => {
     let request: EdenCliProcessRequest | undefined;
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         processRunner: {
           spawn(nextRequest) {
@@ -111,7 +111,7 @@ describe("CLI validation child lifecycle", () => {
     const noOpSignalListener = (): void => undefined;
     process.once("SIGINT", noOpSignalListener);
     try {
-      const buildPromise = runEdenCli(["build", "--project", root], {
+      const buildPromise = runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: () => {
@@ -157,7 +157,7 @@ describe("CLI validation child lifecycle", () => {
       },
     };
 
-    const buildPromise = runEdenCli(["build", "--project", root], {
+    const buildPromise = runEdenCli(["agent", "build", "--project", root], {
       cwd: root,
       stderr: (line) => errors.push(line),
       dryRunRunner: async () =>
@@ -205,7 +205,7 @@ describe("CLI validation child lifecycle", () => {
         async terminate() {},
       };
       await expect(
-        runEdenCli(["build", "--project", root], {
+        runEdenCli(["agent", "build", "--project", root], {
           cwd: root,
           stderr: (line) => errors.push(line),
           dryRunRunner: async () =>
@@ -244,7 +244,7 @@ describe("CLI validation child lifecycle", () => {
       },
     };
 
-    const buildPromise = runEdenCli(["build", "--project", root], {
+    const buildPromise = runEdenCli(["agent", "build", "--project", root], {
       cwd: root,
       stderr: (line) => errors.push(line),
       dryRunRunner: () => {
@@ -302,15 +302,12 @@ describe("CLI validation child lifecycle", () => {
     };
 
     const deployPromise = runEdenCli(
-      [
-        "deploy",
-        "--project",
-        root,
-        "--env",
-        "preview",
-        "--name",
-        "eden-reserved-remote-spawn",
-      ],
+      ["agent", "deploy", "--project",
+      root,
+      "--env",
+      "preview",
+      "--name",
+      "eden-reserved-remote-spawn",],
       {
         cwd: root,
         stderr: (line) => errors.push(line),
@@ -367,7 +364,7 @@ describe("CLI validation child lifecycle", () => {
       },
     };
 
-    const buildPromise = runEdenCli(["build", "--project", root], {
+    const buildPromise = runEdenCli(["agent", "build", "--project", root], {
       cwd: root,
       dryRunRunner: () => {
         queueMicrotask(() => process.emit("SIGTERM"));
@@ -412,7 +409,7 @@ describe("CLI validation child lifecycle", () => {
         if (signal !== undefined) signals.push(signal);
       },
     };
-    const buildPromise = runEdenCli(["build", "--project", root], {
+    const buildPromise = runEdenCli(["agent", "build", "--project", root], {
       cwd: root,
       dryRunRunner: () => {
         queueMicrotask(() => process.emit("SIGTERM"));
@@ -463,7 +460,7 @@ describe("CLI validation child lifecycle", () => {
     }>((resolve) => {
       releaseExit = () => resolve({ exitCode: 0, signal: null });
     });
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner: {
@@ -535,7 +532,7 @@ describe("CLI validation child lifecycle", () => {
       },
     };
 
-    const firstBuild = runEdenCli(["build", "--project", firstRoot], {
+    const firstBuild = runEdenCli(["agent", "build", "--project", firstRoot], {
       cwd: firstRoot,
       stopSignal: firstController.signal,
       dryRunRunner: () => {
@@ -543,7 +540,7 @@ describe("CLI validation child lifecycle", () => {
         return { process: firstProcess, result: firstResult };
       },
     });
-    const secondBuild = runEdenCli(["build", "--project", secondRoot], {
+    const secondBuild = runEdenCli(["agent", "build", "--project", secondRoot], {
       cwd: secondRoot,
       stopSignal: secondController.signal,
       dryRunRunner: () => {
@@ -614,7 +611,7 @@ describe("CLI validation child lifecycle", () => {
     const runnerStartedPromise = new Promise<void>((resolve) => {
       runnerStarted = resolve;
     });
-    const buildPromise = runEdenCli(["dev", "--project", root], {
+    const buildPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       dryRunRunner: () => {
@@ -650,7 +647,7 @@ describe("CLI validation child lifecycle", () => {
     const hook = new Promise<void>((resolve) => {
       releaseHook = resolve;
     });
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner: {
@@ -691,7 +688,7 @@ describe("CLI validation child lifecycle", () => {
       hookStarted = resolve;
     });
     const errors: string[] = [];
-    const buildPromise = runEdenCli(["build", "--project", root], {
+    const buildPromise = runEdenCli(["agent", "build", "--project", root], {
       cwd: root,
       stderr: (line) => errors.push(line),
       dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -723,7 +720,7 @@ describe("CLI validation child lifecycle", () => {
       hookStarted = resolve;
     });
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stderr: (line) => errors.push(line),
       buildPublicationHook: async (boundary) => {
@@ -756,7 +753,7 @@ describe("CLI validation child lifecycle", () => {
       resolveInitialBuild = resolve;
     });
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       stderr: (line) => errors.push(line),
@@ -787,7 +784,7 @@ describe("CLI validation child lifecycle", () => {
     const startedAt = Date.now();
 
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         buildProjectRunner: async (request) => {
           await new Promise((resolve) => setTimeout(resolve, 1_100));
@@ -810,7 +807,7 @@ describe("CLI validation child lifecycle", () => {
       generationStarted = resolve;
     });
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       buildProjectRunner: async (request) => {
@@ -869,7 +866,7 @@ describe("CLI validation child lifecycle", () => {
     });
     const startedAt = Date.now();
 
-    const buildPromise = runEdenCli(["build", "--project", root], {
+    const buildPromise = runEdenCli(["agent", "build", "--project", root], {
       cwd: root,
       stderr: (line) => errors.push(line),
       buildProjectRunner: async (request) => {
@@ -905,7 +902,7 @@ describe("CLI validation child lifecycle", () => {
     let spawned = false;
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         processRunner: {
@@ -945,7 +942,7 @@ describe("CLI validation child lifecycle", () => {
       ready = resolve;
     });
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner: {

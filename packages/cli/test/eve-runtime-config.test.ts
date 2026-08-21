@@ -165,7 +165,7 @@ describe("Eve runtime configuration", () => {
     });
   });
 
-  test("keeps ambient Native/control-plane credentials out of explicit runtime startup", async () => {
+  test("keeps ambient Agent/control-plane credentials out of explicit runtime startup", async () => {
     const root = await createRoot();
     const marker = "explicit-runtime-marker-9f7c";
     const envPath = await writeEnv(
@@ -240,16 +240,13 @@ describe("Eve runtime configuration", () => {
     const errors: string[] = [];
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-redaction",
-        ],
+        ["deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-redaction",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -496,18 +493,15 @@ describe("Eve runtime configuration", () => {
     const requests: string[] = [];
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-env-file",
-          "--env-file",
-          envPath,
-        ],
+        ["deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-env-file",
+        "--env-file",
+        envPath,],
         {
           cwd: root,
           eveRunner: async (request) => {
@@ -518,17 +512,14 @@ describe("Eve runtime configuration", () => {
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-missing-file",
-          `--env-file=${join(root, "missing.env")}`,
-        ],
+        ["deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-missing-file",
+        `--env-file=${join(root, "missing.env")}`,],
         {
           cwd: root,
           eveRunner: async (request) => {
@@ -552,18 +543,15 @@ describe("Eve runtime configuration", () => {
     const errors: string[] = [];
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-parser-error",
-          "--env-file",
-          missingPath,
-        ],
+        ["deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-parser-error",
+        "--env-file",
+        missingPath,],
         {
           cwd: root,
           stderr: (line) => errors.push(line),

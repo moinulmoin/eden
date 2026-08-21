@@ -75,7 +75,7 @@ function expectNoProcessReservations(label) {
 test("documents the supported CLI and clean-room operator boundaries", async () => {
   const readme = await readRepositoryFile("README.md");
   const commandHeadings = [
-    ...readme.matchAll(/^### `eden ([a-z]+)`$/gmu),
+    ...readme.matchAll(/^### `eden agent ([a-z]+)`$/gmu),
   ].map((match) => match[1]);
 
   expect(new Set(commandHeadings)).toEqual(
@@ -100,7 +100,7 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   expect(readme).not.toMatch(/Bearer\s+[A-Za-z0-9_-]{12,}/i);
 });
 
-test("exposes the four-command help surface and rejects unsupported commands", async () => {
+test("exposes the Deploy-first root help and rejects unsupported commands", async () => {
   const help = [];
   const errors = [];
   await expect(
@@ -110,7 +110,7 @@ test("exposes the four-command help surface and rejects unsupported commands", a
     }),
   ).resolves.toBe(0);
 
-  expect(help.join("\n")).toMatch(/init[\s\S]*build[\s\S]*dev[\s\S]*deploy/);
+  expect(help.join("\n")).toMatch(/preflight[\s\S]*deploy[\s\S]*destroy[\s\S]*agent/);
   expect(help.join("\n")).not.toMatch(
     /^\s+(?:run|start|stop|shell|schedule)\s{2,}/imu,
   );
@@ -122,7 +122,7 @@ test("exposes the four-command help surface and rejects unsupported commands", a
       stderr: (line) => errors.push(line),
     }),
   ).resolves.toBe(1);
-  expect(errors.join("\n")).toMatch(/unknown|init|build|dev|deploy/i);
+  expect(errors.join("\n")).toMatch(/unknown|preflight|deploy|destroy|agent/i);
 });
 
 test("ships Apache licensing, Eve attribution, and modified-derivative markers", async () => {

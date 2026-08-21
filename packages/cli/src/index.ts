@@ -75,6 +75,7 @@ import type {
   EdenDiagnostic,
 } from "@eden/compiler";
 import {
+  EVE_CLI_COMMANDS,
   EveCliError,
   eveHelpText,
   parseEveArguments,
@@ -234,28 +235,27 @@ type InternalConfigReadConfig = (
 };
 
 export const EDEN_CLI_COMMANDS = [
+  "preflight",
+  "deploy",
+  "destroy",
+  "agent",
+] as const;
+
+export type EdenCliCommand = (typeof EDEN_CLI_COMMANDS)[number];
+
+export const EDEN_AGENT_COMMANDS = [
   "init",
   "dev",
   "build",
   "deploy",
 ] as const;
 
-export type EdenCliCommand = (typeof EDEN_CLI_COMMANDS)[number];
+export type EdenAgentCommand = (typeof EDEN_AGENT_COMMANDS)[number];
 
 export const EDEN_LOCAL_HOST = "127.0.0.1" as const;
 export const EDEN_LOCAL_PORT = 8797 as const;
 export const EDEN_LOCAL_INSPECTOR_HOST = "127.0.0.1" as const;
 export const EDEN_LOCAL_INSPECTOR_PORT = 9297 as const;
-
-export interface EdenCliInvocation {
-  readonly command: EdenCliCommand;
-  readonly projectRoot?: string;
-}
-
-export interface EdenCliResult {
-  readonly command: EdenCliCommand;
-  readonly ok: boolean;
-}
 
 export interface EdenCliDryRunRequest {
   readonly cwd: string;
@@ -428,7 +428,7 @@ export interface EdenCliRunOptions {
   readonly stdout?: (line: string) => void;
   readonly stderr?: (line: string) => void;
   /**
-   * Eve execution is a separate control-plane seam. Native runners never
+   * Eve execution is a separate control-plane seam. Agent runners never
    * receive an Eve invocation, and the default path fails closed.
    */
   readonly eveRunner?: (
@@ -514,7 +514,7 @@ export type EdenBuildPublicationBoundary =
   | "after-current-promotion";
 
 interface ParsedInvocation {
-  readonly command: EdenCliCommand;
+  readonly command: EdenAgentCommand;
   readonly projectRoot?: string;
   readonly environment?: "preview" | "production";
   readonly workerName?: string;
@@ -628,9 +628,9 @@ export default greet;
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "eden build",
-    "dev": "eden dev",
-    "deploy": "eden deploy"
+    "build": "eden agent build",
+    "dev": "eden agent dev",
+    "deploy": "eden agent deploy"
   }
 }
 `,
@@ -715,24 +715,29 @@ const CONFIG_CANDIDATES = [
 const USAGE = `Usage: eden <command> [options]
 
 Commands:
-  init    Create a minimal Eden project scaffold
-  build   Validate and build a Worker-safe Eden artifact
-  dev     Run the local Eden Worker on 127.0.0.1:8797 (inspector 9297)
+  preflight  Build and inspect a local Eve candidate without remote mutation
+  deploy     Deploy the selected Eve project to the exact named target
+  destroy    Remove the exact owned Eve target
+  agent      Author and operate an agent with Eden's framework
+
+Deploy commands require explicit --project, --env, and --name selectors.
+Run eden <preflight|deploy|destroy> --help for command-specific options.
+Run eden agent --help for Eden Agent commands.
+`;
+
+const AGENT_USAGE = `Usage: eden agent <command> [options]
+
+Commands:
+  init    Create a minimal Eden Agent project scaffold
+  build   Validate and build a Worker-safe Eden Agent artifact
+  dev     Run the local Eden Agent Worker on 127.0.0.1:8797 (inspector 9297)
   deploy  Build, validate, and deploy a selected remote environment
-  eve     Host an existing Eve project through preflight, deploy, or destroy
 
 Options:
   --project <path>  Select the project root (defaults to the current directory)
   --env <name>      Select preview or production for deploy (defaults to preview)
   --name <name>     Select the deployed Worker name for deploy
   --help            Show this help
-
-Eve namespace:
-  eden eve --help
-  eden eve preflight --project <path> --env <preview|production> --name <name>
-  eden eve deploy --project <path> --env <preview|production> --name <name>
-  eden eve destroy --project <path> --env <preview|production> --name <name>
-  Eve requires explicit --project, --env, and --name selectors.
 `;
 
 function defaultStdout(line: string): void {
@@ -827,15 +832,27 @@ function parseWorkerNameValue(
 function parseArguments(
   args: readonly string[],
 ): ParsedInvocation | "help" {
-  if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
+  if (
+    args[0] !== "agent"
+  ) {
+    throw cliError({
+      code: "COMMAND_UNKNOWN",
+      message: `Unknown Eden command "${args[0] ?? ""}".`,
+    });
+  }
+  if (
+    args.length === 1 ||
+    args[1] === "--help" ||
+    args[1] === "-h"
+  ) {
     return "help";
   }
 
-  const commandValue = args[0];
-  if (commandValue === undefined || !isEdenCliCommand(commandValue)) {
+  const commandValue = args[1];
+  if (commandValue === undefined || !isEdenAgentCommand(commandValue)) {
     throw cliError({
       code: "COMMAND_UNKNOWN",
-      message: `Unknown Eden command "${commandValue ?? ""}".`,
+      message: `Unknown Eden Agent command "${commandValue ?? ""}".`,
     });
   }
 
@@ -843,7 +860,7 @@ function parseArguments(
   let environment: "preview" | "production" | undefined;
   let workerName: string | undefined;
   let help = false;
-  for (let index = 1; index < args.length; index += 1) {
+  for (let index = 2; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--help" || argument === "-h") {
       help = true;
@@ -925,7 +942,7 @@ function parseArguments(
   ) {
     throw cliError({
       code: "DEPLOY_OPTIONS_UNSUPPORTED",
-      message: "The --env and --name options are supported only by eden deploy.",
+      message: "The --env and --name options are supported only by eden agent deploy.",
     });
   }
   return {
@@ -2560,7 +2577,7 @@ async function writeScaffoldUnlocked(
     throw cliError({
       code: "INIT_ROOT_NOT_EMPTY",
       message:
-        "eden init requires an empty selected project root and will not overwrite existing files.",
+        "eden agent init requires an empty selected project root and will not overwrite existing files.",
     });
   }
 
@@ -8500,7 +8517,7 @@ async function runDeploy(
       throw cliError({
         code: "WORKER_NAME_MISSING",
         message:
-          "The selected deployment environment must define a Worker name or eden deploy must receive --name.",
+          "The selected deployment environment must define a Worker name or eden agent deploy must receive --name.",
       });
     }
   } catch (error: unknown) {
@@ -9252,7 +9269,7 @@ async function runEveInvocation(
     }
     throw new EveCliError({
       code: "EVE_EXECUTION_FAILED",
-      message: `The eve ${invocation.command} operation failed.`,
+      message: `The ${invocation.command} operation failed.`,
     });
   }
 }
@@ -9264,12 +9281,27 @@ export async function runEdenCli(
   const stdout = options.stdout ?? defaultStdout;
   const stderr = options.stderr ?? defaultStderr;
   try {
-    const parsed: ParsedInvocation | ParsedEveInvocation | "help" =
-      args[0] === "eve"
-        ? parseEveArguments(args)
-        : parseArguments(args);
-    if (parsed === "help") {
+    if (
+      args.length === 0 ||
+      args[0] === "--help" ||
+      args[0] === "-h"
+    ) {
       stdout(USAGE.trimEnd());
+      return 0;
+    }
+    const parsed: ParsedInvocation | ParsedEveInvocation | "help" =
+      args[0] === "agent"
+        ? parseArguments(args)
+        : (EVE_CLI_COMMANDS as readonly string[]).includes(args[0] ?? "")
+          ? parseEveArguments(args)
+          : (() => {
+            throw cliError({
+              code: "COMMAND_UNKNOWN",
+              message: `Unknown Eden command "${args[0] ?? ""}".`,
+            });
+          })();
+    if (parsed === "help") {
+      stdout(AGENT_USAGE.trimEnd());
       return 0;
     }
     if (
@@ -9314,6 +9346,10 @@ export async function main(
 
 export function isEdenCliCommand(value: string): value is EdenCliCommand {
   return (EDEN_CLI_COMMANDS as readonly string[]).includes(value);
+}
+
+function isEdenAgentCommand(value: string): value is EdenAgentCommand {
+  return (EDEN_AGENT_COMMANDS as readonly string[]).includes(value);
 }
 
 if (

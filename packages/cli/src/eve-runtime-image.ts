@@ -334,7 +334,7 @@ export function validateEveHostRequirements(
       "UNSUPPORTED_HOST_REQUIREMENT",
       "sandbox",
       "The selected Eve sandbox has an unknown or unsupported Container host requirement.",
-      "Use a sandbox that can prewarm without privileged, device, or host-kernel access, or run the project outside Eden Eve.",
+      "Use a sandbox that can prewarm without privileged, device, or host-kernel access, or run the project outside Eden Deploy.",
     );
   }
   if (requirements.privileged) {
@@ -350,7 +350,7 @@ export function validateEveHostRequirements(
       "UNSUPPORTED_HOST_REQUIREMENT",
       "device access",
       "The Eve project requires a device or unknown device capability outside the hosting contract.",
-      "Remove the device requirement or choose a supported host; Eden does not grant devices or fall back to Native.",
+      "Remove the device requirement or choose a supported host; Eden does not grant devices or fall back to Agent.",
     );
   }
   if (requirements.kernel !== "supported") {
@@ -1556,7 +1556,7 @@ export async function buildEveRuntimeImage(
           "--env",
           `${name}=${value}`,
         ])
-        : ["--env-file", "-"]),
+        : ["--env-file", "/dev/stdin"]),
       state.imageId,
     ] as const;
     const boot = request.runtimeInjection === undefined

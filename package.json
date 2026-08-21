@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A Cloudflare-native durable agent framework.",
+  "description": "Deploy existing Eve projects and run Eden Agents on Cloudflare.",
+  "license": "Apache-2.0",
   "packageManager": "pnpm@11.21.0",
   "engines": {
     "node": ">=24.17.0 <25"

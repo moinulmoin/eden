@@ -1,8 +1,10 @@
 {
   "name": "@eden/definitions",
   "version": "0.1.0",
+  "description": "Shared definitions for Eden Agents and tools.",
   "type": "module",
   "private": true,
+  "license": "Apache-2.0",
   "types": "./dist/index.d.ts",
   "module": "./dist/index.js",
   "exports": {

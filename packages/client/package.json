@@ -1,8 +1,10 @@
 {
   "name": "@eden/client",
   "version": "0.1.0",
+  "description": "Typed client for Eden Agent sessions and journals.",
   "type": "module",
   "private": true,
+  "license": "Apache-2.0",
   "types": "./dist/index.d.ts",
   "module": "./dist/index.js",
   "exports": {

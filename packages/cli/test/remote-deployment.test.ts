@@ -55,10 +55,10 @@ describe("eden remote deployment orchestration", () => {
     const validations: EdenCliRemoteValidationRequest[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["deploy", "--project", root, "--env", "preview", "--name", "eden-gate-preview"], {
+      runEdenCli(["agent", "deploy", "--project", root, "--env", "preview", "--name", "eden-gate-preview"], {
         cwd: root,
         dryRunRunner: async (request) => {
           dryRuns.push(request);
@@ -113,7 +113,7 @@ describe("eden remote deployment orchestration", () => {
     const root = await createRoot();
     const commands: EdenCliRemoteCommandRequest[] = [];
     const errors: string[] = [];
-    expect(await runEdenCli(["init", "--project", root], { cwd: root })).toBe(0);
+    expect(await runEdenCli(["agent", "init", "--project", root], { cwd: root })).toBe(0);
     await writeFile(
       join(root, "wrangler.json"),
       `${JSON.stringify({
@@ -126,7 +126,7 @@ describe("eden remote deployment orchestration", () => {
     );
 
     await expect(
-      runEdenCli(["deploy", "--project", root, "--env", "preview"], {
+      runEdenCli(["agent", "deploy", "--project", root, "--env", "preview"], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -162,7 +162,7 @@ describe("eden remote deployment orchestration", () => {
       "env": { "preview": { "vars": {}, }, "production": { "name": "eden-overlay-production", }, },
     }\n`;
     for (const root of roots) {
-      expect(await runEdenCli(["init", "--project", root], { cwd: root })).toBe(0);
+      expect(await runEdenCli(["agent", "init", "--project", root], { cwd: root })).toBe(0);
       await writeFile(join(root, "wrangler.jsonc"), config, "utf8");
     }
 
@@ -171,7 +171,7 @@ describe("eden remote deployment orchestration", () => {
       return { exitCode: 0, stdout: request.kind === "deploy" ? "https://overlay.example.workers.dev\n" : "", stderr: "" };
     };
     const deploy = (root: string, env: "preview" | "production") =>
-      runEdenCli(["deploy", "--project", root, "--env", env], {
+      runEdenCli(["agent", "deploy", "--project", root, "--env", env], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
         remoteCommandRunner,
@@ -194,10 +194,10 @@ describe("eden remote deployment orchestration", () => {
   test("allows explicit secret cleanup without deleting an unattempted Worker", async () => {
     const root = await createRoot();
     const commands: EdenCliRemoteCommandRequest[] = [];
-    expect(await runEdenCli(["init", "--project", root], { cwd: root })).toBe(0);
+    expect(await runEdenCli(["agent", "init", "--project", root], { cwd: root })).toBe(0);
 
     await expect(
-      runEdenCli(["deploy", "--project", root, "--name", "eden-secret-only"], {
+      runEdenCli(["agent", "deploy", "--project", root, "--name", "eden-secret-only"], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
         remoteCommandRunner: async (request) => {
@@ -225,10 +225,10 @@ describe("eden remote deployment orchestration", () => {
     const commands: EdenCliRemoteCommandRequest[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["deploy", "--project", root, "--name", "eden-gate-failure"], {
+      runEdenCli(["agent", "deploy", "--project", root, "--name", "eden-gate-failure"], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -270,9 +270,9 @@ describe("eden remote deployment orchestration", () => {
       releaseValidation = () => resolve({ ok: false });
     });
 
-    expect(await runEdenCli(["init", "--project", root], { cwd: root })).toBe(0);
+    expect(await runEdenCli(["agent", "init", "--project", root], { cwd: root })).toBe(0);
     const deployPromise = runEdenCli(
-      ["deploy", "--project", root, "--name", "eden-pending-validation"],
+      ["agent", "deploy", "--project", root, "--name", "eden-pending-validation"],
       {
         cwd: root,
         stopSignal: stopController.signal,
@@ -322,19 +322,16 @@ describe("eden remote deployment orchestration", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-cas-replacement",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-cas-replacement",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -388,20 +385,17 @@ describe("eden remote deployment orchestration", () => {
     let signalScheduled = false;
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
 
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-remote-handle-signal",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-remote-handle-signal",],
         {
           cwd: root,
           dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -461,19 +455,16 @@ describe("eden remote deployment orchestration", () => {
     });
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-cancel-cleanup",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-cancel-cleanup",],
         {
           cwd: root,
           dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -530,19 +521,16 @@ describe("eden remote deployment orchestration", () => {
     });
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-remote-late-handle",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-remote-late-handle",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -580,19 +568,16 @@ describe("eden remote deployment orchestration", () => {
     let deployEntry = "";
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-source-cas",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-source-cas",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -652,19 +637,16 @@ describe("eden remote deployment orchestration", () => {
     let mutated = false;
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-final-spawn-cas",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-final-spawn-cas",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -720,19 +702,16 @@ describe("eden remote deployment orchestration", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-post-preflight-cas",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-post-preflight-cas",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -786,19 +765,16 @@ describe("eden remote deployment orchestration", () => {
     let replaced = false;
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-post-final-read-cas",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-post-final-read-cas",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -862,18 +838,15 @@ describe("eden remote deployment orchestration", () => {
     });
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     const deployPromise = runEdenCli(
-      [
-        "deploy",
-        "--project",
-        root,
-        "--env",
-        "preview",
-        "--name",
-        "eden-pending-remote-cleanup",
-      ],
+      ["agent", "deploy", "--project",
+      root,
+      "--env",
+      "preview",
+      "--name",
+      "eden-pending-remote-cleanup",],
       {
         cwd: root,
         stderr: (line) => errors.push(line),
@@ -930,19 +903,16 @@ describe("eden remote deployment orchestration", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-sync-throw",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-sync-throw",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -990,19 +960,16 @@ describe("eden remote deployment orchestration", () => {
     };
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-promise-mutation-compensation",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-promise-mutation-compensation",],
         {
           cwd: root,
           dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -1054,18 +1021,15 @@ describe("eden remote deployment orchestration", () => {
 
     try {
       await expect(
-        runEdenCli(["init", "--project", root], { cwd: root }),
+        runEdenCli(["agent", "init", "--project", root], { cwd: root }),
       ).resolves.toBe(0);
       const deployPromise = runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-stop-before-result",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-stop-before-result",],
         {
           cwd: root,
           stopSignal: stopController.signal,
@@ -1129,18 +1093,15 @@ describe("eden remote deployment orchestration", () => {
     });
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     const deployPromise = runEdenCli(
-      [
-        "deploy",
-        "--project",
-        root,
-        "--env",
-        "preview",
-        "--name",
-        "eden-held-failed-remote",
-      ],
+      ["agent", "deploy", "--project",
+      root,
+      "--env",
+      "preview",
+      "--name",
+      "eden-held-failed-remote",],
       {
         cwd: root,
         stopSignal: stopController.signal,
@@ -1226,19 +1187,16 @@ describe("eden remote deployment orchestration", () => {
     let sawLeaseBeforeExit = false;
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-result-before-exit",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-result-before-exit",],
         {
           cwd: root,
           remoteCommandRunner: (request) => {
@@ -1301,18 +1259,15 @@ describe("eden remote deployment orchestration", () => {
     let releaseLateResult: (() => void) | undefined;
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     const deployPromise = runEdenCli(
-      [
-        "deploy",
-        "--project",
-        root,
-        "--env",
-        "preview",
-        "--name",
-        "eden-exit-before-result",
-      ],
+      ["agent", "deploy", "--project",
+      root,
+      "--env",
+      "preview",
+      "--name",
+      "eden-exit-before-result",],
       {
         cwd: root,
         stopSignal: stopController.signal,
@@ -1374,18 +1329,15 @@ describe("eden remote deployment orchestration", () => {
     let terminateCount = 0;
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     const deployPromise = runEdenCli(
-      [
-        "deploy",
-        "--project",
-        root,
-        "--env",
-        "preview",
-        "--name",
-        "eden-late-child-after-timeout",
-      ],
+      ["agent", "deploy", "--project",
+      root,
+      "--env",
+      "preview",
+      "--name",
+      "eden-late-child-after-timeout",],
       {
         cwd: root,
         remoteCommandRunner: (request) => {
@@ -1445,18 +1397,15 @@ describe("eden remote deployment orchestration", () => {
     });
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     const deployPromise = runEdenCli(
-      [
-        "deploy",
-        "--project",
-        root,
-        "--env",
-        "preview",
-        "--name",
-        "eden-serialized-compensation",
-      ],
+      ["agent", "deploy", "--project",
+      root,
+      "--env",
+      "preview",
+      "--name",
+      "eden-serialized-compensation",],
       {
         cwd: root,
         remoteCommandRunner: (request) => {
@@ -1513,10 +1462,10 @@ describe("eden remote deployment orchestration", () => {
     const errors: string[] = [];
     let tamperedLease = "";
 
-    expect(await runEdenCli(["init", "--project", root], { cwd: root })).toBe(0);
+    expect(await runEdenCli(["agent", "init", "--project", root], { cwd: root })).toBe(0);
     await expect(
       runEdenCli(
-        ["deploy", "--project", root, "--name", "eden-compensation-lease"],
+        ["agent", "deploy", "--project", root, "--name", "eden-compensation-lease"],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -1575,19 +1524,16 @@ describe("eden remote deployment orchestration", () => {
     let originalLockContents = "";
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-retained-lease",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-retained-lease",],
         {
           cwd: root,
           remoteCommandRunner: async (request) => {
@@ -1674,7 +1620,7 @@ describe("eden remote deployment orchestration", () => {
       token: "orphaned-deploy-token",
     };
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await writeFile(
       orphanedResidue,
@@ -1683,15 +1629,12 @@ describe("eden remote deployment orchestration", () => {
     );
     await expect(
       runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-orphaned-lease-residue",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-orphaned-lease-residue",],
         {
           cwd: root,
           dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -1719,7 +1662,7 @@ describe("eden remote deployment orchestration", () => {
     await writeFile(unverifiedResidue, unverifiedBytes, "utf8");
     const errors: string[] = [];
     await expect(
-      runEdenCli(["deploy", "--project", unverifiedRoot, "--name", "eden-unverified-residue"], {
+      runEdenCli(["agent", "deploy", "--project", unverifiedRoot, "--name", "eden-unverified-residue"], {
         cwd: unverifiedRoot,
         stderr: (line) => errors.push(line),
         remoteBearerSecret: "unverified-residue-secret",
@@ -1749,18 +1692,15 @@ describe("eden remote deployment orchestration", () => {
 
     try {
       await expect(
-        runEdenCli(["init", "--project", root], { cwd: root }),
+        runEdenCli(["agent", "init", "--project", root], { cwd: root }),
       ).resolves.toBe(0);
       const deployPromise = runEdenCli(
-        [
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eden-rejected-exit-observer",
-        ],
+        ["agent", "deploy", "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eden-rejected-exit-observer",],
         {
           cwd: root,
           stopSignal: stopController.signal,

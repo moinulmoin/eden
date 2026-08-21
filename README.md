@@ -5,24 +5,24 @@ Eden has two separated surfaces:
 1. **Eden Deploy** — host an *existing Eve project* on Cloudflare as-is. Eden
    builds the project with its own pinned Eve toolchain, packages the real
    Node/Nitro server into one bounded Cloudflare Container, and places a
-   generic Worker in front of it. The `eden eve` namespace (`deploy`,
-   `destroy`, and an optional read-only `preflight`) is the deploy-first
-   product surface.
-2. **Eden Native** — a small, Cloudflare-native durable agent framework:
+   generic Worker in front of it. `eden deploy`, `eden destroy`, and the
+   optional read-only `eden preflight` command form the deploy-first product
+   surface.
+2. **Eden Agent** — a small, Cloudflare-native durable agent framework:
    filesystem-first authoring, a Node-side compiler, a Worker-safe generated
    bundle, one authenticated Worker host, one SQLite-backed `EdenSession`
    Durable Object, a bounded model/tool/final-response turn, and an NDJSON
-   journal stream, driven by `eden init`, `eden build`, `eden dev`, and
-   `eden deploy`.
+   journal stream, driven by `eden agent init`, `eden agent build`,
+   `eden agent dev`, and `eden agent deploy`.
 
-Deploy never invokes Native, rewrites Eve source, lowers Eve into Native, maps
-Eve application semantics onto Cloudflare primitives, or uses Native as a
-fallback. The two surfaces stay separate on purpose.
+Deploy never invokes the Agent framework, rewrites Eve source, lowers Eve into
+an Eden Agent, maps Eve application semantics onto Cloudflare primitives, or
+uses the Agent runtime as a fallback. The two surfaces stay separate on purpose.
 
-The Native command surface is intentionally frozen at four commands:
-`eden init`, `eden build`, `eden dev`, and `eden deploy`. The Eve hosting
-surface adds only `eden eve preflight`, `eden eve deploy`, and
-`eden eve destroy`. No other Eden command is implied.
+The Agent command surface is intentionally frozen beneath one namespace:
+`eden agent init`, `eden agent build`, `eden agent dev`, and
+`eden agent deploy`. The top-level Deploy surface adds only `eden preflight`,
+`eden deploy`, and `eden destroy`. No other Eden command is implied.
 
 ## Setup
 
@@ -75,8 +75,8 @@ through one generic Worker. Eden owns build orchestration, packaging,
 publication, deployment identity, and cleanup — nothing else.
 
 ```sh
-eden eve deploy  --project <path> --env preview --name <name>
-eden eve destroy --project <path> --env preview --name <name>
+eden deploy  --project <path> --env preview --name <name>
+eden destroy --project <path> --env preview --name <name>
 ```
 
 `deploy` is the primary workflow and runs every required check inline; it does
@@ -89,7 +89,7 @@ deployment record, and never broadens cleanup to sibling targets.
 The optional read-only diagnostic is:
 
 ```sh
-eden eve preflight --project <path> --env preview --name <name>
+eden preflight --project <path> --env preview --name <name>
 ```
 
 Every Eve command requires explicit `--project`, `--env` (`preview` or
@@ -124,26 +124,26 @@ Reserved host variables (`HOST`, `PORT`, `NITRO_*`, `NODE_ENV`, and Eden's own
 identity variables) are rejected in that file, and every emitted record is
 redacted.
 
-### Deploy, Adapt, and Native
+### Deploy, Adapt, and Agent
 
 - **Eden Deploy** (this release) hosts an existing Eve project as-is through
-  the `eden eve` namespace.
+  the top-level `eden preflight`, `eden deploy`, and `eden destroy` commands.
 - **Eden Adapt** is a separate, deliberate future concern: per-primitive
   migration of Vercel-specific pieces onto Cloudflare alternatives. Deploy
   never invokes Adapt automatically.
-- **Eden Native** remains the `eden init`, `eden build`, `eden dev`, and
-  `eden deploy` path documented in the rest of this file.
+- **Eden Agent** remains the `eden agent init`, `eden agent build`,
+  `eden agent dev`, and `eden agent deploy` path documented below.
 
 Deploy performs no source rewriting, no automatic migration, no Workflow World
-or sandbox replacement, and never falls back to the Native runtime when
+or sandbox replacement, and never falls back to the Agent runtime when
 hosting an Eve project.
 
-## Supported CLI
+## Eden Agent CLI
 
-### `eden init`
+### `eden agent init`
 
-`eden init` creates a minimal project only in an empty selected directory. It
-writes:
+`eden agent init` creates a minimal project only in an empty selected
+directory. It writes:
 
 ```text
 agent/instructions.md
@@ -161,11 +161,12 @@ Use `--project <path>` to select a root explicitly. Without it, Eden uses the
 current working directory exactly. It does not search parent or sibling
 directories.
 
-### `eden build`
+### `eden agent build`
 
-`eden build` discovers and validates the selected project, normalizes the agent
-and tools, creates one coherent `.eden/` generation, and runs Wrangler's
-compatibility dry-run. A successful build produces inspectable artifacts:
+`eden agent build` discovers and validates the selected project, normalizes
+the agent and tools, creates one coherent `.eden/` generation, and runs
+Wrangler's compatibility dry-run. A successful build produces inspectable
+artifacts:
 
 ```text
 .eden/discovery.json
@@ -180,10 +181,10 @@ The manifest, module map, bundle digest, and build metadata describe one
 generation. A failed build is not promoted over the last coherent generation.
 The command validates compatibility only; it does not deploy.
 
-### `eden dev`
+### `eden agent dev`
 
-`eden dev` builds before starting the local Worker and watches the authored
-`agent/` tree for coherent rebuilds. It uses only:
+`eden agent dev` builds before starting the local Worker and watches the
+authored `agent/` tree for coherent rebuilds. It uses only:
 
 - Worker: `http://127.0.0.1:8797`
 - Wrangler inspector: `127.0.0.1:9297`
@@ -197,10 +198,10 @@ invoking environment. Eden passes that value to Wrangler without putting it in
 the project, generated artifacts, or normal output. Keep the value outside the
 repository and never paste it into a command transcript.
 
-### `eden deploy`
+### `eden agent deploy`
 
-`eden deploy` accepts only `--env preview` and `--env production`. If `--env`
-is omitted, the target is `preview`; production must be explicit.
+`eden agent deploy` accepts only `--env preview` and `--env production`. If
+`--env` is omitted, the target is `preview`; production must be explicit.
 The command builds the selected generation, verifies its artifact identity,
 runs an environment-specific Wrangler compatibility dry-run, provisions
 `EDEN_BEARER_SECRET` through Wrangler stdin, deploys the generated runtime
@@ -213,7 +214,7 @@ temporary validation:
 
 ```sh
 export EDEN_BEARER_SECRET="$(node -e 'process.stdout.write(`eden-gate-${require("crypto").randomBytes(24).toString("hex")}`)')"
-eden deploy \
+eden agent deploy \
   --project "$PROJECT_ROOT" \
   --env preview \
   --name "eden-gate-preview-$(date +%s)"
@@ -225,8 +226,8 @@ Worker URL. A deployment failure is reported separately from compatibility,
 propagation, authentication, lifecycle, model, and cleanup failures.
 
 If a validation harness provisions the secret separately instead of using
-`eden deploy`, the pinned Wrangler command must remain explicitly scoped to the
-same unique Worker:
+`eden agent deploy`, the pinned Wrangler command must remain explicitly
+scoped to the same unique Worker:
 
 ```sh
 printf '%s' "$EDEN_BEARER_SECRET" |
@@ -262,8 +263,8 @@ to be validator-generated:
 
 ```sh
 PROJECT_ROOT="$(mktemp -d)"
-eden init --project "$PROJECT_ROOT"
-eden build --project "$PROJECT_ROOT"
+eden agent init --project "$PROJECT_ROOT"
+eden agent build --project "$PROJECT_ROOT"
 ```
 
 Check that the generated root contains the five scaffold entries and `.eden/`
@@ -278,7 +279,7 @@ project and start development:
 
 ```sh
 export EDEN_BEARER_SECRET
-eden dev --project "$PROJECT_ROOT"
+eden agent dev --project "$PROJECT_ROOT"
 ```
 
 In another terminal, use the same environment value for authenticated requests.
@@ -348,9 +349,9 @@ turn.completed
 session.waiting
 ```
 
-Finish local validation by sending `Ctrl-C` to the `eden dev` process, confirming
-that ports `8797` and `9297` are no longer listening, and removing only the
-temporary root created by this walkthrough.
+Finish local validation by sending `Ctrl-C` to the `eden agent dev` process,
+confirming that ports `8797` and `9297` are no longer listening, and removing
+only the temporary root created by this walkthrough.
 
 For the complete serial local conformance gate, run this repository-owned
 validator after the frozen install:
@@ -377,8 +378,8 @@ An authorized remote validation uses a unique temporary Worker name and an
 isolated environment target. The repository-owned flow is:
 
 1. Build the exact generation that passed local validation.
-2. Run `eden deploy --env <environment> --name <unique-worker-name>` with
-   `EDEN_BEARER_SECRET` held only in the invoking environment. `eden deploy`
+2. Run `eden agent deploy --env <environment> --name <unique-worker-name>`
+   with `EDEN_BEARER_SECRET` held only in the invoking environment. The command
    supplies the secret to Wrangler through stdin.
 3. Poll the Worker until unauthenticated health fails closed and authenticated
    health, info, session creation, and the Durable Object namespace are ready.
@@ -484,9 +485,9 @@ External effects are not exactly-once unless the destination honors Eden's
 stable idempotency coordinate. Alarms are at-least-once and bounded. Long
 sleeps, approvals, external-event waits, extended retries, and dynamic hosted
 bundles are future seams, not current guarantees. The local HTTP walkthrough
-uses a deterministic bounded runtime fixture; `eden deploy` switches the same
-generated bundle to the live Workers AI adapter and verifies remote parity
-through the full bounded turn.
+uses a deterministic bounded runtime fixture; `eden agent deploy` switches
+the same generated bundle to the live Workers AI adapter and verifies remote
+parity through the full bounded turn.
 
 ## Out of scope
 
@@ -498,10 +499,10 @@ by this milestone.
 
 ## Cleanup
 
-For local validation, stop only the `eden dev` process started by the current
-walkthrough, verify `127.0.0.1:8797` and `127.0.0.1:9297` are free, and remove
-only the known temporary project root. Do not use broad process-name or
-port-kill commands.
+For local validation, stop only the `eden agent dev` process started by the
+current walkthrough, verify `127.0.0.1:8797` and `127.0.0.1:9297` are free,
+and remove only the known temporary project root. Do not use broad process-name
+or port-kill commands.
 
 For an authorized remote validation, remove only the unique Worker, bearer
 secret, and other resources created by that run. Verify the deployment URL is

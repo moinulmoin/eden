@@ -1,8 +1,10 @@
 {
   "name": "@eden/cli",
   "version": "0.1.0",
+  "description": "CLI for Eden Deploy and Eden Agent.",
   "type": "module",
   "private": true,
+  "license": "Apache-2.0",
   "types": "./dist/index.d.ts",
   "module": "./dist/index.js",
   "bin": {

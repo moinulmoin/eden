@@ -99,7 +99,7 @@ describe("eden CLI project commands", () => {
     vi.stubEnv("PATH", psShimDirectory);
     try {
       await expect(
-        runEdenCli(["init", "--project", root], {
+        runEdenCli(["agent", "init", "--project", root], {
           cwd: root,
           stderr: (line) => errors.push(line),
         }),
@@ -126,7 +126,7 @@ describe("eden CLI project commands", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
       }),
@@ -154,7 +154,7 @@ describe("eden CLI project commands", () => {
       const errors: string[] = [];
 
       await expect(
-        runEdenCli(["init", "--project", root], {
+        runEdenCli(["agent", "init", "--project", root], {
           cwd: root,
           stderr: (line) => errors.push(line),
         }),
@@ -178,7 +178,7 @@ describe("eden CLI project commands", () => {
     const output: string[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         stdout: (line) => output.push(line),
       }),
@@ -224,7 +224,7 @@ describe("eden CLI project commands", () => {
       code: "ENOENT",
     });
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
 
     await expect(stat(externalTrustDescriptor)).rejects.toMatchObject({
@@ -251,7 +251,7 @@ describe("eden CLI project commands", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
       }),
@@ -276,7 +276,7 @@ describe("eden CLI project commands", () => {
       const errors: string[] = [];
 
       await expect(
-        runEdenCli(["init", "--project", root], {
+        runEdenCli(["agent", "init", "--project", root], {
           cwd: root,
           stderr: (line) => errors.push(line),
         }),
@@ -297,7 +297,7 @@ describe("eden CLI project commands", () => {
     const beforeEntries = await readdir(provenanceRoot);
 
     await expect(
-      runEdenCli(["init", "--project", provenanceRoot], { cwd: provenanceRoot }),
+      runEdenCli(["agent", "init", "--project", provenanceRoot], { cwd: provenanceRoot }),
     ).resolves.toBe(1);
     await expect(readdir(provenanceRoot)).resolves.toEqual(beforeEntries);
     await expect(readFile(transition, "utf8")).resolves.toBe(transitionBytes);
@@ -308,7 +308,7 @@ describe("eden CLI project commands", () => {
     await writeFile(statePath, stateBytes, "utf8");
     const errors: string[] = [];
     await expect(
-      runEdenCli(["init", "--project", malformedRoot], {
+      runEdenCli(["agent", "init", "--project", malformedRoot], {
         cwd: malformedRoot,
         stderr: (line) => errors.push(line),
       }),
@@ -320,7 +320,7 @@ describe("eden CLI project commands", () => {
   test("recovers only missing canonical files and retains fresh-process residue", async () => {
     const root = await createRoot("eden-cli-init-monotonic-recovery-");
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         initPublicationHook: async (boundary) => {
           if (boundary === "after-state-write") {
@@ -334,7 +334,7 @@ describe("eden CLI project commands", () => {
     const stateBytes = await readFile(statePath, "utf8");
     const state = JSON.parse(stateBytes) as { readonly stageName: string };
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
 
     for (const relativePath of [
@@ -349,7 +349,7 @@ describe("eden CLI project commands", () => {
     await expect(readFile(statePath, "utf8")).resolves.toBe(stateBytes);
     await expect(stat(join(root, state.stageName))).resolves.toBeDefined();
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -361,7 +361,7 @@ describe("eden CLI project commands", () => {
       readFile(statePath, "utf8"),
     ]);
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       Promise.all([
@@ -375,12 +375,12 @@ describe("eden CLI project commands", () => {
   test("refuses ordinary non-empty re-init but accepts exact canonical files only through recovery", async () => {
     const root = await createRoot("eden-cli-init-reinit-");
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     const unrelated = join(root, "notes.txt");
     await writeFile(unrelated, "keep this file\n", "utf8");
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(1);
     await expect(readFile(unrelated, "utf8")).resolves.toBe("keep this file\n");
     await expect(readFile(join(root, "package.json"), "utf8")).resolves.toContain(
@@ -391,7 +391,7 @@ describe("eden CLI project commands", () => {
   test("blocks build while a partial or ambiguous init residue remains", async () => {
     const root = await createRoot("eden-cli-init-partial-build-");
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         initPublicationHook: async (boundary) => {
           if (boundary === "after-state-write") {
@@ -402,7 +402,7 @@ describe("eden CLI project commands", () => {
     ).resolves.toBe(1);
     const errors: string[] = [];
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => {
@@ -417,7 +417,7 @@ describe("eden CLI project commands", () => {
     for (const mode of ["missing", "tampered", "symlink"] as const) {
       const root = await createRoot(`eden-cli-init-residue-${mode}-`);
       await expect(
-        runEdenCli(["init", "--project", root], {
+        runEdenCli(["agent", "init", "--project", root], {
           cwd: root,
           initPublicationHook: async (boundary) => {
             if (boundary === "after-state-write") {
@@ -444,7 +444,7 @@ describe("eden CLI project commands", () => {
       }
       const errors: string[] = [];
       await expect(
-        runEdenCli(["init", "--project", root], {
+        runEdenCli(["agent", "init", "--project", root], {
           cwd: root,
           stderr: (line) => errors.push(line),
         }),
@@ -459,7 +459,7 @@ describe("eden CLI project commands", () => {
   test("rejects closed-schema and complete-tree recovery residue without mutation", async () => {
     const root = await createRoot("eden-cli-init-closed-residue-");
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         initPublicationHook: async (boundary) => {
           if (boundary === "after-state-write") {
@@ -480,13 +480,13 @@ describe("eden CLI project commands", () => {
     })}\n`;
     await writeFile(statePath, withUnknownMetadata, "utf8");
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(1);
     await expect(readFile(statePath, "utf8")).resolves.toBe(withUnknownMetadata);
 
     const freshRoot = await createRoot("eden-cli-init-extra-stage-");
     await expect(
-      runEdenCli(["init", "--project", freshRoot], {
+      runEdenCli(["agent", "init", "--project", freshRoot], {
         cwd: freshRoot,
         initPublicationHook: async (boundary) => {
           if (boundary === "after-state-write") {
@@ -503,7 +503,7 @@ describe("eden CLI project commands", () => {
     await writeFile(extraPath, "unexpected staged bytes\n", "utf8");
     const beforeEntries = await readdir(freshRoot);
     await expect(
-      runEdenCli(["init", "--project", freshRoot], { cwd: freshRoot }),
+      runEdenCli(["agent", "init", "--project", freshRoot], { cwd: freshRoot }),
     ).resolves.toBe(1);
     await expect(readdir(freshRoot)).resolves.toEqual(beforeEntries);
     await expect(readFile(extraPath, "utf8")).resolves.toBe(
@@ -518,7 +518,7 @@ describe("eden CLI project commands", () => {
       const outside = await createRoot(`eden-cli-init-symlink-${kind}-outside-`);
       await writeFile(join(outside, "instructions.md"), "outside bytes\n", "utf8");
       await expect(
-        runEdenCli(["init", "--project", root], {
+        runEdenCli(["agent", "init", "--project", root], {
           cwd: root,
           initPublicationHook: async (boundary) => {
             if (boundary === "after-state-write") {
@@ -542,7 +542,7 @@ describe("eden CLI project commands", () => {
       }
       const before = await readdir(root);
       await expect(
-        runEdenCli(["init", "--project", root], { cwd: root }),
+        runEdenCli(["agent", "init", "--project", root], { cwd: root }),
       ).resolves.toBe(1);
       await expect(readdir(root)).resolves.toEqual(before);
       await expect(readFile(join(outside, "instructions.md"), "utf8")).resolves.toBe(
@@ -558,7 +558,7 @@ describe("eden CLI project commands", () => {
       const outside = await createRoot(`eden-cli-init-race-${kind}-outside-`);
       await writeFile(join(outside, "instructions.md"), "outside bytes\n", "utf8");
       await expect(
-        runEdenCli(["init", "--project", root], {
+        runEdenCli(["agent", "init", "--project", root], {
           cwd: root,
           initPublicationHook: async (boundary) => {
             if (boundary === "after-state-write") {
@@ -573,7 +573,7 @@ describe("eden CLI project commands", () => {
       const stagePath = join(root, state.stageName);
       const errors: string[] = [];
       await expect(
-        runEdenCli(["init", "--project", root], {
+        runEdenCli(["agent", "init", "--project", root], {
           cwd: root,
           stderr: (line) => errors.push(line),
           initPublicationHook: async (boundary, target) => {
@@ -612,7 +612,7 @@ describe("eden CLI project commands", () => {
   test("preserves a destination rename or replacement during monotonic recovery", async () => {
     const renamedRoot = await createRoot("eden-cli-init-rename-");
     await expect(
-      runEdenCli(["init", "--project", renamedRoot], {
+      runEdenCli(["agent", "init", "--project", renamedRoot], {
         cwd: renamedRoot,
         initPublicationHook: async (boundary) => {
           if (boundary === "after-state-write") {
@@ -623,7 +623,7 @@ describe("eden CLI project commands", () => {
     ).resolves.toBe(1);
     const renamedPath = join(renamedRoot, "package.renamed.json");
     await expect(
-      runEdenCli(["init", "--project", renamedRoot], {
+      runEdenCli(["agent", "init", "--project", renamedRoot], {
         cwd: renamedRoot,
         initPublicationHook: async (boundary, target) => {
           if (
@@ -644,7 +644,7 @@ describe("eden CLI project commands", () => {
 
     const replacementRoot = await createRoot("eden-cli-init-replacement-");
     await expect(
-      runEdenCli(["init", "--project", replacementRoot], {
+      runEdenCli(["agent", "init", "--project", replacementRoot], {
         cwd: replacementRoot,
         initPublicationHook: async (boundary) => {
           if (boundary === "after-state-write") {
@@ -655,7 +655,7 @@ describe("eden CLI project commands", () => {
     ).resolves.toBe(1);
     const replacement = "competing initializer bytes\n";
     await expect(
-      runEdenCli(["init", "--project", replacementRoot], {
+      runEdenCli(["agent", "init", "--project", replacementRoot], {
         cwd: replacementRoot,
         initPublicationHook: async (boundary, target) => {
           if (
@@ -686,7 +686,7 @@ describe("eden CLI project commands", () => {
       const root = await createRoot("eden-cli-init-boundary-");
       const errors: string[] = [];
       await expect(
-        runEdenCli(["init", "--project", root], {
+        runEdenCli(["agent", "init", "--project", root], {
           cwd: root,
           stderr: (line) => errors.push(line),
           initPublicationHook: async (boundary) => {
@@ -701,7 +701,7 @@ describe("eden CLI project commands", () => {
       if (interruption === "after-stage-write") {
         await expect(stat(statePath)).rejects.toMatchObject({ code: "ENOENT" });
         await expect(
-          runEdenCli(["init", "--project", root], {
+          runEdenCli(["agent", "init", "--project", root], {
             cwd: root,
             stderr: (line) => errors.push(line),
           }),
@@ -711,7 +711,7 @@ describe("eden CLI project commands", () => {
       }
 
       await expect(stat(statePath)).resolves.toBeDefined();
-      const recovery = await runEdenCli(["init", "--project", root], { cwd: root });
+      const recovery = await runEdenCli(["agent", "init", "--project", root], { cwd: root });
       expect(recovery).toBe(0);
       for (const relativePath of [
         "agent/instructions.md",
@@ -724,7 +724,7 @@ describe("eden CLI project commands", () => {
       }
       if (interruption === "before-complete") {
         await expect(
-          runEdenCli(["build", "--project", root], {
+          runEdenCli(["agent", "build", "--project", root], {
             cwd: root,
             dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
           }),
@@ -759,7 +759,7 @@ describe("eden CLI project commands", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
       }),
@@ -774,10 +774,10 @@ describe("eden CLI project commands", () => {
     const sourcePath = join(root, "agent/tools/greet.ts");
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -790,7 +790,7 @@ describe("eden CLI project commands", () => {
     );
     await writeFile(sourcePath, secondSource, "utf8");
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -812,7 +812,7 @@ describe("eden CLI project commands", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -831,10 +831,10 @@ describe("eden CLI project commands", () => {
     const sourcePath = join(root, "agent/tools/greet.ts");
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -850,7 +850,7 @@ describe("eden CLI project commands", () => {
       "utf8",
     );
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -871,7 +871,7 @@ describe("eden CLI project commands", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -891,10 +891,10 @@ describe("eden CLI project commands", () => {
     const sourcePath = join(root, "agent/tools/greet.ts");
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -910,7 +910,7 @@ describe("eden CLI project commands", () => {
       "utf8",
     );
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -928,7 +928,7 @@ describe("eden CLI project commands", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -953,7 +953,7 @@ describe("eden CLI project commands", () => {
     })}\n`;
 
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         initPublicationHook: async (boundary) => {
           if (boundary !== "before-init-cleanup") return;
@@ -977,7 +977,7 @@ describe("eden CLI project commands", () => {
     const outside = await createRoot("eden-cli-init-release-stage-outside-");
     const replacement = join(root, "replacement-stage");
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         initPublicationHook: async (boundary, target) => {
           if (
@@ -1013,7 +1013,7 @@ describe("eden CLI project commands", () => {
     const replacement = "replacement after final observation\n";
     let observedOriginal = false;
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         initPublicationHook: async (boundary, target) => {
           if (
@@ -1075,7 +1075,7 @@ describe("eden CLI project commands", () => {
 
     const errors: string[] = [];
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
       }),
@@ -1103,7 +1103,7 @@ describe("eden CLI project commands", () => {
 
     const errors: string[] = [];
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
       }),
@@ -1125,10 +1125,10 @@ describe("eden CLI project commands", () => {
     const sourcePath = join(root, "agent/tools/greet.ts");
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -1145,7 +1145,7 @@ describe("eden CLI project commands", () => {
       "utf8",
     );
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -1168,7 +1168,7 @@ describe("eden CLI project commands", () => {
 
     const errors: string[] = [];
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
@@ -1205,7 +1205,7 @@ describe("eden CLI project commands", () => {
 
     const errors: string[] = [];
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
       }),
@@ -1235,7 +1235,7 @@ describe("eden CLI project commands", () => {
 
     const errors: string[] = [];
     await expect(
-      runEdenCli(["init", "--project", root], {
+      runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
       }),
@@ -1254,7 +1254,7 @@ describe("eden CLI project commands", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", link], {
+      runEdenCli(["agent", "init", "--project", link], {
         cwd: parent,
         stderr: (line) => errors.push(line),
       }),
@@ -1269,11 +1269,11 @@ describe("eden CLI project commands", () => {
     const calls: EdenCliDryRunRequest[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     const originalConfig = await readFile(join(root, "wrangler.jsonc"), "utf8");
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async (request) => {
           calls.push(request);
@@ -1306,10 +1306,10 @@ describe("eden CLI project commands", () => {
     const root = await createRoot("eden-cli-failed-build-");
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -1329,7 +1329,7 @@ export default {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => {
@@ -1350,10 +1350,10 @@ export default {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -1361,7 +1361,7 @@ export default {
     const before = await artifactHashes(root);
 
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => ({
@@ -1388,10 +1388,10 @@ export default {
     const sourcePath = join(root, "agent/tools/greet.ts");
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({
           exitCode: 0,
@@ -1405,7 +1405,7 @@ export default {
 
     const errors: string[] = [];
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => {
@@ -1431,10 +1431,10 @@ export default {
     const configPath = join(root, "wrangler.jsonc");
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({
           exitCode: 0,
@@ -1448,7 +1448,7 @@ export default {
 
     const errors: string[] = [];
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         dryRunRunner: async () => {
@@ -1479,10 +1479,10 @@ export default {
       const root = await createRoot("eden-cli-build-publication-race-");
 
       await expect(
-        runEdenCli(["init", "--project", root], { cwd: root }),
+        runEdenCli(["agent", "init", "--project", root], { cwd: root }),
       ).resolves.toBe(0);
       await expect(
-        runEdenCli(["build", "--project", root], {
+        runEdenCli(["agent", "build", "--project", root], {
           cwd: root,
           dryRunRunner: async () => ({
             exitCode: 0,
@@ -1515,7 +1515,7 @@ export default {
       } as unknown as Parameters<typeof runEdenCli>[1];
 
       await expect(
-        runEdenCli(["build", "--project", root], buildOptions),
+        runEdenCli(["agent", "build", "--project", root], buildOptions),
       ).resolves.toBe(1);
 
       const after = await readArtifactGeneration(join(root, ".eden"));
@@ -1544,11 +1544,11 @@ export default {
     async (boundary) => {
       const root = await createRoot("eden-cli-build-first-publication-");
       await expect(
-        runEdenCli(["init", "--project", root], { cwd: root }),
+        runEdenCli(["agent", "init", "--project", root], { cwd: root }),
       ).resolves.toBe(0);
 
       await expect(
-        runEdenCli(["build", "--project", root], {
+        runEdenCli(["agent", "build", "--project", root], {
           cwd: root,
           dryRunRunner: async () => ({
             exitCode: 0,
@@ -1574,7 +1574,7 @@ export default {
       }
 
       await expect(
-        runEdenCli(["build", "--project", root], {
+        runEdenCli(["agent", "build", "--project", root], {
           cwd: root,
           dryRunRunner: async () => ({
             exitCode: 0,
@@ -1590,7 +1590,12 @@ export default {
   );
 
   test("advertises exactly the supported command names and rejects unknown commands", async () => {
-    expect(EDEN_CLI_COMMANDS).toEqual(["init", "dev", "build", "deploy"]);
+    expect(EDEN_CLI_COMMANDS).toEqual([
+      "preflight",
+      "deploy",
+      "destroy",
+      "agent",
+    ]);
     const errors: string[] = [];
 
     await expect(
@@ -1598,6 +1603,6 @@ export default {
         stderr: (line) => errors.push(line),
       }),
     ).resolves.toBe(1);
-    expect(errors.join("")).toMatch(/unknown|init|dev|build|deploy/i);
+    expect(errors.join("")).toMatch(/unknown|preflight|deploy|destroy|agent/i);
   });
 });

@@ -628,12 +628,12 @@ async function assertCleanRoomArtifacts(projectRoot) {
     JSON.stringify(initialEntries) !==
     JSON.stringify([".eden", ".wrangler", "agent", "package.json", "wrangler.jsonc"])
   ) {
-    throw new Error("eden init/build produced an unexpected project tree.");
+    throw new Error("eden agent init/build produced an unexpected project tree.");
   }
   for (const forbidden of [".env", ".dev.vars"]) {
     try {
       await stat(join(projectRoot, forbidden));
-      throw new Error(`eden init created forbidden secret file ${forbidden}.`);
+      throw new Error(`eden agent init created forbidden secret file ${forbidden}.`);
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
@@ -642,7 +642,7 @@ async function assertCleanRoomArtifacts(projectRoot) {
   const artifactNames = (await readdir(join(projectRoot, ".eden"))).sort();
   for (const required of ["CURRENT", "generations"]) {
     if (!artifactNames.includes(required)) {
-      throw new Error(`eden build produced no ${required} artifact root.`);
+      throw new Error(`eden agent build produced no ${required} artifact root.`);
     }
   }
   const { readArtifactGeneration } = await import(
@@ -712,14 +712,14 @@ async function runLocalFirstUse(
   await runCli(
     repositoryRoot,
     projectRoot,
-    ["init", "--project", projectRoot],
+    ["agent", "init", "--project", projectRoot],
     undefined,
     signal,
   );
   await runCli(
     repositoryRoot,
     projectRoot,
-    ["build", "--project", projectRoot],
+    ["agent", "build", "--project", projectRoot],
     undefined,
     signal,
   );
@@ -850,7 +850,7 @@ function startDev(repositoryRoot, projectRoot, secret, signal) {
   throwIfAborted(signal);
   const child = spawnOwnedProcess({
     file: process.execPath,
-    args: [join(repositoryRoot, EDEN_CLI_PATH), "dev", "--project", projectRoot],
+    args: [join(repositoryRoot, EDEN_CLI_PATH), "agent", "dev", "--project", projectRoot],
     cwd: repositoryRoot,
     env: childEnvironment({ EDEN_BEARER_SECRET: secret }),
     label: "conformance-eden-dev",

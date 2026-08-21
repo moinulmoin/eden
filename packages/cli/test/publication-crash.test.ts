@@ -119,7 +119,7 @@ async function killWithSigkill(child: ChildProcess): Promise<void> {
 
 async function init(root: string): Promise<void> {
   await expect(
-    runEdenCli(["init", "--project", root], {
+    runEdenCli(["agent", "init", "--project", root], {
       cwd: root,
     }),
   ).resolves.toBe(0);
@@ -127,7 +127,7 @@ async function init(root: string): Promise<void> {
 
 async function build(root: string): Promise<void> {
   await expect(
-    runEdenCli(["build", "--project", root], {
+    runEdenCli(["agent", "build", "--project", root], {
       cwd: root,
       dryRunRunner: async () => ({
         exitCode: 0,
@@ -176,7 +176,7 @@ describe("CLI OS-crash publication recovery", () => {
       await rm(readyPath, { force: true });
 
       const beforeEntries = await readdir(root);
-      const recovery = await runEdenCli(["init", "--project", root], {
+      const recovery = await runEdenCli(["agent", "init", "--project", root], {
         cwd: root,
       });
       if (!mayRecover) {
@@ -218,7 +218,7 @@ describe("CLI OS-crash publication recovery", () => {
       await rm(readyPath, { force: true });
 
       await expect(
-        runEdenCli(["init", "--project", root], { cwd: root }),
+        runEdenCli(["agent", "init", "--project", root], { cwd: root }),
       ).resolves.toBe(0);
       await expect(
         readFile(join(root, "agent/instructions.md"), "utf8"),
@@ -238,10 +238,10 @@ describe("CLI OS-crash publication recovery", () => {
     await rm(first.readyPath, { force: true });
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),
@@ -266,7 +266,7 @@ describe("CLI OS-crash publication recovery", () => {
     await rm(readyPath, { force: true });
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(1);
     await expect(readFile(join(root, "package.json"), "utf8"))
       .resolves.toBe(sentinel);
@@ -296,7 +296,7 @@ describe("CLI OS-crash publication recovery", () => {
     await writeFile(residue, "tampered staged bytes\n", "utf8");
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(1);
     await expect(readFile(residue, "utf8")).resolves.toBe(
       "tampered staged bytes\n",
@@ -319,7 +319,7 @@ describe("CLI OS-crash publication recovery", () => {
     await rm(readyPath, { force: true });
 
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     const snapshot = await Promise.all([
       readdir(root),
@@ -327,7 +327,7 @@ describe("CLI OS-crash publication recovery", () => {
       readFile(join(root, "package.json"), "utf8"),
     ]);
     await expect(
-      runEdenCli(["init", "--project", root], { cwd: root }),
+      runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
     await expect(
       Promise.all([
@@ -337,7 +337,7 @@ describe("CLI OS-crash publication recovery", () => {
       ]),
     ).resolves.toEqual(snapshot);
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       }),

@@ -1,8 +1,10 @@
 {
   "name": "@eden/compiler",
   "version": "0.1.0",
+  "description": "Filesystem compiler for Eden Agents.",
   "type": "module",
   "private": true,
+  "license": "Apache-2.0",
   "types": "./dist/index.d.ts",
   "module": "./dist/index.js",
   "exports": {

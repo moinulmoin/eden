@@ -48,7 +48,7 @@ const pauseAtBoundary = async (observedBoundary, observedTarget) => {
 };
 
 const exitCode = await runEdenCli(
-  [command, "--project", projectRoot],
+  ["agent", command, "--project", projectRoot],
   {
     cwd: projectRoot,
     dryRunRunner: async () => ({

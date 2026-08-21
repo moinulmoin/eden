@@ -54,7 +54,7 @@ async function createRoot(prefix: string): Promise<string> {
 
 async function initRoot(root: string): Promise<void> {
   await expect(
-    runEdenCli(["init", "--project", root], { cwd: root }),
+    runEdenCli(["agent", "init", "--project", root], { cwd: root }),
   ).resolves.toBe(0);
 }
 
@@ -161,7 +161,7 @@ describe("eden dev and deploy orchestration", () => {
       }),
     );
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       processRunner: {
         spawn(request: EdenCliProcessRequest) {
@@ -250,7 +250,7 @@ describe("eden dev and deploy orchestration", () => {
     );
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         runtimeReadinessTimeoutMs: 100,
         stderr: (line) => errors.push(line),
@@ -311,7 +311,7 @@ describe("eden dev and deploy orchestration", () => {
     };
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         processRunner,
         runtimeGenerationProof: async () => true,
@@ -361,7 +361,7 @@ describe("eden dev and deploy orchestration", () => {
     let secretFilePath: string | undefined;
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         processRunner: {
           spawn(request: EdenCliProcessRequest) {
@@ -402,7 +402,7 @@ describe("eden dev and deploy orchestration", () => {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         processRunner: {
           spawn() {
@@ -437,7 +437,7 @@ describe("eden dev and deploy orchestration", () => {
     let spawned = false;
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         stderr: (line) => errors.push(line),
         processRunner: {
@@ -472,7 +472,7 @@ describe("eden dev and deploy orchestration", () => {
     let secretFilePath: string | undefined;
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         processRunner: {
           spawn(request: EdenCliProcessRequest) {
@@ -512,7 +512,7 @@ describe("eden dev and deploy orchestration", () => {
       },
     );
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       processRunner: {
         spawn(request: EdenCliProcessRequest) {
@@ -565,7 +565,7 @@ describe("eden dev and deploy orchestration", () => {
         releaseExit = () => resolve({ exitCode: 0, signal: null });
       },
     );
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       processRunner: {
         spawn(request: EdenCliProcessRequest) {
@@ -631,7 +631,7 @@ describe("eden dev and deploy orchestration", () => {
       },
     };
     const dryRun = { process: dryRunProcess, result };
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       dryRunRunner: () => {
         dryRunStarted?.();
@@ -690,7 +690,7 @@ describe("eden dev and deploy orchestration", () => {
       process: watchDryRunProcess,
       result: watchResult,
     };
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       processRunner: {
         spawn() {
@@ -720,8 +720,8 @@ describe("eden dev and deploy orchestration", () => {
           void writeFile(
             join(root, "agent/tools/greet.ts"),
             `export default {
-  description: "watch signal fixture",
-  inputSchema: {
+      description: "watch signal fixture",
+      inputSchema: {
     "~standard": {
       version: 1,
       vendor: "fixture",
@@ -729,12 +729,12 @@ describe("eden dev and deploy orchestration", () => {
         return { value };
       },
     },
-  },
-  execute() {
+      },
+      execute() {
     return { greeting: "watch signal fixture" };
-  },
-};
-`,
+      },
+    };
+    `,
             "utf8",
           );
         }
@@ -769,7 +769,7 @@ describe("eden dev and deploy orchestration", () => {
       release = () => resolve({ exitCode: 0, signal: null });
     });
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       processRunner: {
         spawn() {
@@ -853,7 +853,7 @@ describe("eden dev and deploy orchestration", () => {
     let spawned = false;
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         processRunner: {
           spawn() {
@@ -1069,7 +1069,7 @@ describe("eden dev and deploy orchestration", () => {
       },
     };
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner: {
@@ -1119,7 +1119,7 @@ export default {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         processRunner: {
           spawn(request: EdenCliProcessRequest) {
@@ -1156,7 +1156,7 @@ export default {
       const spawned: EdenCliProcessRequest[] = [];
       const errors: string[] = [];
       await expect(
-        runEdenCli(["dev", "--project", root], {
+        runEdenCli(["agent", "dev", "--project", root], {
           cwd: root,
           processRunner: {
             spawn(request: EdenCliProcessRequest) {
@@ -1192,7 +1192,7 @@ export default {
     const errors: string[] = [];
 
     await expect(
-      runEdenCli(["dev", "--project", root], {
+      runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         processRunner: {
           spawn() {
@@ -1244,7 +1244,7 @@ export default {
       ),
     );
     const initialDigest = await (async () => {
-      const result = await runEdenCli(["build", "--project", root], {
+      const result = await runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({
           exitCode: 0,
@@ -1260,7 +1260,7 @@ export default {
     const releases: Array<() => void> = [];
     const dryRuns: EdenCliDryRunRequest[] = [];
     let coherent = false;
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       processRunner: {
         spawn(request: EdenCliProcessRequest) {
@@ -1425,7 +1425,7 @@ export default greet;
     let baselineEntry: string | undefined;
     const pollers = new Set<NodeJS.Timeout>();
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       processRunner: {
         spawn(request: EdenCliProcessRequest) {
@@ -1549,7 +1549,7 @@ export default greet;
       ),
     );
     await expect(
-      runEdenCli(["build", "--project", root], {
+      runEdenCli(["agent", "build", "--project", root], {
         cwd: root,
         dryRunRunner: async () => ({
           exitCode: 0,
@@ -1621,7 +1621,7 @@ export default greet;
       },
     } as Parameters<typeof runEdenCli>[1];
 
-    const devPromise = runEdenCli(["dev", "--project", root], devOptions);
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], devOptions);
     try {
       await new Promise<void>((resolve) => {
         const check = (): void => {
@@ -1699,7 +1699,7 @@ export default greet;
     const compatibilityErrors: string[] = [];
     let compatibilityCalls = 0;
     await expect(
-      runEdenCli(["deploy", "--project", root], {
+      runEdenCli(["agent", "deploy", "--project", root], {
         cwd: root,
         stderr: (line) => compatibilityErrors.push(line),
         dryRunRunner: async () => {
@@ -1720,7 +1720,7 @@ export default greet;
     const wranglerCalls: EdenCliDryRunRequest[] = [];
     let call = 0;
     await expect(
-      runEdenCli(["deploy", "--project", root, "--env", "production"], {
+      runEdenCli(["agent", "deploy", "--project", root, "--env", "production"], {
         cwd: root,
         stderr: (line) => wranglerErrors.push(line),
         dryRunRunner: async (request) => {

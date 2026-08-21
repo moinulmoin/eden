@@ -18,7 +18,7 @@ export interface EveCliInvocation {
 
 export interface EveCliHelp {
   readonly kind: "help";
-  readonly scope: "namespace" | EveCliCommand;
+  readonly scope: EveCliCommand;
 }
 
 export type ParsedEveInvocation = EveCliHelp | EveCliInvocation;
@@ -67,24 +67,24 @@ export class EveCliError extends Error {
 
 const EVE_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 
-export const EVE_USAGE = `Usage: eden eve [command] [options]
+export const EVE_USAGE = `Usage: eden <preflight|deploy|destroy> [options]
 
-Eve commands:
+Eden Deploy commands:
   preflight  Build and inspect a local Eve candidate without remote mutation
-  deploy     Deploy the selected Eve candidate to the exact named target
+  deploy     Deploy the selected Eve project to the exact named target
   destroy    Remove the exact owned Eve target
 
-Every Eve command requires --project, --env, and --name.
+Every Deploy command requires --project, --env, and --name.
 --env accepts only preview or production.
 --env-file is accepted only by preflight and deploy.
-Eden Native remains available through the top-level init, build, dev, and deploy commands.
+Eden Agent authoring remains available through the separate eden agent namespace.
 
 Options:
   --help  Show this help
 `;
 
 const EVE_COMMAND_USAGE: Readonly<Record<EveCliCommand, string>> = {
-  preflight: `Usage: eden eve preflight --project <path> --env <preview|production> --name <name> [--env-file <path>]
+  preflight: `Usage: eden preflight --project <path> --env <preview|production> --name <name> [--env-file <path>]
 
 Build and inspect an immutable local Eve candidate. Preflight is read-only toward remote resources.
 
@@ -95,7 +95,7 @@ Options:
   --env-file <path>    Optional opaque runtime environment file
   --help               Show this help
 `,
-  deploy: `Usage: eden eve deploy --project <path> --env <preview|production> --name <name> [--env-file <path>]
+  deploy: `Usage: eden deploy --project <path> --env <preview|production> --name <name> [--env-file <path>]
 
 Deploy the selected Eve project to one exact target after host checks pass.
 
@@ -106,7 +106,7 @@ Options:
   --env-file <path>    Optional opaque runtime environment file
   --help               Show this help
 `,
-  destroy: `Usage: eden eve destroy --project <path> --env <preview|production> --name <name>
+  destroy: `Usage: eden destroy --project <path> --env <preview|production> --name <name>
 
 Destroy only the exact owned Eve target after ownership verification.
 
@@ -203,43 +203,30 @@ function parseCommand(
   );
 }
 
-function namespaceHelp(args: readonly string[]): EveCliHelp | undefined {
-  if (args.length === 1) {
-    return { kind: "help", scope: "namespace" };
-  }
-  if (args.length === 2 && (args[1] === "--help" || args[1] === "-h")) {
-    return { kind: "help", scope: "namespace" };
-  }
-  return undefined;
-}
 
 export function eveHelpText(scope: EveCliHelp["scope"]): string {
-  return scope === "namespace"
-    ? EVE_USAGE.trimEnd()
-    : EVE_COMMAND_USAGE[scope].trimEnd();
+  return EVE_COMMAND_USAGE[scope].trimEnd();
 }
 
 export function parseEveArguments(
   args: readonly string[],
 ): ParsedEveInvocation {
-  if (args[0] !== "eve") {
-    throw eveError(
-      "EVE_NAMESPACE_REQUIRED",
-      "Eve commands must start with the literal eve namespace.",
-    );
+  const command = parseCommand(args[0]);
+  if (
+    args.length === 2 &&
+    (args[1] === "--help" || args[1] === "-h")
+  ) {
+    return { kind: "help", scope: command };
   }
 
-  const namespace = namespaceHelp(args);
-  if (namespace !== undefined) return namespace;
 
-  const command = parseCommand(args[1]);
   let projectRoot: string | undefined;
   let environment: EveCliEnvironment | undefined;
   let name: string | undefined;
   let envFile: string | undefined;
   let help = false;
 
-  for (let index = 2; index < args.length; index += 1) {
+  for (let index = 1; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === undefined) {
       throw eveError(
@@ -321,7 +308,7 @@ export function parseEveArguments(
       if (command === "destroy") {
         throw eveError(
           "EVE_ENV_FILE_UNSUPPORTED",
-          "The --env-file option is supported only by eve preflight and eve deploy.",
+          "The --env-file option is supported only by eden preflight and eden deploy.",
         );
       }
       if (envFile !== undefined) {
@@ -339,7 +326,7 @@ export function parseEveArguments(
       if (command === "destroy") {
         throw eveError(
           "EVE_ENV_FILE_UNSUPPORTED",
-          "The --env-file option is supported only by eve preflight and eve deploy.",
+          "The --env-file option is supported only by eden preflight and eden deploy.",
         );
       }
       if (envFile !== undefined) {

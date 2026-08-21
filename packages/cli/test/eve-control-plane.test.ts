@@ -94,8 +94,8 @@ afterEach(async () => {
   );
 });
 
-describe("eden eve namespace", () => {
-  test("keeps Native commands visible while adding a separate Eve namespace", async () => {
+describe("top-level Eden Deploy commands", () => {
+  test("advertises Deploy first and keeps Agent explicit", async () => {
     const output: string[] = [];
 
     await expect(
@@ -104,29 +104,46 @@ describe("eden eve namespace", () => {
       }),
     ).resolves.toBe(0);
 
-    expect(output.join("\n")).toMatch(/init|build|dev|deploy/u);
-    expect(output.join("\n")).toMatch(/eve/u);
-    expect(EDEN_CLI_COMMANDS).toEqual(["init", "dev", "build", "deploy"]);
+    expect(output.join("\n")).toMatch(/preflight|deploy|destroy/u);
+    expect(output.join("\n")).toMatch(/agent/u);
+    expect(output.join("\n")).not.toMatch(/eden eve/u);
+    expect(EDEN_CLI_COMMANDS).toEqual([
+      "preflight",
+      "deploy",
+      "destroy",
+      "agent",
+    ]);
+    expect(isEdenCliCommand("agent")).toBe(true);
     expect(isEdenCliCommand("eve")).toBe(false);
   });
 
   test.each([
-    ["namespace", ["eve", "--help"], /preflight|deploy|destroy/u],
-    ["preflight", ["eve", "preflight", "--help"], /--project|--env-file/u],
-    ["deploy", ["eve", "deploy", "--help"], /--project|--env-file/u],
-    ["destroy", ["eve", "destroy", "--help"], /--project|--name/u],
+    ["eve", "preflight"],
+    ["native"],
+    ["init"],
+    ["build"],
+    ["dev"],
+  ] as const)("rejects obsolete root command path %j", async (...args) => {
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(args, {
+        stderr: (line) => errors.push(line),
+      }),
+    ).resolves.toBe(1);
+    expect(errors.join("\n")).toMatch(/Unknown Eden command/u);
+  });
+
+  test.each([
+    ["root", ["--help"], /preflight|deploy|destroy/u],
+    ["preflight", ["preflight", "--help"], /--project|--env-file/u],
+    ["deploy", ["deploy", "--help"], /--project|--env-file/u],
+    ["destroy", ["destroy", "--help"], /--project|--name/u],
   ] as const)(
     "exposes actionable %s help without project side effects",
     async (_scope, args, expected) => {
-      const missingProject = join(
-        tmpdir(),
-        "eden-eve-help-project-does-not-exist",
-      );
       const before = await readdir(tmpdir());
       const output: string[] = [];
-      const helpArgs = args[1] === "--help"
-        ? args
-        : [...args, "--project", missingProject];
+      const helpArgs = args;
 
       await expect(
         runEdenCli(helpArgs, {
@@ -137,7 +154,7 @@ describe("eden eve namespace", () => {
             },
           },
           dryRunRunner: async () => {
-            throw new Error("help must not run a Native dry-run");
+            throw new Error("help must not run an Agent dry-run");
           },
         }),
       ).resolves.toBe(0);
@@ -147,35 +164,32 @@ describe("eden eve namespace", () => {
     },
   );
 
-  test("keeps Eve parsing separate from Native execution", async () => {
+  test("keeps Eve parsing separate from Agent execution", async () => {
     const root = await createRoot();
-    let nativeBuildInvoked = false;
+    let agentBuildInvoked = false;
     const errors: string[] = [];
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "preflight",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-namespace-test",
-        ],
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-namespace-test",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
           dryRunRunner: async () => {
-            nativeBuildInvoked = true;
+            agentBuildInvoked = true;
             return { exitCode: 0, stdout: "", stderr: "" };
           },
         },
       ),
     ).resolves.toBe(1);
 
-    expect(nativeBuildInvoked).toBe(false);
+    expect(agentBuildInvoked).toBe(false);
     expect(errors.join("\n")).not.toMatch(/COMMAND_UNKNOWN/u);
   });
 
@@ -183,22 +197,19 @@ describe("eden eve namespace", () => {
     const root = await createRoot();
     const parent = join(root, "..");
     const requests: unknown[] = [];
-    let nativeSpawned = false;
-    let nativeDryRun = false;
+    let agentSpawned = false;
+    let agentDryRun = false;
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "deploy",
-          "--project",
-          join(parent, root.split("/").pop() as string),
-          "--env",
-          "production",
-          "--name",
-          "eve-opaque-path",
-          "--env-file=/tmp/opaque-runtime.env",
-        ],
+        ["deploy",
+        "--project",
+        join(parent, root.split("/").pop() as string),
+        "--env",
+        "production",
+        "--name",
+        "eve-opaque-path",
+        "--env-file=/tmp/opaque-runtime.env",],
         {
           cwd: parent,
           eveRunner: async (request) => {
@@ -206,12 +217,12 @@ describe("eden eve namespace", () => {
           },
           processRunner: {
             spawn() {
-              nativeSpawned = true;
-              throw new Error("Native process runner must not receive Eve work");
+              agentSpawned = true;
+              throw new Error("Agent process runner must not receive Eve work");
             },
           },
           dryRunRunner: async () => {
-            nativeDryRun = true;
+            agentDryRun = true;
             return { exitCode: 0, stdout: "", stderr: "" };
           },
         },
@@ -228,27 +239,24 @@ describe("eden eve namespace", () => {
         envFile: "/tmp/opaque-runtime.env",
       },
     ]);
-    expect(nativeSpawned).toBe(false);
-    expect(nativeDryRun).toBe(false);
+    expect(agentSpawned).toBe(false);
+    expect(agentDryRun).toBe(false);
   });
 
-  test("redacts arbitrary Eve runner failures without Native fallback", async () => {
+  test("redacts arbitrary Eve runner failures without Agent fallback", async () => {
     const root = await createRoot();
     const errors: string[] = [];
     const secret = "eve-runner-secret-marker";
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "preflight",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-redacted-failure",
-        ],
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-redacted-failure",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -270,16 +278,13 @@ describe("eden eve namespace", () => {
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "preflight",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-concrete-preflight",
-        ],
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-concrete-preflight",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -318,16 +323,13 @@ describe("eden eve namespace", () => {
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "preflight",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-read-only",
-        ],
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-read-only",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -440,18 +442,15 @@ describe("eden eve namespace", () => {
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "preflight",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-runtime-read-only",
-          "--env-file",
-          envFile,
-        ],
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-runtime-read-only",
+        "--env-file",
+        envFile,],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -527,16 +526,13 @@ describe("eden eve namespace", () => {
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "preflight",
-          "--project",
-          root,
-          "--env",
-          "production",
-          "--name",
-          "eve-conflict",
-        ],
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "production",
+        "--name",
+        "eve-conflict",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -625,16 +621,13 @@ describe("eden eve namespace", () => {
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "preflight",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-race",
-        ],
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-race",],
         {
           cwd: root,
           eveControlPlane: {
@@ -687,16 +680,13 @@ describe("eden eve namespace", () => {
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "preflight",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-runtime-race",
-        ],
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-runtime-race",],
         {
           cwd: root,
           eveControlPlane: {
@@ -766,7 +756,7 @@ describe("eden eve namespace", () => {
       for (const [missing, suffix] of Object.entries(required)) {
         let error: unknown;
         try {
-          parseEveArguments(["eve", command, ...suffix]);
+          parseEveArguments([command, ...suffix]);
         } catch (caught: unknown) {
           error = caught;
         }
@@ -780,17 +770,14 @@ describe("eden eve namespace", () => {
 
   test("parses both environments and scopes env-file to preflight/deploy", () => {
     expect(
-      parseEveArguments([
-        "eve",
-        "preflight",
-        "--project",
-        "/tmp/eve-project",
-        "--env",
-        "preview",
-        "--name",
-        "eve-preview",
-        "--env-file=/tmp/eve.env",
-      ]),
+      parseEveArguments(["preflight",
+      "--project",
+      "/tmp/eve-project",
+      "--env",
+      "preview",
+      "--name",
+      "eve-preview",
+      "--env-file=/tmp/eve.env",]),
     ).toEqual({
       kind: "invocation",
       command: "preflight",
@@ -801,15 +788,12 @@ describe("eden eve namespace", () => {
     });
 
     expect(
-      parseEveArguments([
-        "eve",
-        "deploy",
-        "--project=/tmp/eve-project",
-        "--env=production",
-        "--name=eve-production",
-        "--env-file",
-        "/tmp/eve.env",
-      ]),
+      parseEveArguments(["deploy",
+      "--project=/tmp/eve-project",
+      "--env=production",
+      "--name=eve-production",
+      "--env-file",
+      "/tmp/eve.env",]),
     ).toEqual({
       kind: "invocation",
       command: "deploy",
@@ -821,18 +805,15 @@ describe("eden eve namespace", () => {
 
     let error: unknown;
     try {
-      parseEveArguments([
-        "eve",
-        "destroy",
-        "--project",
-        "/tmp/eve-project",
-        "--env",
-        "preview",
-        "--name",
-        "eve-preview",
-        "--env-file",
-        "/tmp/eve.env",
-      ]);
+      parseEveArguments(["destroy",
+      "--project",
+      "/tmp/eve-project",
+      "--env",
+      "preview",
+      "--name",
+      "eve-preview",
+      "--env-file",
+      "/tmp/eve.env",]);
     } catch (caught: unknown) {
       error = caught;
     }
@@ -896,11 +877,8 @@ describe("eden eve namespace", () => {
     (_description, suffix, expected) => {
       let error: unknown;
       try {
-        parseEveArguments([
-          "eve",
-          "preflight",
-          ...suffix,
-        ]);
+        parseEveArguments(["preflight",
+        ...suffix,]);
       } catch (caught: unknown) {
         error = caught;
       }
@@ -909,15 +887,14 @@ describe("eden eve namespace", () => {
     },
   );
 
-  test("returns typed help markers for namespace and subcommands", () => {
-    expect(parseEveArguments(["eve"])).toEqual<EveCliHelp>({
-      kind: "help",
-      scope: "namespace",
-    });
-    expect(parseEveArguments(["eve", "destroy", "--help"])).toEqual<EveCliHelp>({
+  test("returns typed subcommand help and rejects the obsolete namespace", () => {
+    expect(parseEveArguments(["destroy", "--help"])).toEqual<EveCliHelp>({
       kind: "help",
       scope: "destroy",
     });
+    expect(() => parseEveArguments(["eve"])).toThrowError(
+      expect.objectContaining({ code: "EVE_COMMAND_UNKNOWN" }),
+    );
   });
 
   test("deploys one exact target, injects protected runtime values, and promotes only after health identity", async () => {
@@ -943,18 +920,15 @@ describe("eden eve namespace", () => {
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-deploy-fixture",
-          "--env-file",
-          envFile,
-        ],
+        ["deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-deploy-fixture",
+        "--env-file",
+        envFile,],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -1083,16 +1057,13 @@ describe("eden eve namespace", () => {
 
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-indeterminate-fixture",
-        ],
+        ["deploy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-indeterminate-fixture",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -1163,7 +1134,7 @@ describe("eden eve namespace", () => {
   });
 });
 
-describe("eden eve destroy", () => {
+describe("eden destroy", () => {
   async function createDeployedFixture(): Promise<{
     readonly root: string;
     readonly generationRoot: string;
@@ -1236,16 +1207,13 @@ describe("eden eve destroy", () => {
     const errors: string[] = [];
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "destroy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-destroy-fixture",
-        ],
+        ["destroy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-destroy-fixture",],
         {
           cwd: root,
           stderr: (line) => errors.push(line),
@@ -1261,16 +1229,13 @@ describe("eden eve destroy", () => {
     let reads = 0;
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "destroy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-destroy-fixture",
-        ],
+        ["destroy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-destroy-fixture",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -1299,16 +1264,13 @@ describe("eden eve destroy", () => {
     let containerId: string | undefined = "container-123";
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "destroy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-destroy-fixture",
-        ],
+        ["destroy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-destroy-fixture",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -1362,16 +1324,13 @@ describe("eden eve destroy", () => {
     const errors: string[] = [];
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "destroy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-destroy-fixture",
-        ],
+        ["destroy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-destroy-fixture",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -1409,16 +1368,13 @@ describe("eden eve destroy", () => {
     const errors: string[] = [];
     await expect(
       runEdenCli(
-        [
-          "eve",
-          "destroy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-destroy-fixture",
-        ],
+        ["destroy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-destroy-fixture",],
         {
           cwd: root,
           stdout: (line) => output.push(line),

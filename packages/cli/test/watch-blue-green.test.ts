@@ -31,7 +31,7 @@ async function createRoot(): Promise<string> {
 
 async function initRoot(root: string): Promise<void> {
   await expect(
-    runEdenCli(["init", "--project", root], { cwd: root }),
+    runEdenCli(["agent", "init", "--project", root], { cwd: root }),
   ).resolves.toBe(0);
 }
 
@@ -222,7 +222,7 @@ describe("eden dev watch blue-green replacement", () => {
         },
       };
 
-      const devPromise = runEdenCli(["dev", "--project", root], {
+      const devPromise = runEdenCli(["agent", "dev", "--project", root], {
         cwd: root,
         stopSignal: stopController.signal,
         processRunner,
@@ -370,7 +370,7 @@ describe("eden dev watch blue-green replacement", () => {
       },
     };
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
@@ -519,7 +519,7 @@ describe("eden dev watch blue-green replacement", () => {
       },
     };
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
@@ -678,7 +678,7 @@ describe("eden dev watch blue-green replacement", () => {
       },
     };
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
@@ -801,7 +801,7 @@ describe("eden dev watch blue-green replacement", () => {
       },
     };
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
@@ -908,7 +908,7 @@ describe("eden dev watch blue-green replacement", () => {
       },
     };
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner,
@@ -990,7 +990,7 @@ describe("eden dev watch blue-green replacement", () => {
       }),
     );
 
-    const devPromise = runEdenCli(["dev", "--project", root], {
+    const devPromise = runEdenCli(["agent", "dev", "--project", root], {
       cwd: root,
       stopSignal: stopController.signal,
       processRunner: {
