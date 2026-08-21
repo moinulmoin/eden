@@ -933,9 +933,12 @@ ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "
       dockerignoreParent,
       "runtime .dockerignore",
     );
-    if (dockerfile.includes("RUNTIME_SECRET") || closure.files.some((file) =>
-      file.path.includes(".env") || file.path.includes(".npmrc")
-    )) {
+    const forbiddenRuntimeConfigFile = (path: string): boolean =>
+      path.split("/").some((segment) =>
+        segment.startsWith(".env") || segment === ".npmrc"
+      );
+    if (dockerfile.includes("RUNTIME_SECRET") ||
+      closure.files.some(forbiddenRuntimeConfigFile)) {
       throw packagingError(
         "SECRET_EXCLUSION_FAILED",
         "runtime image context",
