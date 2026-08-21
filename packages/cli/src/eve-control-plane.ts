@@ -1691,13 +1691,16 @@ async function runEveDeployment(
         imagePublication.reason,
       );
     }
+    const publishedRepo = imagePublication.imageReference.split("@")[0];
+    const expectedRepo = targetImageReference.split("@")[0];
     if (
-      imagePublication.imageDigest !== imageDigest ||
-      imageDigestFromReference(imagePublication.imageReference) !== imageDigest
+      publishedRepo !== expectedRepo ||
+      imageDigestFromReference(imagePublication.imageReference) !==
+        imagePublication.imageDigest
     ) {
       await writeEveIndeterminateEvidence(
         candidate,
-        "The published Cloudflare image digest did not match the local candidate.",
+        "The published image did not match the exact target repository and digest identity.",
         {
           accountId,
           targetKey,
@@ -1707,7 +1710,7 @@ async function runEveDeployment(
       );
       throw deploymentFailure(
         "DEPLOY_INDETERMINATE",
-        "The published Cloudflare image digest did not match the local candidate.",
+        "The published image did not match the exact target repository and digest identity.",
       );
     }
     imageReference = imagePublication.imageReference;
