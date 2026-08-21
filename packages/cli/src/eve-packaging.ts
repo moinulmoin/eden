@@ -1458,6 +1458,36 @@ async function resolveProjectLocalEve(
     }
     current = dirname(current);
   }
+  const directPackagePath = await realpath(
+    join(nodeModulesRoot, "eve", "package.json"),
+  ).catch(() => undefined);
+  if (
+    directPackagePath !== undefined &&
+    isWithin(nodeModulesRoot, directPackagePath)
+  ) {
+    let directValue: unknown;
+    try {
+      directValue = JSON.parse(
+        (await readFile(directPackagePath)).toString("utf8"),
+      ) as unknown;
+    } catch {
+      directValue = undefined;
+    }
+    if (
+      typeof directValue === "object" &&
+      directValue !== null &&
+      !Array.isArray(directValue) &&
+      (directValue as { readonly name?: unknown }).name === "eve" &&
+      typeof (directValue as { readonly version?: unknown }).version ===
+        "string" &&
+      (directValue as { readonly version: string }).version.length > 0
+    ) {
+      return {
+        version: (directValue as { readonly version: string }).version,
+        path: "node_modules/.bin/eve",
+      };
+    }
+  }
   throw new EvePackagingError({
     code: "DEPENDENCY_AMBIGUITY",
     subject: "node_modules/.bin/eve",
