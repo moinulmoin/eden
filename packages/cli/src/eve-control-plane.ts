@@ -1356,7 +1356,12 @@ function defaultHealthRunner(): EveDeploymentHealthRunner {
     const attempts = 12;
     const perAttemptTimeoutMs = 20_000;
     const retryDelayMs = 5_000;
+    let sawResponse = false;
     let lastReason = "The public Eve health request did not complete.";
+    const wait = async (): Promise<void> => {
+      // Executor form: the CLI lib target predates Promise.withResolvers.
+      await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+    };
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       let response: Response;
       try {
@@ -1364,13 +1369,11 @@ function defaultHealthRunner(): EveDeploymentHealthRunner {
           method: "GET",
           signal: AbortSignal.timeout(perAttemptTimeoutMs),
         });
+        sawResponse = true;
       } catch {
         lastReason =
           "The public Eve health request did not complete before the bounded deadline (cold Container boot may still be starting).";
-        // Executor form: the CLI lib target predates Promise.withResolvers.
-        await new Promise<void>((resolveDelay) =>
-          setTimeout(resolveDelay, retryDelayMs)
-        );
+        await wait();
         continue;
       }
       let body: unknown;
@@ -1387,19 +1390,18 @@ function defaultHealthRunner(): EveDeploymentHealthRunner {
           (body as Record<string, unknown>).state === "ready" ||
           (body as Record<string, unknown>).ready === true
         );
-      if (!ready) {
+      if (ready) {
         return {
-          status: "failed",
-          reason: "The public Eve health route did not report ready.",
+          status: "ready",
+          identity: responseIdentity(response, body),
         };
       }
-      return {
-        status: "ready",
-        identity: responseIdentity(response, body),
-      };
+      lastReason =
+        "The public Eve health route did not report ready before the bounded deadline.";
+      await wait();
     }
     return {
-      status: "indeterminate",
+      status: sawResponse ? "failed" : "indeterminate",
       reason: lastReason,
     };
   };
