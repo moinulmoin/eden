@@ -77,6 +77,17 @@ import type {
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
 const wranglerEntrypoint = require.resolve("wrangler");
+
+export const DEFAULT_EVE_HOST_REQUIREMENTS: EveHostRequirements = Object.freeze({
+  architecture: "linux/amd64",
+  world: "supported",
+  sandbox: "supported",
+  privileged: false,
+  devices: "none",
+  kernel: "supported",
+  network: "supported",
+  durableLocalFilesystem: false,
+});
 const wranglerCwd = dirname(wranglerEntrypoint);
 
 export const DEFAULT_EVE_NODE_IMAGE: EveNodeImage = Object.freeze({

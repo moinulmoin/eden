@@ -88,6 +88,7 @@ import {
   redactEveRuntimeOutput,
 } from "./eve-runtime-config.js";
 import {
+  DEFAULT_EVE_HOST_REQUIREMENTS,
   runEveControlPlane,
   runEveDestroy,
   type EvePreflightOptions,
@@ -176,6 +177,7 @@ export type {
   EveRuntimeStatus,
 } from "./eve-runtime-image.js";
 export {
+  DEFAULT_EVE_HOST_REQUIREMENTS,
   DEFAULT_EVE_NODE_IMAGE,
   runEveControlPlane,
   runEveDestroy,
@@ -9226,6 +9228,9 @@ async function runEveInvocation(
       await runEveControlPlane(request, {
         ...options.eveControlPlane,
         runtimeConfigLoader,
+        ...(options.eveControlPlane?.hostRequirements === undefined
+          ? { hostRequirements: DEFAULT_EVE_HOST_REQUIREMENTS }
+          : {}),
         ...(options.stdout === undefined ? {} : { stdout: options.stdout }),
       });
       return;
