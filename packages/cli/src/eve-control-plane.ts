@@ -489,6 +489,7 @@ function candidateMetadata(
 
 function safeWranglerEnvironment(): NodeJS.ProcessEnv {
   return {
+    PATH: process.env.PATH,
     HOME: process.env.HOME,
     TMPDIR: process.env.TMPDIR,
     LANG: process.env.LANG,
