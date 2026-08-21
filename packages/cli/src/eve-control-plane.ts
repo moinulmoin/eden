@@ -2463,16 +2463,7 @@ async function collectEvePreflight(
 
   let runtimeEvidence: EvePreflightRuntimeEvidence | undefined;
   let runtimeInjection: EveRuntimeInjection | undefined;
-  if (runtimeConfig !== undefined && options.runtimeRunner === undefined) {
-    checks.push(
-      check(
-        "VAL-SEC-003",
-        "blocked",
-        "The explicit environment was validated, but no disposable protected Eve-start runner was supplied for local injection.",
-        "Provide a local protected injection runner; runtime values must never enter argv, image layers, or logs.",
-      ),
-    );
-  } else if (hostRequirements !== undefined && hostRequirementsValid) {
+  if (hostRequirements !== undefined && hostRequirementsValid) {
     try {
       if (runtimeConfig !== undefined && request.command === "preflight") {
         runtimeInjection = await prepareEveRuntimeInjection(runtimeConfig, {
