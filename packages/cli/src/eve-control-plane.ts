@@ -1006,6 +1006,26 @@ async function writeEveDeploymentArtifacts(
     mode: 0o600,
     flag: "wx",
   });
+  const runtimePackageRoot = dirname(
+    require.resolve("@eden/runtime-cloudflare/package.json"),
+  );
+  const bundleSource = join(
+    runtimePackageRoot,
+    "dist",
+    "eden-eve-host-worker.mjs",
+  );
+  const bundleContents = await readFile(bundleSource).catch(() => undefined);
+  if (bundleContents === undefined) {
+    throw deploymentFailure(
+      "EVE_HOST_BUNDLE_UNAVAILABLE",
+      "The vendored Eve host worker bundle is missing from the installed runtime package.",
+    );
+  }
+  await writeFile(
+    join(workerRoot, "eden-eve-host-worker.mjs"),
+    bundleContents,
+    { mode: 0o644, flag: "wx" },
+  );
   const config = {
     $schema: "https://developers.cloudflare.com/workers/wrangler/config-schema.json",
     ...hostConfig.worker,

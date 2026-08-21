@@ -1,4 +1,4 @@
-/* global AbortController, AbortSignal, TextDecoder, clearTimeout, fetch, process, setTimeout */
+/* global AbortController, AbortSignal, TextDecoder, clearTimeout, fetch, setTimeout */
 
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";

@@ -434,7 +434,7 @@ export interface EdenCliRunOptions {
   ) => void | Promise<void>;
   /**
    * Finite local control-plane seams for the built-in Eve preflight path.
-   * Runtime values and Cloudflare mutations never cross this option boundary.
+   * Runtime values and remote-provider mutations never cross this boundary.
    */
   readonly eveControlPlane?: EvePreflightOptions;
   readonly initPublicationHook?: (

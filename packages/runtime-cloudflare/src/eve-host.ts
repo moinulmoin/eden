@@ -1,5 +1,3 @@
-import { Container } from "@cloudflare/containers";
-
 export const EVE_HOST_DEFAULTS = {
   compatibilityDate: "2026-04-01",
   healthPath: "/eve/v1/health",
@@ -52,11 +50,10 @@ export const EVE_HOST_OWNED_HEADERS = [
 ] as const;
 
 const EVE_HOST_OWNED_HEADER_SET = new Set<string>(EVE_HOST_OWNED_HEADERS);
-const WORKER_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+export const WORKER_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const SUBDOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
-const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+export const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 const INSTANCE_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,125}[a-z0-9])?$/u;
-const MODULE_SPECIFIER_PATTERN = /^@?[A-Za-z0-9._/-]+$/u;
 const SHA256_IMAGE_PATTERN =
   /^(?:[a-z0-9.-]+\/)?[a-z0-9._/-]+@sha256:[0-9a-f]{64}$/u;
 
@@ -180,10 +177,9 @@ export interface EveHostConfig {
 
 export interface EveGeneratedWorkerSourceRequest {
   readonly config: EveHostConfig;
-  readonly runtimeModuleSpecifier?: string;
 }
 
-function assertNonEmpty(value: string, subject: string): void {
+export function assertNonEmpty(value: string, subject: string): void {
   if (value.length === 0) {
     throw new EveHostError(
       "HOST_ORIGIN_UNAVAILABLE",
@@ -192,7 +188,7 @@ function assertNonEmpty(value: string, subject: string): void {
   }
 }
 
-function assertStableOrigin(value: string, workerName?: string): void {
+export function assertStableOrigin(value: string, workerName?: string): void {
   let origin: URL;
   try {
     origin = new URL(value);
@@ -354,18 +350,7 @@ export function createEveHostConfig(
 export function generateEveHostWorkerSource(
   request: EveGeneratedWorkerSourceRequest,
 ): string {
-  const moduleSpecifier =
-    request.runtimeModuleSpecifier ?? "@eden/runtime-cloudflare";
-  if (
-    !MODULE_SPECIFIER_PATTERN.test(moduleSpecifier) ||
-    moduleSpecifier.startsWith(".") ||
-    moduleSpecifier.includes("..")
-  ) {
-    throw new EveHostError(
-      "HOST_READINESS_UNPROVEN",
-      "The generated Worker runtime module specifier is not a safe package reference.",
-    );
-  }
+  const moduleSpecifier = "./eden-eve-host-worker.mjs";
   const workerOptions = {
     publicOrigin: request.config.container.publicOrigin,
     workerName: request.config.worker.name,
@@ -620,7 +605,7 @@ const RESERVED_EVE_HOST_VARIABLES = new Set([
   "EDEN_EVE_RUNTIME_REVISION",
 ]);
 
-function readProtectedRuntimeVariables(
+export function readProtectedRuntimeVariables(
   env: EveHostContainerEnvironment,
 ): Record<string, string> {
   const names = env.EVE_RUNTIME_VARIABLE_NAMES ?? [];
@@ -841,178 +826,3 @@ export function createEveReadinessGate(
   return gate;
 }
 
-/**
- * The class is intentionally only the outer Container lifecycle. The image
- * entrypoint remains the project-local Eve start supervisor.
- */
-type EveHostContainerContext = ConstructorParameters<typeof Container>[0];
-
-export class EveHostContainer extends Container<EveHostContainerEnvironment> {
-  override defaultPort = EVE_HOST_DEFAULTS.internalPort;
-  override requiredPorts = [EVE_HOST_DEFAULTS.internalPort];
-  override sleepAfter = EVE_HOST_DEFAULTS.sleepAfter;
-  override entrypoint = [...EVE_HOST_DEFAULTS.startCommand];
-  override enableInternet = true;
-  override pingEndpoint = "localhost/eve/v1/health";
-  readonly lifecycle = createEveHostLifecycleObserver();
-  private readinessStarted = false;
-  private readinessEvidence: EveHostReadinessEvidence | undefined;
-  private readonly readiness: EveReadinessGate;
-
-  constructor(
-    ctx: EveHostContainerContext,
-    env: EveHostContainerEnvironment,
-  ) {
-    super(ctx, env);
-    const publicOrigin = env.EVE_PUBLIC_ORIGIN;
-    const deploymentId = env.EDEN_EVE_DEPLOYMENT_ID;
-    const generationId = env.EDEN_EVE_GENERATION_ID;
-    if (
-      publicOrigin === undefined ||
-      deploymentId === undefined ||
-      generationId === undefined
-    ) {
-      throw new EveHostError(
-        "HOST_ORIGIN_UNAVAILABLE",
-        "The verified public origin and deployment identity must exist before Eve starts.",
-      );
-    }
-    assertStableOrigin(publicOrigin);
-    assertNonEmpty(deploymentId, "deployment identity");
-    assertNonEmpty(generationId, "generation identity");
-    const runtimeEnv = readProtectedRuntimeVariables(env);
-    this.envVars = {
-      ...runtimeEnv,
-      HOST: "0.0.0.0",
-      NITRO_HOST: "0.0.0.0",
-      PORT: String(EVE_HOST_DEFAULTS.internalPort),
-      NITRO_PORT: String(EVE_HOST_DEFAULTS.internalPort),
-      NODE_ENV: "production",
-      WORKFLOW_LOCAL_BASE_URL: publicOrigin,
-      EDEN_EVE_DEPLOYMENT_ID: deploymentId,
-      EDEN_EVE_GENERATION_ID: generationId,
-      ...(env.EDEN_EVE_RUNTIME_REVISION === undefined
-        ? {}
-        : { EDEN_EVE_RUNTIME_REVISION: env.EDEN_EVE_RUNTIME_REVISION }),
-    };
-    this.readiness = createEveReadinessGate({
-      startAndWaitForPorts: (options) =>
-        this.startAndWaitForPorts(options),
-      healthFetch: (request) =>
-        this.containerFetch(request, EVE_HOST_DEFAULTS.internalPort),
-    });
-  }
-
-  async ensureEveReady(
-    signal: AbortSignal = new AbortController().signal,
-  ): Promise<EveHostReadinessEvidence> {
-    if (this.readinessEvidence !== undefined) {
-      return this.readinessEvidence;
-    }
-    if (!this.readinessStarted) {
-      this.readinessStarted = true;
-      this.lifecycle.record("start_requested");
-    }
-    const evidence = await this.readiness(signal);
-    this.readinessEvidence = evidence;
-    this.lifecycle.record("health_ready", evidence.healthStatus);
-    return evidence;
-  }
-
-  override async fetch(request: Request): Promise<Response> {
-    await this.ensureEveReady(request.signal);
-    return super.fetch(request);
-  }
-
-  override onStart(): void {
-    if (this.lifecycle.events.some((event) => event.type === "started")) {
-      this.lifecycle.record("replaced");
-    }
-    this.lifecycle.record("started");
-  }
-
-  override onStop(params: {
-    readonly exitCode: number;
-    readonly reason: "exit" | "runtime_signal";
-  }): void {
-    this.readinessStarted = false;
-    this.readinessEvidence = undefined;
-    this.readiness.reset();
-    this.lifecycle.record("stopped", `${params.reason}:${params.exitCode}`);
-  }
-
-  override onError(error: unknown): unknown {
-    this.readinessStarted = false;
-    this.readinessEvidence = undefined;
-    this.readiness.reset();
-    this.lifecycle.record(
-      "errored",
-      error instanceof Error ? error.name : "unknown",
-    );
-    throw new EveHostError(
-      "HOST_READINESS_UNPROVEN",
-      "The Eve Container supervisor reported an error.",
-    );
-  }
-
-}
-
-export type EveHostWorkerEnvironment = EveHostContainerEnvironment;
-
-export interface EveHostWorkerOptions extends EveHostForwardingMetadata {
-  readonly workerName: string;
-  readonly containerBindingName: string;
-  readonly stableContainerInstanceName: string;
-}
-
-function createCorrelationId(): string {
-  return crypto.randomUUID();
-}
-
-export function createEveHostWorker(
-  options: EveHostWorkerOptions,
-): ExportedHandler<EveHostWorkerEnvironment> {
-  if (!WORKER_NAME_PATTERN.test(options.workerName)) {
-    throw new EveHostError(
-      "HOST_ORIGIN_UNAVAILABLE",
-      "The exact Worker name is not valid.",
-    );
-  }
-  assertStableOrigin(options.publicOrigin, options.workerName);
-  assertNonEmpty(options.stableContainerInstanceName, "Container instance name");
-  if (!IDENTIFIER_PATTERN.test(options.containerBindingName)) {
-    throw new EveHostError(
-      "HOST_READINESS_UNPROVEN",
-      "The Container binding name is not valid.",
-    );
-  }
-  return {
-    async fetch(request, env): Promise<Response> {
-      const namespace = (
-        env as unknown as Record<
-          string,
-          DurableObjectNamespace<EveHostContainer> | undefined
-        >
-      )[options.containerBindingName];
-      if (namespace === undefined) {
-        throw new EveHostError(
-          "HOST_READINESS_UNPROVEN",
-          "The configured Container binding is unavailable.",
-        );
-      }
-      const container = namespace.getByName(
-        options.stableContainerInstanceName,
-      );
-      const forwarded = createTrustedEveRequest(request, {
-        publicOrigin: options.publicOrigin,
-        deploymentId: options.deploymentId,
-        generationId: options.generationId,
-        correlationId: createCorrelationId(),
-        ...(options.runtimeRevisionHandle === undefined
-          ? {}
-          : { runtimeRevisionHandle: options.runtimeRevisionHandle }),
-      });
-      return container.fetch(forwarded);
-    },
-  };
-}

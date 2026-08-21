@@ -2,7 +2,6 @@ import { describe, expect, test } from "vitest";
 
 import {
   EVE_HOST_DEFAULTS,
-  EveHostContainer,
   createEveHostConfig,
   createEveHostProxy,
   createEveReadinessGate,
@@ -11,6 +10,7 @@ import {
   resolveStableWorkersDevOrigin,
   type EveContainerTransport,
 } from "../src/eve-host.js";
+import { EveHostContainer } from "../src/eve-host-runtime.js";
 
 const IDENTITY = {
   workerName: "eden-eve-preview",
@@ -92,12 +92,10 @@ describe("generic Eve Cloudflare host", () => {
       "export { EveHostContainer as CustomEveContainer };",
     );
     expect(customSource).toContain('"containerBindingName":"CUSTOM_CONTAINER"');
-    expect(() =>
-      generateEveHostWorkerSource({
-        config,
-        runtimeModuleSpecifier: "data:text/javascript,evil",
-      }),
-    ).toThrow(/safe package reference/u);
+    expect(source).toContain(
+      'import { EveHostContainer, createEveHostWorker } from "./eden-eve-host-worker.mjs";',
+    );
+    expect(source).not.toMatch(/@eden\/runtime-cloudflare|node:/u);
   });
 
   test("resolves only an explicit workers.dev account subdomain", () => {
