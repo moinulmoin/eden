@@ -21,6 +21,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import {
+  homedir,
+} from "node:os";
+import {
   createServer,
 } from "node:net";
 import {
@@ -611,10 +614,25 @@ function authenticatedAccountId(value: unknown): string | undefined {
   return (account as { readonly id: string }).id;
 }
 
+async function readWranglerOAuthToken(): Promise<string | undefined> {
+  const root = process.env.WRANGLER_HOME ??
+    (process.platform === "darwin"
+      ? join(homedir(), "Library", "Preferences", ".wrangler")
+      : join(homedir(), ".config", ".wrangler"));
+  const raw = await readFile(join(root, "config", "default.toml"), "utf8")
+    .catch(() => undefined);
+  if (raw === undefined) return undefined;
+  const match = /^oauth_token\s*=\s*["']([^"'\r\n]+)["']/m.exec(raw);
+  return match === null ? undefined : match[1];
+}
+
 async function readWorkersDevSubdomain(
   accountId: string | undefined,
 ): Promise<string | undefined> {
-  const token = process.env.CLOUDFLARE_API_TOKEN;
+  const envToken = process.env.CLOUDFLARE_API_TOKEN;
+  const token = envToken !== undefined && envToken.length > 0
+    ? envToken
+    : await readWranglerOAuthToken();
   if (accountId === undefined || token === undefined || token.length === 0) {
     return undefined;
   }
