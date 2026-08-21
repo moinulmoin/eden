@@ -28,6 +28,9 @@ import {
   spawn,
 } from "node:child_process";
 import {
+  fileURLToPath,
+} from "node:url";
+import {
   promisify,
 } from "node:util";
 
@@ -1007,7 +1010,9 @@ async function writeEveDeploymentArtifacts(
     flag: "wx",
   });
   const runtimePackageRoot = dirname(
-    require.resolve("@eden/runtime-cloudflare/package.json"),
+    dirname(
+      fileURLToPath(import.meta.resolve("@eden/runtime-cloudflare")),
+    ),
   );
   const bundleSource = join(
     runtimePackageRoot,
