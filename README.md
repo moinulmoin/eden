@@ -1,14 +1,28 @@
 # Eden
 
-Eden is a small, Cloudflare-native durable agent framework. This repository contains
-the first vertical slice: filesystem-first authoring, a Node-side compiler, a
-Worker-safe generated bundle, one authenticated Worker host, one SQLite-backed
-`EdenSession` Durable Object, a bounded model/tool/final-response turn, and an
-NDJSON journal stream.
+Eden has two separated surfaces:
 
-The supported command surface is intentionally frozen at four commands:
-`eden init`, `eden build`, `eden dev`, and `eden deploy`. The command names below
-are the complete CLI surface for this milestone. No other Eden command is implied.
+1. **Eden Deploy** — host an *existing Eve project* on Cloudflare as-is. Eden
+   builds the project with its own pinned Eve toolchain, packages the real
+   Node/Nitro server into one bounded Cloudflare Container, and places a
+   generic Worker in front of it. The `eden eve` namespace (`deploy`,
+   `destroy`, and an optional read-only `preflight`) is the deploy-first
+   product surface.
+2. **Eden Native** — a small, Cloudflare-native durable agent framework:
+   filesystem-first authoring, a Node-side compiler, a Worker-safe generated
+   bundle, one authenticated Worker host, one SQLite-backed `EdenSession`
+   Durable Object, a bounded model/tool/final-response turn, and an NDJSON
+   journal stream, driven by `eden init`, `eden build`, `eden dev`, and
+   `eden deploy`.
+
+Deploy never invokes Native, rewrites Eve source, lowers Eve into Native, maps
+Eve application semantics onto Cloudflare primitives, or uses Native as a
+fallback. The two surfaces stay separate on purpose.
+
+The Native command surface is intentionally frozen at four commands:
+`eden init`, `eden build`, `eden dev`, and `eden deploy`. The Eve hosting
+surface adds only `eden eve preflight`, `eden eve deploy`, and
+`eden eve destroy`. No other Eden command is implied.
 
 ## Setup
 
@@ -49,6 +63,80 @@ eden() {
   node packages/cli/dist/index.js "$@"
 }
 ```
+
+## Eden Deploy: host an existing Eve project
+
+Eden Deploy takes an existing Eve project directory and runs the real Eve
+application on Cloudflare. Eve stays the execution authority: Eden runs the
+project's own `eve build`, starts the official project-local
+`eve start --host 0.0.0.0 --port 8080` supervisor inside one bounded
+Cloudflare Container (`max_instances: 1`), and routes the public surface
+through one generic Worker. Eden owns build orchestration, packaging,
+publication, deployment identity, and cleanup — nothing else.
+
+```sh
+eden eve deploy  --project <path> --env preview --name <name>
+eden eve destroy --project <path> --env preview --name <name>
+```
+
+`deploy` is the primary workflow and runs every required check inline; it does
+not require a prior preflight. `destroy` removes only the exact Worker and
+Container application recorded for that target, verifies bounded absence, and
+only then clears the target's `CURRENT` pointer. Destroy is idempotent when
+the exact target is already absent, fails closed without a matching immutable
+deployment record, and never broadens cleanup to sibling targets.
+
+The optional read-only diagnostic is:
+
+```sh
+eden eve preflight --project <path> --env preview --name <name>
+```
+
+Every Eve command requires explicit `--project`, `--env` (`preview` or
+`production`), and `--name`. `--env-file <path>` is accepted only by
+`preflight` and `deploy`; `destroy` rejects it and needs no environment file.
+Preview-first evidence makes no production SLA claim.
+
+### Project-owned services and the Workflow World
+
+The Eve project's providers, models, credentials, databases, queues, external
+APIs, channels, schedules, sandbox, authentication, authorization, and
+configured Workflow World remain authoritative. Eden does not migrate,
+replace, translate, or silently drop any of them. Model access stays exactly
+what the project declares — Eden never substitutes a provider silently.
+
+A preview deployment that boots Eve's local Workflow World proves health,
+startup, and fresh request handling only. Container-local disk and process
+memory are disposable: a Container restart reinitializes local World state and
+does not demonstrate persistence. Production durability is the project
+owner's responsibility through a project-configured, Cloudflare-reachable,
+durable Eve-compatible World. The preview deployment runs one logical
+Container instance with `max_instances: 1`; Eden makes no horizontal-scaling
+or custom-domain promise in this release.
+
+### Environment handling
+
+Runtime values are supplied only through an explicit `--env-file` using a
+small opaque `KEY=VALUE` grammar. Eden parses names, not values: the values
+flow through a protected seam into the Container environment and Cloudflare
+secrets, never into argv, image layers, logs, artifacts, or the journal.
+Reserved host variables (`HOST`, `PORT`, `NITRO_*`, `NODE_ENV`, and Eden's own
+identity variables) are rejected in that file, and every emitted record is
+redacted.
+
+### Deploy, Adapt, and Native
+
+- **Eden Deploy** (this release) hosts an existing Eve project as-is through
+  the `eden eve` namespace.
+- **Eden Adapt** is a separate, deliberate future concern: per-primitive
+  migration of Vercel-specific pieces onto Cloudflare alternatives. Deploy
+  never invokes Adapt automatically.
+- **Eden Native** remains the `eden init`, `eden build`, `eden dev`, and
+  `eden deploy` path documented in the rest of this file.
+
+Deploy performs no source rewriting, no automatic migration, no Workflow World
+or sandbox replacement, and never falls back to the Native runtime when
+hosting an Eve project.
 
 ## Supported CLI
 
