@@ -933,8 +933,8 @@ ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "
       dockerignoreParent,
       "runtime .dockerignore",
     );
-    const forbiddenRuntimeConfigFile = (path: string): boolean =>
-      path.split("/").some((segment) =>
+    const forbiddenRuntimeConfigFile = (file: EveRuntimeClosureFile): boolean =>
+      file.path.split("/").some((segment) =>
         segment.startsWith(".env") || segment === ".npmrc"
       );
     if (dockerfile.includes("RUNTIME_SECRET") ||
