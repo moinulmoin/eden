@@ -195,7 +195,27 @@ export function createEveHostWorker(
           ? {}
           : { runtimeRevisionHandle: options.runtimeRevisionHandle }),
       });
-      return container.fetch(forwarded);
+      const response = await container.fetch(forwarded);
+      const headers = new Headers(response.headers);
+      headers.set("x-eden-eve-worker-name", options.workerName);
+      headers.set("x-eden-eve-public-origin", options.publicOrigin);
+      headers.set("x-eden-eve-deployment-id", options.deploymentId);
+      headers.set("x-eden-eve-generation-id", options.generationId);
+      headers.set(
+        "x-eden-eve-container-instance",
+        options.stableContainerInstanceName,
+      );
+      if (options.runtimeRevisionHandle !== undefined) {
+        headers.set(
+          "x-eden-eve-runtime-revision",
+          options.runtimeRevisionHandle,
+        );
+      }
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
     },
   };
 }

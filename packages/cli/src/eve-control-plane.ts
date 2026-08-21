@@ -1332,41 +1332,54 @@ function responseIdentity(
 
 function defaultHealthRunner(): EveDeploymentHealthRunner {
   return async (request) => {
-    let response: Response;
-    try {
-      response = await fetch(`${request.origin}/eve/v1/health`, {
-        method: "GET",
-        signal: AbortSignal.timeout(30_000),
-      });
-    } catch {
+    const attempts = 12;
+    const perAttemptTimeoutMs = 20_000;
+    const retryDelayMs = 5_000;
+    let lastReason = "The public Eve health request did not complete.";
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      let response: Response;
+      try {
+        response = await fetch(`${request.origin}/eve/v1/health`, {
+          method: "GET",
+          signal: AbortSignal.timeout(perAttemptTimeoutMs),
+        });
+      } catch {
+        lastReason =
+          "The public Eve health request did not complete before the bounded deadline (cold Container boot may still be starting).";
+        // Executor form: the CLI lib target predates Promise.withResolvers.
+        await new Promise<void>((resolveDelay) =>
+          setTimeout(resolveDelay, retryDelayMs)
+        );
+        continue;
+      }
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        body = undefined;
+      }
+      const ready = response.ok &&
+        typeof body === "object" &&
+        body !== null &&
+        (
+          (body as Record<string, unknown>).status === "ready" ||
+          (body as Record<string, unknown>).state === "ready" ||
+          (body as Record<string, unknown>).ready === true
+        );
+      if (!ready) {
+        return {
+          status: "failed",
+          reason: "The public Eve health route did not report ready.",
+        };
+      }
       return {
-        status: "indeterminate",
-        reason: "The public Eve health request did not complete.",
-      };
-    }
-    let body: unknown;
-    try {
-      body = await response.json();
-    } catch {
-      body = undefined;
-    }
-    const ready = response.ok &&
-      typeof body === "object" &&
-      body !== null &&
-      (
-        (body as Record<string, unknown>).status === "ready" ||
-        (body as Record<string, unknown>).state === "ready" ||
-        (body as Record<string, unknown>).ready === true
-      );
-    if (!ready) {
-      return {
-        status: "failed",
-        reason: "The public Eve health route did not report ready.",
+        status: "ready",
+        identity: responseIdentity(response, body),
       };
     }
     return {
-      status: "ready",
-      identity: responseIdentity(response, body),
+      status: "indeterminate",
+      reason: lastReason,
     };
   };
 }
