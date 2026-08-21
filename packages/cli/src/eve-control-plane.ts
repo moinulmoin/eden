@@ -2898,12 +2898,42 @@ export async function runEveDestroy(
     throw new EveCliError({ code, message, source: "eve destroy" });
   };
 
-  const lock = await acquireEveTargetLock(
-    request.projectRoot,
-    request.environment,
-    request.name,
-  );
+  let lockReleased = false;
   try {
+    const lock = await acquireEveTargetLock(
+      request.projectRoot,
+      request.environment,
+      request.name,
+    );
+    try {
+      await runEveDestroyLocked(request, options, checks, emit, fail);
+    } finally {
+      lockReleased = await releaseEveTargetLock(lock);
+    }
+  } catch (error: unknown) {
+    if (error instanceof EveCliError) throw error;
+    if (error instanceof EveRuntimeConfigError) throw error;
+    throw new EveCliError({
+      code: "EVE_DESTROY_FAILED",
+      message: "The eve destroy operation failed.",
+      source: "eve destroy",
+    });
+  }
+  if (!lockReleased) {
+    fail(
+      "EVE_DEPLOY_LOCK_RELEASE_UNPROVEN",
+      "The Eve destroy lock could not be released with exact ownership proof; local residue was retained.",
+    );
+  }
+}
+
+async function runEveDestroyLocked(
+  request: EveCliExecutionRequest,
+  options: EvePreflightOptions,
+  checks: EvePreflightCheck[],
+  emit: (outcome: EveDestroyOutcome) => void,
+  fail: (code: string, message: string) => never,
+): Promise<void> {
     const found = await readEveDestroyRecord(
       request.projectRoot,
       request.environment,
@@ -3094,15 +3124,4 @@ export async function runEveDestroy(
       name: request.name,
       checks,
     });
-  } finally {
-    const released = await releaseEveTargetLock(lock);
-    if (!released) {
-      throw new EveCliError({
-        code: "EVE_DEPLOY_LOCK_RELEASE_UNPROVEN",
-        message:
-          "The Eve destroy lock could not be released with exact ownership proof; local residue was retained.",
-        source: "deployment-lock",
-      });
-    }
-  }
 }
