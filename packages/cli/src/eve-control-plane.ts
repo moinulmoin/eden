@@ -387,13 +387,6 @@ export interface EveDestroyCloudflareReadRequest {
   readonly containerApplicationName: string;
 }
 
-const noRuntimeResourcesCleanup: EveRuntimeCleanup = Object.freeze({
-  bootContainerId: null,
-  bootContainerRemoved: true,
-  imageIdentity: "exact",
-  imageRetained: false,
-  verified: true,
-});
 
 interface EvePreflightCollection {
   readonly result: EvePreflightResult;
@@ -824,20 +817,6 @@ async function findAvailableEveHealthPort(): Promise<number> {
 async function defaultRuntimeRunner(
   request: EvePreflightRuntimeRunnerRequest,
 ): Promise<EvePreflightRuntimeEvidence> {
-  if (request.runtimeInjection !== undefined) {
-    return {
-      ok: false,
-      checks: [
-        check(
-          "VAL-SEC-003",
-          "blocked",
-          "The built-in runtime-image seam cannot inject explicit environment values into a disposable Eve start process.",
-          "Provide a protected local Eve-start runner for env-file preflight; values must not enter argv, image layers, or logs.",
-        ),
-      ],
-      cleanup: noRuntimeResourcesCleanup,
-    };
-  }
   let result: Awaited<ReturnType<typeof buildEveRuntimeImage>>;
   try {
     const imageRequest: EveRuntimeImageRequest = {
@@ -848,6 +827,9 @@ async function defaultRuntimeRunner(
       ...(request.publicOrigin === undefined
         ? {}
         : { publicOrigin: request.publicOrigin }),
+      ...(request.runtimeInjection === undefined
+        ? {}
+        : { runtimeInjection: request.runtimeInjection }),
       retainImage: request.retainImage ?? false,
     };
     result = await buildEveRuntimeImage(imageRequest);
