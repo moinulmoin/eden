@@ -125,7 +125,14 @@ const CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS = 10_000;
 // published field. Full serial measurements reached 1.64s; keep its budget
 // local rather than changing Vitest's default for unrelated compiler tests.
 const MALFORMED_PUBLISHED_ARTIFACT_TEST_TIMEOUT_MS = 10_000;
-const WRANGLER_DRY_RUN_PROCESS_TIMEOUT_MS = 10_000;
+// The only real Wrangler spawn in the suite. Warm runs measure ~1.1s, but the
+// first invocation after a fresh install loads Wrangler's whole module graph
+// through a cold filesystem cache and exceeded 10s on the macos-14 runner
+// (killed mid-boot, before any output). Keep the tight local default and let
+// slow runners widen the budget through this knob.
+const WRANGLER_DRY_RUN_PROCESS_TIMEOUT_MS =
+  Number.parseInt(process.env.EDEN_WRANGLER_DRY_RUN_TIMEOUT_MS ?? "", 10) ||
+  10_000;
 
 async function createClosedGrammarProject(
   instructions: string,
@@ -2185,7 +2192,7 @@ describe("artifact generation", () => {
         /Total Upload|dry-run|Successfully built/u,
       );
     },
-    15_000,
+    WRANGLER_DRY_RUN_PROCESS_TIMEOUT_MS + 15_000,
   );
 
   test("rejects ambient bindings before publishing a Worker artifact", async () => {

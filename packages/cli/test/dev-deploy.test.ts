@@ -978,16 +978,45 @@ describe("eden dev and deploy orchestration", () => {
       [
         "--input-type=module",
         "-e",
-        "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);",
+        "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1000);",
       ],
       {
         argv0: marker,
         detached: true,
-        stdio: "ignore",
+        stdio: ["ignore", "pipe", "ignore"],
       },
     );
     const childPid = child.pid;
     expect(childPid).toBeGreaterThan(0);
+    // `ps` reports the marker as soon as the child exists, which can precede
+    // Node installing the fixture's SIGTERM handler on a slow cold boot. A
+    // SIGTERM sent into that window terminates the child outright (observed on
+    // the macos-14 runner), so the escalation under test never happens.
+    // Await the handler-installed byte directly before any signaling; the
+    // timer only bounds a broken fixture, it never gates the happy path.
+    await new Promise<void>((resolve, reject) => {
+      const failureBound = setTimeout(() => {
+        reject(
+          new Error(
+            `owned stop fixture never installed its SIGTERM handler (pid ${childPid})`,
+          ),
+        );
+      }, 10_000);
+      child.stdout?.on("data", (chunk: Buffer) => {
+        if (String(chunk).includes("ready")) {
+          clearTimeout(failureBound);
+          resolve();
+        }
+      });
+      child.once("exit", () => {
+        clearTimeout(failureBound);
+        reject(
+          new Error(
+            `owned stop fixture exited before installing its SIGTERM handler (pid ${childPid})`,
+          ),
+        );
+      });
+    });
     let identity: EdenCliProcessIdentity | undefined;
     for (let attempt = 0; attempt < 50 && identity === undefined; attempt += 1) {
       identity = await new Promise<typeof identity>((resolve) => {
