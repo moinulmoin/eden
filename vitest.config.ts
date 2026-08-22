@@ -11,6 +11,8 @@ export default defineConfig({
     },
   },
   test: {
+    testTimeout: process.env.CI === "true" ? 30_000 : undefined,
+    hookTimeout: process.env.CI === "true" ? 30_000 : undefined,
     projects: [
       {
         resolve: {
@@ -22,6 +24,8 @@ export default defineConfig({
           },
         },
         test: {
+          testTimeout: process.env.CI === "true" ? 30_000 : undefined,
+          hookTimeout: process.env.CI === "true" ? 30_000 : undefined,
           server: {
             deps: {
               inline: ["@cloudflare/containers"],

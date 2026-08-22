@@ -27,7 +27,6 @@ jobs:
           pnpm run build
           pnpm run typecheck
           pnpm run lint
-
       - name: Serial test suite
         run: pnpm run test
 
