@@ -3,7 +3,7 @@
 ## 1. System Overview
 
 Eden is a TypeScript monorepo that provides an explicit CLI, a compiler for
-Eden Native projects, a Cloudflare Worker runtime, and an additive Eve
+Eden Agent projects, a Cloudflare Worker runtime, and an additive Eve
 packaging boundary. The reviewed change adds local Eve packaging only. Eve
 mode accepts an explicitly selected project root, copies a filtered immutable
 snapshot into an Eden-owned generation, runs a pinned pnpm install and the
@@ -48,18 +48,18 @@ runtime code.
 - Immutable source and output digests used for deployment identity.
 - Local Docker image, build container, temporary context, and cleanup
   ownership records.
-- Existing Eden Native compiler/runtime behavior and CLI ABI.
+- Existing Eden Agent compiler/runtime behavior and CLI ABI.
 
 ## 4. Attack Surface Inventory
 
-- `eden eve` project and artifact path arguments.
+- `eden preflight`, `eden deploy`, and `eden destroy` project and artifact path arguments.
 - Recursive filesystem traversal and snapshot copying.
 - JSON package manifest and YAML lockfile metadata parsing.
 - Project-local pnpm lifecycle scripts and Eve build code.
 - Docker/OrbStack command invocation and image/context paths.
 - Generated Dockerfile, `.dockerignore`, manifests, and diagnostic output.
 - Runtime configuration identity/name descriptors supplied by another worker.
-- Existing Native CLI/runtime and Cloudflare control-plane modules.
+- Existing Agent CLI/runtime and Cloudflare control-plane modules.
 
 ## 5. Threat Analysis
 
@@ -118,7 +118,7 @@ runtime code.
 
 ### Elevation of Privilege
 
-- Eve mode must never route failures into the Eden Native compiler/runtime or
+- Eve mode must never route failures into the Eden Agent compiler/runtime or
   use global executables. The project-local Eve binary and literal `eve build`
   are the only application build authority.
 - Docker builder commands use a sanitized environment and no runtime secrets.
@@ -151,9 +151,9 @@ source. Only safe names and identities may be recorded.
 Hash and compare the complete allowlisted input file set and deployment-safety
 input identity at every stage. Do not retry automatically after a race.
 
-### Native fallback
+### Agent fallback
 
-Do not import or invoke the Eden compiler, Native runtime, turn runner, or
+Do not import or invoke the Eden compiler, Agent runtime, turn runner, or
 fixture adapters while handling Eve package failures.
 
 ## 7. Security Testing Strategy
@@ -182,5 +182,5 @@ fixture adapters while handling Eve package failures.
 
 ## 9. Version Changelog
 
-- 1.0.0: Initial repository threat model covering Eden Native and the local
-  Eve immutable packaging boundary.
+- 1.1.0: Renamed Eden Native to Eden Agent and replaced the obsolete
+  `eden eve` namespace with the top-level Deploy commands.
