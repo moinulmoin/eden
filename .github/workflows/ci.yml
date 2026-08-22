@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Enable pinned pnpm
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, typecheck, lint
+        run: |
+          pnpm run build
+          pnpm run typecheck
+          pnpm run lint
+
+      - name: Serial test suite
+        run: pnpm run test
+
+      - name: Local conformance
+        run: pnpm run conformance:local

@@ -1,0 +1,35 @@
+commands:
+  install: corepack pnpm install --frozen-lockfile
+  test: corepack pnpm run test && corepack pnpm run conformance:local
+  build: corepack pnpm run build
+  typecheck: corepack pnpm run typecheck
+  lint: corepack pnpm run lint
+  cli_test: corepack pnpm --filter @eden/cli run test
+  cli_build: corepack pnpm --filter @eden/cli run build
+  runtime_test: corepack pnpm --filter @eden/runtime-cloudflare run test
+  compiler_test: corepack pnpm --filter @eden/compiler run test
+
+services:
+  eden-local:
+    port: 8797
+    depends_on: []
+    start: >-
+      test -n "${EDEN_BEARER_SECRET:?EDEN_BEARER_SECRET is required}" &&
+      corepack pnpm run build &&
+      EDEN_HOST=127.0.0.1 EDEN_PORT=8797 EDEN_INSPECTOR_PORT=9297
+      corepack pnpm exec node packages/cli/dist/index.js agent dev
+      --project examples/basic-agent
+    stop: >-
+      env -u EDEN_BEARER_SECRET
+      EDEN_HOST=127.0.0.1 EDEN_PORT=8797 EDEN_INSPECTOR_PORT=9297
+      corepack pnpm exec node --input-type=module -e
+      'import("./packages/cli/dist/index.js").then(({ stopEdenDev }) =>
+      stopEdenDev({ cwd: process.cwd(), projectRoot: "examples/basic-agent" }))
+      .then((code) => { process.exitCode = code; })
+      .catch((error) => { console.error(error); process.exitCode = 1; })'
+    healthcheck: >-
+      test -n "${EDEN_BEARER_SECRET:?EDEN_BEARER_SECRET is required}" &&
+      printf 'header = "Authorization: Bearer %s"\n' "$EDEN_BEARER_SECRET" |
+      curl --config - --fail --silent --show-error
+      http://127.0.0.1:8797/eden/v1/health >/dev/null &&
+      nc -z 127.0.0.1 9297

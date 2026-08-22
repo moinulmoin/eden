@@ -1,12 +1,11 @@
 import { readFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
-import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { spawn, execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import process from "node:process";
 import { setTimeout as delayTimer } from "node:timers/promises";
-import { join } from "node:path";
-import { dirname } from "node:path";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 import {
@@ -19,7 +18,9 @@ import {
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const missionManifestPath = process.env.EDEN_SERVICES_MANIFEST ??
   (process.env.FACTORY_RUNTIME_SETTINGS_PATH === undefined
-    ? undefined
+    ? (existsSync(join(repositoryRoot, "services.yaml"))
+      ? join(repositoryRoot, "services.yaml")
+      : undefined)
     : join(dirname(process.env.FACTORY_RUNTIME_SETTINGS_PATH), "services.yaml"));
 
 function manifestCommands(source) {
