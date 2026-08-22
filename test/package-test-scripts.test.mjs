@@ -28,7 +28,9 @@ const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS = 300_000;
 // The slowest observed compiler-filter child was 96.0s; retain a measured 54s
 // cushion for cold starts and serial load while still bounding one hung child
 // well inside the enclosing 300s assertion.
-const PACKAGE_TEST_PROCESS_TIMEOUT_MS = 150_000;
+const PACKAGE_TEST_PROCESS_TIMEOUT_MS =
+  Number.parseInt(process.env.EDEN_PACKAGE_TEST_TIMEOUT_MS ?? "", 10) ||
+  150_000;
 // Keep compiler output bounded while leaving a measured margin over the
 // harness default for six serial package logs. This is intentionally finite;
 // a noisy or stuck compiler must produce an explicit harness failure.

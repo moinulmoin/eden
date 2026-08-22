@@ -29,6 +29,9 @@ jobs:
           pnpm run lint
       - name: Serial test suite
         run: pnpm run test
+        env:
+          EDEN_OWNED_TERM_GRACE_MS: "5000"
+          EDEN_PACKAGE_TEST_TIMEOUT_MS: "300000"
 
       - name: Local conformance
         run: pnpm run conformance:local
