@@ -32,6 +32,7 @@ jobs:
         env:
           EDEN_OWNED_TERM_GRACE_MS: "5000"
           EDEN_PACKAGE_TEST_TIMEOUT_MS: "300000"
+          EDEN_PACKAGE_TEST_SCRIPTS_TIMEOUT_MS: "600000"
           EDEN_WRANGLER_DRY_RUN_TIMEOUT_MS: "120000"
       - name: Local conformance
         run: pnpm run conformance:local

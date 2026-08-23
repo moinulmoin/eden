@@ -24,7 +24,11 @@ const workspacePackageDirectories = [
 // assertion. A 300s budget leaves at least a 74.1s margin for the slower
 // assertion while staying scoped to this portability regression instead of
 // masking unrelated hangs globally.
-const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS = 300_000;
+const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS =
+  Number.parseInt(
+    process.env.EDEN_PACKAGE_TEST_SCRIPTS_TIMEOUT_MS ?? "",
+    10,
+  ) || 300_000;
 // The slowest observed compiler-filter child was 96.0s; retain a measured 54s
 // cushion for cold starts and serial load while still bounding one hung child
 // well inside the enclosing 300s assertion.
