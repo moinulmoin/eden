@@ -234,8 +234,12 @@ test("keeps invalid-input and interrupted-step fixtures in the serial conformanc
 
   const readme = await readFile(join(repositoryRoot, "README.md"), "utf8");
   expect(readme).toContain("corepack pnpm run conformance:local");
-  expect(readme).toMatch(/disconnects after committed cursor `5`/i);
-  expect(readme).toMatch(/`startIndex=5`/i);
-  expect(readme).toMatch(/invalid tool input/i);
-  expect(readme).toMatch(/interrupted/i);
+  const validationDoc = await readFile(
+    join(repositoryRoot, "docs/validation.md"),
+    "utf8",
+  );
+  expect(validationDoc).toMatch(/disconnects after committed cursor `5`/i);
+  expect(validationDoc).toMatch(/`startIndex=5`/i);
+  expect(validationDoc).toMatch(/invalid tool input/i);
+  expect(validationDoc).toMatch(/interrupted/i);
 });

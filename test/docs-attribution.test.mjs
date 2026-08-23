@@ -74,8 +74,12 @@ function expectNoProcessReservations(label) {
 
 test("documents the supported CLI and clean-room operator boundaries", async () => {
   const readme = await readRepositoryFile("README.md");
+  const deployDoc = await readRepositoryFile("docs/deploy.md");
+  const agentCliDoc = await readRepositoryFile("docs/agent-cli.md");
+  const validationDoc = await readRepositoryFile("docs/validation.md");
+
   const commandHeadings = [
-    ...readme.matchAll(/^### `eden agent ([a-z]+)`$/gmu),
+    ...agentCliDoc.matchAll(/^## `eden agent ([a-z]+)`$/gmu),
   ].map((match) => match[1]);
 
   expect(new Set(commandHeadings)).toEqual(
@@ -87,17 +91,23 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   expect(readme).toMatch(/127\.0\.0\.1:8797/);
   expect(readme).toMatch(/127\.0\.0\.1:9297/);
   expect(readme).toContain("EDEN_BEARER_SECRET");
-  expect(readme).toMatch(/cursor|startIndex/i);
-  expect(readme).toMatch(/Durable Object/i);
-  expect(readme).toMatch(/local validation/i);
-  expect(readme).toMatch(/deployed validation/i);
-  expect(readme).toMatch(/cleanup/i);
-  expect(readme).toMatch(/workerd/i);
-  expect(readme).toMatch(/node:vm/i);
-  expect(readme).toMatch(/provisional limits/i);
-  expect(readme).toMatch(/out of scope/i);
-  expect(readme).not.toMatch(/eden (?:run|start|stop|shell|schedule|workflow)\b/i);
-  expect(readme).not.toMatch(/Bearer\s+[A-Za-z0-9_-]{12,}/i);
+  expect(deployDoc).toMatch(/Eve project/i);
+  expect(deployDoc).toMatch(/--env-file/i);
+  expect(agentCliDoc).toMatch(/Durable Object/i);
+  expect(agentCliDoc).toMatch(/workerd/i);
+  expect(agentCliDoc).toMatch(/node:vm/i);
+  expect(validationDoc).toMatch(/cursor|startIndex/i);
+  expect(validationDoc).toMatch(/local validation/i);
+  expect(validationDoc).toMatch(/deployed validation/i);
+  expect(validationDoc).toMatch(/cleanup/i);
+  expect(validationDoc).toMatch(/provisional limits/i);
+  expect(validationDoc).toMatch(/out of scope/i);
+  for (const document of [readme, deployDoc, agentCliDoc, validationDoc]) {
+    expect(document).not.toMatch(
+      /eden (?:run|start|stop|shell|schedule|workflow)\b/i,
+    );
+    expect(document).not.toMatch(/Bearer\s+[A-Za-z0-9_-]{12,}/i);
+  }
 });
 
 test("exposes the Deploy-first root help and rejects unsupported commands", async () => {
@@ -199,9 +209,14 @@ test("retains the exact upstream Eve NOTICE block", async () => {
 test(
   "targets every documented mutating Wrangler command explicitly",
   async () => {
-    const readme = await readRepositoryFile("README.md");
-    const commands = extractDocumentedWranglerCommands(readme);
-    expect(commands.length).toBeGreaterThan(0);
+    const [readme, agentCliDoc, validationDoc] = await Promise.all([
+      readRepositoryFile("README.md"),
+      readRepositoryFile("docs/agent-cli.md"),
+      readRepositoryFile("docs/validation.md"),
+    ]);
+    const commands = extractDocumentedWranglerCommands(
+      `${readme}\n${agentCliDoc}\n${validationDoc}`,
+    );
 
     const helpByCommand = new Map();
     for (const command of ["deploy", "secret put", "secret delete", "delete"]) {
@@ -830,18 +845,14 @@ test(
   async () => {
   let replaceIdentity = false;
   let replacementInjected = false;
-  let replacementRoot;
+  let rootPid;
   const signals = [];
   const snapshot = () => {
     const entries = snapshotOwnedProcesses();
     if (entries === undefined) return entries;
-    const root = entries.find((entry) =>
-      entry.command.includes("eden-owned-wrangler-identity-replacement-"),
-    );
-    replacementRoot ??= root;
-    if (!replaceIdentity || replacementRoot === undefined) return entries;
+    if (!replaceIdentity || rootPid === undefined) return entries;
     return entries.map((entry) =>
-      entry.pid === replacementRoot.pid
+      entry.pid === rootPid
         ? {
             ...entry,
             command: "unrelated-replacement-process",
@@ -857,13 +868,22 @@ test(
       'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)',
     ],
     cwd: repositoryRoot,
-    timeoutMs: 150,
+    // The fixture must install its SIGTERM handler before the timeout
+    // delivers the first signal: node's exec-to-handler window (~25ms here)
+    // can stretch past 150ms under load, letting the first SIGTERM terminate
+    // an unarmed root and verify cleanup as a natural exit.
+    timeoutMs: 600,
     label: "wrangler-identity-replacement-fixture",
     snapshot,
     sendSignal: (target, signal) => {
       signals.push(signal);
       if (signal === "SIGTERM" && !replacementInjected) {
         replacementInjected = true;
+        // The harness signals the owned group (-pgid) and the detached root
+        // leads that group, so the first SIGTERM target names exactly this
+        // run's root. Keying the replacement on that pid ignores stale
+        // same-label fixtures leaked by earlier interrupted runs.
+        rootPid = Math.abs(target);
         replaceIdentity = true;
       }
       return process.kill(target, signal);

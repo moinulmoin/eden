@@ -1,13 +1,12 @@
 # Eden
 
-Eden has two separated surfaces:
+Eden is one CLI with two separated surfaces:
 
 1. **Eden Deploy** — host an *existing Eve project* on Cloudflare as-is. Eden
    builds the project with its own pinned Eve toolchain, packages the real
    Node/Nitro server into one bounded Cloudflare Container, and places a
-   generic Worker in front of it. `eden deploy`, `eden destroy`, and the
-   optional read-only `eden preflight` command form the deploy-first product
-   surface.
+   generic Worker in front of it. The top-level `eden preflight`, `eden deploy`,
+   and `eden destroy` commands form the deploy-first product surface.
 2. **Eden Agent** — a small, Cloudflare-native durable agent framework:
    filesystem-first authoring, a Node-side compiler, a Worker-safe generated
    bundle, one authenticated Worker host, one SQLite-backed `EdenSession`
@@ -19,23 +18,16 @@ Deploy never invokes the Agent framework, rewrites Eve source, lowers Eve into
 an Eden Agent, maps Eve application semantics onto Cloudflare primitives, or
 uses the Agent runtime as a fallback. The two surfaces stay separate on purpose.
 
-The Agent command surface is intentionally frozen beneath one namespace:
-`eden agent init`, `eden agent build`, `eden agent dev`, and
-`eden agent deploy`. The top-level Deploy surface adds only `eden preflight`,
-`eden deploy`, and `eden destroy`. No other Eden command is implied.
-
-## Setup
-
-The repository is a pnpm workspace with TypeScript project references. The
-local gate is reproducible without Turbo and without a remote deployment.
-
-Requirements:
+## Requirements
 
 - Node `24.17.0` (the version in `.nvmrc`)
 - pnpm `11.21.0` through Corepack
 - Wrangler `4.120.0`, installed by the frozen lockfile
 
-From the repository root:
+## Setup
+
+The repository is a pnpm workspace with TypeScript project references. The
+local gate is reproducible without Turbo and without a remote deployment.
 
 ```sh
 corepack pnpm install --frozen-lockfile
@@ -45,18 +37,13 @@ corepack pnpm exec eslint . --max-warnings 0
 corepack pnpm exec vitest run --maxWorkers=1
 ```
 
-The checks above are the milestone gate. They are reproducible without
-Turbo and without a remote deployment.
-
 After `corepack pnpm run build`, invoke the local CLI entry point with:
 
 ```sh
 node packages/cli/dist/index.js --help
 ```
 
-In the walkthrough below, `eden` means that same built entry point. Run this
-from the repository root; the direct path keeps project-root and workspace
-dependency resolution stable without installing a global binary:
+In the examples below, `eden` means that same built entry point:
 
 ```sh
 eden() {
@@ -64,454 +51,41 @@ eden() {
 }
 ```
 
-## Eden Deploy: host an existing Eve project
+## Quickstart
 
-Eden Deploy takes an existing Eve project directory and runs the real Eve
-application on Cloudflare. Eve stays the execution authority: Eden runs the
-project's own `eve build`, starts the official project-local
-`eve start --host 0.0.0.0 --port 8080` supervisor inside one bounded
-Cloudflare Container (`max_instances: 1`), and routes the public surface
-through one generic Worker. Eden owns build orchestration, packaging,
-publication, deployment identity, and cleanup — nothing else.
+Host an existing Eve project (preview target, exact named Worker):
 
 ```sh
-eden deploy  --project <path> --env preview --name <name>
-eden destroy --project <path> --env preview --name <name>
+export EDEN_BEARER_SECRET="$(openssl rand -hex 24)"
+eden deploy --project ./my-eve-app --env preview --name my-eve-preview-$(date +%s)
 ```
 
-`deploy` is the primary workflow and runs every required check inline; it does
-not require a prior preflight. `destroy` removes only the exact Worker and
-Container application recorded for that target, verifies bounded absence, and
-only then clears the target's `CURRENT` pointer. Destroy is idempotent when
-the exact target is already absent, fails closed without a matching immutable
-deployment record, and never broadens cleanup to sibling targets.
-
-The optional read-only diagnostic is:
+Author a new agent with the Eden framework:
 
 ```sh
-eden preflight --project <path> --env preview --name <name>
+export EDEN_BEARER_SECRET="$(openssl rand -hex 24)"
+eden agent init --project ./my-agent
+eden agent build --project ./my-agent
+eden agent dev --project ./my-agent   # http://127.0.0.1:8797 (inspector 127.0.0.1:9297)
 ```
 
-Every Eve command requires explicit `--project`, `--env` (`preview` or
-`production`), and `--name`. `--env-file <path>` is accepted only by
-`preflight` and `deploy`; `destroy` rejects it and needs no environment file.
-Preview-first evidence makes no production SLA claim.
+## Local gate
 
-### Project-owned services and the Workflow World
-
-The Eve project's providers, models, credentials, databases, queues, external
-APIs, channels, schedules, sandbox, authentication, authorization, and
-configured Workflow World remain authoritative. Eden does not migrate,
-replace, translate, or silently drop any of them. Model access stays exactly
-what the project declares — Eden never substitutes a provider silently.
-
-A preview deployment that boots Eve's local Workflow World proves health,
-startup, and fresh request handling only. Container-local disk and process
-memory are disposable: a Container restart reinitializes local World state and
-does not demonstrate persistence. Production durability is the project
-owner's responsibility through a project-configured, Cloudflare-reachable,
-durable Eve-compatible World. The preview deployment runs one logical
-Container instance with `max_instances: 1`; Eden makes no horizontal-scaling
-or custom-domain promise in this release.
-
-### Environment handling
-
-Runtime values are supplied only through an explicit `--env-file` using a
-small opaque `KEY=VALUE` grammar. Eden parses names, not values: the values
-flow through a protected seam into the Container environment and Cloudflare
-secrets, never into argv, image layers, logs, artifacts, or the journal.
-Reserved host variables (`HOST`, `PORT`, `NITRO_*`, `NODE_ENV`, and Eden's own
-identity variables) are rejected in that file, and every emitted record is
-redacted.
-
-### Deploy, Adapt, and Agent
-
-- **Eden Deploy** (this release) hosts an existing Eve project as-is through
-  the top-level `eden preflight`, `eden deploy`, and `eden destroy` commands.
-- **Eden Adapt** is a separate, deliberate future concern: per-primitive
-  migration of Vercel-specific pieces onto Cloudflare alternatives. Deploy
-  never invokes Adapt automatically.
-- **Eden Agent** remains the `eden agent init`, `eden agent build`,
-  `eden agent dev`, and `eden agent deploy` path documented below.
-
-Deploy performs no source rewriting, no automatic migration, no Workflow World
-or sandbox replacement, and never falls back to the Agent runtime when
-hosting an Eve project.
-
-## Eden Agent CLI
-
-### `eden agent init`
-
-`eden agent init` creates a minimal project only in an empty selected
-directory. It writes:
-
-```text
-agent/instructions.md
-agent/agent.ts
-agent/tools/greet.ts
-package.json
-wrangler.jsonc
-```
-
-Tool identity is derived from the tool path, so the scaffold discovers `greet`
-without a registration file. `init` does not create `.env`, `.dev.vars`, or any
-secret file, and it never overwrites an existing root.
-
-Use `--project <path>` to select a root explicitly. Without it, Eden uses the
-current working directory exactly. It does not search parent or sibling
-directories.
-
-### `eden agent build`
-
-`eden agent build` discovers and validates the selected project, normalizes
-the agent and tools, creates one coherent `.eden/` generation, and runs
-Wrangler's compatibility dry-run. A successful build produces inspectable
-artifacts:
-
-```text
-.eden/discovery.json
-.eden/diagnostics.json
-.eden/manifest.json
-.eden/module-map.json
-.eden/agent-bundle.mjs
-.eden/build-metadata.json
-```
-
-The manifest, module map, bundle digest, and build metadata describe one
-generation. A failed build is not promoted over the last coherent generation.
-The command validates compatibility only; it does not deploy.
-
-### `eden agent dev`
-
-`eden agent dev` builds before starting the local Worker and watches the
-authored `agent/` tree for coherent rebuilds. It uses only:
-
-- Worker: `http://127.0.0.1:8797`
-- Wrangler inspector: `127.0.0.1:9297`
-
-It refuses occupied approved ports and does not use or stop ports `8787` or
-`8800`. The CLI tracks only the child process it starts. Stop that owned
-process with `Ctrl-C`; do not kill arbitrary listeners by port or process name.
-
-The local runtime fails closed unless `EDEN_BEARER_SECRET` is set in the
-invoking environment. Eden passes that value to Wrangler without putting it in
-the project, generated artifacts, or normal output. Keep the value outside the
-repository and never paste it into a command transcript.
-
-### `eden agent deploy`
-
-`eden agent deploy` accepts only `--env preview` and `--env production`. If
-`--env` is omitted, the target is `preview`; production must be explicit.
-The command builds the selected generation, verifies its artifact identity,
-runs an environment-specific Wrangler compatibility dry-run, provisions
-`EDEN_BEARER_SECRET` through Wrangler stdin, deploys the generated runtime
-wrapper and bundle, waits for edge and Durable Object propagation, and validates
-authenticated health, generation metadata, session creation, cursor reconnect,
-the live `eden-dev` model/tool/final turn, and the expected lifecycle.
-
-Set `EDEN_BEARER_SECRET` outside the project and pass a unique `--name` for
-temporary validation:
-
-```sh
-export EDEN_BEARER_SECRET="$(node -e 'process.stdout.write(`eden-gate-${require("crypto").randomBytes(24).toString("hex")}`)')"
-eden agent deploy \
-  --project "$PROJECT_ROOT" \
-  --env preview \
-  --name "eden-gate-preview-$(date +%s)"
-```
-
-The secret is never placed in an argument, URL, artifact, or normal output.
-Successful deployment output includes the selected generation ID and reachable
-Worker URL. A deployment failure is reported separately from compatibility,
-propagation, authentication, lifecycle, model, and cleanup failures.
-
-If a validation harness provisions the secret separately instead of using
-`eden agent deploy`, the pinned Wrangler command must remain explicitly
-scoped to the same unique Worker:
-
-```sh
-printf '%s' "$EDEN_BEARER_SECRET" |
-  corepack pnpm exec wrangler secret put EDEN_BEARER_SECRET \
-    --name "$WORKER_NAME" --config "$PROJECT_ROOT/wrangler.jsonc"
-```
-
-Keep `--env` off these name-scoped secret commands intentionally. In Wrangler
-4.120, adding `--env` selects an environment-suffixed Worker rather than the
-exact unique Worker named by `--name`.
-
-Eden resolves the effective target with Wrangler 4.120's pinned
-`unstable_readConfig` parser from the immutable selected config snapshot.
-JSONC comments and trailing commas are supported, and Wrangler's environment
-overlay rules apply: preview may inherit and receive a preview suffix, while
-production may override the name. A configured name selects the target only;
-it is treated as shared and never grants destructive cleanup authority.
-
-Only an explicit, unique `--name` authorizes remote compensation. On failure,
-Eden may delete the provisioned secret, but it deletes the Worker only after a
-deployment was attempted. Configured/shared targets are preserved and report
-`REMOTE_CLEANUP_SKIPPED_UNOWNED` alongside the primary failure. If cleanup or
-its ownership lease cannot settle, Eden reports `REMOTE_CLEANUP_TIMEOUT` or
-`REMOTE_CLEANUP_LEASE_RETAINED` and retains the late operation, lock, and lease
-residue for manual inspection and cleanup. Invalid Wrangler syntax fails closed
-with actionable `PROJECT_CONFIG_INVALID`.
-
-## Clean-room local validation
-
-The following walkthrough uses only the repository checkout and the approved
-local ports. Create a temporary root whose contents are disposable and known
-to be validator-generated:
-
-```sh
-PROJECT_ROOT="$(mktemp -d)"
-eden agent init --project "$PROJECT_ROOT"
-eden agent build --project "$PROJECT_ROOT"
-```
-
-Check that the generated root contains the five scaffold entries and `.eden/`
-after the build. Eden may retain its hidden, root-contained
-`.eden-init-provenance-*` ownership directory; it contains only internal
-recovery state and is not a secret-bearing project file. There must be no
-`.env`, `.dev.vars`, bearer value, raw Durable Object identifier, or secret
-file.
-
-In one terminal, set `EDEN_BEARER_SECRET` to a local value held outside the
-project and start development:
-
-```sh
-export EDEN_BEARER_SECRET
-eden agent dev --project "$PROJECT_ROOT"
-```
-
-In another terminal, use the same environment value for authenticated requests.
-Every route is protected:
-
-```sh
-curl --fail --silent \
-  -H "Authorization: Bearer ${EDEN_BEARER_SECRET}" \
-  http://127.0.0.1:8797/eden/v1/health
-
-curl --fail --silent \
-  -H "Authorization: Bearer ${EDEN_BEARER_SECRET}" \
-  -H "Content-Type: application/json" \
-  -X POST \
-  -d '{}' \
-  http://127.0.0.1:8797/eden/v1/session
-```
-
-The session response contains an opaque `sessionId`. Submit one message, then
-read the durable stream:
-
-```sh
-curl --fail --silent \
-  -H "Authorization: Bearer ${EDEN_BEARER_SECRET}" \
-  -H "Content-Type: application/json" \
-  -X POST \
-  -d '{"message":"Say hello to Eden."}' \
-  "http://127.0.0.1:8797/eden/v1/session/<session-id>"
-
-curl --fail --silent \
-  -H "Authorization: Bearer ${EDEN_BEARER_SECRET}" \
-  "http://127.0.0.1:8797/eden/v1/session/<session-id>/stream?startIndex=0&follow=false"
-```
-
-Save the greatest committed `streamIndex` from the NDJSON response. A positive
-cursor is the last accepted committed event, not the next event to request. To
-reconnect, use it as that last accepted cursor:
-
-```sh
-curl --fail --silent \
-  -H "Authorization: Bearer ${EDEN_BEARER_SECRET}" \
-  "http://127.0.0.1:8797/eden/v1/session/<session-id>/stream?startIndex=<last-stream-index>&follow=false"
-```
-
-`startIndex=0` replays from the beginning. A positive `startIndex` resumes
-strictly after that cursor. The executable local conformance flow deliberately
-disconnects after committed cursor `5`, then reconnects with
-`startIndex=5` and verifies cursors `6` through `12`. A disconnected stream
-does not cancel an accepted turn; reconnect from the saved absolute cursor and
-verify that committed events are ordered and the session reaches
-`session.waiting`.
-
-The required successful lifecycle is visible in the journal:
-
-```text
-session.started
-turn.started
-message.received
-step.started
-actions.requested
-action.result
-step.completed
-step.started
-message.completed
-step.completed
-turn.completed
-session.waiting
-```
-
-Finish local validation by sending `Ctrl-C` to the `eden agent dev` process,
-confirming that ports `8797` and `9297` are no longer listening, and removing
-only the temporary root created by this walkthrough.
-
-For the complete serial local conformance gate, run this repository-owned
-validator after the frozen install:
+Run the full serial conformance validator after the frozen install:
 
 ```sh
 corepack pnpm run conformance:local
 ```
 
-It creates and removes its own empty temporary root, runs the documented
-`init` → `build` → `dev` → authenticated session flow, disconnects after
-committed cursor `5` and reconnects through `session.waiting`, then runs one
-deterministic public failure/recovery flow through the Workers pool. That flow
-evicts and reconnects invalid tool input and interrupted-uncommitted sessions,
-checks durable failure/retry state and no false success, and verifies a
-completed effect replays with execution count `1`. The gate also runs the
-journal-delivery and typed-client cursor fixtures. The validator runs
-serially, uses only `127.0.0.1:8797` and `127.0.0.1:9297`, keeps its generated
-bearer outside the project and captured output, and verifies that its process,
-ports, and temporary root are removed.
+## Documentation
 
-## Deployed validation
+| Document | Contents |
+| --- | --- |
+| [`docs/deploy.md`](./docs/deploy.md) | Eve hosting: targets, destroy semantics, Workflow World, env-file handling, Deploy/Adapt/Agent positioning |
+| [`docs/agent-cli.md`](./docs/agent-cli.md) | Agent CLI reference, authentication boundaries, architecture, compatibility findings |
+| [`docs/validation.md`](./docs/validation.md) | Clean-room walkthrough, deployed validation, provisional limits, out of scope, cleanup |
 
-An authorized remote validation uses a unique temporary Worker name and an
-isolated environment target. The repository-owned flow is:
+## License
 
-1. Build the exact generation that passed local validation.
-2. Run `eden agent deploy --env <environment> --name <unique-worker-name>`
-   with `EDEN_BEARER_SECRET` held only in the invoking environment. The command
-   supplies the secret to Wrangler through stdin.
-3. Poll the Worker until unauthenticated health fails closed and authenticated
-   health, info, session creation, and the Durable Object namespace are ready.
-4. Run authenticated command, NDJSON cursor-reconnect, and live model/tool/final
-   response checks through the `eden-dev` AI Gateway path.
-5. Compare the remote tool identity, normalized shapes, lifecycle order, safe
-   version metadata, and final-message contract with the local run.
-6. Delete every validator-owned temporary Worker and secret, then verify that
-   the URL is unreachable and the temporary secret/resource entries are absent.
-
-Preview and production use separate Worker and Durable Object namespace targets.
-Never use production as an implicit temporary target, and never delete shared
-production resources during cleanup. For a temporary Worker named explicitly
-with `--name`, Wrangler 4.120 cleanup is:
-
-```sh
-corepack pnpm exec wrangler secret delete EDEN_BEARER_SECRET \
-  --name "$WORKER_NAME" --config "$PROJECT_ROOT/wrangler.jsonc"
-corepack pnpm exec wrangler delete "$WORKER_NAME" \
-  --env "$ENVIRONMENT" --config "$PROJECT_ROOT/wrangler.jsonc" --force
-```
-
-Run both commands only for resources owned by that validation. Secret deletion
-does not accept `--force` in the pinned Wrangler version. When `--name`
-selects an explicit Worker, keep the secret commands name-scoped and omit
-`--env`; adding an environment there targets a suffixed Worker name.
-
-## Authentication and request boundaries
-
-- Every implemented route requires `Authorization: Bearer ...`.
-- Missing, empty, or invalid credentials fail closed before session lookup.
-- The server resolves the fixed test principal; callers cannot choose a
-  principal, tenant, session owner, or platform locator in the body or headers.
-- Session IDs and event IDs are opaque. A session ID is not authorization by
-  itself.
-- Session creation accepts `{}`. Commands accept only
-  `{ "message": string }`.
-- Request JSON is bounded to a nesting depth of 32. Create requests are
-  limited to 1 KiB, command requests to 32 KiB, and messages to 16 KiB.
-- NDJSON uses `application/x-ndjson`; each event has a persisted absolute
-  cursor, opaque event ID, type, bounded data, and commit timestamp.
-
-Do not put credentials, bindings, provider clients, full prompts, complete
-transcripts, or unbounded model/tool payloads in source, tests, events, logs,
-or documentation.
-
-## Architecture boundaries
-
-```text
-agent/ source tree
-  -> Node-only Eden compiler
-  -> .eden manifest and Worker-safe bundle
-  -> Cloudflare Worker HTTP host
-  -> EdenSession SQLite Durable Object
-  -> Workers AI through the eden-dev AI Gateway
-```
-
-- The compiler owns filesystem discovery, path-derived tool names,
-  normalization, diagnostics, manifest generation, and static bundling. It
-  never runs inside the Worker.
-- The Worker host owns authentication and routing, not canonical session state.
-- `EdenSession` is the sole journal and state-transition authority. SQLite
-  commits precede NDJSON delivery, model advancement, and tool-result
-  advancement.
-- The model adapter keeps Workers AI, AI Gateway, and binding details behind
-  Eden-owned contracts.
-- The typed client stores only the opaque session ID and last accepted
-  absolute cursor. Transport connection state is not durability.
-- Durable Object alarms are bounded, at-least-once recovery support, not a
-  general scheduler or workflow engine.
-
-The local workerd/runtime filesystem is not a project filesystem or security
-sandbox. Source discovery and compilation happen in Node, and the Worker
-receives static artifacts only.
-
-## Compatibility findings
-
-Eden uses Eve as a research and selective-derivation reference. The pinned Eve
-reference is package `0.31.3` at commit
-`0b102bc90e7cf2c3e294f6ca3af86c307d449b1a`. Portable agent-definition,
-protocol, reducer, cursor, normalization, and lifecycle concepts were
-re-derived into Eden-owned contracts and tested at the Worker boundary.
-
-The unmodified Eve compiler and full model/tool harness do not run unchanged in
-`workerd`: they depend on Node package-location behavior and `node:vm`
-assumptions, while Workers exposes `node:vm` only as a non-functional
-compatibility stub. Eden therefore keeps compilation in Node and deploys a
-static Worker-safe generated module bundle with extracted pure helpers.
-
-## Provisional limits
-
-This milestone proves one narrow use case:
-
-- one filesystem agent
-- one typed tool
-- one durable session
-- one bounded model/tool/final-response turn
-- two model steps at most for the turn
-- at most three attempts for a recoverable logical step/job
-- JSON-compatible bounded tool results and final content
-
-External effects are not exactly-once unless the destination honors Eden's
-stable idempotency coordinate. Alarms are at-least-once and bounded. Long
-sleeps, approvals, external-event waits, extended retries, and dynamic hosted
-bundles are future seams, not current guarantees. The local HTTP walkthrough
-uses a deterministic bounded runtime fixture; `eden agent deploy` switches
-the same generated bundle to the live Workers AI adapter and verifies remote
-parity through the full bounded turn.
-
-## Out of scope
-
-Schedules, subagents, MCP, channels beyond the default HTTP/NDJSON surface,
-dashboard UI, shell or filesystem tools, sandbox/container execution, R2,
-D1, Queues, native Workflows, Dynamic Workers, Dynamic Workflows, broad
-integrations, and hosted multi-tenant bundles are not implemented or implied
-by this milestone.
-
-## Cleanup
-
-For local validation, stop only the `eden agent dev` process started by the
-current walkthrough, verify `127.0.0.1:8797` and `127.0.0.1:9297` are free,
-and remove only the known temporary project root. Do not use broad process-name
-or port-kill commands.
-
-For an authorized remote validation, remove only the unique Worker, bearer
-secret, and other resources created by that run. Verify the deployment URL is
-unreachable and resource/secret listings no longer contain the temporary
-entries. Preserve shared preview or production resources.
-
-## License and attribution
-
-Eden is distributed under the Apache License, Version 2.0; see [`LICENSE`](./LICENSE).
-The repository [`NOTICE`](./NOTICE) records the Eve reference, Apache
-obligations, and the modified-derivative file markings. Eden does not include
-unmodified third-party runtime code.
+Apache-2.0. See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE) for third-party
+attribution.
