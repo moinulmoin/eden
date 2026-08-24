@@ -869,6 +869,14 @@ function startDev(repositoryRoot, projectRoot, secret, signal) {
   };
 }
 
+
+const FIXTURE_FAILURE_OUTPUT_TAIL_LINES = 200;
+function fixtureFailureOutputTail(result) {
+  const lines = `${result.stdout}\n${result.stderr}`
+    .split(/\r?\n/u)
+    .filter((line) => line.length > 0);
+  return lines.slice(-FIXTURE_FAILURE_OUTPUT_TAIL_LINES).join("\n");
+}
 async function runRecoveryFixtures(repositoryRoot, signal) {
   const summaries = [];
   for (const fixture of LOCAL_RECOVERY_FIXTURES) {
@@ -892,7 +900,13 @@ async function runRecoveryFixtures(repositoryRoot, signal) {
       const reportPath = join(reportRoot, "vitest.json");
       const result = await runProcess(
         "corepack",
-        [...args, "--reporter=json", "--outputFile", reportPath],
+        [
+          ...args,
+          "--reporter=default",
+          "--reporter=json",
+          "--outputFile",
+          reportPath,
+        ],
         {
           cwd: repositoryRoot,
           signal,
@@ -901,6 +915,12 @@ async function runRecoveryFixtures(repositoryRoot, signal) {
       );
       throwIfAborted(signal);
       if (!result.ok) {
+        const outputTail = fixtureFailureOutputTail(result);
+        process.stderr.write(
+          `Deterministic recovery fixture ${fixture} child output ` +
+            `(last ${FIXTURE_FAILURE_OUTPUT_TAIL_LINES} lines max):\n` +
+            `${outputTail.length === 0 ? "(no output captured)" : outputTail}\n`,
+        );
         throw new Error(
           `Deterministic recovery fixture ${fixture} failed (exit code ${
             result.code ?? "unknown"
