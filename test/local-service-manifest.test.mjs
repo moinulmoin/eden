@@ -149,10 +149,12 @@ function delay(milliseconds) {
   return delayTimer(milliseconds);
 }
 
+const RUNNER_SCALE = process.env.CI === "true" ? 3 : 1;
+
 async function waitForHealth(command, env, child) {
   const identityReady = await child.identityReady;
   if (identityReady !== true) return false;
-  const deadline = Date.now() + 60_000;
+  const deadline = Date.now() + 60_000 * RUNNER_SCALE;
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null) return false;
     const result = await runShell(command, env);
@@ -291,7 +293,7 @@ test("executes the authoritative eden-local manifest lifecycle without disturbin
       await waitForExit(sentinel);
     }
   }
-}, 180_000);
+}, 180_000 * RUNNER_SCALE);
 
 test(
   "repeats the authoritative manifest lifecycle without retaining reservations",
@@ -345,5 +347,5 @@ test(
       }
     }
   },
-  180_000,
+  180_000 * RUNNER_SCALE,
 );

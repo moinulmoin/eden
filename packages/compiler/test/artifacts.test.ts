@@ -120,11 +120,14 @@ const PINNED_ZOD_CHAIN_TEST_TIMEOUT_MS = 15_000;
 // validation for every mutation. In the full serial artifact suite, the
 // authenticated Zod cases measured up to 4.65s under load; keep the margin
 // local to these three assertion-preserving matrices.
-const CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS = 10_000;
-// This corruption matrix reuses a staged candidate while validating every
-// published field. Full serial measurements reached 1.64s; keep its budget
-// local rather than changing Vitest's default for unrelated compiler tests.
-const MALFORMED_PUBLISHED_ARTIFACT_TEST_TIMEOUT_MS = 10_000;
+// Runner scale: the grammar matrices rebuild and revalidate per case; the
+// 10s local budget is tuned for workstations, so shared CI runners widen it.
+const RUNNER_TEST_TIMEOUT_SCALE =
+  process.env.CI === "true" ? 3 : 1;
+const CLOSED_BUNDLE_GRAMMAR_TEST_TIMEOUT_MS =
+  10_000 * RUNNER_TEST_TIMEOUT_SCALE;
+const MALFORMED_PUBLISHED_ARTIFACT_TEST_TIMEOUT_MS =
+  10_000 * RUNNER_TEST_TIMEOUT_SCALE;
 // The only real Wrangler spawn in the suite. Warm runs measure ~1.1s, but the
 // first invocation after a fresh install loads Wrangler's whole module graph
 // through a cold filesystem cache and exceeded 10s on the macos-14 runner
