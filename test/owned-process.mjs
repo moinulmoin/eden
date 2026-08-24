@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
 import process from "node:process";
@@ -39,11 +40,87 @@ function appendBounded(parts, state, chunk, maxBuffer) {
 }
 
 /**
- * Capture a complete process snapshot. An unavailable or malformed `ps`
- * result is represented as undefined rather than as an empty process list.
- * Callers must therefore fail closed when ownership cannot be observed.
+ * Capture a Linux process snapshot from procfs. /proc/<pid>/stat contains
+ * stable numeric identity fields, while /proc/<pid>/cmdline preserves the
+ * argv0 marker installed by the owned-process spawn helpers.
+ */
+function snapshotLinuxProcesses() {
+  let processDirectories;
+  try {
+    processDirectories = readdirSync("/proc", { encoding: "utf8" });
+  } catch {
+    return undefined;
+  }
+
+  const entries = [];
+  for (const directory of processDirectories) {
+    if (!/^\d+$/u.test(directory)) continue;
+    const pid = Number(directory);
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+
+    let stat;
+    let cmdline;
+    try {
+      stat = readFileSync(`/proc/${directory}/stat`, "utf8");
+      cmdline = readFileSync(`/proc/${directory}/cmdline`);
+    } catch {
+      // A process can disappear, or procfs can deny one entry, mid-scan.
+      continue;
+    }
+
+    // comm is parenthesized and may itself contain spaces or ')'. The final
+    // ')' is the delimiter before field 3, so split only after that point.
+    const commStart = stat.indexOf("(");
+    const commEnd = stat.lastIndexOf(")");
+    if (commStart <= 0 || commEnd <= commStart || stat[commEnd + 1] !== " ") {
+      continue;
+    }
+    const fields = stat.slice(commEnd + 2).trim().split(/\s+/u);
+    // Fields 0, 1, 2 are stat fields 3, 4, 5; field 22 is index 19.
+    if (fields.length <= 19) continue;
+    const state = fields[0];
+    const ppid = Number(fields[1]);
+    const pgid = Number(fields[2]);
+    // Linux starttime is clock ticks since boot. Keep raw ticks as the
+    // immutable token: callers compare equality only, so CLK_TCK conversion
+    // is unnecessary and boot-relative tick wrap does not affect comparisons.
+    const start = fields[19];
+    let command = cmdline
+      .toString("utf8")
+      .replace(/\0+$/u, "")
+      .replaceAll("\0", " ");
+    if (command.length === 0) {
+      // Zombies and kernel threads can have an empty cmdline. Preserve the
+      // procfs comm form (including parentheses) as a non-empty fallback.
+      command = stat.slice(commStart, commEnd + 1);
+    }
+    if (
+      state.length === 0 ||
+      !Number.isSafeInteger(ppid) ||
+      ppid < 0 ||
+      !Number.isSafeInteger(pgid) ||
+      pgid <= 0 ||
+      typeof start !== "string" ||
+      start.length === 0
+    ) {
+      // Existing ownership validation requires a positive PGID. Kernel
+      // threads normally report pgrp 0, so they are not signalable targets.
+      continue;
+    }
+
+    entries.push({ pid, ppid, pgid, start, state, command });
+  }
+  return entries;
+}
+
+/**
+ * Capture a complete process snapshot. An unavailable or malformed procfs or
+ * ps result is represented as undefined rather than as an empty process
+ * list. Callers must therefore fail closed when ownership cannot be observed.
  */
 export function snapshotOwnedProcesses() {
+  if (process.platform === "linux") return snapshotLinuxProcesses();
+
   try {
     const output = execFileSync(
       "ps",
