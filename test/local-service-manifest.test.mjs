@@ -153,15 +153,38 @@ const RUNNER_SCALE = process.env.CI === "true" ? 3 : 1;
 
 async function waitForHealth(command, env, child) {
   const identityReady = await child.identityReady;
-  if (identityReady !== true) return false;
+  const failWithDiagnostics = async (reason, result) => {
+    const nc = await runShell("command -v nc", env);
+    const childStatus =
+      child.exitCode !== null || child.signalCode !== null
+        ? `exitCode=${child.exitCode ?? "null"} signal=${child.signalCode ?? "null"}`
+        : "child=running";
+    throw new Error(
+      [
+        `eden-local healthcheck failed: ${reason} (${childStatus})`,
+        `last healthcheck code=${result?.code ?? "null"}`,
+        `last healthcheck stdout=${JSON.stringify(result?.stdout ?? "")}`,
+        `last healthcheck stderr=${JSON.stringify(result?.stderr ?? "")}`,
+        `command -v nc code=${nc.code ?? "null"}`,
+        `command -v nc stdout=${JSON.stringify(nc.stdout ?? "")}`,
+        `command -v nc stderr=${JSON.stringify(nc.stderr ?? "")}`,
+      ].join(" "),
+    );
+  };
+  if (identityReady !== true) {
+    return await failWithDiagnostics(`identityReady=${identityReady}`, undefined);
+  }
   const deadline = Date.now() + 60_000 * RUNNER_SCALE;
+  let lastResult;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null || child.signalCode !== null) return false;
-    const result = await runShell(command, env);
-    if (result.code === 0) return true;
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return await failWithDiagnostics("child exited before health", lastResult);
+    }
+    lastResult = await runShell(command, env);
+    if (lastResult.code === 0) return true;
     await delay(250);
   }
-  return false;
+  return await failWithDiagnostics("healthcheck deadline exhausted", lastResult);
 }
 
 async function waitForExit(child, timeout = 10_000) {
