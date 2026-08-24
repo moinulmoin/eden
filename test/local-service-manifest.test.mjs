@@ -1,9 +1,10 @@
+import { existsSync, openSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { spawn, execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import process from "node:process";
+import { tmpdir } from "node:os";
 import { setTimeout as delayTimer } from "node:timers/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -104,14 +105,20 @@ async function runShell(command, env) {
 }
 
 function startShell(command, env) {
+  const logPath = join(
+    tmpdir(),
+    `eden-manifest-service-${randomUUID()}.log`,
+  );
+  const logFd = openSync(logPath, "a");
   const child = spawnOwnedProcess({
     file: process.execPath,
     args: ownedShellArgs(command),
     cwd: repositoryRoot,
     env,
     label: `manifest-${randomUUID()}`,
-    stdio: ["ignore", "ignore", "ignore"],
+    stdio: ["ignore", logFd, logFd],
   });
+  child.logPath = logPath;
   return child;
 }
 
@@ -150,7 +157,6 @@ function delay(milliseconds) {
 }
 
 const RUNNER_SCALE = process.env.CI === "true" ? 3 : 1;
-
 async function waitForHealth(command, env, child) {
   const identityReady = await child.identityReady;
   const failWithDiagnostics = async (reason, result) => {
@@ -159,6 +165,9 @@ async function waitForHealth(command, env, child) {
       child.exitCode !== null || child.signalCode !== null
         ? `exitCode=${child.exitCode ?? "null"} signal=${child.signalCode ?? "null"}`
         : "child=running";
+    const serviceLog = existsSync(child.logPath)
+      ? readFileSync(child.logPath, "utf8").slice(-4000)
+      : "";
     throw new Error(
       [
         `eden-local healthcheck failed: ${reason} (${childStatus})`,
@@ -168,6 +177,7 @@ async function waitForHealth(command, env, child) {
         `command -v nc code=${nc.code ?? "null"}`,
         `command -v nc stdout=${JSON.stringify(nc.stdout ?? "")}`,
         `command -v nc stderr=${JSON.stringify(nc.stderr ?? "")}`,
+        `service log tail=${JSON.stringify(serviceLog)}`,
       ].join(" "),
     );
   };
