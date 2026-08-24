@@ -45,6 +45,11 @@ afterEach(async () => {
   );
 });
 
+// Mirror the runner-configurable budgets in src so timing assertions hold on
+// any machine, not just workstations with the compiled-in defaults.
+const GENERATION_PUBLISH_TIMEOUT_MS =
+  Number.parseInt(process.env.EDEN_GENERATION_PUBLISH_TIMEOUT_MS ?? "", 10) ||
+  1_000;
 beforeEach(() => {
   vi.stubEnv("EDEN_BEARER_SECRET", "validation-test-secret");
 });
@@ -701,7 +706,9 @@ describe("CLI validation child lifecycle", () => {
     await started;
     const startedAt = Date.now();
     await expect(buildPromise).resolves.toBe(1);
-    expect(Date.now() - startedAt).toBeLessThan(3_000);
+    expect(Date.now() - startedAt).toBeLessThan(
+      GENERATION_PUBLISH_TIMEOUT_MS + 2_000,
+    );
     expect(errors.join("\n")).toMatch(/GENERATION_WORK_TIMEOUT|failed closed/i);
     releaseHook?.();
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -885,12 +892,14 @@ describe("CLI validation child lifecycle", () => {
     const publicationReached = await Promise.race([
       publicationStartedPromise.then(() => true),
       new Promise<boolean>((resolve) =>
-        setTimeout(() => resolve(false), 3_000),
+        setTimeout(() => resolve(false), GENERATION_PUBLISH_TIMEOUT_MS + 2_000),
       ),
     ]);
     expect(publicationReached).toBe(true);
     await expect(buildPromise).resolves.toBe(1);
-    expect(Date.now() - startedAt).toBeLessThan(4_000);
+    expect(Date.now() - startedAt).toBeLessThan(
+      GENERATION_PUBLISH_TIMEOUT_MS + 1_100 + 2_000,
+    );
     expect(errors.join("\n")).toMatch(/GENERATION_WORK_TIMEOUT|failed closed/i);
     releasePublication?.();
   }, 15_000);
