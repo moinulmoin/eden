@@ -5206,12 +5206,22 @@ const OWNED_PROCESS_CLEANUP_TIMEOUT_MS =
  * short publication/cleanup budgets below; the measured local path is already
  * longer than one second on a clean build.
  */
-const GENERATION_WORK_TIMEOUT_MS = 5_000;
-const GENERATION_PUBLICATION_TIMEOUT_MS = 1_000;
+const GENERATION_WORK_TIMEOUT_MS =
+  Number.parseInt(process.env.EDEN_GENERATION_WORK_TIMEOUT_MS ?? "", 10) ||
+  5_000;
+const GENERATION_PUBLICATION_TIMEOUT_MS =
+  Number.parseInt(process.env.EDEN_GENERATION_PUBLISH_TIMEOUT_MS ?? "", 10) ||
+  1_000;
 const CLEANUP_POLL_TIMEOUT_MS = 1_000;
-const RUNTIME_GENERATION_PROOF_TIMEOUT_MS = 10_000;
-const RUNTIME_PROCESS_READY_TIMEOUT_MS = 10_000;
-const RUNTIME_WATCHER_READY_TIMEOUT_MS = 10_000;
+const RUNTIME_GENERATION_PROOF_TIMEOUT_MS =
+  Number.parseInt(process.env.EDEN_RUNTIME_PROOF_TIMEOUT_MS ?? "", 10) ||
+  10_000;
+const RUNTIME_PROCESS_READY_TIMEOUT_MS =
+  Number.parseInt(process.env.EDEN_RUNTIME_READY_TIMEOUT_MS ?? "", 10) ||
+  10_000;
+const RUNTIME_WATCHER_READY_TIMEOUT_MS =
+  Number.parseInt(process.env.EDEN_RUNTIME_WATCHER_TIMEOUT_MS ?? "", 10) ||
+  10_000;
 
 interface OwnedRunnerReservation {
   readonly release: () => void;
