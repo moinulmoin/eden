@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — 2026-08-21
+## 0.1.0 — 2026-08-26
 
 Initial release.
 
@@ -20,3 +20,5 @@ Initial release.
 - Removed the obsolete `eden eve` namespace.
 - Removed root aliases for Agent `init`, `build`, and `dev`; root `deploy` now always means Eden Deploy.
 - Added command-specific help and explicit target selection through `--project`, `--env`, and `--name`.
+- Added the `@moinulmoin/eden` package and `eden` binary with npm, pnpm, and
+  Bun installer compatibility; Node remains the runtime.

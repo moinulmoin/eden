@@ -18,9 +18,10 @@ Deploy never invokes the Agent framework, rewrites Eve source, lowers Eve into
 an Eden Agent, maps Eve application semantics onto Cloudflare primitives, or
 uses the Agent runtime as a fallback. The two surfaces stay separate on purpose.
 
-## Prepared package install
+## Install
 
-The v0.1.0 package set is prepared locally under the `@moinulmoin` namespace:
+The public v0.1.0 CLI package is `@moinulmoin/eden`. Package managers install
+its three companion packages automatically:
 
 | Package | Version | Purpose |
 | --- | --- | --- |
@@ -29,10 +30,8 @@ The v0.1.0 package set is prepared locally under the `@moinulmoin` namespace:
 | `@moinulmoin/eden-compiler` | `0.1.0` | Node-side Agent compiler |
 | `@moinulmoin/eden-runtime-cloudflare` | `0.1.0` | Cloudflare Worker and Durable Object runtime |
 
-The repository workspace root remains private, as do the client and example
-workspaces. The package set is prepared but has not been published to npm. The
-repository and existing v0.1.0 release remain private on GitHub. Until the npm
-publication is complete, use the source-checkout instructions below.
+The monorepo root, typed client, and example workspaces are not published.
+Users install only `@moinulmoin/eden`.
 
 Install the CLI globally with npm:
 

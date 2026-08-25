@@ -92,8 +92,8 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   expect(readme).toContain("npm install --global @moinulmoin/eden@0.1.0");
   expect(readme).toContain("pnpm add --global @moinulmoin/eden@0.1.0");
   expect(readme).toContain("bun add --global @moinulmoin/eden@0.1.0");
-  expect(readme).toMatch(/has not been published to npm/i);
-  expect(readme).toMatch(/release remain private on GitHub/i);
+  expect(readme).toContain("## Install");
+  expect(readme).toContain("Users install only `@moinulmoin/eden`.");
   expect(readme).toMatch(/Bun is supported as an installer only/i);
   expect(readme).toMatch(/Node `>=24\.17\.0 <25` remains the Eden runtime/i);
   for (const packageName of [
