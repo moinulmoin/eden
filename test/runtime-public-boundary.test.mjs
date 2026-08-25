@@ -18,8 +18,14 @@ async function createConsumerProject() {
   const root = await mkdtemp(join(tmpdir(), "eden-runtime-public-boundary-"));
   temporaryRoots.push(root);
 
-  const runtimePackageRoot = join(root, "node_modules/@eden/runtime-cloudflare");
-  const definitionsPackageRoot = join(root, "node_modules/@eden/definitions");
+  const runtimePackageRoot = join(
+    root,
+    "node_modules/@moinulmoin/eden-runtime-cloudflare",
+  );
+  const definitionsPackageRoot = join(
+    root,
+    "node_modules/@moinulmoin/eden-definitions",
+  );
   await mkdir(runtimePackageRoot, { recursive: true });
   await mkdir(definitionsPackageRoot, { recursive: true });
   await cp(runtimeDist, join(runtimePackageRoot, "dist"), { recursive: true });
@@ -40,7 +46,7 @@ async function createConsumerProject() {
   type EdenEventType,
   type EdenModelResult,
   type EdenRuntime,
-} from "@eden/runtime-cloudflare";
+} from "@moinulmoin/eden-runtime-cloudflare";
 
 const runtime: EdenRuntime = createRuntime(
   {
@@ -150,7 +156,9 @@ test("public declarations do not re-export internal Worker implementation module
     "session-schema",
     "session-journal",
   ]) {
-    expect(() => require.resolve(`@eden/runtime-cloudflare/${subpath}`)).toThrow(
+    expect(() =>
+      require.resolve(`@moinulmoin/eden-runtime-cloudflare/${subpath}`),
+    ).toThrow(
       /not exported|not defined by ["']exports["']|package path .* is not exported/i,
     );
   }

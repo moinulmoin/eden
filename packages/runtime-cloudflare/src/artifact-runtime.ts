@@ -2,7 +2,7 @@ import type {
   EdenAgentDefinition,
   EdenJsonValue,
   EdenToolDefinition,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 export interface EdenArtifactGenerationMetadata {
   readonly generationId: string;

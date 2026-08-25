@@ -12,7 +12,7 @@ import { join, relative } from "node:path";
 
 import { afterEach, describe, expect, test } from "vitest";
 
-import { readArtifactGeneration } from "@eden/compiler";
+import { readArtifactGeneration } from "@moinulmoin/eden-compiler";
 import {
   runEdenCli,
   type EdenCliRemoteCommandRequest,
@@ -53,7 +53,7 @@ describe("eden source and deployment identity binding", () => {
     await writeFile(
       agentPath,
       `import { model } from "../.eden-helper.js";
-import type { EdenAgentDefinition } from "@eden/definitions";
+import type { EdenAgentDefinition } from "@moinulmoin/eden-definitions";
 
 const agent: EdenAgentDefinition = {
   model,
@@ -194,7 +194,7 @@ export default agent;
     await writeFile(
       toolPath,
       `import { inputSchema } from "selected-schema-fixture";
-import type { EdenToolDefinition } from "@eden/definitions";
+import type { EdenToolDefinition } from "@moinulmoin/eden-definitions";
 
 const greet: EdenToolDefinition<unknown, { readonly greeting: string }> = {
   description: "Greet using a selected dependency.",
@@ -281,7 +281,7 @@ export default greet;
     await writeFile(
       agentPath,
       `import { model } from "../.eden-build-candidate-1234-deadbeef/model.js";
-import type { EdenAgentDefinition } from "@eden/definitions";
+import type { EdenAgentDefinition } from "@moinulmoin/eden-definitions";
 
 const agent: EdenAgentDefinition = {
   model,

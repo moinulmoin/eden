@@ -49,14 +49,14 @@ import type {
   EdenStandardSchemaIssue,
   EdenStandardSchemaV1,
   EdenToolContext,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 import {
   EDEN_AGENT_BUNDLE_VERSION,
   EDEN_MANIFEST_VERSION,
   EDEN_PROTOCOL_VERSION,
   EDEN_RUNTIME_VERSION,
   EDEN_SCHEMA_VERSION,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 export {
   EDEN_AGENT_BUNDLE_VERSION,
@@ -64,7 +64,7 @@ export {
   EDEN_PROTOCOL_VERSION,
   EDEN_RUNTIME_VERSION,
   EDEN_SCHEMA_VERSION,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 export type {
   EdenAgentDefinition,
   EdenArtifactSet,
@@ -76,7 +76,7 @@ export type {
   EdenManifest,
   EdenSourceReference,
   EdenToolManifest,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 export interface EdenCompilerOptions {
   readonly projectRoot: string;
@@ -1597,7 +1597,7 @@ function isUnsupportedModuleSpecifier(specifier: string): boolean {
     NODE_ONLY_MODULES.has(specifier) ||
     specifier === "chokidar" ||
     specifier === "wrangler" ||
-    specifier === "@eden/compiler"
+    specifier === "@moinulmoin/eden-compiler"
   );
 }
 

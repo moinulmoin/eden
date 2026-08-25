@@ -9,7 +9,7 @@ import type {
   EdenToolDefinition,
   EdenTurnStatus,
   EdenVersionSet,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 import { readConfiguredEdenArtifact } from "./artifact-runtime.js";
 import { createWorkersAIModelAdapter } from "./model-adapter-internal.js";
@@ -1146,7 +1146,7 @@ export class EdenSession extends DurableObject<EdenSessionEnvironment> {
         ? createWorkersAIModelAdapter({
             binding: runtimeEnvironment.AI,
             modelId: configured.agent.model,
-            gatewayId: "eden-dev",
+            gatewayId: "default",
           })
         : undefined;
     const testModel =

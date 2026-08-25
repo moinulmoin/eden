@@ -6,7 +6,7 @@ import type {
   EdenStepPhase,
   EdenTurnStatus,
   EdenVersionSet,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 import type { EdenSqlStorage } from "./session-journal.js";
 import { readJournalEvents, readLatestJournalCursor } from "./session-journal.js";

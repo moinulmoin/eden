@@ -6,7 +6,7 @@ import {
   type EdenEvent,
   type EdenJsonValue,
   type EdenToolDefinition,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 import {
   createModelAdapter,
   type EdenModelAdapter,

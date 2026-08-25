@@ -1,6 +1,6 @@
 {
-  "threat_model_version": "1.0.0",
-  "last_updated": "2026-08-19T00:00:00Z",
+  "threat_model_version": "1.2.0",
+  "last_updated": "2026-08-26T00:00:00Z",
   "security_team_contacts": [],
   "compliance_requirements": [],
   "scan_frequency": "on_commit",

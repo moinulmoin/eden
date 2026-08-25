@@ -77,6 +77,8 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   const deployDoc = await readRepositoryFile("docs/deploy.md");
   const agentCliDoc = await readRepositoryFile("docs/agent-cli.md");
   const validationDoc = await readRepositoryFile("docs/validation.md");
+  const threatModel = await readRepositoryFile(".factory/threat-model.md");
+  const workflow = await readRepositoryFile(".github/workflows/ci.yml");
 
   const commandHeadings = [
     ...agentCliDoc.matchAll(/^## `eden agent ([a-z]+)`$/gmu),
@@ -87,6 +89,36 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   );
   expect(commandHeadings).toHaveLength(4);
   expect(readme).toContain("corepack pnpm install --frozen-lockfile");
+  expect(readme).toContain("npm install --global @moinulmoin/eden@0.1.0");
+  expect(readme).toContain("pnpm add --global @moinulmoin/eden@0.1.0");
+  expect(readme).toContain("bun add --global @moinulmoin/eden@0.1.0");
+  expect(readme).toMatch(/has not been published to npm/i);
+  expect(readme).toMatch(/release remain private on GitHub/i);
+  expect(readme).toMatch(/Bun is supported as an installer only/i);
+  expect(readme).toMatch(/Node `>=24\.17\.0 <25` remains the Eden runtime/i);
+  for (const packageName of [
+    "@moinulmoin/eden",
+    "@moinulmoin/eden-definitions",
+    "@moinulmoin/eden-compiler",
+    "@moinulmoin/eden-runtime-cloudflare",
+  ]) {
+    expect(readme).toContain(`\`${packageName}\``);
+  }
+  expect(agentCliDoc).toMatch(/AI Gateway[\s\S]*`default`/i);
+  expect(agentCliDoc).toContain("https://developers.cloudflare.com/ai-gateway/get-started/");
+  expect(validationDoc).toMatch(/AI Gateway[\s\S]*`default`/i);
+  expect(validationDoc).toContain("https://developers.cloudflare.com/ai-gateway/get-started/");
+  for (const document of [readme, agentCliDoc, validationDoc]) {
+    expect(document).not.toMatch(/eden-dev[\s\S]*AI Gateway/i);
+  }
+  expect(threatModel).toMatch(/Eden Deploy[\s\S]*Eden Agent/);
+  expect(threatModel).toContain("remote Cloudflare boundary");
+  expect(threatModel).toMatch(/gateway ID\s+`default`/u);
+  expect(workflow).toContain("permissions:\n  contents: read");
+  expect(workflow).toContain("actions/checkout@11d5960a326750d5838078e36cf38b85af677262");
+  expect(workflow).toContain("actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020");
+  expect(workflow).toContain("oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6");
+  expect(workflow).toContain("bun-version: 1.4.0");
   expect(readme).toMatch(/without (?:Turbo|Turborepo)/i);
   expect(readme).toMatch(/127\.0\.0\.1:8797/);
   expect(readme).toMatch(/127\.0\.0\.1:9297/);
@@ -165,7 +197,7 @@ test("ships Apache licensing, Eve attribution, and modified-derivative markers",
   }
 });
 
-test("retains the exact upstream Eve NOTICE block", async () => {
+test("retains the exact release NOTICE", async () => {
   const notice = await readRepositoryFile("NOTICE");
   const expectedNotice = [
     "eve",
@@ -188,6 +220,15 @@ test("retains the exact upstream Eve NOTICE block", async () => {
     "Apache-2.0 terms are included in LICENSE. This notice is retained for the",
     "Eve attribution obligation; it does not grant ownership of Eden's original",
     "implementation.",
+    "",
+    "Cloudflare Containers",
+    "  @cloudflare/containers, version 0.3.7",
+    "  https://github.com/cloudflare/containers",
+    "",
+    "Eden's generated Worker host bundle includes software from",
+    "`@cloudflare/containers`, distributed under MIT OR Apache-2.0. Eden",
+    "redistributes that bundled software under the Apache-2.0 option included in",
+    "LICENSE.",
     "",
     "The following Eden source files are marked in-file as modified derivatives of",
     "portable Eve concepts:",

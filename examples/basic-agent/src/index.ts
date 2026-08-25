@@ -1,4 +1,4 @@
-import type { EdenAgentDefinition } from "@eden/definitions";
+import type { EdenAgentDefinition } from "@moinulmoin/eden-definitions";
 
 export const basicAgent: EdenAgentDefinition = {
   model: "@cf/zai-org/glm-4.7-flash",

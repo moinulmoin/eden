@@ -1,9 +1,8 @@
 {
-  "name": "@eden/runtime-cloudflare",
+  "name": "@moinulmoin/eden-runtime-cloudflare",
   "version": "0.1.0",
   "description": "Cloudflare runtime for Eden Deploy and Eden Agent.",
   "type": "module",
-  "private": true,
   "license": "Apache-2.0",
   "types": "./dist/index.d.ts",
   "module": "./dist/index.js",
@@ -13,21 +12,41 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.mjs",
+    "dist/**/*.d.ts",
+    "LICENSE",
+    "NOTICE"
+  ],
   "dependencies": {
-    "@cloudflare/containers": "0.3.7",
-    "@eden/definitions": "workspace:*",
-    "ai": "7.0.58",
-    "workers-ai-provider": "4.0.0"
+    "@moinulmoin/eden-definitions": "workspace:*"
   },
   "devDependencies": {
+    "@cloudflare/containers": "0.3.7",
     "@cloudflare/vitest-pool-workers": "0.20.3",
     "@cloudflare/workers-types": "5.20260810.1"
   },
   "scripts": {
     "build": "tsc -b && node scripts/bundle-eve-host.mjs",
+    "prepack": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && pnpm run build",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src --max-warnings 0",
     "test": "vitest run --passWithNoTests --maxWorkers=1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moinulmoin/eden.git",
+    "directory": "packages/runtime-cloudflare"
+  },
+  "homepage": "https://github.com/moinulmoin/eden#readme",
+  "bugs": {
+    "url": "https://github.com/moinulmoin/eden/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24.17.0 <25"
   }
 }

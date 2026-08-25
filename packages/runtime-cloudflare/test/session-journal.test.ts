@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 
-import { EDEN_VERSIONS } from "@eden/definitions";
+import { EDEN_VERSIONS } from "@moinulmoin/eden-definitions";
 import {
   commitSessionTransaction,
   readJournalEvents,

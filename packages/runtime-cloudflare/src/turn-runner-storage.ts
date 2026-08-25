@@ -2,7 +2,7 @@ import type {
   EdenEvent,
   EdenEventType,
   EdenJsonValue,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 import type { EdenModelResult } from "./model-adapter.js";
 import {

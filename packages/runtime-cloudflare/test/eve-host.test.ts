@@ -95,7 +95,7 @@ describe("generic Eve Cloudflare host", () => {
     expect(source).toContain(
       'import { EveHostContainer, createEveHostWorker } from "./eden-eve-host-worker.mjs";',
     );
-    expect(source).not.toMatch(/@eden\/runtime-cloudflare|node:/u);
+    expect(source).not.toMatch(/@moinulmoin\/eden-runtime-cloudflare|node:/u);
   });
 
   test("resolves only an explicit workers.dev account subdomain", () => {

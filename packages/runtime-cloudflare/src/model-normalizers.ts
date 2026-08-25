@@ -3,7 +3,7 @@
  * 0b102bc90e7cf2c3e294f6ca3af86c307d449b1a. See repository NOTICE and LICENSE.
  */
 
-import type { EdenJsonValue } from "@eden/definitions";
+import type { EdenJsonValue } from "@moinulmoin/eden-definitions";
 import type {
   EdenModelCorrelation,
   EdenModelFailure,

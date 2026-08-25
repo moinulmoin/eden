@@ -129,7 +129,10 @@ isolated environment target. The repository-owned flow is:
 3. Poll the Worker until unauthenticated health fails closed and authenticated
    health, info, session creation, and the Durable Object namespace are ready.
 4. Run authenticated command, NDJSON cursor-reconnect, and live model/tool/final
-   response checks through the `eden-dev` AI Gateway path.
+   response checks through Cloudflare AI Gateway gateway ID `default`. If the
+   gateway does not exist, Cloudflare creates it on the first authenticated
+   request; Eden does not provision a named gateway. See [Cloudflare's AI Gateway
+   getting-started guide](https://developers.cloudflare.com/ai-gateway/get-started/).
 5. Compare the remote tool identity, normalized shapes, lifecycle order, safe
    version metadata, and final-message contract with the local run.
 6. Delete every validator-owned temporary Worker and secret, then verify that

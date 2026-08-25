@@ -73,7 +73,7 @@ import {
 } from "./eve-runtime-config.js";
 import type {
   EveHostConfig,
-} from "@eden/runtime-cloudflare";
+} from "@moinulmoin/eden-runtime-cloudflare";
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
@@ -781,7 +781,7 @@ async function resolvedCloudflareOrigin(
   }
   try {
     const { resolveStableWorkersDevOrigin } = await import(
-      "@eden/runtime-cloudflare"
+      "@moinulmoin/eden-runtime-cloudflare"
     );
     const origin = resolveStableWorkersDevOrigin({
       workerName,
@@ -1044,7 +1044,7 @@ async function writeEveDeploymentArtifacts(
   });
   const runtimePackageRoot = dirname(
     dirname(
-      fileURLToPath(import.meta.resolve("@eden/runtime-cloudflare")),
+      fileURLToPath(import.meta.resolve("@moinulmoin/eden-runtime-cloudflare")),
     ),
   );
   const bundleSource = join(
@@ -1644,7 +1644,7 @@ async function runEveDeployment(
   let stableWorkersDevOrigin: string;
   try {
     const { resolveStableWorkersDevOrigin } = await import(
-      "@eden/runtime-cloudflare"
+      "@moinulmoin/eden-runtime-cloudflare"
     );
     stableWorkersDevOrigin = resolveStableWorkersDevOrigin({
       workerName: request.name,
@@ -1809,7 +1809,7 @@ async function runEveDeployment(
   try {
     const {
       createEveHostConfig,
-    } = await import("@eden/runtime-cloudflare");
+    } = await import("@moinulmoin/eden-runtime-cloudflare");
     hostConfig = createEveHostConfig({
       accountId,
       workerName: identity.workerName,
@@ -1835,7 +1835,7 @@ async function runEveDeployment(
     );
   }
   const { generateEveHostWorkerSource } = await import(
-    "@eden/runtime-cloudflare"
+    "@moinulmoin/eden-runtime-cloudflare"
   );
   const workerSource = generateEveHostWorkerSource({ config: hostConfig });
   const paths = await writeEveDeploymentArtifacts(

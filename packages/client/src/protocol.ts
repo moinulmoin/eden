@@ -10,7 +10,7 @@ import type {
   EdenJsonValue,
   EdenSessionStatus,
   EdenStepPhase,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 const MAX_EVENT_LINE_BYTES = 128 * 1024;
 const MAX_JSON_DEPTH = 32;

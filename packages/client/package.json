@@ -1,5 +1,5 @@
 {
-  "name": "@eden/client",
+  "name": "@moinulmoin/eden-client",
   "version": "0.1.0",
   "description": "Typed client for Eden Agent sessions and journals.",
   "type": "module",
@@ -15,7 +15,7 @@
   },
   "files": ["dist"],
   "dependencies": {
-    "@eden/definitions": "workspace:*"
+    "@moinulmoin/eden-definitions": "workspace:*"
   },
   "scripts": {
     "build": "tsc -b",

@@ -5,7 +5,7 @@ import {
 } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 
-import { EDEN_VERSIONS } from "@eden/definitions";
+import { EDEN_VERSIONS } from "@moinulmoin/eden-definitions";
 import {
   createOpaqueSessionId,
   createSessionObjectName,

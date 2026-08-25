@@ -18,13 +18,56 @@ Deploy never invokes the Agent framework, rewrites Eve source, lowers Eve into
 an Eden Agent, maps Eve application semantics onto Cloudflare primitives, or
 uses the Agent runtime as a fallback. The two surfaces stay separate on purpose.
 
+## Prepared package install
+
+The v0.1.0 package set is prepared locally under the `@moinulmoin` namespace:
+
+| Package | Version | Purpose |
+| --- | --- | --- |
+| `@moinulmoin/eden` | `0.1.0` | CLI package; installs the `eden` binary |
+| `@moinulmoin/eden-definitions` | `0.1.0` | Eden Agent definitions |
+| `@moinulmoin/eden-compiler` | `0.1.0` | Node-side Agent compiler |
+| `@moinulmoin/eden-runtime-cloudflare` | `0.1.0` | Cloudflare Worker and Durable Object runtime |
+
+The repository workspace root remains private, as do the client and example
+workspaces. The package set is prepared but has not been published to npm. The
+repository and existing v0.1.0 release remain private on GitHub. Until the npm
+publication is complete, use the source-checkout instructions below.
+
+Install the CLI globally with npm:
+
+```sh
+npm install --global @moinulmoin/eden@0.1.0
+```
+
+Install the CLI globally with pnpm:
+
+```sh
+pnpm add --global @moinulmoin/eden@0.1.0
+```
+
+Bun is supported as an installer only:
+
+```sh
+bun add --global @moinulmoin/eden@0.1.0
+```
+
+Node `>=24.17.0 <25` remains the Eden runtime requirement, including when Bun
+installs the package; do not force the CLI through `bunx --bun`. Eden Deploy
+v0.1.0 accepts pinned pnpm Eve projects, not Bun lockfiles or project toolchains.
+
+The live Eden Agent model path uses Cloudflare AI Gateway's `default` gateway.
+Cloudflare creates that gateway on the first authenticated request when it does
+not already exist; Eden does not claim to provision a named gateway. See
+[Cloudflare's AI Gateway getting-started guide](https://developers.cloudflare.com/ai-gateway/get-started/).
+
 ## Requirements
 
-- Node `24.17.0` (the version in `.nvmrc`)
-- pnpm `11.21.0` through Corepack
+- Node `>=24.17.0 <25` (the version range represented by `.nvmrc`)
+- pnpm `11.21.0` through Corepack for source checkouts
 - Wrangler `4.120.0`, installed by the frozen lockfile
 
-## Setup
+## Source checkout
 
 The repository is a pnpm workspace with TypeScript project references. The
 local gate is reproducible without Turbo and without a remote deployment.

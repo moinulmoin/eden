@@ -11,7 +11,7 @@ import {
   MAX_RECOVERY_JOBS_PER_INSPECTION_PAGE,
   type RecoveryJobInput,
 } from "../src/session-jobs.js";
-import { EDEN_VERSIONS } from "@eden/definitions";
+import { EDEN_VERSIONS } from "@moinulmoin/eden-definitions";
 import {
   createOpaqueSessionId,
   createSessionObjectName,

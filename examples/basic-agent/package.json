@@ -1,5 +1,5 @@
 {
-  "name": "@eden/example-basic-agent",
+  "name": "@moinulmoin/eden-example-basic-agent",
   "version": "0.1.0",
   "type": "module",
   "private": true,
@@ -15,9 +15,9 @@
     "dist"
   ],
   "dependencies": {
-    "@eden/client": "workspace:*",
-    "@eden/definitions": "workspace:*",
-    "@eden/runtime-cloudflare": "workspace:*",
+    "@moinulmoin/eden-client": "workspace:*",
+    "@moinulmoin/eden-definitions": "workspace:*",
+    "@moinulmoin/eden-runtime-cloudflare": "workspace:*",
     "zod": "4.4.3"
   },
   "scripts": {

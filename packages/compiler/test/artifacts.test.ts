@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { join, relative } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import type { EdenArtifactSet } from "@eden/definitions";
+import type { EdenArtifactSet } from "@moinulmoin/eden-definitions";
 
 import {
   EdenCompilerError,
@@ -1136,7 +1136,7 @@ describe("artifact generation", () => {
     expect(generation.manifest.bundleDigest).toBe(bundleDigest);
     expect(generation.buildMetadata.bundleDigest).toBe(bundleDigest);
     expect(generation.bundle).not.toMatch(
-      /\b(?:node:|node_modules|chokidar|wrangler|@eden\/compiler|process\.env|Buffer|require\s*\(|__dirname|__filename)\b/u,
+      /\b(?:node:|node_modules|chokidar|wrangler|@moinulmoin\/eden-compiler|process\.env|Buffer|require\s*\(|__dirname|__filename)\b/u,
     );
     expect(generation.manifest.tools).toEqual([
       expect.objectContaining({ name: "greet", module: "tool:greet" }),

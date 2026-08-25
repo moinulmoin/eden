@@ -1,9 +1,9 @@
 import type {
   EdenJsonValue,
   EdenModelOptions,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
-export type { EdenModelOptions } from "@eden/definitions";
+export type { EdenModelOptions } from "@moinulmoin/eden-definitions";
 
 export type EdenModelRole = "system" | "user" | "assistant" | "tool";
 

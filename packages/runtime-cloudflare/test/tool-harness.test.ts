@@ -5,7 +5,7 @@ import {
   EDEN_VERSIONS,
   type EdenToolContext,
   type EdenToolDefinition,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 import {
   commitSessionTransaction,
   readJournalEvents,

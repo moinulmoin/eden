@@ -26,7 +26,7 @@ import {
 import { fileURLToPath } from "url";
 import { afterAll, describe, expect, test, vi } from "vitest";
 
-import { readArtifactGeneration } from "@eden/compiler";
+import { readArtifactGeneration } from "@moinulmoin/eden-compiler";
 import {
   EDEN_CLI_COMMANDS,
   runEdenCli,

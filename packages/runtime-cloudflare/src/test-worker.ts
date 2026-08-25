@@ -1,7 +1,7 @@
 import type {
   EdenJsonValue,
   EdenToolDefinition,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 import { EdenSession } from "./session.js";
 import { handleEdenRequest, type EdenWorkerEnvironment } from "./http-host.js";
 import {

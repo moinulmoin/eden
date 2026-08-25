@@ -14,7 +14,7 @@ import {
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { buildProject } from "@eden/compiler";
+import { buildProject } from "@moinulmoin/eden-compiler";
 import {
   runEdenCli,
   type EdenCliDryRunHandle,

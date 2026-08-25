@@ -4,10 +4,10 @@ commands:
   build: corepack pnpm run build
   typecheck: corepack pnpm run typecheck
   lint: corepack pnpm run lint
-  cli_test: corepack pnpm --filter @eden/cli run test
-  cli_build: corepack pnpm --filter @eden/cli run build
-  runtime_test: corepack pnpm --filter @eden/runtime-cloudflare run test
-  compiler_test: corepack pnpm --filter @eden/compiler run test
+  cli_test: corepack pnpm --filter @moinulmoin/eden run test
+  cli_build: corepack pnpm --filter @moinulmoin/eden run build
+  runtime_test: corepack pnpm --filter @moinulmoin/eden-runtime-cloudflare run test
+  compiler_test: corepack pnpm --filter @moinulmoin/eden-compiler run test
 
 services:
   eden-local:

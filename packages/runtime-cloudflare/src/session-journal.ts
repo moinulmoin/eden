@@ -10,7 +10,7 @@ import type {
   EdenJsonValue,
   EdenStepPhase,
   EdenTurnStatus,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 const MAX_EVENT_PAYLOAD_BYTES = 131_072;
 const EVENT_ID_BYTES = 16;

@@ -1,6 +1,14 @@
-import { readFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { accessSync, constants } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
 import { expect, test } from "vitest";
@@ -54,6 +62,31 @@ function resolveExecutable(name) {
   return name;
 }
 
+function findExecutable(name) {
+  const directories = (process.env.PATH ?? "").split(":");
+  if (process.env.BUN_INSTALL !== undefined) {
+    directories.push(join(process.env.BUN_INSTALL, "bin"));
+  }
+  if (process.env.HOME !== undefined) {
+    directories.push(join(process.env.HOME, ".bun", "bin"));
+  }
+  for (const directory of directories) {
+    if (directory.length === 0) continue;
+    const candidate = join(directory, name);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Keep looking through PATH and standard Bun locations.
+    }
+  }
+  return undefined;
+}
+
+const tarEntrypoint = resolveExecutable("tar");
+const npmEntrypoint = findExecutable("npm");
+const bunEntrypoint = findExecutable("bun");
+
 const corepackEntrypoint = resolveExecutable("corepack");
 
 async function runPnpm(args, cwd, options = {}) {
@@ -100,6 +133,25 @@ async function runPnpm(args, cwd, options = {}) {
   };
 }
 
+async function runNpm(args, cwd, options = {}) {
+  return runPnpm(
+    [
+      "-e",
+      [
+        'const { spawnSync } = require("node:child_process");',
+        "const result = spawnSync(process.argv[1], process.argv.slice(2), { stdio: \"inherit\" });",
+        "if (result.error !== undefined) throw result.error;",
+        "if (result.signal !== null) process.kill(process.pid, result.signal);",
+        "process.exitCode = result.status ?? 1;",
+      ].join("\n"),
+      npmEntrypoint,
+      ...args,
+    ],
+    cwd,
+    { ...options, file: process.execPath },
+  );
+}
+
 function outcomeDiagnostic(result, label) {
   return [
     `${label} failed`,
@@ -142,6 +194,155 @@ function expectSuccessfulPackageChild(result, label) {
   }
 }
 
+const distributionPackages = [
+  {
+    directory: "packages/definitions",
+    name: "@moinulmoin/eden-definitions",
+    requiredDistFiles: ["dist/index.js", "dist/index.d.ts"],
+  },
+  {
+    directory: "packages/compiler",
+    name: "@moinulmoin/eden-compiler",
+    requiredDistFiles: ["dist/index.js", "dist/index.d.ts"],
+    dependencies: {
+      "@moinulmoin/eden-definitions": "0.1.0",
+    },
+  },
+  {
+    directory: "packages/runtime-cloudflare",
+    name: "@moinulmoin/eden-runtime-cloudflare",
+    requiredDistFiles: [
+      "dist/index.js",
+      "dist/index.d.ts",
+      "dist/test-worker.js",
+      "dist/eden-eve-host-worker.mjs",
+    ],
+    dependencies: {
+      "@moinulmoin/eden-definitions": "0.1.0",
+    },
+  },
+  {
+    directory: "packages/cli",
+    name: "@moinulmoin/eden",
+    requiredDistFiles: ["dist/index.js", "dist/index.d.ts"],
+    requiredRootFiles: ["README.md"],
+    dependencies: {
+      "@moinulmoin/eden-compiler": "0.1.0",
+      "@moinulmoin/eden-runtime-cloudflare": "0.1.0",
+    },
+    bin: {
+      eden: "./dist/index.js",
+    },
+  },
+];
+
+async function tarEntries(tarball, cwd, label) {
+  const result = await runPnpm(
+    ["-tzf", tarball],
+    cwd,
+    { file: tarEntrypoint, label },
+  );
+  expectSuccessfulPackageChild(result, label);
+  return result.stdout.split(/\r?\n/u).filter((entry) => entry.length > 0);
+}
+
+async function tarMember(tarball, member, cwd, label) {
+  const result = await runPnpm(
+    ["-xOf", tarball, member],
+    cwd,
+    { file: tarEntrypoint, label },
+  );
+  expectSuccessfulPackageChild(result, label);
+  return result.stdout;
+}
+
+async function packageBin(consumerRoot, label) {
+  const binPath = join(consumerRoot, "node_modules", ".bin", "eden");
+  const packageEntryPath = join(
+    consumerRoot,
+    "node_modules",
+    "@moinulmoin",
+    "eden",
+    "dist",
+    "index.js",
+  );
+  accessSync(binPath, constants.X_OK);
+  accessSync(packageEntryPath, constants.R_OK);
+  return { binPath, packageEntryPath, label };
+}
+
+async function runInstalledEden(
+  consumerRoot,
+  args,
+  label,
+  { nodeOwned = false } = {},
+) {
+  const { binPath, packageEntryPath } = await packageBin(consumerRoot, label);
+  const result = await runPnpm(
+    nodeOwned ? [packageEntryPath, ...args] : args,
+    consumerRoot,
+    {
+      file: nodeOwned ? process.execPath : binPath,
+      label,
+    },
+  );
+  expectSuccessfulPackageChild(result, label);
+  return result;
+}
+function localTarballSpecs(root, tarballs) {
+  return Object.fromEntries(
+    distributionPackages.map(({ name: packageName }) => [
+      packageName,
+      `file:${relative(root, tarballs.get(packageName)).replaceAll("\\", "/")}`,
+    ]),
+  );
+}
+async function writeTarballConsumerManifest(
+  root,
+  name,
+  tarballs,
+  {
+    npmOverrides = false,
+    localOverrides = false,
+  } = {},
+) {
+  const dependencies = localTarballSpecs(root, tarballs);
+  const manifest = {
+    name,
+    private: true,
+    type: "module",
+    dependencies,
+    ...(npmOverrides || localOverrides
+      ? {
+          overrides: localOverrides
+            ? dependencies
+            : Object.fromEntries(
+                Object.keys(dependencies).map((packageName) => [
+                  packageName,
+                  `$${packageName}`,
+                ]),
+              ),
+        }
+      : {}),
+  };
+  await writeFile(
+    join(root, "package.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+async function writePnpmOverrides(root, tarballs) {
+  const overrides = Object.entries(localTarballSpecs(root, tarballs))
+    .map(([name, spec]) => `  ${JSON.stringify(name)}: ${JSON.stringify(spec)}`)
+    .join("\n");
+  await writeFile(
+    join(root, "pnpm-workspace.yaml"),
+    `packages: []\noverrides:\n${overrides}\n`,
+    "utf8",
+  );
+}
+
 test.sequential(
   "workspace package test scripts run from their own directories",
   async () => {
@@ -165,11 +366,11 @@ test.sequential(
   "the compiler test script works through a workspace filter",
   async () => {
     const result = await runPnpm(
-      ["--filter", "@eden/compiler", "run", "test"],
+      ["--filter", "@moinulmoin/eden-compiler", "run", "test"],
       repositoryRoot,
       { timeoutMs: PACKAGE_TEST_PROCESS_TIMEOUT_MS },
     );
-    expectSuccessfulPackageChild(result, "@eden/compiler filter");
+    expectSuccessfulPackageChild(result, "@moinulmoin/eden-compiler filter");
   },
   PACKAGE_TEST_SCRIPTS_TIMEOUT_MS,
 );
@@ -248,3 +449,219 @@ test("treats a signal or null-code package child as a failure", async () => {
     expectNoReservations("package signal fixture");
   }
 });
+
+test.sequential(
+  "release package tarballs install cleanly outside the workspace",
+  async () => {
+    const cleanRoom = await mkdtemp(join(tmpdir(), "eden-distribution-"));
+    try {
+      const tarballDirectory = join(cleanRoom, "tarballs");
+      await mkdir(tarballDirectory);
+      const tarballs = new Map();
+
+      for (const packageSpec of distributionPackages) {
+        const packageRoot = join(repositoryRoot, packageSpec.directory);
+        const before = new Set(await readdir(tarballDirectory));
+        const result = await runPnpm(
+          ["pack", "--pack-destination", tarballDirectory],
+          packageRoot,
+          { label: `pack ${packageSpec.name}` },
+        );
+        expectSuccessfulPackageChild(result, `pack ${packageSpec.name}`);
+        const newTarballs = (await readdir(tarballDirectory)).filter(
+          (entry) => !before.has(entry) && entry.endsWith(".tgz"),
+        );
+        expect(newTarballs, `one tarball for ${packageSpec.name}`).toHaveLength(1);
+        tarballs.set(packageSpec.name, join(tarballDirectory, newTarballs[0]));
+      }
+
+      const repositoryLicense = await readFile(
+        join(repositoryRoot, "LICENSE"),
+        "utf8",
+      );
+      const repositoryNotice = await readFile(
+        join(repositoryRoot, "NOTICE"),
+        "utf8",
+      );
+      for (const packageSpec of distributionPackages) {
+        const tarball = tarballs.get(packageSpec.name);
+        const label = `inspect ${packageSpec.name}`;
+        const entries = await tarEntries(tarball, cleanRoom, `${label} manifest`);
+        expect(new Set(entries).size, `${label} duplicate entries`).toBe(
+          entries.length,
+        );
+        expect(entries).toEqual(
+          expect.arrayContaining([
+            "package/package.json",
+            "package/LICENSE",
+            "package/NOTICE",
+            ...packageSpec.requiredDistFiles.map((file) => `package/${file}`),
+            ...(packageSpec.requiredRootFiles ?? []).map(
+              (file) => `package/${file}`,
+            ),
+          ]),
+        );
+        const unexpectedEntries = entries.filter((entry) => {
+          if (
+            entry === "package/" ||
+            entry === "package/dist" ||
+            entry === "package/LICENSE" ||
+            entry === "package/NOTICE" ||
+            entry === "package/README.md" ||
+            entry === "package/package.json"
+          ) {
+            return false;
+          }
+          return !entry.startsWith("package/dist/");
+        });
+        expect(unexpectedEntries, `${label} package file allowlist`).toEqual([]);
+        expect(
+          entries.some((entry) =>
+            /(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|\.eden|\.wrangler)/u.test(
+              entry,
+            ),
+          ),
+          `${label} generated project files`,
+        ).toBe(false);
+        expect(
+          entries.filter((entry) =>
+            /\.map$|\.tsbuildinfo$|^package\/(?:src|test|node_modules)\//u.test(
+              entry,
+            ),
+          ),
+          `${label} generated/source exclusions`,
+        ).toEqual([]);
+        for (const file of packageSpec.requiredDistFiles) {
+          const content = await tarMember(
+            tarball,
+            `package/${file}`,
+            cleanRoom,
+            `${label} ${file}`,
+          );
+          expect(content.length, `${label} ${file} content`).toBeGreaterThan(0);
+        }
+
+        const packageJson = JSON.parse(
+          await tarMember(tarball, "package/package.json", cleanRoom, label),
+        );
+        expect(packageJson.name).toBe(packageSpec.name);
+        expect(packageJson.version).toBe("0.1.0");
+        expect(packageJson.private ?? false).toBe(false);
+        expect(packageJson.license).toBe("Apache-2.0");
+        expect(packageJson.bin).toEqual(packageSpec.bin);
+        if (packageSpec.dependencies !== undefined) {
+          expect(packageJson.dependencies).toMatchObject(packageSpec.dependencies);
+        }
+        for (const section of [
+          "dependencies",
+          "optionalDependencies",
+          "peerDependencies",
+          "devDependencies",
+        ]) {
+          for (const [dependency, spec] of Object.entries(
+            packageJson[section] ?? {},
+          )) {
+            expect(spec, `${label} ${section}.${dependency}`).toEqual(
+              expect.any(String),
+            );
+            expect(
+              spec,
+              `${label} ${section}.${dependency} npm closure`,
+            ).not.toMatch(/^(?:workspace:|file:|link:|\.{1,2}\/|\/)/u);
+          }
+        }
+        await expect(
+          tarMember(tarball, "package/LICENSE", cleanRoom, `${label} LICENSE`),
+        ).resolves.toBe(repositoryLicense);
+        await expect(
+          tarMember(tarball, "package/NOTICE", cleanRoom, `${label} NOTICE`),
+        ).resolves.toBe(repositoryNotice);
+      }
+
+      expect(npmEntrypoint, "npm is required for the installer proof").toBeDefined();
+      const npmConsumer = await mkdtemp(join(cleanRoom, "npm-consumer-"));
+      await writeTarballConsumerManifest(
+        npmConsumer,
+        "eden-distribution-npm-consumer",
+        tarballs,
+        { npmOverrides: true },
+      );
+      const npmInstall = await runNpm(
+        ["install", "--ignore-scripts", "--no-audit", "--no-fund"],
+        npmConsumer,
+        { label: "npm local tarball install" },
+      );
+      expectSuccessfulPackageChild(npmInstall, "npm local tarball install");
+      const npmHelp = await runInstalledEden(
+        npmConsumer,
+        ["--help"],
+        "npm installed eden help",
+      );
+      expect(npmHelp.stdout).toContain("Usage: eden <command>");
+      const pnpmConsumer = await mkdtemp(join(cleanRoom, "pnpm-consumer-"));
+      await writeTarballConsumerManifest(
+        pnpmConsumer,
+        "eden-distribution-pnpm-consumer",
+        tarballs,
+      );
+      await writePnpmOverrides(pnpmConsumer, tarballs);
+      const pnpmInstall = await runPnpm(
+        ["install", "--prefer-offline", "--ignore-scripts"],
+        pnpmConsumer,
+        { label: "pnpm tarball install" },
+      );
+      expectSuccessfulPackageChild(pnpmInstall, "pnpm tarball install");
+      const pnpmHelp = await runInstalledEden(
+        pnpmConsumer,
+        ["--help"],
+        "pnpm installed eden help",
+      );
+      expect(pnpmHelp.stdout).toContain("Usage: eden <command>");
+      const pnpmAgent = join(pnpmConsumer, "agent-project");
+      await mkdir(pnpmAgent);
+      const pnpmInit = await runInstalledEden(
+        pnpmConsumer,
+        ["agent", "init", "--project", pnpmAgent],
+        "pnpm installed eden agent init",
+        { nodeOwned: true },
+      );
+      expect(pnpmInit.stdout).toContain("Initialized Eden project");
+      const pnpmBuild = await runInstalledEden(
+        pnpmConsumer,
+        ["agent", "build", "--project", pnpmAgent],
+        "pnpm installed eden agent build",
+        { nodeOwned: true },
+      );
+      expect(pnpmBuild.code).toBe(0);
+      expect(await readdir(join(pnpmAgent, ".eden"))).toContain("CURRENT");
+
+      expect(bunEntrypoint, "Bun is required for the installer proof").toBeDefined();
+      const bunConsumer = await mkdtemp(join(cleanRoom, "bun-consumer-"));
+      await writeTarballConsumerManifest(
+        bunConsumer,
+        "eden-distribution-bun-consumer",
+        tarballs,
+        { localOverrides: true },
+      );
+      const bunInstall = await runPnpm(
+        ["install", "--no-progress", "--ignore-scripts"],
+        bunConsumer,
+        {
+          file: bunEntrypoint,
+          label: "bun local tarball install",
+        },
+      );
+      expectSuccessfulPackageChild(bunInstall, "bun local tarball install");
+      const bunHelp = await runInstalledEden(
+        bunConsumer,
+        ["--help"],
+        "bun installed eden help",
+      );
+      expect(bunHelp.stdout).toContain("Usage: eden <command>");
+    } finally {
+      await rm(cleanRoom, { recursive: true, force: true });
+      expectNoReservations("release package distribution");
+    }
+  },
+  PACKAGE_TEST_SCRIPTS_TIMEOUT_MS,
+);

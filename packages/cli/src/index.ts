@@ -68,12 +68,12 @@ import {
   readArtifactGenerationAt,
   resolveContainedProjectPath,
   resolveProjectRoot,
-} from "@eden/compiler";
+} from "@moinulmoin/eden-compiler";
 import type {
   EdenCompilerResult,
   EdenArtifactGeneration,
   EdenDiagnostic,
-} from "@eden/compiler";
+} from "@moinulmoin/eden-compiler";
 import {
   EVE_CLI_COMMANDS,
   EveCliError,
@@ -564,7 +564,7 @@ const INIT_SCAFFOLD: readonly ScaffoldFile[] = [
   },
   {
     relativePath: "agent/agent.ts",
-    content: `import type { EdenAgentDefinition } from "@eden/definitions";
+    content: `import type { EdenAgentDefinition } from "@moinulmoin/eden-definitions";
 
 const agent: EdenAgentDefinition = {
   model: "@cf/zai-org/glm-4.7-flash",
@@ -579,7 +579,7 @@ export default agent;
   },
   {
     relativePath: "agent/tools/greet.ts",
-    content: `import type { EdenToolDefinition } from "@eden/definitions";
+    content: `import type { EdenToolDefinition } from "@moinulmoin/eden-definitions";
 
 interface GreetInput {
   readonly name: string;
@@ -627,10 +627,20 @@ export default greet;
   "name": "eden-basic-agent",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=24.17.0 <25"
+  },
   "scripts": {
     "build": "eden agent build",
     "dev": "eden agent dev",
     "deploy": "eden agent deploy"
+  },
+  "devDependencies": {
+    "@moinulmoin/eden": "0.1.0",
+    "@moinulmoin/eden-definitions": "0.1.0",
+    "typescript": "5.9.3",
+    "wrangler": "4.120.0"
   }
 }
 `,
@@ -638,7 +648,7 @@ export default greet;
   {
     relativePath: "wrangler.jsonc",
     content: `{
-  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "eden-basic-agent",
   "main": ".eden/agent-bundle.mjs",
   "compatibility_date": "2026-04-01",
@@ -3912,23 +3922,14 @@ function resolveDeploymentExecutableSync(
   cwd: string,
 ): DeploymentExecutable {
   const packageDirectory = dirname(fileURLToPath(import.meta.url));
-  const packageDirectoryCandidates = [
-    join(packageDirectory, "../node_modules/wrangler"),
-    join(packageDirectory, "../../..", "node_modules/wrangler"),
-    join(cwd, "node_modules/wrangler"),
-    join(process.cwd(), "node_modules/wrangler"),
-  ];
-  for (const packageDirectoryCandidate of packageDirectoryCandidates) {
-    const directEntry = join(
-      packageDirectoryCandidate,
-      "wrangler-dist/cli.js",
-    );
-    if (existsSync(directEntry)) {
-      return {
-        command: process.execPath,
-        commandArgs: [directEntry],
-      };
-    }
+  try {
+    return {
+      command: process.execPath,
+      commandArgs: [require.resolve("wrangler")],
+    };
+  } catch {
+    // Report an installed shell shim separately below; it is not a safe
+    // substitute for the direct JavaScript entrypoint.
   }
 
   // Keep the legacy executable lookup as a last-resort diagnostic path. The
@@ -3976,7 +3977,11 @@ async function resolveRuntimeWorkerEntrypoint(): Promise<string> {
   const packageDirectory = dirname(fileURLToPath(import.meta.url));
   const runtimePackage = (() => {
     try {
-      return dirname(require.resolve("@eden/runtime-cloudflare"));
+      return dirname(
+        fileURLToPath(
+          import.meta.resolve("@moinulmoin/eden-runtime-cloudflare"),
+        ),
+      );
     } catch {
       return undefined;
     }
@@ -9365,7 +9370,7 @@ function isEdenAgentCommand(value: string): value is EdenAgentCommand {
 
 if (
   process.argv[1] !== undefined &&
-  process.argv[1] === fileURLToPath(import.meta.url)
+  realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
 ) {
   void main().then((exitCode) => {
     process.exitCode = exitCode;

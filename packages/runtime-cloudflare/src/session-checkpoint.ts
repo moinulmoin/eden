@@ -1,7 +1,7 @@
 import type {
   EdenJsonValue,
   EdenStepPhase,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 import {
   commitSessionTransaction,

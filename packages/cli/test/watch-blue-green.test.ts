@@ -84,7 +84,7 @@ async function generationFromRequest(
 }
 
 function updatedToolSource(description: string): string {
-  return `import type { EdenToolDefinition } from "@eden/definitions";
+  return `import type { EdenToolDefinition } from "@moinulmoin/eden-definitions";
 
 const greet: EdenToolDefinition<
   { readonly name: string },

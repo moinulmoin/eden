@@ -5,7 +5,7 @@ import type {
   EdenStandardSchemaV1,
   EdenToolContext,
   EdenToolDefinition,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 import { normalizeEdenJsonValue } from "./model-normalizers.js";
 
 import {

@@ -1,6 +1,6 @@
 import type {
   EdenJsonValue,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 import {
   executeTypedTool,

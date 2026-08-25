@@ -1,7 +1,7 @@
 import {
   EDEN_VERSIONS,
   type EdenCommandRequest,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 import {
   createOpaqueMessageId,

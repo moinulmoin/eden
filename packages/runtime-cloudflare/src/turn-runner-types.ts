@@ -4,7 +4,7 @@ import type {
   EdenJsonValue,
   EdenModelOptions,
   EdenToolDefinition,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 import type {
   EdenModelAdapter,

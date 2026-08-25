@@ -3,7 +3,7 @@ import type {
   EdenEventType,
   EdenSessionSnapshot,
   EdenVersionSet,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 export {
   configureEdenArtifact,
@@ -21,7 +21,7 @@ export type {
   EdenEventType,
   EdenSessionSnapshot,
   EdenVersionSet,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 export {
   createModelAdapter,

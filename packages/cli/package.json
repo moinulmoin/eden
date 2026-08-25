@@ -1,9 +1,8 @@
 {
-  "name": "@eden/cli",
+  "name": "@moinulmoin/eden",
   "version": "0.1.0",
   "description": "CLI for Eden Deploy and Eden Agent.",
   "type": "module",
-  "private": true,
   "license": "Apache-2.0",
   "types": "./dist/index.d.ts",
   "module": "./dist/index.js",
@@ -16,21 +15,43 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.mjs",
+    "dist/**/*.d.ts",
+    "LICENSE",
+    "NOTICE"
+  ],
   "dependencies": {
-    "@eden/compiler": "workspace:*",
-    "@eden/runtime-cloudflare": "workspace:*",
+    "@moinulmoin/eden-compiler": "workspace:*",
+    "@moinulmoin/eden-runtime-cloudflare": "workspace:*",
     "chokidar": "5.0.0",
     "wrangler": "4.120.0"
   },
   "scripts": {
     "build": "tsc -b",
     "postbuild": "chmod 755 dist/index.js",
+    "prepack": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && pnpm run build",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src --max-warnings 0",
     "test": "pnpm --dir ../.. exec vitest run packages/cli/test --passWithNoTests --maxWorkers=1"
   },
   "devDependencies": {
     "@types/node": "24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moinulmoin/eden.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/moinulmoin/eden#readme",
+  "bugs": {
+    "url": "https://github.com/moinulmoin/eden/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24.17.0 <25"
   }
 }

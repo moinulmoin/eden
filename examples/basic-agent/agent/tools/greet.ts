@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import type {
   EdenToolDefinition,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 interface GreetInput {
   readonly name: string;

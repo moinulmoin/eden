@@ -71,7 +71,8 @@ runs an environment-specific Wrangler compatibility dry-run, provisions
 `EDEN_BEARER_SECRET` through Wrangler stdin, deploys the generated runtime
 wrapper and bundle, waits for edge and Durable Object propagation, and validates
 authenticated health, generation metadata, session creation, cursor reconnect,
-the live `eden-dev` model/tool/final turn, and the expected lifecycle.
+the live Workers AI model/tool/final turn through the `default` AI Gateway, and
+the expected lifecycle.
 
 Set `EDEN_BEARER_SECRET` outside the project and pass a unique `--name` for
 temporary validation:
@@ -88,6 +89,11 @@ The secret is never placed in an argument, URL, artifact, or normal output.
 Successful deployment output includes the selected generation ID and reachable
 Worker URL. A deployment failure is reported separately from compatibility,
 propagation, authentication, lifecycle, model, and cleanup failures.
+
+The live model adapter uses Cloudflare AI Gateway gateway ID `default`. Cloudflare
+creates that gateway on the first authenticated request when it does not already
+exist; Eden does not provision a named gateway. See [Cloudflare's AI Gateway
+getting-started guide](https://developers.cloudflare.com/ai-gateway/get-started/).
 
 If a validation harness provisions the secret separately instead of using
 `eden agent deploy`, the pinned Wrangler command must remain explicitly
@@ -146,7 +152,7 @@ agent/ source tree
   -> .eden manifest and Worker-safe bundle
   -> Cloudflare Worker HTTP host
   -> EdenSession SQLite Durable Object
-  -> Workers AI through the eden-dev AI Gateway
+  -> Workers AI through Cloudflare AI Gateway `default`
 ```
 
 - The compiler owns filesystem discovery, path-derived tool names,

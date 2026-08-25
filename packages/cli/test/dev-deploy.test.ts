@@ -27,7 +27,7 @@ import {
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { readArtifactGeneration } from "@eden/compiler";
+import { readArtifactGeneration } from "@moinulmoin/eden-compiler";
 import {
   EDEN_LOCAL_HOST,
   EDEN_LOCAL_INSPECTOR_PORT,
@@ -1377,7 +1377,7 @@ export default {
 
     await writeFile(
       join(root, "agent/tools/greet.ts"),
-      `import type { EdenToolDefinition } from "@eden/definitions";
+      `import type { EdenToolDefinition } from "@moinulmoin/eden-definitions";
 const greet: EdenToolDefinition<{ readonly name: string }, { readonly greeting: string }> = {
   description: "Greet a person by name.",
   inputSchema: {
@@ -1523,7 +1523,7 @@ export default greet;
       const initialDigest = await artifactDigest(root);
       await writeFile(
         join(root, "agent/tools/greet.ts"),
-        `import type { EdenToolDefinition } from "@eden/definitions";
+        `import type { EdenToolDefinition } from "@moinulmoin/eden-definitions";
 const greet: EdenToolDefinition<{ readonly name: string }, { readonly greeting: string }> = {
   description: "Updated watch greeting.",
   inputSchema: {
@@ -1672,7 +1672,7 @@ export default greet;
       await new Promise((resolve) => setTimeout(resolve, 100));
       await writeFile(
         join(root, "agent/tools/greet.ts"),
-        `import type { EdenToolDefinition } from "@eden/definitions";
+        `import type { EdenToolDefinition } from "@moinulmoin/eden-definitions";
 const greet: EdenToolDefinition<{ readonly name: string }, { readonly greeting: string }> = {
   description: "Updated watch greeting before a failed replacement.",
   inputSchema: {

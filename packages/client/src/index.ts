@@ -4,7 +4,7 @@ import type {
   EdenEventType,
   EdenSessionAcceptance,
   EdenSessionSnapshot,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 export type {
   EdenCommandRequest,
@@ -13,7 +13,7 @@ export type {
   EdenEventType,
   EdenSessionAcceptance,
   EdenSessionSnapshot,
-} from "@eden/definitions";
+} from "@moinulmoin/eden-definitions";
 
 import {
   assertValidState,

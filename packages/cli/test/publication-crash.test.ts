@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, test } from "vitest";
 
-import { readArtifactGeneration } from "@eden/compiler";
+import { readArtifactGeneration } from "@moinulmoin/eden-compiler";
 import { runEdenCli } from "../src/index.js";
 
 const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
