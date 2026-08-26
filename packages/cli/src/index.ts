@@ -637,8 +637,8 @@ export default greet;
     "deploy": "eden agent deploy"
   },
   "devDependencies": {
-    "@moinulmoin/eden": "0.1.1",
-    "@moinulmoin/eden-definitions": "0.1.1",
+    "@moinulmoin/eden": "0.1.2",
+    "@moinulmoin/eden-definitions": "0.1.2",
     "typescript": "5.9.3",
     "wrangler": "4.120.0"
   }

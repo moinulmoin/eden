@@ -17,15 +17,15 @@ create a new Eden-native agent, start with `eden agent init`.
 Use any one of these package managers:
 
 ```sh
-npm install --global @moinulmoin/eden@0.1.1
+npm install --global @moinulmoin/eden@0.1.2
 ```
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.1.1
+pnpm add --global @moinulmoin/eden@0.1.2
 ```
 
 ```sh
-bun add --global @moinulmoin/eden@0.1.1
+bun add --global @moinulmoin/eden@0.1.2
 ```
 
 Then confirm the CLI is available:

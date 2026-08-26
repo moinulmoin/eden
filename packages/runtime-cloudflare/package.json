@@ -1,6 +1,6 @@
 {
   "name": "@moinulmoin/eden-runtime-cloudflare",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Cloudflare runtime for Eden Deploy and Eden Agent.",
   "type": "module",
   "license": "Apache-2.0",
@@ -20,7 +20,7 @@
     "NOTICE"
   ],
   "dependencies": {
-    "@moinulmoin/eden-definitions": "workspace:*"
+    "@moinulmoin/eden-definitions": "0.1.2"
   },
   "devDependencies": {
     "@cloudflare/containers": "0.3.7",

@@ -66,10 +66,10 @@ importers:
   packages/cli:
     dependencies:
       '@moinulmoin/eden-compiler':
-        specifier: workspace:*
+        specifier: 0.1.2
         version: link:../compiler
       '@moinulmoin/eden-runtime-cloudflare':
-        specifier: workspace:*
+        specifier: 0.1.2
         version: link:../runtime-cloudflare
       chokidar:
         specifier: 5.0.0
@@ -91,7 +91,7 @@ importers:
   packages/compiler:
     dependencies:
       '@moinulmoin/eden-definitions':
-        specifier: workspace:*
+        specifier: 0.1.2
         version: link:../definitions
       esbuild:
         specifier: 0.28.2
@@ -109,7 +109,7 @@ importers:
   packages/runtime-cloudflare:
     dependencies:
       '@moinulmoin/eden-definitions':
-        specifier: workspace:*
+        specifier: 0.1.2
         version: link:../definitions
     devDependencies:
       '@cloudflare/containers':

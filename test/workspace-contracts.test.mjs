@@ -12,6 +12,12 @@ const workspaceDirectories = [
   "packages/cli",
   "examples/basic-agent",
 ];
+const publicPackageNames = new Set([
+  "@moinulmoin/eden-definitions",
+  "@moinulmoin/eden-compiler",
+  "@moinulmoin/eden-runtime-cloudflare",
+  "@moinulmoin/eden",
+]);
 
 async function readJson(relativePath) {
   return JSON.parse(await readFile(join(repositoryRoot, relativePath), "utf8"));
@@ -38,7 +44,7 @@ test("the repository declares the six Eden workspaces and root quality scripts",
   for (const directory of workspaceDirectories) {
     const packageJson = await readJson(join(directory, "package.json"));
     expect(typeof packageJson.name).toBe("string");
-    expect(packageJson.version).toBe("0.1.1");
+    expect(packageJson.version).toBe("0.1.2");
     expect(packageJson.types).toBe("./dist/index.d.ts");
     expect(packageJson.module).toBe("./dist/index.js");
     expect(typeof packageJson.exports).toBe("object");
@@ -72,8 +78,17 @@ test("workspace dependencies and project references form an acyclic declaration 
       ...packageJson.dependencies,
       ...packageJson.devDependencies,
     })
-      .filter(([name, version]) => packageNames.has(name) && version === "workspace:*")
+      .filter(([name]) => packageNames.has(name))
       .map(([name]) => name);
+    if (publicPackageNames.has(packageName)) {
+      for (const [dependency, version] of Object.entries(
+        packageJson.dependencies ?? {},
+      )) {
+        if (publicPackageNames.has(dependency)) {
+          expect(version).toBe("0.1.2");
+        }
+      }
+    }
     graph.set(packageName, dependencies);
   }
 

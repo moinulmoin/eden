@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 — 2026-08-26
+
+- Replaced public `workspace:*` dependency specifiers with exact `0.1.2`
+  versions so every supported installer resolves the published package graph.
+
 ## 0.1.1 — 2026-08-26
 
 - Replaced the placeholder npm README with complete installation,

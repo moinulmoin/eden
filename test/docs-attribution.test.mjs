@@ -89,9 +89,9 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   );
   expect(commandHeadings).toHaveLength(4);
   for (const document of [readme, packageReadme]) {
-    expect(document).toContain("npm install --global @moinulmoin/eden@0.1.1");
-    expect(document).toContain("pnpm add --global @moinulmoin/eden@0.1.1");
-    expect(document).toContain("bun add --global @moinulmoin/eden@0.1.1");
+    expect(document).toContain("npm install --global @moinulmoin/eden@0.1.2");
+    expect(document).toContain("pnpm add --global @moinulmoin/eden@0.1.2");
+    expect(document).toContain("bun add --global @moinulmoin/eden@0.1.2");
     expect(document).toMatch(/Node `>=24\.17\.0`/u);
     expect(document).toContain("Docker or OrbStack");
     expect(document).toContain("npx wrangler@4.120.0 login");
