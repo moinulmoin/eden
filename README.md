@@ -1,133 +1,255 @@
 # Eden
 
-Eden is one CLI with two separated surfaces:
+Eden runs AI agents on Cloudflare through one CLI.
 
-1. **Eden Deploy** — host an *existing Eve project* on Cloudflare as-is. Eden
-   builds the project with its own pinned Eve toolchain, packages the real
-   Node/Nitro server into one bounded Cloudflare Container, and places a
-   generic Worker in front of it. The top-level `eden preflight`, `eden deploy`,
-   and `eden destroy` commands form the deploy-first product surface.
-2. **Eden Agent** — a small, Cloudflare-native durable agent framework:
-   filesystem-first authoring, a Node-side compiler, a Worker-safe generated
-   bundle, one authenticated Worker host, one SQLite-backed `EdenSession`
-   Durable Object, a bounded model/tool/final-response turn, and an NDJSON
-   journal stream, driven by `eden agent init`, `eden agent build`,
-   `eden agent dev`, and `eden agent deploy`.
+Use it in one of two ways:
 
-Deploy never invokes the Agent framework, rewrites Eve source, lowers Eve into
-an Eden Agent, maps Eve application semantics onto Cloudflare primitives, or
-uses the Agent runtime as a fallback. The two surfaces stay separate on purpose.
+1. **Deploy an existing Eve project.** Eden installs the project's pinned pnpm
+   lockfile, runs its project-local Eve executable, packages the real Node/Nitro
+   server into a Cloudflare Container, and publishes a generic Worker in front
+   of it. Eve remains the application and workflow authority.
+2. **Create an Eden Agent.** Eden compiles an `agent/` directory into a static
+   Worker generation backed by a SQLite Durable Object session journal.
+
+The two workflows are intentionally separate. Deploy never rewrites an Eve
+project into an Eden Agent or silently replaces its providers and services.
 
 ## Install
 
-The public v0.1.0 CLI package is `@moinulmoin/eden`. Package managers install
-its three companion packages automatically:
-
-| Package | Version | Purpose |
-| --- | --- | --- |
-| `@moinulmoin/eden` | `0.1.0` | CLI package; installs the `eden` binary |
-| `@moinulmoin/eden-definitions` | `0.1.0` | Eden Agent definitions |
-| `@moinulmoin/eden-compiler` | `0.1.0` | Node-side Agent compiler |
-| `@moinulmoin/eden-runtime-cloudflare` | `0.1.0` | Cloudflare Worker and Durable Object runtime |
-
-The monorepo root, typed client, and example workspaces are not published.
-Users install only `@moinulmoin/eden`.
-
-Install the CLI globally with npm:
+Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.1.0
+npm install --global @moinulmoin/eden@0.1.1
 ```
 
-Install the CLI globally with pnpm:
+Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.1.0
+pnpm add --global @moinulmoin/eden@0.1.1
 ```
 
-Bun is supported as an installer only:
+Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.1.0
+bun add --global @moinulmoin/eden@0.1.1
 ```
 
-Node `>=24.17.0 <25` remains the Eden runtime requirement, including when Bun
-installs the package; do not force the CLI through `bunx --bun`. Eden Deploy
-v0.1.0 accepts pinned pnpm Eve projects, not Bun lockfiles or project toolchains.
+Confirm the installation:
 
-The live Eden Agent model path uses Cloudflare AI Gateway's `default` gateway.
-Cloudflare creates that gateway on the first authenticated request when it does
-not already exist; Eden does not claim to provision a named gateway. See
-[Cloudflare's AI Gateway getting-started guide](https://developers.cloudflare.com/ai-gateway/get-started/).
+```sh
+eden --help
+```
+
+Users install only `@moinulmoin/eden`; its companion packages are resolved
+automatically. Bun is supported as an installer only. Node `>=24.17.0` remains
+the Eden runtime, so do not force the CLI through `bunx --bun`.
 
 ## Requirements
 
-- Node `>=24.17.0 <25` (the version range represented by `.nvmrc`)
-- pnpm `11.21.0` through Corepack for source checkouts
-- Wrangler `4.120.0`, installed by the frozen lockfile
+For every workflow:
 
-## Source checkout
+- macOS or Linux
+- Node `>=24.17.0`
+- a Cloudflare account
+- Wrangler authentication:
 
-The repository is a pnpm workspace with TypeScript project references. The
-local gate is reproducible without Turbo and without a remote deployment.
+  ```sh
+  npx wrangler@4.120.0 login
+  ```
+
+For **Eden Deploy**, also provide:
+
+- Docker or OrbStack with Linux/amd64 container support
+- an existing Eve project with an exact `packageManager: "pnpm@..."` entry
+- the matching root `pnpm-lock.yaml`
+- the providers, credentials, databases, Workflow World, and external services
+  already required by the Eve project
+
+Eden Deploy supports pinned pnpm Eve projects in this release. Bun project
+lockfiles and native Windows are not currently supported.
+
+For **Eden Agent**, Corepack must be available. The setup below enables the
+generated project's pinned pnpm `11.21.0` version once.
+
+## Deploy an existing Eve project
+
+Deploy performs all required checks inline. A separate preflight is optional.
 
 ```sh
-corepack pnpm install --frozen-lockfile
-corepack pnpm run build
-corepack pnpm exec tsc -b --pretty false
-corepack pnpm exec eslint . --max-warnings 0
-corepack pnpm exec vitest run --maxWorkers=1
+eden deploy \
+  --project ./my-eve-app \
+  --env preview \
+  --name my-eve-preview
 ```
 
-After `corepack pnpm run build`, invoke the local CLI entry point with:
+A successful deployment prints the immutable generation and public
+`workers.dev` URL. The authored Eve directory is unchanged.
+
+If the project needs runtime values, provide an explicit environment file
+outside source control:
+
+```sh
+eden deploy \
+  --project ./my-eve-app \
+  --env preview \
+  --name my-eve-preview \
+  --env-file ~/.config/my-eve-app/preview.env
+```
+
+Eden passes values through its protected deployment path. Values are not placed
+in command arguments, image layers, generated artifacts, or normal logs.
+
+Run the optional read-only diagnostic when troubleshooting:
+
+```sh
+eden preflight \
+  --project ./my-eve-app \
+  --env preview \
+  --name my-eve-preview
+```
+
+Remove the exact deployment when finished:
+
+```sh
+eden destroy \
+  --project ./my-eve-app \
+  --env preview \
+  --name my-eve-preview
+```
+
+Destroy requires Eden's immutable ownership record, verifies the current remote
+identity, and never broadens cleanup to similarly named resources.
+
+### What Deploy preserves
+
+The Eve project remains responsible for its:
+
+- model providers and credentials
+- databases, queues, and external APIs
+- channels, schedules, authentication, and authorization
+- sandbox and Workflow World
+
+Container-local memory and disk are disposable. A production Eve deployment
+needs a project-configured, Cloudflare-reachable durable Workflow World. This
+release uses one logical Container instance and does not promise horizontal
+scaling or custom domains.
+
+## Create an Eden Agent
+
+Create a project in an empty directory and install its generated dependencies:
+
+```sh
+mkdir my-agent
+eden agent init --project ./my-agent
+cd my-agent
+corepack enable
+pnpm install
+```
+
+The generated authoring tree is intentionally small:
+
+```text
+agent/
+├── agent.ts
+├── instructions.md
+└── tools/
+    └── greet.ts
+```
+
+Build the Worker generation:
+
+```sh
+pnpm run build
+```
+
+Start the Agent locally:
+
+```sh
+export EDEN_BEARER_SECRET="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(24).toString("hex"))')"
+pnpm run dev
+```
+
+The local surfaces are:
+
+- Worker: `http://127.0.0.1:8797`
+- Wrangler inspector: `http://127.0.0.1:9297`
+
+Leave this terminal running until Eden prints its ready message. Press `Ctrl-C`
+to stop local development before continuing to deployment; the bearer value
+remains in the current shell.
+
+Deploy to an explicit preview target:
+
+```sh
+pnpm run deploy -- \
+  --env preview \
+  --name my-agent-preview
+```
+
+After testing, remove the exact preview Worker and its secret:
+
+```sh
+pnpm exec wrangler secret delete EDEN_BEARER_SECRET \
+  --name my-agent-preview \
+  --config "$PWD/wrangler.jsonc"
+pnpm exec wrangler delete my-agent-preview \
+  --env preview \
+  --config "$PWD/wrangler.jsonc" \
+  --force
+unset EDEN_BEARER_SECRET
+```
+
+Run these commands only for the explicit preview name you just created.
+
+The Agent runtime uses Workers AI through Cloudflare AI Gateway's `default`
+gateway. Cloudflare creates that gateway on the first authenticated request when
+it does not already exist.
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `eden preflight` | Inspect an Eve candidate without remote mutation |
+| `eden deploy` | Deploy an existing Eve project to one exact target |
+| `eden destroy` | Remove one exact Eden-owned Eve deployment |
+| `eden agent init` | Create an Eden Agent project |
+| `eden agent build` | Compile an Agent generation |
+| `eden agent dev` | Run an Agent locally |
+| `eden agent deploy` | Deploy the Agent runtime |
+
+Run `eden <command> --help` for command-specific options.
+
+## Develop from source
+
+The repository is a pnpm workspace with TypeScript project references. It works
+without Turbo or Turborepo.
+
+```sh
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm run typecheck
+pnpm run lint
+pnpm run test
+pnpm run conformance:local
+```
+
+After the build, invoke the source-checkout CLI with:
 
 ```sh
 node packages/cli/dist/index.js --help
 ```
 
-In the examples below, `eden` means that same built entry point:
-
-```sh
-eden() {
-  node packages/cli/dist/index.js "$@"
-}
-```
-
-## Quickstart
-
-Host an existing Eve project (preview target, exact named Worker):
-
-```sh
-export EDEN_BEARER_SECRET="$(openssl rand -hex 24)"
-eden deploy --project ./my-eve-app --env preview --name my-eve-preview-$(date +%s)
-```
-
-Author a new agent with the Eden framework:
-
-```sh
-export EDEN_BEARER_SECRET="$(openssl rand -hex 24)"
-eden agent init --project ./my-agent
-eden agent build --project ./my-agent
-eden agent dev --project ./my-agent   # http://127.0.0.1:8797 (inspector 127.0.0.1:9297)
-```
-
-## Local gate
-
-Run the full serial conformance validator after the frozen install:
-
-```sh
-corepack pnpm run conformance:local
-```
-
 ## Documentation
 
-| Document | Contents |
-| --- | --- |
-| [`docs/deploy.md`](./docs/deploy.md) | Eve hosting: targets, destroy semantics, Workflow World, env-file handling, Deploy/Adapt/Agent positioning |
-| [`docs/agent-cli.md`](./docs/agent-cli.md) | Agent CLI reference, authentication boundaries, architecture, compatibility findings |
-| [`docs/validation.md`](./docs/validation.md) | Clean-room walkthrough, deployed validation, provisional limits, out of scope, cleanup |
+- [Eden Deploy](./docs/deploy.md): deployment lifecycle, environment handling,
+  cleanup, durability, and current limits
+- [Eden Agent CLI](./docs/agent-cli.md): Agent commands, authentication, runtime,
+  and architecture
+- [Validation](./docs/validation.md): local and deployed checks, evidence, and
+  cleanup
 
 ## License
 
-Apache-2.0. See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE) for third-party
-attribution.
+Apache-2.0. See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE) for the applicable
+Eve and Cloudflare attribution.

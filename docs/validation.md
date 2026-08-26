@@ -102,7 +102,7 @@ For the complete serial local conformance gate, run this repository-owned
 validator after the frozen install:
 
 ```sh
-corepack pnpm run conformance:local
+pnpm run conformance:local
 ```
 
 It creates and removes its own empty temporary root, runs the documented
@@ -144,9 +144,9 @@ production resources during cleanup. For a temporary Worker named explicitly
 with `--name`, Wrangler 4.120 cleanup is:
 
 ```sh
-corepack pnpm exec wrangler secret delete EDEN_BEARER_SECRET \
+pnpm exec wrangler secret delete EDEN_BEARER_SECRET \
   --name "$WORKER_NAME" --config "$PROJECT_ROOT/wrangler.jsonc"
-corepack pnpm exec wrangler delete "$WORKER_NAME" \
+pnpm exec wrangler delete "$WORKER_NAME" \
   --env "$ENVIRONMENT" --config "$PROJECT_ROOT/wrangler.jsonc" --force
 ```
 

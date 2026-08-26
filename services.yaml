@@ -1,13 +1,13 @@
 commands:
-  install: corepack pnpm install --frozen-lockfile
-  test: corepack pnpm run test && corepack pnpm run conformance:local
-  build: corepack pnpm run build
-  typecheck: corepack pnpm run typecheck
-  lint: corepack pnpm run lint
-  cli_test: corepack pnpm --filter @moinulmoin/eden run test
-  cli_build: corepack pnpm --filter @moinulmoin/eden run build
-  runtime_test: corepack pnpm --filter @moinulmoin/eden-runtime-cloudflare run test
-  compiler_test: corepack pnpm --filter @moinulmoin/eden-compiler run test
+  install: pnpm install --frozen-lockfile
+  test: pnpm run test && pnpm run conformance:local
+  build: pnpm run build
+  typecheck: pnpm run typecheck
+  lint: pnpm run lint
+  cli_test: pnpm --filter @moinulmoin/eden run test
+  cli_build: pnpm --filter @moinulmoin/eden run build
+  runtime_test: pnpm --filter @moinulmoin/eden-runtime-cloudflare run test
+  compiler_test: pnpm --filter @moinulmoin/eden-compiler run test
 
 services:
   eden-local:
@@ -15,14 +15,14 @@ services:
     depends_on: []
     start: >-
       test -n "${EDEN_BEARER_SECRET:?EDEN_BEARER_SECRET is required}" &&
-      corepack pnpm run build &&
+      pnpm run build &&
       EDEN_HOST=127.0.0.1 EDEN_PORT=8797 EDEN_INSPECTOR_PORT=9297
-      corepack pnpm exec node packages/cli/dist/index.js agent dev
+      node packages/cli/dist/index.js agent dev
       --project examples/basic-agent
     stop: >-
       env -u EDEN_BEARER_SECRET
       EDEN_HOST=127.0.0.1 EDEN_PORT=8797 EDEN_INSPECTOR_PORT=9297
-      corepack pnpm exec node --input-type=module -e
+      node --input-type=module -e
       'import("./packages/cli/dist/index.js").then(({ stopEdenDev }) =>
       stopEdenDev({ cwd: process.cwd(), projectRoot: "examples/basic-agent" }))
       .then((code) => { process.exitCode = code; })

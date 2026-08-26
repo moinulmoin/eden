@@ -629,7 +629,7 @@ export default greet;
   "type": "module",
   "packageManager": "pnpm@11.21.0",
   "engines": {
-    "node": ">=24.17.0 <25"
+    "node": ">=24.17.0"
   },
   "scripts": {
     "build": "eden agent build",
@@ -637,8 +637,8 @@ export default greet;
     "deploy": "eden agent deploy"
   },
   "devDependencies": {
-    "@moinulmoin/eden": "0.1.0",
-    "@moinulmoin/eden-definitions": "0.1.0",
+    "@moinulmoin/eden": "0.1.1",
+    "@moinulmoin/eden-definitions": "0.1.1",
     "typescript": "5.9.3",
     "wrangler": "4.120.0"
   }

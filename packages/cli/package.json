@@ -1,7 +1,15 @@
 {
   "name": "@moinulmoin/eden",
-  "version": "0.1.0",
-  "description": "CLI for Eden Deploy and Eden Agent.",
+  "version": "0.1.1",
+  "description": "Deploy existing Eve agents to Cloudflare and author Cloudflare-native Eden Agents.",
+  "keywords": [
+    "ai",
+    "agents",
+    "cli",
+    "cloudflare",
+    "durable-objects",
+    "eve"
+  ],
   "type": "module",
   "license": "Apache-2.0",
   "types": "./dist/index.d.ts",
@@ -52,6 +60,6 @@
     "access": "public"
   },
   "engines": {
-    "node": ">=24.17.0 <25"
+    "node": ">=24.17.0"
   }
 }

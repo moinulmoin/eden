@@ -74,10 +74,10 @@ function expectNoProcessReservations(label) {
 
 test("documents the supported CLI and clean-room operator boundaries", async () => {
   const readme = await readRepositoryFile("README.md");
+  const packageReadme = await readRepositoryFile("packages/cli/README.md");
   const deployDoc = await readRepositoryFile("docs/deploy.md");
   const agentCliDoc = await readRepositoryFile("docs/agent-cli.md");
   const validationDoc = await readRepositoryFile("docs/validation.md");
-  const threatModel = await readRepositoryFile(".factory/threat-model.md");
   const workflow = await readRepositoryFile(".github/workflows/ci.yml");
 
   const commandHeadings = [
@@ -88,22 +88,28 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
     new Set(["init", "dev", "build", "deploy"]),
   );
   expect(commandHeadings).toHaveLength(4);
-  expect(readme).toContain("corepack pnpm install --frozen-lockfile");
-  expect(readme).toContain("npm install --global @moinulmoin/eden@0.1.0");
-  expect(readme).toContain("pnpm add --global @moinulmoin/eden@0.1.0");
-  expect(readme).toContain("bun add --global @moinulmoin/eden@0.1.0");
-  expect(readme).toContain("## Install");
-  expect(readme).toContain("Users install only `@moinulmoin/eden`.");
-  expect(readme).toMatch(/Bun is supported as an installer only/i);
-  expect(readme).toMatch(/Node `>=24\.17\.0 <25` remains the Eden runtime/i);
-  for (const packageName of [
-    "@moinulmoin/eden",
-    "@moinulmoin/eden-definitions",
-    "@moinulmoin/eden-compiler",
-    "@moinulmoin/eden-runtime-cloudflare",
-  ]) {
-    expect(readme).toContain(`\`${packageName}\``);
+  for (const document of [readme, packageReadme]) {
+    expect(document).toContain("npm install --global @moinulmoin/eden@0.1.1");
+    expect(document).toContain("pnpm add --global @moinulmoin/eden@0.1.1");
+    expect(document).toContain("bun add --global @moinulmoin/eden@0.1.1");
+    expect(document).toMatch(/Node `>=24\.17\.0`/u);
+    expect(document).toContain("Docker or OrbStack");
+    expect(document).toContain("npx wrangler@4.120.0 login");
+    expect(document).toContain("eden deploy");
+    expect(document).toContain("eden destroy");
+    expect(document).toContain("mkdir my-agent");
+    expect(document).toContain("eden agent init");
+    expect(document).toContain("pnpm install");
+    expect(document).toContain("corepack enable");
+    expect(document).toContain("runs its project-local Eve executable");
+    expect(document).toContain("wrangler delete my-agent-preview");
+    expect(document).not.toContain("openssl");
   }
+  expect(readme).toContain("pnpm install --frozen-lockfile");
+  expect(readme).toContain("## Install");
+  expect(readme).toContain("Users install only `@moinulmoin/eden`;");
+  expect(readme).toMatch(/Bun is supported as an installer only/i);
+  expect(readme).toMatch(/Node `>=24\.17\.0` remains\s+the Eden runtime/i);
   expect(agentCliDoc).toMatch(/AI Gateway[\s\S]*`default`/i);
   expect(agentCliDoc).toContain("https://developers.cloudflare.com/ai-gateway/get-started/");
   expect(validationDoc).toMatch(/AI Gateway[\s\S]*`default`/i);
@@ -111,9 +117,6 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   for (const document of [readme, agentCliDoc, validationDoc]) {
     expect(document).not.toMatch(/eden-dev[\s\S]*AI Gateway/i);
   }
-  expect(threatModel).toMatch(/Eden Deploy[\s\S]*Eden Agent/);
-  expect(threatModel).toContain("remote Cloudflare boundary");
-  expect(threatModel).toMatch(/gateway ID\s+`default`/u);
   expect(workflow).toContain("permissions:\n  contents: read");
   expect(workflow).toContain("actions/checkout@11d5960a326750d5838078e36cf38b85af677262");
   expect(workflow).toContain("actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020");

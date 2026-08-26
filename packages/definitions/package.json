@@ -1,6 +1,6 @@
 {
   "name": "@moinulmoin/eden-definitions",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shared definitions for Eden Agents and tools.",
   "type": "module",
   "license": "Apache-2.0",
@@ -39,6 +39,6 @@
     "access": "public"
   },
   "engines": {
-    "node": ">=24.17.0 <25"
+    "node": ">=24.17.0"
   }
 }

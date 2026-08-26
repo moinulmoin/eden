@@ -7,7 +7,7 @@
  * package-private adapters.
  */
 
-export const EDEN_PACKAGE_VERSION = "0.1.0" as const;
+export const EDEN_PACKAGE_VERSION = "0.1.1" as const;
 export const EDEN_RUNTIME_VERSION = "eden-runtime-1" as const;
 export const EDEN_AGENT_BUNDLE_VERSION = "eden-agent-bundle-1" as const;
 export const EDEN_MANIFEST_VERSION = "eden-manifest-1" as const;

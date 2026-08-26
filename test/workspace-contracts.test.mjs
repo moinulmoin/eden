@@ -38,7 +38,7 @@ test("the repository declares the six Eden workspaces and root quality scripts",
   for (const directory of workspaceDirectories) {
     const packageJson = await readJson(join(directory, "package.json"));
     expect(typeof packageJson.name).toBe("string");
-    expect(packageJson.version).toBe("0.1.0");
+    expect(packageJson.version).toBe("0.1.1");
     expect(packageJson.types).toBe("./dist/index.d.ts");
     expect(packageJson.module).toBe("./dist/index.js");
     expect(typeof packageJson.exports).toBe("object");

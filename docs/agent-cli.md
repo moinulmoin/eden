@@ -101,7 +101,7 @@ scoped to the same unique Worker:
 
 ```sh
 printf '%s' "$EDEN_BEARER_SECRET" |
-  corepack pnpm exec wrangler secret put EDEN_BEARER_SECRET \
+  pnpm exec wrangler secret put EDEN_BEARER_SECRET \
     --name "$WORKER_NAME" --config "$PROJECT_ROOT/wrangler.jsonc"
 ```
 

@@ -233,7 +233,7 @@ test("keeps invalid-input and interrupted-step fixtures in the serial conformanc
   ]);
 
   const readme = await readFile(join(repositoryRoot, "README.md"), "utf8");
-  expect(readme).toContain("corepack pnpm run conformance:local");
+  expect(readme).toContain("pnpm run conformance:local");
   const validationDoc = await readFile(
     join(repositoryRoot, "docs/validation.md"),
     "utf8",

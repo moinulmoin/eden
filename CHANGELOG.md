@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 — 2026-08-26
+
+- Replaced the placeholder npm README with complete installation,
+  prerequisites, Deploy, Agent, cleanup, and limitation guidance.
+- Relaxed the Node engine declaration to `>=24.17.0`; later Node majors are no
+  longer rejected without evidence.
+- Removed internal Factory mission and scan scaffolding from the public tree.
+
 ## 0.1.0 — 2026-08-26
 
 Initial release.
