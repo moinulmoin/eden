@@ -626,7 +626,14 @@ async function assertCleanRoomArtifacts(projectRoot) {
     .sort();
   if (
     JSON.stringify(initialEntries) !==
-    JSON.stringify([".eden", ".wrangler", "agent", "package.json", "wrangler.jsonc"])
+    JSON.stringify([
+      ".eden",
+      ".wrangler",
+      "agent",
+      "package.json",
+      "pnpm-workspace.yaml",
+      "wrangler.jsonc",
+    ])
   ) {
     throw new Error("eden agent init/build produced an unexpected project tree.");
   }
