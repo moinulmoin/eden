@@ -1,6 +1,6 @@
 {
   "name": "@moinulmoin/eden-compiler",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Filesystem compiler for Eden Agents.",
   "type": "module",
   "license": "Apache-2.0",
@@ -20,7 +20,7 @@
     "NOTICE"
   ],
   "dependencies": {
-    "@moinulmoin/eden-definitions": "0.1.2",
+    "@moinulmoin/eden-definitions": "0.1.3",
     "esbuild": "0.28.2",
     "typescript": "5.9.3"
   },

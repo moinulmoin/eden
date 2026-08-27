@@ -19,19 +19,19 @@ project into an Eden Agent or silently replaces its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.1.2
+npm install --global @moinulmoin/eden@0.1.3
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.1.2
+pnpm add --global @moinulmoin/eden@0.1.3
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.1.2
+bun add --global @moinulmoin/eden@0.1.3
 ```
 
 Confirm the installation:
@@ -242,12 +242,15 @@ node packages/cli/dist/index.js --help
 
 ## Documentation
 
-- [Eden Deploy](./docs/deploy.md): deployment lifecycle, environment handling,
-  cleanup, durability, and current limits
-- [Eden Agent CLI](./docs/agent-cli.md): Agent commands, authentication, runtime,
-  and architecture
-- [Validation](./docs/validation.md): local and deployed checks, evidence, and
-  cleanup
+- [Documentation index](./docs/README.md): choose a workflow and find every guide
+- [Installation](./docs/install.md): Node, npm/pnpm/Bun, Cloudflare, containers,
+  updates, uninstallation, and PATH problems
+- [Eden Deploy](./docs/deploy.md): complete existing-Eve preview deployment,
+  verification, exact cleanup, durability, and current limits
+- [Eden Agent CLI](./docs/agent-cli.md): initialization, local authenticated
+  use, preview deployment, cleanup, command reference, and architecture
+- [Validation](./docs/validation.md): advanced local and deployed lifecycle,
+  cursor recovery, evidence, and cleanup checks
 
 ## License
 

@@ -4,6 +4,170 @@ The Agent command surface is intentionally frozen beneath one namespace:
 `eden agent init`, `eden agent build`, `eden agent dev`, and
 `eden agent deploy`. No other Eden command is implied.
 
+Start with [installation and account setup](./install.md).
+
+## First successful local Agent
+
+Create an empty project root, initialize it, and install the generated
+dependencies:
+
+```sh
+mkdir my-agent
+eden agent init --project ./my-agent
+cd my-agent
+corepack enable
+pnpm install
+```
+
+`corepack enable` is a one-time machine setup. After it, use `pnpm` directly.
+The generated project pins pnpm `11.21.0`.
+
+The initial authoring tree is:
+
+```text
+agent/
+├── agent.ts
+├── instructions.md
+└── tools/
+    └── greet.ts
+package.json
+pnpm-workspace.yaml
+wrangler.jsonc
+```
+
+Build one static Worker generation:
+
+```sh
+pnpm run build
+```
+
+A successful build creates `.eden/` and prints the selected generation. It does
+not deploy anything.
+
+### Start authenticated local development
+
+The local Worker fails closed without a bearer secret. Keep the secret outside
+the repository while sharing it between two terminals:
+
+```sh
+SECRET_FILE="${TMPDIR:-/tmp}/eden-agent-local-${USER}.secret"
+umask 077
+node -e 'process.stdout.write(require("node:crypto").randomBytes(24).toString("hex"))' > "$SECRET_FILE"
+export EDEN_BEARER_SECRET="$(cat "$SECRET_FILE")"
+pnpm run dev
+```
+
+Leave this first terminal running. Eden prints a ready message after the initial
+build and starts only:
+
+- Worker: `http://127.0.0.1:8797`
+- Wrangler inspector: `127.0.0.1:9297`
+
+In a second terminal, enter the same project and load the same temporary value:
+
+```sh
+cd /absolute/path/to/my-agent
+SECRET_FILE="${TMPDIR:-/tmp}/eden-agent-local-${USER}.secret"
+export EDEN_BEARER_SECRET="$(cat "$SECRET_FILE")"
+```
+
+Verify authenticated health:
+
+```sh
+curl --fail --silent \
+  --header "Authorization: Bearer $EDEN_BEARER_SECRET" \
+  http://127.0.0.1:8797/eden/v1/health
+```
+
+Create a session:
+
+```sh
+SESSION_JSON="$(curl --fail --silent \
+  --header "Authorization: Bearer $EDEN_BEARER_SECRET" \
+  --header "Content-Type: application/json" \
+  --request POST \
+  --data '{}' \
+  http://127.0.0.1:8797/eden/v1/session)"
+
+SESSION_ID="$(printf '%s' "$SESSION_JSON" |
+  node -e 'let value=""; process.stdin.on("data", chunk => value += chunk); process.stdin.on("end", () => process.stdout.write(JSON.parse(value).sessionId))')"
+```
+
+Send one message and read the committed NDJSON stream:
+
+```sh
+curl --fail --silent \
+  --header "Authorization: Bearer $EDEN_BEARER_SECRET" \
+  --header "Content-Type: application/json" \
+  --request POST \
+  --data '{"message":"Greet Ada."}' \
+  "http://127.0.0.1:8797/eden/v1/session/$SESSION_ID"
+
+curl --fail --silent \
+  --header "Authorization: Bearer $EDEN_BEARER_SECRET" \
+  "http://127.0.0.1:8797/eden/v1/session/$SESSION_ID/stream?startIndex=0&follow=false"
+```
+
+The stream should contain ordered lifecycle events and finish with the session
+waiting for another command.
+
+Stop only the `pnpm run dev` process in the first terminal with `Ctrl-C`. Then
+remove the local secret file and clear both shell variables:
+
+```sh
+rm "$SECRET_FILE"
+unset EDEN_BEARER_SECRET SECRET_FILE
+```
+
+## First preview deployment
+
+Remote deployment uses Workers AI and requires the Cloudflare account selected
+by `npx wrangler@4.120.0 whoami`.
+
+From the generated project root, create a fresh secret and unique preview name:
+
+```sh
+export EDEN_BEARER_SECRET="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(24).toString("hex"))')"
+WORKER_NAME="my-agent-preview-$(date +%s)"
+```
+
+Deploy:
+
+```sh
+pnpm run deploy -- \
+  --env preview \
+  --name "$WORKER_NAME"
+```
+
+The command builds the selected generation, performs Wrangler compatibility
+checks, writes the bearer through Wrangler stdin, deploys the Worker and Durable
+Object binding, waits for propagation, and verifies authenticated health,
+session creation, cursor reconnect, and one live model/tool/final turn.
+
+Copy the exact printed `workers.dev` URL. After testing, delete only the Worker
+and secret created with the unique name:
+
+```sh
+pnpm exec wrangler secret delete EDEN_BEARER_SECRET \
+  --name "$WORKER_NAME" \
+  --config "$PWD/wrangler.jsonc"
+pnpm exec wrangler delete "$WORKER_NAME" \
+  --env preview \
+  --config "$PWD/wrangler.jsonc" \
+  --force
+unset EDEN_BEARER_SECRET
+```
+
+Keep `--env` off the name-scoped secret command. Wrangler otherwise targets a
+different environment-suffixed name.
+
+Confirm the printed URL is unreachable and compare the Cloudflare Workers list
+before and after the run. Require zero new Worker, secret, or Durable Object
+target residue associated with `WORKER_NAME`.
+
+For the complete cursor-recovery and lifecycle checks, continue with
+[Validation and cleanup](./validation.md).
+
 ## `eden agent init`
 
 `eden agent init` creates a minimal project only in an empty selected
@@ -14,6 +178,7 @@ agent/instructions.md
 agent/agent.ts
 agent/tools/greet.ts
 package.json
+pnpm-workspace.yaml
 wrangler.jsonc
 ```
 

@@ -188,6 +188,10 @@ describe("eden CLI project commands", () => {
     await expect(stat(join(root, "agent/agent.ts"))).resolves.toBeDefined();
     await expect(stat(join(root, "agent/tools/greet.ts"))).resolves.toBeDefined();
     await expect(stat(join(root, "package.json"))).resolves.toBeDefined();
+    await expect(stat(join(root, "pnpm-workspace.yaml"))).resolves.toBeDefined();
+    await expect(readFile(join(root, "pnpm-workspace.yaml"), "utf8")).resolves.toBe(
+      "allowBuilds:\n  esbuild: true\n  workerd: true\n",
+    );
     await expect(stat(join(root, "wrangler.jsonc"))).resolves.toBeDefined();
     const wrangler = JSON.parse(
       await readFile(join(root, "wrangler.jsonc"), "utf8"),
@@ -205,7 +209,7 @@ describe("eden CLI project commands", () => {
       (await readdir(root))
         .filter((entry) => !entry.startsWith(".eden-init-provenance-"))
         .sort(),
-    ).toEqual(["agent", "package.json", "wrangler.jsonc"]);
+    ).toEqual(["agent", "package.json", "pnpm-workspace.yaml", "wrangler.jsonc"]);
     await expect(stat(join(root, ".env"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(stat(join(root, ".dev.vars"))).rejects.toMatchObject({ code: "ENOENT" });
     expect(output.join("")).toContain("Initialized");
@@ -342,6 +346,7 @@ describe("eden CLI project commands", () => {
       "agent/agent.ts",
       "agent/tools/greet.ts",
       "package.json",
+      "pnpm-workspace.yaml",
       "wrangler.jsonc",
     ]) {
       await expect(stat(join(root, relativePath))).resolves.toBeDefined();
@@ -718,6 +723,7 @@ describe("eden CLI project commands", () => {
         "agent/agent.ts",
         "agent/tools/greet.ts",
         "package.json",
+        "pnpm-workspace.yaml",
         "wrangler.jsonc",
       ]) {
         await expect(stat(join(root, relativePath))).resolves.toBeDefined();

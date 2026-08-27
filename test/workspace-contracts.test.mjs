@@ -44,7 +44,7 @@ test("the repository declares the six Eden workspaces and root quality scripts",
   for (const directory of workspaceDirectories) {
     const packageJson = await readJson(join(directory, "package.json"));
     expect(typeof packageJson.name).toBe("string");
-    expect(packageJson.version).toBe("0.1.2");
+    expect(packageJson.version).toBe("0.1.3");
     expect(packageJson.types).toBe("./dist/index.d.ts");
     expect(packageJson.module).toBe("./dist/index.js");
     expect(typeof packageJson.exports).toBe("object");
@@ -85,7 +85,7 @@ test("workspace dependencies and project references form an acyclic declaration 
         packageJson.dependencies ?? {},
       )) {
         if (publicPackageNames.has(dependency)) {
-          expect(version).toBe("0.1.2");
+          expect(version).toBe("0.1.3");
         }
       }
     }

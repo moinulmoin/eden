@@ -194,6 +194,7 @@ describe("CLI OS-crash publication recovery", () => {
         "agent/agent.ts",
         "agent/tools/greet.ts",
         "package.json",
+        "pnpm-workspace.yaml",
         "wrangler.jsonc",
       ]) {
         await expect(stat(join(root, relativePath))).resolves.toBeDefined();

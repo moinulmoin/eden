@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3 — 2026-08-27
+
+- Made generated Eden Agent projects install cleanly with pinned pnpm 11 by
+  approving only the required `esbuild` and `workerd` dependency builds.
+- Added detailed user installation, Deploy, Agent, verification, and cleanup
+  documentation under `docs/`.
+
 ## 0.1.2 — 2026-08-26
 
 - Replaced public `workspace:*` dependency specifiers with exact `0.1.2`

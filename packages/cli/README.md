@@ -17,15 +17,15 @@ create a new Eden-native agent, start with `eden agent init`.
 Use any one of these package managers:
 
 ```sh
-npm install --global @moinulmoin/eden@0.1.2
+npm install --global @moinulmoin/eden@0.1.3
 ```
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.1.2
+pnpm add --global @moinulmoin/eden@0.1.3
 ```
 
 ```sh
-bun add --global @moinulmoin/eden@0.1.2
+bun add --global @moinulmoin/eden@0.1.3
 ```
 
 Then confirm the CLI is available:
@@ -207,6 +207,8 @@ Run `eden <command> --help` for command-specific options.
 
 ## Documentation
 
+- [Documentation index](https://github.com/moinulmoin/eden/blob/main/docs/README.md)
+- [Installation](https://github.com/moinulmoin/eden/blob/main/docs/install.md)
 - [Deploying Eve projects](https://github.com/moinulmoin/eden/blob/main/docs/deploy.md)
 - [Eden Agent CLI](https://github.com/moinulmoin/eden/blob/main/docs/agent-cli.md)
 - [Validation and cleanup](https://github.com/moinulmoin/eden/blob/main/docs/validation.md)

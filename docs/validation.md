@@ -1,5 +1,9 @@
 # Validation runbook
 
+This is the advanced operator and maintainer runbook. First-time users should
+start with [installation](./install.md), then follow either the
+[Eve deployment guide](./deploy.md) or the [Eden Agent guide](./agent-cli.md).
+
 ## Clean-room local validation
 
 The following walkthrough uses only the repository checkout and the approved
@@ -12,7 +16,7 @@ eden agent init --project "$PROJECT_ROOT"
 eden agent build --project "$PROJECT_ROOT"
 ```
 
-Check that the generated root contains the five scaffold entries and `.eden/`
+Check that the generated root contains the six scaffold entries and `.eden/`
 after the build. Eden may retain its hidden, root-contained
 `.eden-init-provenance-*` ownership directory; it contains only internal
 recovery state and is not a secret-bearing project file. There must be no

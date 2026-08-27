@@ -637,12 +637,19 @@ export default greet;
     "deploy": "eden agent deploy"
   },
   "devDependencies": {
-    "@moinulmoin/eden": "0.1.2",
-    "@moinulmoin/eden-definitions": "0.1.2",
+    "@moinulmoin/eden": "0.1.3",
+    "@moinulmoin/eden-definitions": "0.1.3",
     "typescript": "5.9.3",
     "wrangler": "4.120.0"
   }
 }
+`,
+  },
+  {
+    relativePath: "pnpm-workspace.yaml",
+    content: `allowBuilds:
+  esbuild: true
+  workerd: true
 `,
   },
   {
@@ -1637,6 +1644,7 @@ function initRootEntriesAllowed(
     INIT_STATE_FILE,
     "agent",
     "package.json",
+    "pnpm-workspace.yaml",
     "wrangler.jsonc",
     ".eden",
   ]);
