@@ -205,7 +205,7 @@ const distributionPackages = [
     name: "@moinulmoin/eden-compiler",
     requiredDistFiles: ["dist/index.js", "dist/index.d.ts"],
     dependencies: {
-      "@moinulmoin/eden-definitions": "0.1.3",
+      "@moinulmoin/eden-definitions": "0.1.4",
     },
   },
   {
@@ -218,7 +218,7 @@ const distributionPackages = [
       "dist/eden-eve-host-worker.mjs",
     ],
     dependencies: {
-      "@moinulmoin/eden-definitions": "0.1.3",
+      "@moinulmoin/eden-definitions": "0.1.4",
     },
   },
   {
@@ -227,8 +227,8 @@ const distributionPackages = [
     requiredDistFiles: ["dist/index.js", "dist/index.d.ts"],
     requiredRootFiles: ["README.md"],
     dependencies: {
-      "@moinulmoin/eden-compiler": "0.1.3",
-      "@moinulmoin/eden-runtime-cloudflare": "0.1.3",
+      "@moinulmoin/eden-compiler": "0.1.4",
+      "@moinulmoin/eden-runtime-cloudflare": "0.1.4",
     },
     bin: {
       eden: "./dist/index.js",
@@ -545,7 +545,7 @@ test.sequential(
           await tarMember(tarball, "package/package.json", cleanRoom, label),
         );
         expect(packageJson.name).toBe(packageSpec.name);
-        expect(packageJson.version).toBe("0.1.3");
+        expect(packageJson.version).toBe("0.1.4");
         expect(packageJson.private ?? false).toBe(false);
         expect(packageJson.license).toBe("Apache-2.0");
         expect(packageJson.bin).toEqual(packageSpec.bin);

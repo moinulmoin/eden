@@ -1,6 +1,6 @@
 {
   "name": "@moinulmoin/eden-client",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Typed client for Eden Agent sessions and journals.",
   "type": "module",
   "private": true,

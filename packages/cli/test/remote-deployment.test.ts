@@ -48,7 +48,7 @@ afterEach(async () => {
 });
 
 describe("eden remote deployment orchestration", () => {
-  test("provisions the bearer through Wrangler and validates the selected generation", async () => {
+  test("deploys after a prior same-identity build and validates the selected generation", async () => {
     const root = await createRoot();
     const dryRuns: EdenCliDryRunRequest[] = [];
     const commands: EdenCliRemoteCommandRequest[] = [];
@@ -57,6 +57,17 @@ describe("eden remote deployment orchestration", () => {
     await expect(
       runEdenCli(["agent", "init", "--project", root], { cwd: root }),
     ).resolves.toBe(0);
+    await expect(
+      runEdenCli(["agent", "build", "--project", root], {
+        cwd: root,
+        dryRunRunner: async () => ({
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+        }),
+      }),
+    ).resolves.toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, 5));
     await expect(
       runEdenCli(["agent", "deploy", "--project", root, "--env", "preview", "--name", "eden-gate-preview"], {
         cwd: root,

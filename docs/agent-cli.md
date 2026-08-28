@@ -134,7 +134,7 @@ WORKER_NAME="my-agent-preview-$(date +%s)"
 Deploy:
 
 ```sh
-pnpm run deploy -- \
+pnpm run deploy \
   --env preview \
   --name "$WORKER_NAME"
 ```

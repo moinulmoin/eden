@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4 — 2026-08-29
+
+- Fixed Agent deployment after a prior same-identity build by excluding the
+  diagnostic build timestamp from immutable artifact identity comparison.
+- Corrected pnpm deployment examples so CLI options reach Eden without a
+  literal `--` argument.
+
 ## 0.1.3 — 2026-08-27
 
 - Made generated Eden Agent projects install cleanly with pinned pnpm 11 by

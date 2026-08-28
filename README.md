@@ -19,19 +19,19 @@ project into an Eden Agent or silently replaces its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.1.3
+npm install --global @moinulmoin/eden@0.1.4
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.1.3
+pnpm add --global @moinulmoin/eden@0.1.4
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.1.3
+bun add --global @moinulmoin/eden@0.1.4
 ```
 
 Confirm the installation:
@@ -181,7 +181,7 @@ remains in the current shell.
 Deploy to an explicit preview target:
 
 ```sh
-pnpm run deploy -- \
+pnpm run deploy \
   --env preview \
   --name my-agent-preview
 ```

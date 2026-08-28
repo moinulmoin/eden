@@ -637,8 +637,8 @@ export default greet;
     "deploy": "eden agent deploy"
   },
   "devDependencies": {
-    "@moinulmoin/eden": "0.1.3",
-    "@moinulmoin/eden-definitions": "0.1.3",
+    "@moinulmoin/eden": "0.1.4",
+    "@moinulmoin/eden-definitions": "0.1.4",
     "typescript": "5.9.3",
     "wrangler": "4.120.0"
   }
@@ -2899,7 +2899,10 @@ async function copyDeploymentGenerationSnapshot(
       root,
       snapshotGeneration,
     );
-    if (stableJson(validated.artifacts) !== stableJson(generation.artifacts)) {
+    if (
+      stableArtifactIdentity(validated.artifacts) !==
+      stableArtifactIdentity(generation.artifacts)
+    ) {
       throw cliError({
         code: "ARTIFACT_INCOHERENT",
         message:
@@ -3573,6 +3576,19 @@ function stableJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function stableArtifactIdentity(
+  artifacts: EdenArtifactGeneration["artifacts"],
+): string {
+  const { buildMetadata, ...artifactsWithoutMetadata } = artifacts;
+  const metadataWithoutCreatedAt = Object.fromEntries(
+    Object.entries(buildMetadata).filter(([key]) => key !== "createdAt"),
+  );
+  return stableJson({
+    ...artifactsWithoutMetadata,
+    buildMetadata: metadataWithoutCreatedAt,
+  });
 }
 
 async function assertCanonicalGenerationMatches(

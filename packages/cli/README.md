@@ -17,15 +17,15 @@ create a new Eden-native agent, start with `eden agent init`.
 Use any one of these package managers:
 
 ```sh
-npm install --global @moinulmoin/eden@0.1.3
+npm install --global @moinulmoin/eden@0.1.4
 ```
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.1.3
+pnpm add --global @moinulmoin/eden@0.1.4
 ```
 
 ```sh
-bun add --global @moinulmoin/eden@0.1.3
+bun add --global @moinulmoin/eden@0.1.4
 ```
 
 Then confirm the CLI is available:
@@ -160,7 +160,7 @@ remains in the current shell.
 Deploy the Agent to an explicit preview target:
 
 ```sh
-pnpm run deploy -- \
+pnpm run deploy \
   --env preview \
   --name my-agent-preview
 ```

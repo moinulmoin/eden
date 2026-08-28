@@ -1,6 +1,6 @@
 {
   "name": "@moinulmoin/eden",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Deploy existing Eve agents to Cloudflare and author Cloudflare-native Eden Agents.",
   "keywords": [
     "ai",
@@ -31,8 +31,8 @@
     "NOTICE"
   ],
   "dependencies": {
-    "@moinulmoin/eden-compiler": "0.1.3",
-    "@moinulmoin/eden-runtime-cloudflare": "0.1.3",
+    "@moinulmoin/eden-compiler": "0.1.4",
+    "@moinulmoin/eden-runtime-cloudflare": "0.1.4",
     "chokidar": "5.0.0",
     "wrangler": "4.120.0"
   },
