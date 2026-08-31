@@ -33,19 +33,19 @@ Choose one installer.
 ### npm
 
 ```sh
-npm install --global @moinulmoin/eden@0.1.4
+npm install --global @moinulmoin/eden@0.1.5
 ```
 
 ### pnpm
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.1.4
+pnpm add --global @moinulmoin/eden@0.1.5
 ```
 
 ### Bun
 
 ```sh
-bun add --global @moinulmoin/eden@0.1.4
+bun add --global @moinulmoin/eden@0.1.5
 ```
 
 Bun is an installer only. Do not run Eden with `bunx --bun`.

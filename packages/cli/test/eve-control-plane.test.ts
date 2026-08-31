@@ -897,7 +897,16 @@ describe("top-level Eden Deploy commands", () => {
     );
   });
 
-  test("deploys one exact target, injects protected runtime values, and promotes only after health identity", async () => {
+  test.each([
+    { discarded: true, expectedExitCode: 0, expectedErrorCode: undefined },
+    {
+      discarded: false,
+      expectedExitCode: 1,
+      expectedErrorCode: "EVE_RUNTIME_IMAGE_CLEANUP_FAILED",
+    },
+  ] as const)(
+    "deploys one exact target and reports exact runtime-image cleanup (discarded=$discarded)",
+    async ({ discarded, expectedExitCode, expectedErrorCode }) => {
     const root = await createRoot();
     await writeFile(
       join(root, "package.json"),
@@ -913,6 +922,7 @@ describe("top-level Eden Deploy commands", () => {
     const marker = "deploy-secret-marker-1e9b";
     await writeFile(envFile, `OPAQUE_RUNTIME=${marker}\n`, "utf8");
     const output: string[] = [];
+    const errors: string[] = [];
     const operations: string[] = [];
     let protectedPut = false;
     let promotedAfterHealth = false;
@@ -932,6 +942,7 @@ describe("top-level Eden Deploy commands", () => {
         {
           cwd: root,
           stdout: (line) => output.push(line),
+          stderr: (line) => errors.push(line),
           eveControlPlane: {
             artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
             builder: fakeBuilder(),
@@ -1025,19 +1036,33 @@ describe("top-level Eden Deploy commands", () => {
                 identity: request.identity,
               };
             },
+            discardRuntimeImage: async (request) => {
+              operations.push("discard-runtime-image");
+              expect(request.imageId).toBe(imageDigest);
+              expect(request.generationId).toBe("generation-one");
+              expect(request.generationRoot).toContain("generation-one");
+              return discarded;
+            },
             afterPromotion: () => {
               promotedAfterHealth = operations.includes("health");
             },
           },
         },
       ),
-    ).resolves.toBe(0);
+    ).resolves.toBe(expectedExitCode);
 
     expect(protectedPut).toBe(true);
-    expect(operations).toEqual(["publish", "health"]);
+    expect(operations).toEqual(["publish", "health", "discard-runtime-image"]);
     expect(promotedAfterHealth).toBe(true);
     expect(output.join("\n")).not.toContain(marker);
     expect(output.join("\n")).toContain("eve deploy");
+    expect(output.join("\n")).toContain("VAL-CROSS-004");
+    if (expectedErrorCode === undefined) {
+      expect(errors).toEqual([]);
+    } else {
+      expect(errors.join("\n")).toContain(expectedErrorCode);
+      expect(errors.join("\n")).toContain("do not retry");
+    }
   });
 
   test("keeps deploy indeterminate and leaves the target pointer unchanged when publication outcome is ambiguous", async () => {

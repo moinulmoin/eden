@@ -49,6 +49,10 @@ Both workflows begin with [installation and account setup](./install.md).
 documents the full local lifecycle, NDJSON cursor recovery, deployed validation,
 and resource cleanup checks. It is not required for a first successful run.
 
+[Current Eve compatibility](./eve-compatibility.md) documents the independently
+versioned Eve fixture, local production-runtime gate, public eval boundary, and
+disposable Cloudflare preview procedure used to validate Eden Deploy.
+
 ## Supported surface
 
 The public command surface is:

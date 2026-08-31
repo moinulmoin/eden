@@ -134,6 +134,7 @@ export type {
 } from "./eve-runtime-config.js";
 export {
   buildEveRuntimeImage,
+  discardEveRuntimeImage,
   revalidateEveRuntimeCandidate,
   validateEveHostRequirements,
 } from "./eve-runtime-image.js";
@@ -171,6 +172,7 @@ export type {
   EveRuntimeClosureFile,
   EveRuntimeCleanup,
   EveRuntimeImage,
+  EveRuntimeImageDiscardRequest,
   EveRuntimeImageMetadata,
   EveRuntimeImageRequest,
   EveRuntimeImageResult,
@@ -217,6 +219,7 @@ export type {
   EvePreflightRuntimeRunner,
   EvePreflightRuntimeRunnerRequest,
   EveRuntimeConfigLoader,
+  EveRuntimeImageDiscardRunner,
   EveWorkerDeleteRunner,
 } from "./eve-control-plane.js";
 
@@ -637,8 +640,8 @@ export default greet;
     "deploy": "eden agent deploy"
   },
   "devDependencies": {
-    "@moinulmoin/eden": "0.1.4",
-    "@moinulmoin/eden-definitions": "0.1.4",
+    "@moinulmoin/eden": "0.1.5",
+    "@moinulmoin/eden-definitions": "0.1.5",
     "typescript": "5.9.3",
     "wrangler": "4.120.0"
   }

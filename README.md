@@ -19,19 +19,19 @@ project into an Eden Agent or silently replaces its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.1.4
+npm install --global @moinulmoin/eden@0.1.5
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.1.4
+pnpm add --global @moinulmoin/eden@0.1.5
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.1.4
+bun add --global @moinulmoin/eden@0.1.5
 ```
 
 Confirm the installation:

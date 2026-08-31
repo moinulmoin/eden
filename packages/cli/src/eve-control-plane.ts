@@ -57,10 +57,12 @@ import {
 } from "./eve-packaging.js";
 import {
   buildEveRuntimeImage,
+  discardEveRuntimeImage,
   revalidateEveRuntimeCandidate,
   validateEveHostRequirements,
   type EveHostRequirements,
   type EveRuntimeCleanup,
+  type EveRuntimeImageDiscardRequest,
   type EveRuntimeImageRequest,
 } from "./eve-runtime-image.js";
 import {
@@ -199,6 +201,10 @@ export interface EvePreflightRuntimeRunnerRequest {
 export type EvePreflightRuntimeRunner = (
   request: EvePreflightRuntimeRunnerRequest,
 ) => EvePreflightRuntimeEvidence | Promise<EvePreflightRuntimeEvidence>;
+
+export type EveRuntimeImageDiscardRunner = (
+  request: EveRuntimeImageDiscardRequest,
+) => boolean | Promise<boolean>;
 
 export interface EveDeploymentIdentity {
   readonly projectId: string;
@@ -345,6 +351,7 @@ export interface EvePreflightOptions {
   readonly compensate?: EveDeploymentCompensationRunner;
   readonly health?: EveDeploymentHealthRunner;
   readonly afterPromotion?: () => void | Promise<void>;
+  readonly discardRuntimeImage?: EveRuntimeImageDiscardRunner;
   readonly retainRuntimeImage?: boolean;
   readonly stdout?: (line: string) => void;
   /**
@@ -2171,9 +2178,46 @@ async function runEveDeployment(
     candidate.generationRoot,
   );
   await options.afterPromotion?.();
+  let runtimeImageCleanup: EvePreflightCheck | undefined;
+  if (runtimeEvidence.cleanup.imageRetained) {
+    if (options.retainRuntimeImage === true) {
+      runtimeImageCleanup = check(
+        "VAL-CROSS-004",
+        "skipped",
+        "The exact local runtime image was intentionally retained by the programmatic caller.",
+      );
+    } else {
+      let discarded = false;
+      try {
+        discarded = await (options.discardRuntimeImage ??
+          discardEveRuntimeImage)({
+          imageId: imageDigest,
+          generationId: candidate.generationId,
+          generationRoot: candidate.generationRoot,
+        });
+      } catch {
+        discarded = false;
+      }
+      runtimeImageCleanup = discarded
+        ? check(
+          "VAL-CROSS-004",
+          "passed",
+          "The exact local runtime image and its publication tags were removed after the healthy deployment was promoted.",
+        )
+        : check(
+          "VAL-CROSS-004",
+          "failed",
+          "The remote deployment is healthy, but exact local runtime-image cleanup could not be verified.",
+          `Remove only the recorded image ${imageDigest}; do not retry or run broad Docker cleanup.`,
+        );
+    }
+  }
   return {
     ...collected.result,
-    ok: true,
+    ok: runtimeImageCleanup?.status !== "failed",
+    ...(runtimeImageCleanup === undefined
+      ? {}
+      : { checks: [...collected.result.checks, runtimeImageCleanup] }),
     deployment: deploymentMetadata(identity, targetKey, "deployed"),
   };
 }
@@ -2748,10 +2792,14 @@ export async function runEveControlPlane(
         throw new EveCliError({
           code: status === "indeterminate"
             ? "DEPLOY_INDETERMINATE"
-            : "EVE_DEPLOYMENT_FAILED",
+            : status === "deployed"
+              ? "EVE_RUNTIME_IMAGE_CLEANUP_FAILED"
+              : "EVE_DEPLOYMENT_FAILED",
           message:
             status === "indeterminate"
               ? "The Eve deployment outcome is indeterminate; inspect the retained exact ownership evidence before retrying."
+              : status === "deployed"
+                ? "The Eve deployment is healthy and promoted, but exact local runtime-image cleanup failed; do not retry the deployment."
               : "The Eve deployment failed before exact target promotion.",
         });
       }

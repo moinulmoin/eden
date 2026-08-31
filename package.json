@@ -1,6 +1,6 @@
 {
   "name": "eden",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "description": "Deploy existing Eve projects and run Eden Agents on Cloudflare.",
@@ -14,7 +14,8 @@
     "typecheck": "pnpm exec tsc -b --pretty false",
     "lint": "pnpm exec eslint . --max-warnings 0",
     "test": "pnpm exec vitest run --maxWorkers=1",
-    "conformance:local": "node scripts/local-conformance.mjs"
+    "conformance:local": "node scripts/local-conformance.mjs",
+    "compat:eve:local": "node validation/eve-compat/run-local.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.20.3",

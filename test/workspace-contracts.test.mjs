@@ -35,6 +35,7 @@ test("the repository declares the six Eden workspaces and root quality scripts",
     lint: "pnpm exec eslint . --max-warnings 0",
     test: "pnpm exec vitest run --maxWorkers=1",
     "conformance:local": "node scripts/local-conformance.mjs",
+    "compat:eve:local": "node validation/eve-compat/run-local.mjs",
   });
   expect(lockfile).toMatch(/lockfileVersion: ['"]9\.0['"]/);
   expect(workspace).toMatch(/packages\/\*/);
@@ -44,7 +45,7 @@ test("the repository declares the six Eden workspaces and root quality scripts",
   for (const directory of workspaceDirectories) {
     const packageJson = await readJson(join(directory, "package.json"));
     expect(typeof packageJson.name).toBe("string");
-    expect(packageJson.version).toBe("0.1.4");
+    expect(packageJson.version).toBe("0.1.5");
     expect(packageJson.types).toBe("./dist/index.d.ts");
     expect(packageJson.module).toBe("./dist/index.js");
     expect(typeof packageJson.exports).toBe("object");
@@ -85,7 +86,7 @@ test("workspace dependencies and project references form an acyclic declaration 
         packageJson.dependencies ?? {},
       )) {
         if (publicPackageNames.has(dependency)) {
-          expect(version).toBe("0.1.4");
+          expect(version).toBe("0.1.5");
         }
       }
     }

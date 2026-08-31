@@ -20,6 +20,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import {
   buildEveRuntimeImage,
+  discardEveRuntimeImage,
   validateEveHostRequirements,
   type EveRuntimeImageRequest,
 } from "../src/eve-runtime-image.js";
@@ -150,6 +151,8 @@ if (args[0] === "version") {
       process.stdout.write("/workspace\\n");
     } else if (format.includes(".Config.Env")) {
       process.stdout.write(JSON.stringify(["HOST=0.0.0.0", "NITRO_HOST=0.0.0.0", "PORT=8080", "NITRO_PORT=8080", "NODE_ENV=production"]) + "\\n");
+    } else if (format.includes("eden.eve.generation")) {
+      process.stdout.write(imageId + " generation-one\\n");
     } else {
       process.stdout.write(imageId + " linux amd64\\n");
     }
@@ -410,6 +413,82 @@ describe("Eve runtime image boundary", () => {
     expect(dockerArgs.some((args) =>
       args[0] === "image" && args[1] === "rm"
     )).toBe(true);
+  });
+
+  test("discards a retained runtime image only after exact generation-label proof", async () => {
+    const root = await createRoot("eden-eve-runtime-image-discard-");
+    const candidate = await writeCandidate(root);
+    const fakeDocker = await writeFakeDocker(root);
+    const imageId = `sha256:${"1".repeat(64)}`;
+
+    await expect(discardEveRuntimeImage({
+      imageId,
+      generationId: candidate.generationId,
+      generationRoot: candidate.generationRoot,
+      dockerCommand: fakeDocker.command,
+    })).resolves.toBe(true);
+
+    const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(dockerArgs).toContainEqual([
+      "image",
+      "inspect",
+      imageId,
+      "--format",
+      "{{.Id}} {{index .Config.Labels \"eden.eve.generation\"}}",
+    ]);
+    expect(dockerArgs).toContainEqual(["image", "rm", "--force", imageId]);
+  });
+
+  test("refuses to discard a retained runtime image with a different generation label", async () => {
+    const root = await createRoot("eden-eve-runtime-image-discard-mismatch-");
+    const candidate = await writeCandidate(root);
+    const fakeDocker = await writeFakeDocker(root);
+    const imageId = `sha256:${"1".repeat(64)}`;
+
+    await expect(discardEveRuntimeImage({
+      imageId,
+      generationId: "generation-two",
+      generationRoot: candidate.generationRoot,
+      dockerCommand: fakeDocker.command,
+    })).resolves.toBe(false);
+
+    const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(dockerArgs.some((args) =>
+      args[0] === "image" && args[1] === "rm"
+    )).toBe(false);
+  });
+
+  test("treats an already absent retained runtime image as verified cleanup", async () => {
+    const root = await createRoot("eden-eve-runtime-image-discard-absent-");
+    const candidate = await writeCandidate(root);
+    const fakeDocker = await writeFakeDocker(root);
+    const imageId = `sha256:${"1".repeat(64)}`;
+    await writeFile(`${fakeDocker.log}.image-removed`, "removed\n", "utf8");
+
+    await expect(discardEveRuntimeImage({
+      imageId,
+      generationId: candidate.generationId,
+      generationRoot: candidate.generationRoot,
+      dockerCommand: fakeDocker.command,
+    })).resolves.toBe(true);
+
+    const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(dockerArgs).toEqual([[
+      "image",
+      "inspect",
+      imageId,
+      "--format",
+      "{{.Id}} {{index .Config.Labels \"eden.eve.generation\"}}",
+    ]]);
   });
 
   test("fails when the real Eve health route never reports ready", async () => {

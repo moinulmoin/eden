@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5 — 2026-08-31
+
+- Added a pinned Eve 0.47.3 compatibility project and CI gate covering frozen
+  install, typecheck, production build/start, public health, fail-closed bearer
+  auth, and the public Eve eval runner when a model credential is available.
+- Removed the exact retained local runtime image and publication tags after a
+  healthy Eve deployment is promoted, with generation-label ownership proof.
+
 ## 0.1.4 — 2026-08-29
 
 - Fixed Agent deployment after a prior same-identity build by excluding the

@@ -149,6 +149,11 @@ identity, removes only that Worker and Container application, verifies bounded
 absence, and only then clears the target's `CURRENT` pointer. It never deletes
 by prefix or broad account search.
 
+After a healthy deployment is promoted, `deploy` also verifies and removes its
+exact retained local Docker image and publication tags. The immutable
+generation label must match before Eden removes anything. An indeterminate
+publication keeps its exact local evidence instead of guessing at cleanup.
+
 Confirm the URL is no longer reachable:
 
 ```sh
@@ -167,6 +172,9 @@ npx wrangler@4.120.0 containers list
 
 Require zero new Worker or Container residue associated with `WORKER_NAME`.
 An unreachable URL alone is not sufficient cleanup evidence.
+
+Maintainers validating Eden against the current Eve release should also follow
+the [current Eve compatibility runbook](./eve-compatibility.md).
 
 ## Preview and production
 

@@ -169,6 +169,13 @@ export interface EveRuntimeImageRequest {
   readonly retainImage?: boolean;
 }
 
+export interface EveRuntimeImageDiscardRequest {
+  readonly imageId: string;
+  readonly generationId: string;
+  readonly generationRoot: string;
+  readonly dockerCommand?: string;
+}
+
 export interface EveRuntimeImageResult {
   readonly schemaVersion: 1;
   readonly worker: "eve-packaging-worker";
@@ -1341,6 +1348,52 @@ async function removeOwnedImage(
     verified = false;
   }
   return verified;
+}
+
+export async function discardEveRuntimeImage(
+  request: EveRuntimeImageDiscardRequest,
+): Promise<boolean> {
+  if (
+    !IMAGE_ID_PATTERN.test(request.imageId) ||
+    !/^[a-z0-9][a-z0-9._-]{0,127}$/u.test(request.generationId)
+  ) {
+    return false;
+  }
+  const state: DockerState = {
+    command: request.dockerCommand ?? "docker",
+    env: safeDockerEnvironment(),
+    generationRoot: request.generationRoot,
+    imageIdPath: join(request.generationRoot, "runtime-image-id"),
+    imageLabel: `eden.eve.generation=${request.generationId}`,
+    imageBuilt: true,
+    imageId: request.imageId,
+    containerId: undefined,
+    imageRetained: true,
+  };
+  let inspected: { readonly stdout: string };
+  try {
+    inspected = await docker(state, [
+      "image",
+      "inspect",
+      request.imageId,
+      "--format",
+      "{{.Id}} {{index .Config.Labels \"eden.eve.generation\"}}",
+    ]);
+  } catch (error: unknown) {
+    const stderr = typeof error === "object" &&
+        error !== null &&
+        "stderr" in error &&
+        typeof (error as { readonly stderr?: unknown }).stderr === "string"
+      ? (error as { readonly stderr: string }).stderr
+      : "";
+    return /(?:no such|not found|does not exist)/iu.test(stderr);
+  }
+  if (
+    inspected.stdout.trim() !== `${request.imageId} ${request.generationId}`
+  ) {
+    return false;
+  }
+  return removeOwnedImage(state);
 }
 
 function healthReady(value: unknown): boolean {

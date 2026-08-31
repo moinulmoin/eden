@@ -1,0 +1,29 @@
+{
+  "name": "eden-eve-compatibility",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#*": "./agent/*",
+    "#evals/*": "./evals/*"
+  },
+  "scripts": {
+    "build": "eve build",
+    "eval": "eve eval --strict",
+    "start": "eve start",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "ai": "7.0.58",
+    "eve": "0.47.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.0",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@11.21.0"
+}

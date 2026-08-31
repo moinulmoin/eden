@@ -6,6 +6,7 @@ export default tseslint.config(
     ignores: [
       "**/dist/**",
       "**/node_modules/**",
+      "**/.output/**",
       "**/.wrangler/**",
       "**/.eden/**",
       "**/*.d.ts",

@@ -54,3 +54,5 @@ jobs:
           EDEN_RUNTIME_PROOF_TIMEOUT_MS: "30000"
           EDEN_RUNTIME_READY_TIMEOUT_MS: "30000"
           EDEN_RUNTIME_WATCHER_TIMEOUT_MS: "30000"
+      - name: Current Eve compatibility
+        run: pnpm run compat:eve:local
