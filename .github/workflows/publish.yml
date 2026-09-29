@@ -77,10 +77,19 @@ jobs:
       - name: Smoke supported installers
         env:
           VERSION: ${{ steps.version.outputs.value }}
+        # npm's tarball CDN can lag the registry metadata by minutes.
         run: |
-          npx --yes --package="@moinulmoin/eden@$VERSION" eden --help
-          pnpm dlx "@moinulmoin/eden@$VERSION" --help
-          bunx --package "@moinulmoin/eden@$VERSION" eden --help
+          retry() {
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              "$@" && return 0
+              echo "attempt $attempt failed; retrying in 30s"
+              sleep 30
+            done
+            return 1
+          }
+          retry npx --yes --package="@moinulmoin/eden@$VERSION" eden --help
+          retry pnpm dlx "@moinulmoin/eden@$VERSION" --help
+          retry bunx --package "@moinulmoin/eden@$VERSION" eden --help
 
   release:
     needs: publish

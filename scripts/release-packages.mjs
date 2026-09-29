@@ -231,14 +231,19 @@ function requireOidc() {
   }
 }
 
+// npm can take several minutes to expose a newly published version; 0.2.0's
+// runtime package needed more than 60s.
+const REGISTRY_VISIBILITY_ATTEMPTS = 60;
+const REGISTRY_VISIBILITY_DELAY_MS = 5_000;
+
 async function waitForRegistry(record, version) {
-  for (let attempt = 1; attempt <= 12; attempt += 1) {
+  for (let attempt = 1; attempt <= REGISTRY_VISIBILITY_ATTEMPTS; attempt += 1) {
     const publishedIntegrity = registryIntegrity(record.name, version);
     if (publishedIntegrity === record.integrity) return;
     if (publishedIntegrity !== undefined) {
       fail(`${record.name}@${version} exists with different bytes`);
     }
-    if (attempt < 12) await delay(5_000);
+    if (attempt < REGISTRY_VISIBILITY_ATTEMPTS) await delay(REGISTRY_VISIBILITY_DELAY_MS);
   }
   fail(`${record.name}@${version} did not become visible on npm`);
 }
