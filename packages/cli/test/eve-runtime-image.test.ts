@@ -6,6 +6,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -13,6 +14,7 @@ import {
   tmpdir,
 } from "node:os";
 import {
+  dirname,
   join,
 } from "node:path";
 
@@ -21,6 +23,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import {
   buildEveRuntimeImage,
   discardEveRuntimeImage,
+  revalidateEveRuntimeCandidate,
   validateEveHostRequirements,
   type EveRuntimeImageRequest,
 } from "../src/eve-runtime-image.js";
@@ -33,7 +36,10 @@ async function createRoot(prefix: string): Promise<string> {
   return root;
 }
 
-async function writeCandidate(root: string): Promise<EveRuntimeImageRequest["candidate"]> {
+async function writeCandidate(
+  root: string,
+  extraOutputFiles: Record<string, string> = {},
+): Promise<EveRuntimeImageRequest["candidate"]> {
   const generationRoot = join(root, "generation");
   const snapshotRoot = join(generationRoot, "container", "snapshot");
   await mkdir(join(snapshotRoot, ".output/server"), { recursive: true });
@@ -71,17 +77,46 @@ async function writeCandidate(root: string): Promise<EveRuntimeImageRequest["can
     JSON.stringify({ name: "eve-fixture", private: true }),
     "utf8",
   );
+  for (const [relativePath, contents] of Object.entries(extraOutputFiles)) {
+    const outputPath = join(snapshotRoot, ".output", relativePath);
+    await mkdir(dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, contents, "utf8");
+  }
 
+
+  const outputFiles: Array<{
+    readonly relativePath: string;
+    readonly sha256: string;
+    readonly byteLength: number;
+  }> = [];
+  const collectOutput = async (directory: string, relativeDirectory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const entryPath = join(directory, entry.name);
+      const relativePath = relativeDirectory.length === 0
+        ? entry.name
+        : `${relativeDirectory}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await collectOutput(entryPath, relativePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const bytes = await readFile(entryPath);
+      outputFiles.push({
+        relativePath: `.output/${relativePath}`,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        byteLength: bytes.byteLength,
+      });
+    }
+  };
+  await collectOutput(join(snapshotRoot, ".output"), "");
   const entrypoint = await readFile(
     join(snapshotRoot, ".output/server/index.mjs"),
   );
   const outputSha256 = createHash("sha256").update(entrypoint).digest("hex");
   const outputDigest = createHash("sha256")
-    .update(JSON.stringify([{
-      relativePath: ".output/server/index.mjs",
-      sha256: outputSha256,
-      byteLength: entrypoint.byteLength,
-    }]) + "\n")
+    .update(JSON.stringify(outputFiles) + "\n")
     .digest("hex");
   return {
     generationId: "generation-one",
@@ -104,7 +139,7 @@ async function writeCandidate(root: string): Promise<EveRuntimeImageRequest["can
       regularFile: true,
       symlinkEscape: false,
       outputDigest,
-      fileCount: 1,
+      fileCount: outputFiles.length,
     },
     runtimeVariableNames: [],
   };
@@ -573,5 +608,79 @@ describe("Eve runtime image boundary", () => {
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
     expect(dockerArgs.some((args) => args[0] === "image" && args[1] === "rm")).toBe(false);
+  });
+
+  test("carries every validated authored source entry into the runtime image", async () => {
+    const root = await createRoot("eden-eve-runtime-image-source-");
+    const candidate = await writeCandidate(root);
+    const fakeDocker = await writeFakeDocker(root);
+    await mkdir(join(candidate.snapshotRoot, "agents/worker"), { recursive: true });
+    await writeFile(
+      join(candidate.snapshotRoot, "agents/worker/agent.ts"),
+      "export default {};\n",
+      "utf8",
+    );
+    await writeFile(
+      join(candidate.snapshotRoot, "pnpm-workspace.yaml"),
+      "minimumReleaseAgeExclude:\n  - eve@0.66.3\n",
+      "utf8",
+    );
+    await writeFile(
+      join(candidate.snapshotRoot, ".env"),
+      "RUNTIME_SECRET=do-not-copy\n",
+      "utf8",
+    );
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+      healthPort: 4314,
+      retainImage: false,
+      fetchHealth: async () => new Response(
+        JSON.stringify({ status: "ready" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result.status).toBe("ready");
+    const dockerfile = await readFile(
+      join(candidate.generationRoot, "container/runtime.Dockerfile"),
+      "utf8",
+    );
+    for (const entry of ["agent", "agents", "package.json", "pnpm-workspace.yaml"]) {
+      expect(dockerfile).toContain(
+        `COPY --from=candidate ["/candidate/${entry}","/workspace/${entry}"]`,
+      );
+    }
+    expect(dockerfile).not.toContain(".env");
+    expect(dockerfile).not.toContain("RUNTIME_SECRET");
+    expect(dockerfile).not.toContain("do-not-copy");
+  });
+
+  test("validates the output closure when sibling package names collide under locale ordering", async () => {
+    const root = await createRoot("eden-eve-runtime-image-ordering-");
+    const candidate = await writeCandidate(root, {
+      "server/node_modules/quickjs-emscripten/dist/chunk-a.mjs": "export const a = 1;\n",
+      "server/node_modules/quickjs-emscripten-core/dist/chunk-b.mjs": "export const b = 1;\n",
+    });
+
+    const closure = await revalidateEveRuntimeCandidate(candidate);
+
+    expect(closure.eveStartClosureRetained).toBe(true);
+    expect(closure.files).toHaveLength(6);
   });
 });

@@ -14,9 +14,10 @@
     "typecheck": "tsc"
   },
   "dependencies": {
-    "ai": "7.0.58",
-    "eve": "0.47.3",
-    "zod": "4.4.3"
+    "ai": "7.0.105",
+    "eve": "0.66.3",
+    "just-bash": "3.4.2",
+    "zod": "4.5.4"
   },
   "devDependencies": {
     "@types/node": "24.0.0",

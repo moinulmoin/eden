@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.2.0 — 2026-09-30
+
+Eden now has one job: deploy an existing Eve project to your own Cloudflare
+account.
+
+### Breaking
+
+- Removed Eden Agent (`eden agent init|build|dev|deploy`) and its packages
+  `@moinulmoin/eden-compiler` and `@moinulmoin/eden-definitions`. The CLI now
+  has three commands: `eden preflight`, `eden deploy`, and `eden destroy`.
+
+### Added
+
+- Validated Eve 0.66.3 (was 0.47.3). A fresh `eve init` project passes
+  `eden preflight`, and a real preview deploy served a model turn with a tool
+  call.
+- `eden deploy` and `eden preflight` work without flags: the project is the
+  current directory, the environment is `preview`, and the name is derived
+  from `package.json`. `--env production` and `destroy` still require an
+  explicit `--name`.
+- Human-readable output by default: progress lines, ✓/✗ checks, and a
+  summary with the URL and elapsed time. `--json` prints the previous
+  machine-readable result for scripts and CI.
+
+### Changed
+
+- The Cloudflare Container uses the `basic` instance type (1 GiB) instead of
+  the 256 MiB default.
+- `eden destroy` also deletes the registry image tags recorded for the exact
+  target, including images left by aborted pushes, and reports any it could
+  not remove.
+
+### Fixed
+
+- Image builds copy the project's `pnpm-workspace.yaml` before frozen
+  installs, so pnpm policy behaves the same inside the image as locally.
+- The runtime image includes `package.json` and the authored Eve source that
+  `eve start` needs, with secret files still excluded.
+- Build failures are classified by the step that failed. A failing
+  `eve build` reports `EVE_BUILD_FAILED` (with a `just-bash` hint when Eve's
+  sandbox fallback is missing), and pnpm failures report pnpm's own error
+  code, such as `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` or
+  `ERR_PNPM_IGNORED_BUILDS`.
+- Fixed a runtime-tree ordering mismatch that raised `SOURCE_RACE` on real
+  Eve 0.66.3 builds.
+- The Worker no longer overrides the container start command, which crashed
+  the container under `wrangler dev` by running `eve start` twice.
+
 ## 0.1.5 — 2026-08-31
 
 - Added a pinned Eve 0.47.3 compatibility project and CI gate covering frozen

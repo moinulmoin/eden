@@ -3,14 +3,7 @@ export const EVE_HOST_DEFAULTS = {
   healthPath: "/eve/v1/health",
   internalPort: 8080,
   maxInstances: 1,
-  startCommand: [
-    "./node_modules/.bin/eve",
-    "start",
-    "--host",
-    "0.0.0.0",
-    "--port",
-    "8080",
-  ] as const,
+  instanceType: "basic",
   sleepAfter: "24h",
 } as const;
 
@@ -140,6 +133,7 @@ export interface EveHostWranglerConfig {
       readonly image: string;
       readonly image_build_context?: string;
       readonly max_instances: 1;
+      readonly instance_type: "basic";
     },
   ];
   readonly durable_objects: {
@@ -295,6 +289,7 @@ export function createEveHostConfig(
       ? {}
       : { image_build_context: request.containerImageBuildContext }),
     max_instances: EVE_HOST_DEFAULTS.maxInstances,
+    instance_type: EVE_HOST_DEFAULTS.instanceType,
   } as const;
   return {
     worker: {

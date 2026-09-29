@@ -344,6 +344,7 @@ const START_COMMAND = [
 const EVE_ENTRYPOINT = ".output/server/index.mjs" as const;
 const EVE_EXCLUDED_DIRECTORY_NAMES = new Set([
   ".eden",
+  ".eve",
   ".git",
   ".hg",
   ".next",
@@ -443,11 +444,12 @@ function isPathExcluded(
   if (excludedDirectory !== undefined) {
     return {
       excluded: true,
-      category: excludedDirectory === ".eden" || excludedDirectory === ".git"
+      category: excludedDirectory === ".eden" ||
+          excludedDirectory === ".eve" || excludedDirectory === ".git"
         ? "generated-state"
         : excludedDirectory === "node_modules"
-          ? "node_modules"
-          : "build-cache",
+        ? "node_modules"
+        : "build-cache",
     };
   }
   if (runtimeEnvRelativePath !== undefined && relativePath === runtimeEnvRelativePath) {
@@ -1319,6 +1321,34 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   });
 }
 
+const EVE_GENERATED_SNAPSHOT_ROOTS: Record<string, true> = {
+  ".dockerignore": true,
+  ".output": true,
+  "node_modules": true,
+};
+
+/**
+ * The authored Eve project source the runtime stage must carry so `eve start`
+ * can resolve the project context (agent/, agents/ workspaces, flat layouts,
+ * and the manifest). Returns validated top-level snapshot entries with every
+ * capture-time exclusion still applied; generated roots are never source.
+ */
+export async function eveSnapshotSourceEntries(
+  snapshotRoot: string,
+): Promise<readonly string[]> {
+  const entries = await readdir(snapshotRoot, { withFileTypes: true });
+  const names: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile() && !entry.isDirectory()) continue;
+    if (entry.isSymbolicLink()) continue;
+    if (EVE_GENERATED_SNAPSHOT_ROOTS[entry.name] === true) continue;
+    if (isPathExcluded(entry.name, undefined).excluded) continue;
+    names.push(entry.name);
+  }
+  names.sort((left, right) => left.localeCompare(right));
+  return names;
+}
+
 async function writeDockerBuildFiles(options: {
   readonly snapshotRoot: string;
   readonly dockerfilePath: string;
@@ -1338,10 +1368,22 @@ async function writeDockerBuildFiles(options: {
     });
   }
   const image = `${options.nodeImage.reference}@${options.nodeImage.digest}`;
+  const installSources = ["package.json", "pnpm-lock.yaml"];
+  if (
+    (await lstat(join(options.snapshotRoot, "pnpm-workspace.yaml"))
+      .catch(() => undefined))?.isFile() === true
+  ) {
+    installSources.push("pnpm-workspace.yaml");
+  }
+  const runtimeSourceCopies = (await eveSnapshotSourceEntries(options.snapshotRoot))
+    .map((name) =>
+      `COPY --from=builder ${JSON.stringify([`/workspace/${name}`, `/app/${name}`])}`
+    )
+    .join("\n");
   const dockerfile = `# syntax=docker/dockerfile:1
 FROM --platform=linux/amd64 ${image} AS builder
 WORKDIR /workspace
-COPY package.json pnpm-lock.yaml ./
+COPY ${JSON.stringify([...installSources, "./"])}
 RUN corepack enable \\
   && corepack prepare pnpm@${options.packageManagerVersion} --activate \\
   && test "$(corepack pnpm --version)" = "${options.packageManagerVersion}" \\
@@ -1365,6 +1407,7 @@ ENV HOST=0.0.0.0 \\
     NITRO_PORT=8080 \\
     NODE_ENV=production
 COPY --from=builder /workspace/.output /app/.output
+${runtimeSourceCopies}
 COPY --from=runtime-deps /workspace/node_modules /app/node_modules
 EXPOSE 8080
 ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "8080"]
@@ -1744,6 +1787,83 @@ function safeError(
   };
 }
 
+/**
+ * The reported BuildKit step decides the classification: an echoed
+ * `RUN corepack pnpm install --frozen-lockfile` line from an earlier cached
+ * step must not relabel a failing `eve build` step as a pnpm install failure.
+ */
+function failingDockerStepCommand(stderr: string): string | undefined {
+  let command: string | undefined;
+  let position = -1;
+  for (const pattern of [
+    /process "([^"]+)" did not complete/gu,
+    /executor failed running \[([^\]]+)\]/gu,
+    /The command '([^']+)' returned a non-zero code/gu,
+  ]) {
+    for (const match of stderr.matchAll(pattern)) {
+      if (match.index >= position) {
+        position = match.index;
+        command = match[1];
+      }
+    }
+  }
+  return command;
+}
+
+function classifyPnpmInstallFailure(stderr: string): EvePackagingError | undefined {
+  if (/ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION/u.test(stderr)) {
+    return new EvePackagingError({
+      code: "DEPENDENCY_AMBIGUITY",
+      subject: "ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION",
+      reason: "The isolated pinned pnpm install rejected a dependency that is newer than the project's minimumReleaseAge policy.",
+      remediation: "Wait until the release ages past the minimumReleaseAge cutoff, or name the exact pin in minimumReleaseAgeExclude inside the project pnpm-workspace.yaml.",
+    });
+  }
+  if (/ERR_PNPM_(?:OUTDATED_LOCKFILE|LOCKFILE_MISSING_DEPENDENCY)/u.test(stderr)) {
+    return new EvePackagingError({
+      code: "DEPENDENCY_AMBIGUITY",
+      subject: "frozen pnpm install",
+      reason: "The isolated pinned pnpm install could not complete without changing or bypassing the lockfile.",
+      remediation: "Regenerate pnpm-lock.yaml with the declared pnpm version and retry without relaxing frozen mode.",
+    });
+  }
+  if (/ERR_PNPM_IGNORED_BUILDS/u.test(stderr)) {
+    return new EvePackagingError({
+      code: "DEPENDENCY_AMBIGUITY",
+      subject: "ERR_PNPM_IGNORED_BUILDS",
+      reason: "The isolated pinned pnpm install refused dependency build scripts that the project pnpm policy neither allows nor ignores.",
+      remediation: "Name the dependency under allowBuilds or ignoredBuiltDependencies in the project pnpm-workspace.yaml and retry.",
+    });
+  }
+  const pnpmErrorCode = /ERR_PNPM_[A-Z0-9_]+/u.exec(stderr)?.[0];
+  if (pnpmErrorCode !== undefined) {
+    return new EvePackagingError({
+      code: "DEPENDENCY_AMBIGUITY",
+      subject: pnpmErrorCode,
+      reason: `The isolated pinned pnpm install failed with ${pnpmErrorCode}.`,
+      remediation: "Fix the pnpm failure reported by the isolated build without relaxing the frozen lockfile or the declared pnpm pin, then retry.",
+    });
+  }
+  return undefined;
+}
+
+function classifyEveBuildFailure(stderr: string): EvePackagingError {
+  if (/\bjust-bash\b/u.test(stderr)) {
+    return new EvePackagingError({
+      code: "EVE_BUILD_FAILED",
+      subject: "eve build",
+      reason: "The project-local Eve build failed inside the isolated Linux/amd64 builder because Eve's default sandbox needs just-bash where no Docker daemon or /dev/kvm exists.",
+      remediation: "Declare just-bash as a production dependency of the Eve project, regenerate pnpm-lock.yaml, and retry.",
+    });
+  }
+  return new EvePackagingError({
+    code: "EVE_BUILD_FAILED",
+    subject: "eve build",
+    reason: "The project-local Eve build failed inside the isolated Linux/amd64 builder.",
+    remediation: "Fix the project-local Eve build and retry without changing the authored project during packaging.",
+  });
+}
+
 function classifyDockerBuildFailure(error: unknown): EvePackagingError {
   const stderr = typeof error === "object" &&
       error !== null &&
@@ -1751,15 +1871,36 @@ function classifyDockerBuildFailure(error: unknown): EvePackagingError {
       typeof (error as { readonly stderr?: unknown }).stderr === "string"
     ? (error as { readonly stderr: string }).stderr
     : "";
-  if (
-    /ERR_PNPM_(?:OUTDATED_LOCKFILE|LOCKFILE_MISSING_DEPENDENCY)/u.test(stderr) ||
-    /frozen-lockfile|pnpm --version/u.test(stderr)
-  ) {
+  const step = failingDockerStepCommand(stderr);
+  if (step !== undefined) {
+    if (/\beve\b/u.test(step) && /\bbuild\b/u.test(step)) {
+      return classifyEveBuildFailure(stderr);
+    }
+    if (/pnpm|corepack/u.test(step)) {
+      const pnpmFailure = classifyPnpmInstallFailure(stderr);
+      if (pnpmFailure !== undefined) return pnpmFailure;
+      return new EvePackagingError({
+        code: "DEPENDENCY_AMBIGUITY",
+        subject: "frozen pnpm install",
+        reason: "The isolated pinned pnpm toolchain or install step did not complete inside the builder.",
+        remediation: "Keep the declared exact pnpm version and the frozen lockfile; fix the reported toolchain or install failure and retry.",
+      });
+    }
+  }
+  const pnpmFailure = classifyPnpmInstallFailure(stderr);
+  if (pnpmFailure !== undefined) return pnpmFailure;
+  if (/\bjust-bash\b|Cannot find package/u.test(stderr)) {
+    return classifyEveBuildFailure(stderr);
+  }
+  if (/eve build/u.test(stderr)) {
+    return classifyEveBuildFailure(stderr);
+  }
+  if (/frozen-lockfile|pnpm --version/u.test(stderr)) {
     return new EvePackagingError({
       code: "DEPENDENCY_AMBIGUITY",
       subject: "frozen pnpm install",
-      reason: "The isolated pinned pnpm install could not complete without changing or bypassing the lockfile.",
-      remediation: "Regenerate pnpm-lock.yaml with the declared pnpm version and retry without relaxing frozen mode.",
+      reason: "The isolated pinned pnpm toolchain or install step did not complete inside the builder.",
+      remediation: "Keep the declared exact pnpm version and the frozen lockfile; fix the reported toolchain or install failure and retry.",
     });
   }
   if (/node_modules\/\.bin\/eve|test -x/u.test(stderr)) {
@@ -1768,14 +1909,6 @@ function classifyDockerBuildFailure(error: unknown): EvePackagingError {
       subject: "node_modules/.bin/eve",
       reason: "The isolated build could not resolve the project-local Eve executable.",
       remediation: "Declare Eve as a project dependency and retry with the frozen lockfile.",
-    });
-  }
-  if (/eve build/u.test(stderr)) {
-    return new EvePackagingError({
-      code: "EVE_BUILD_FAILED",
-      subject: "eve build",
-      reason: "The project-local Eve build failed inside the isolated Linux/amd64 builder.",
-      remediation: "Fix the project-local Eve build and retry without changing the authored project during packaging.",
     });
   }
   return new EvePackagingError({

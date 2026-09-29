@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export const EVE_CLI_COMMANDS = [
   "preflight",
   "deploy",
@@ -12,8 +14,14 @@ export interface EveCliInvocation {
   readonly command: EveCliCommand;
   readonly projectRoot: string;
   readonly environment: EveCliEnvironment;
-  readonly name: string;
+  /**
+   * Absent only on preflight/deploy preview invocations; index.ts derives a
+   * deterministic Worker name from the project before execution.
+   */
+  readonly name?: string;
   readonly envFile?: string;
+  /** When true the command prints the machine-readable result object. */
+  readonly json?: boolean;
 }
 
 export interface EveCliHelp {
@@ -34,7 +42,10 @@ export interface EveCliExecutionRequest {
    * layer is the only owner allowed to open or parse its contents.
    */
   readonly envFile?: string;
+  /** When true the command prints the machine-readable result object. */
+  readonly json?: boolean;
 }
+
 
 export type EveCliRunner = (
   request: EveCliExecutionRequest,
@@ -74,46 +85,51 @@ Eden Deploy commands:
   deploy     Deploy the selected Eve project to the exact named target
   destroy    Remove the exact owned Eve target
 
-Every Deploy command requires --project, --env, and --name.
---env accepts only preview or production.
---env-file is accepted only by preflight and deploy.
-Eden Agent authoring remains available through the separate eden agent namespace.
+Without flags, preflight and deploy use the current directory, the preview
+environment, and a Worker name derived from the project's package.json name.
+--env accepts only preview or production; production and destroy always
+require an explicit --name. --env-file is accepted only by preflight and deploy.
+All three commands print a human summary by default; --json prints the
+machine-readable result object for scripts and CI.
 
 Options:
   --help  Show this help
 `;
 
 const EVE_COMMAND_USAGE: Readonly<Record<EveCliCommand, string>> = {
-  preflight: `Usage: eden preflight --project <path> --env <preview|production> --name <name> [--env-file <path>]
+  preflight: `Usage: eden preflight [--project <path>] [--env <preview|production>] [--name <name>] [--env-file <path>] [--json]
 
 Build and inspect an immutable local Eve candidate. Preflight is read-only toward remote resources.
 
 Options:
-  --project <path>     Required canonical Eve project root
-  --env <environment>  Required preview or production target
-  --name <name>        Required exact target name
+  --project <path>     Eve project root (default: current directory)
+  --env <environment>  preview or production target (default: preview)
+  --name <name>        Exact target name (default: derived from the project's package.json; required for production)
   --env-file <path>    Optional opaque runtime environment file
+  --json               Print the machine-readable result object (default: human summary)
   --help               Show this help
 `,
-  deploy: `Usage: eden deploy --project <path> --env <preview|production> --name <name> [--env-file <path>]
+  deploy: `Usage: eden deploy [--project <path>] [--env <preview|production>] [--name <name>] [--env-file <path>] [--json]
 
 Deploy the selected Eve project to one exact target after host checks pass.
 
 Options:
-  --project <path>     Required canonical Eve project root
-  --env <environment>  Required preview or production target
-  --name <name>        Required exact target name
+  --project <path>     Eve project root (default: current directory)
+  --env <environment>  preview or production target (default: preview)
+  --name <name>        Exact target name (default: derived from the project's package.json; required for production)
   --env-file <path>    Optional opaque runtime environment file
+  --json               Print the machine-readable result object (default: human summary)
   --help               Show this help
 `,
-  destroy: `Usage: eden destroy --project <path> --env <preview|production> --name <name>
+  destroy: `Usage: eden destroy --name <name> [--project <path>] [--env <preview|production>] [--json]
 
 Destroy only the exact owned Eve target after ownership verification.
 
 Options:
-  --project <path>     Required canonical Eve project root
-  --env <environment>  Required preview or production target
   --name <name>        Required exact target name
+  --project <path>     Eve project root (default: current directory)
+  --env <environment>  preview or production target (default: preview)
+  --json               Print the machine-readable result object (default: human summary)
   --help               Show this help
 `,
 };
@@ -225,6 +241,7 @@ export function parseEveArguments(
   let name: string | undefined;
   let envFile: string | undefined;
   let help = false;
+  let json = false;
 
   for (let index = 1; index < args.length; index += 1) {
     const argument = args[index];
@@ -338,6 +355,11 @@ export function parseEveArguments(
       envFile = parseEnvFileValue(argument.slice("--env-file=".length));
       continue;
     }
+    if (argument === "--json") {
+      json = true;
+      continue;
+    }
+
     if (argument.startsWith("-")) {
       throw eveError(
         "EVE_OPTION_UNKNOWN",
@@ -353,31 +375,55 @@ export function parseEveArguments(
   if (help) {
     return { kind: "help", scope: command };
   }
-  if (projectRoot === undefined) {
-    throw eveError(
-      "EVE_PROJECT_REQUIRED",
-      "The --project option is required for every Eve command.",
-    );
-  }
-  if (environment === undefined) {
-    throw eveError(
-      "EVE_ENV_REQUIRED",
-      "The --env option is required for every Eve command.",
-    );
-  }
-  if (name === undefined) {
+  const resolvedEnvironment = environment ?? "preview";
+  const resolvedProjectRoot = projectRoot ?? ".";
+  if (
+    name === undefined &&
+    (command === "destroy" || resolvedEnvironment === "production")
+  ) {
     throw eveError(
       "EVE_NAME_REQUIRED",
-      "The --name option is required for every Eve command.",
+      "An explicit --name is required for destroy and for production targets.",
     );
   }
 
   return {
     kind: "invocation",
     command,
-    projectRoot,
-    environment,
-    name,
+    projectRoot: resolvedProjectRoot,
+    environment: resolvedEnvironment,
+    ...(name === undefined ? {} : { name }),
     ...(envFile === undefined ? {} : { envFile }),
+    ...(json ? { json: true } : {}),
   };
+}
+
+const WORKER_NAME_LIMIT = 63;
+
+/**
+ * Derive a stable, collision-safe Cloudflare Worker name from a raw package
+ * name. The sanitized slug is combined with a short digest of the raw name so
+ * distinct package names that collide after sanitization stay distinct. The
+ * result is deterministic across runs and always satisfies EVE_NAME_PATTERN.
+ */
+export function deriveEveTargetName(rawPackageName: string): string {
+  const slug = rawPackageName
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/gu, "-")
+    .replace(/-{2,}/gu, "-")
+    .replace(/^-+|-+$/gu, "");
+  if (slug.length === 0) {
+    throw eveError(
+      "EVE_NAME_DERIVATION_FAILED",
+      "A target name could not be derived from the project package.json; pass an explicit --name.",
+    );
+  }
+  const digest = createHash("sha256")
+    .update(rawPackageName, "utf8")
+    .digest("hex")
+    .slice(0, 8);
+  const stem = slug
+    .slice(0, WORKER_NAME_LIMIT - digest.length - 1)
+    .replace(/-+$/u, "");
+  return `${stem}-${digest}`;
 }

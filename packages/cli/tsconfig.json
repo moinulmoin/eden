@@ -7,7 +7,6 @@
   },
   "include": ["src"],
   "references": [
-    { "path": "../compiler" },
     { "path": "../runtime-cloudflare" }
   ]
 }

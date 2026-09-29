@@ -30,7 +30,6 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
   override defaultPort = EVE_HOST_DEFAULTS.internalPort;
   override requiredPorts = [EVE_HOST_DEFAULTS.internalPort];
   override sleepAfter = EVE_HOST_DEFAULTS.sleepAfter;
-  override entrypoint = [...EVE_HOST_DEFAULTS.startCommand];
   override enableInternet = true;
   override pingEndpoint = "localhost/eve/v1/health";
   readonly lifecycle = createEveHostLifecycleObserver();

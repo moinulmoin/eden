@@ -5,16 +5,10 @@ import { expect, test } from "vitest";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workspaceDirectories = [
-  "packages/definitions",
-  "packages/compiler",
   "packages/runtime-cloudflare",
-  "packages/client",
   "packages/cli",
-  "examples/basic-agent",
 ];
 const publicPackageNames = new Set([
-  "@moinulmoin/eden-definitions",
-  "@moinulmoin/eden-compiler",
   "@moinulmoin/eden-runtime-cloudflare",
   "@moinulmoin/eden",
 ]);
@@ -23,7 +17,7 @@ async function readJson(relativePath) {
   return JSON.parse(await readFile(join(repositoryRoot, relativePath), "utf8"));
 }
 
-test("the repository declares the six Eden workspaces and root quality scripts", async () => {
+test("the repository declares the Eden workspaces and root quality scripts", async () => {
   const rootPackage = await readJson("package.json");
   const workspace = await readFile(join(repositoryRoot, "pnpm-workspace.yaml"), "utf8");
   const lockfile = await readFile(join(repositoryRoot, "pnpm-lock.yaml"), "utf8");
@@ -34,18 +28,16 @@ test("the repository declares the six Eden workspaces and root quality scripts",
     typecheck: "pnpm exec tsc -b --pretty false",
     lint: "pnpm exec eslint . --max-warnings 0",
     test: "pnpm exec vitest run --maxWorkers=1",
-    "conformance:local": "node scripts/local-conformance.mjs",
     "compat:eve:local": "node validation/eve-compat/run-local.mjs",
   });
   expect(lockfile).toMatch(/lockfileVersion: ['"]9\.0['"]/);
   expect(workspace).toMatch(/packages\/\*/);
-  expect(workspace).toMatch(/examples\/\*/);
   expect(JSON.stringify(rootPackage)).not.toMatch(/turbo/i);
 
   for (const directory of workspaceDirectories) {
     const packageJson = await readJson(join(directory, "package.json"));
     expect(typeof packageJson.name).toBe("string");
-    expect(packageJson.version).toBe("0.1.5");
+    expect(packageJson.version).toBe(rootPackage.version);
     expect(packageJson.types).toBe("./dist/index.d.ts");
     expect(packageJson.module).toBe("./dist/index.js");
     expect(typeof packageJson.exports).toBe("object");
@@ -61,6 +53,7 @@ test("the repository declares the six Eden workspaces and root quality scripts",
 });
 
 test("workspace dependencies and project references form an acyclic declaration graph", async () => {
+  const { version: releaseVersion } = await readJson("package.json");
   const packageNames = new Set();
   const packages = new Map();
 
@@ -86,7 +79,7 @@ test("workspace dependencies and project references form an acyclic declaration 
         packageJson.dependencies ?? {},
       )) {
         if (publicPackageNames.has(dependency)) {
-          expect(version).toBe("0.1.5");
+          expect(version).toBe(releaseVersion);
         }
       }
     }
@@ -108,12 +101,8 @@ test("workspace dependencies and project references form an acyclic declaration 
 
 test("public source contracts do not expose platform or provider types", async () => {
   const sourceFiles = [
-    "packages/definitions/src/index.ts",
-    "packages/compiler/src/index.ts",
     "packages/runtime-cloudflare/src/index.ts",
-    "packages/client/src/index.ts",
     "packages/cli/src/index.ts",
-    "examples/basic-agent/src/index.ts",
   ];
   for (const file of sourceFiles) {
     const source = await readFile(join(repositoryRoot, file), "utf8");

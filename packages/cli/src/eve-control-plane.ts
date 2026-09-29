@@ -98,6 +98,10 @@ export const DEFAULT_EVE_NODE_IMAGE: EveNodeImage = Object.freeze({
   digest: "sha256:862263c612aa437e3037674b85419622a9d93bff80aa1eee5398dfe686375532",
 });
 
+/** The single tag Eden pushes to the managed Cloudflare registry per generation. */
+const EVE_REGISTRY_IMAGE_TAG = "candidate";
+
+
 export type EvePreflightCheckStatus =
   | "passed"
   | "failed"
@@ -355,18 +359,32 @@ export interface EvePreflightOptions {
   readonly retainRuntimeImage?: boolean;
   readonly stdout?: (line: string) => void;
   /**
+   * "human" prints short progress lines and a summary; "json" prints only the
+   * machine-readable result object. Programmatic callers default to "json";
+   * the CLI passes "human" unless --json was supplied.
+   */
+  readonly outputFormat?: "human" | "json";
+  /**
    * Destroy seams. Defaults use only Wrangler reads/deletes plus the
    * immutable local deployment record; tests may inject exact fakes.
    */
   readonly destroyCloudflareRead?: EveDestroyCloudflareReadRunner;
   readonly deleteWorker?: EveWorkerDeleteRunner;
   readonly deleteContainer?: EveContainerDeleteRunner;
+  readonly deleteRegistryImage?: EveRegistryImageDeleteRunner;
 }
 
 export interface EveDestroyTargetRead {
   readonly workerExists: boolean;
   readonly containerApplicationId?: string;
   readonly accountId?: string;
+  /**
+   * Subset of the request's owned registry image tags (`repository:tag`)
+   * still present in the managed registry. `undefined` means the reader
+   * could not enumerate the registry; destroy then relies on the exact
+   * delete outcomes only.
+   */
+  readonly registryImagesPresent?: readonly string[];
 }
 
 export type EveDestroyCloudflareReadRunner = (
@@ -385,6 +403,12 @@ export type EveContainerDeleteRunner = (
   "deleted" | "absent" | "indeterminate"
 >;
 
+export type EveRegistryImageDeleteRunner = (
+  request: { readonly image: string },
+) => "deleted" | "absent" | "indeterminate" | Promise<
+  "deleted" | "absent" | "indeterminate"
+>;
+
 export type EveRuntimeConfigLoader = (
   path: string,
   cwd: string,
@@ -393,8 +417,9 @@ export type EveRuntimeConfigLoader = (
 export interface EveDestroyCloudflareReadRequest {
   readonly workerName: string;
   readonly containerApplicationName: string;
+  /** Exact `repository:tag` image refs recorded for this target. */
+  readonly registryImages?: readonly string[];
 }
-
 
 interface EvePreflightCollection {
   readonly result: EvePreflightResult;
@@ -468,6 +493,165 @@ function allChecksClear(checks: readonly EvePreflightCheck[]): boolean {
   return checks.every((value) =>
     value.status === "passed" || value.status === "skipped"
   );
+}
+
+/** True when the caller asked for the human progress/summary output. */
+function humanOutput(options: EvePreflightOptions): boolean {
+  return options.outputFormat === "human";
+}
+
+function emitLine(options: EvePreflightOptions, line: string): void {
+  (options.stdout ?? (() => undefined))(redactEveRuntimeOutput(line));
+}
+
+/** Short stage markers so a multi-minute run shows what it is doing. */
+function eveProgress(options: EvePreflightOptions, stage: string): void {
+  if (humanOutput(options)) emitLine(options, `... ${stage}`);
+}
+
+
+function eveCheckLines(
+  checks: readonly EvePreflightCheck[],
+): readonly string[] {
+  const lines: string[] = [];
+  for (const value of checks) {
+    const glyph = value.status === "passed"
+      ? "✓"
+      : value.status === "skipped"
+        ? "-"
+        : "✗";
+    lines.push(`${glyph} ${value.id} — ${value.message}`);
+    if (
+      (value.status === "failed" || value.status === "blocked") &&
+      value.remediation !== undefined
+    ) {
+      lines.push(`  → ${value.remediation}`);
+    }
+  }
+  return lines;
+}
+
+function formatEveElapsed(startedAt: number): string {
+  const elapsed = (Date.now() - startedAt) / 1000;
+  return `${elapsed.toFixed(elapsed < 10 ? 1 : 0)}s`;
+}
+
+
+
+/**
+ * Human summary lines for a preflight or deploy result: every check with a
+ * status glyph, then a compact tail with the outcome.
+ */
+function humanEveResultLines(
+  result: EvePreflightResult,
+  startedAt: number,
+  eveVersion: string | undefined,
+): readonly string[] {
+  const lines: string[] = [...eveCheckLines(result.checks)];
+  const elapsed = formatEveElapsed(startedAt);
+  const commandLabel = result.command === "eve deploy" ? "deploy" : "preflight";
+  if (result.ok) {
+    if (result.command === "eve deploy") {
+      const url = result.deployment?.stableWorkersDevOrigin;
+      lines.push(
+        "",
+        `✓ deployed ${result.name} (${result.environment})` +
+          (eveVersion === undefined ? "" : ` · eve ${eveVersion}`),
+      );
+      if (url !== undefined) lines.push(url);
+      lines.push(`done in ${elapsed}`);
+    } else {
+      lines.push(
+        "",
+        `✓ ${result.name} (${result.environment}) — preflight passed in ${elapsed}`,
+      );
+    }
+    return lines;
+  }
+  const firstFailure = result.checks.find((value) =>
+    value.status === "failed" || value.status === "blocked"
+  );
+  if (result.deployment !== undefined) {
+    lines.push(
+      "",
+      `✗ ${commandLabel} ${result.deployment.status}`,
+      `  → ${result.deployment.status === "indeterminate"
+        ? "The outcome is indeterminate; inspect the retained ownership evidence before retrying the same exact target."
+        : result.deployment.status === "deployed"
+          ? "The deployment is live; only local runtime-image cleanup failed, so do not retry the deployment."
+          : "The deployment failed before promotion; the exact target was not claimed."
+      }`,
+    );
+  } else if (firstFailure !== undefined) {
+    lines.push(
+      "",
+      `✗ ${commandLabel} failed — first failing check: ${firstFailure.id}`,
+    );
+  } else {
+    lines.push("", `✗ ${commandLabel} failed`);
+  }
+  lines.push(`stopped after ${elapsed}`);
+  return lines;
+}
+
+function emitEveResult(
+  options: EvePreflightOptions,
+  result: EvePreflightResult,
+  startedAt: number,
+  eveVersion: string | undefined,
+): void {
+  if (humanOutput(options)) {
+    for (const line of humanEveResultLines(result, startedAt, eveVersion)) {
+      emitLine(options, line);
+    }
+    return;
+  }
+  emitLine(options, JSON.stringify(result));
+}
+
+/**
+ * Human summary lines for a destroy outcome: removed resources, anything
+ * retained, and the outcome tail.
+ */
+function humanEveDestroyLines(
+  outcome: EveDestroyOutcome,
+  startedAt: number,
+): readonly string[] {
+  const lines = [...eveCheckLines(outcome.checks)];
+  const elapsed = formatEveElapsed(startedAt);
+  if (outcome.ok) {
+    lines.push(
+      "",
+      outcome.status === "absent"
+        ? `✓ ${outcome.name} (${outcome.environment}) is already absent — nothing removed`
+        : `✓ destroyed ${outcome.name} (${outcome.environment}) in ${elapsed}`,
+      "  retained: local deployment records under .eden/eve-deploy",
+    );
+    return lines;
+  }
+  const firstFailure = outcome.checks.find((value) =>
+    value.status === "failed" || value.status === "blocked"
+  );
+  lines.push(
+    "",
+    `✗ destroy ${outcome.name} ${outcome.status}` +
+      (firstFailure === undefined ? "" : ` — first failing check: ${firstFailure.id}`),
+  );
+  return lines;
+}
+
+function emitEveDestroyOutcome(
+  options: EvePreflightOptions,
+  outcome: EveDestroyOutcome,
+  startedAt: number,
+): void {
+  if (humanOutput(options)) {
+    for (const line of humanEveDestroyLines(outcome, startedAt)) {
+      emitLine(options, line);
+    }
+    return;
+  }
+  emitLine(options, JSON.stringify(outcome));
 }
 
 function runtimeConfigExclusion(
@@ -1698,6 +1882,7 @@ async function runEveDeployment(
       );
     }
   } else {
+    eveProgress(options, "pushing container image to the Cloudflare registry");
     const localImageReference = runtimeEvidence.imageReference;
     if (localImageReference === undefined || localImageReference.length === 0) {
       throw deploymentFailure(
@@ -1707,7 +1892,7 @@ async function runEveDeployment(
     }
     const imageRepository =
       `eden-eve-${targetKey}-${candidate.generationId}`;
-    const imageTag = `${imageRepository}:candidate`;
+    const imageTag = `${imageRepository}:${EVE_REGISTRY_IMAGE_TAG}`;
     const targetImageReference =
       `registry.cloudflare.com/${accountId}/${imageRepository}@${imageDigest}`;
     const imagePublication = await (options.publishImage ??
@@ -1766,6 +1951,7 @@ async function runEveDeployment(
   }
   let runtimeInjection: EveRuntimeInjection | undefined;
   if (collected.runtimeConfig !== undefined) {
+    eveProgress(options, "registering runtime variables");
     try {
       runtimeInjection = await prepareEveRuntimeInjection(
         collected.runtimeConfig,
@@ -1859,6 +2045,7 @@ async function runEveDeployment(
   };
   let publication: EveDeploymentPublicationResult;
   try {
+    eveProgress(options, "publishing Worker and Container application");
     publication = await (options.publish ?? defaultPublicationRunner())(
       publicationRequest,
     );
@@ -1979,6 +2166,7 @@ async function runEveDeployment(
 
   let health: EveDeploymentHealthResult;
   try {
+    eveProgress(options, `verifying health at ${stableWorkersDevOrigin}`);
     health = await (options.health ?? defaultHealthRunner())({
       identity,
       origin: stableWorkersDevOrigin,
@@ -2228,6 +2416,9 @@ async function collectEvePreflight(
 ): Promise<EvePreflightCollection> {
   let runtimeConfig: EveRuntimeConfig | undefined;
   const checks: EvePreflightCheck[] = [];
+  if (request.envFile !== undefined) {
+    eveProgress(options, "validating environment file");
+  }
   try {
     if (request.envFile === undefined) {
       checks.push(
@@ -2312,6 +2503,11 @@ async function collectEvePreflight(
       runtimeConfig,
     };
   }
+
+  eveProgress(
+    options,
+    "packaging project — snapshot, frozen install, eve build",
+  );
 
   const nodeImage = options.nodeImage ?? DEFAULT_EVE_NODE_IMAGE;
   const artifactRoot = options.artifactRoot ??
@@ -2436,6 +2632,7 @@ async function collectEvePreflight(
   let cloudflare: EveCloudflareReadResult | undefined;
   let publicOrigin: string | undefined;
   if (request.command === "deploy") {
+    eveProgress(options, "checking Cloudflare access and exact target");
     try {
       cloudflare = await readEveCloudflareTarget(
         {
@@ -2548,6 +2745,10 @@ async function collectEvePreflight(
   let runtimeEvidence: EvePreflightRuntimeEvidence | undefined;
   let runtimeInjection: EveRuntimeInjection | undefined;
   if (hostRequirements !== undefined && hostRequirementsValid) {
+    eveProgress(
+      options,
+      "building linux/amd64 runtime image, booting eve, checking health",
+    );
     try {
       if (runtimeConfig !== undefined && request.command === "preflight") {
         runtimeInjection = await prepareEveRuntimeInjection(runtimeConfig, {
@@ -2685,6 +2886,7 @@ async function collectEvePreflight(
   }
 
   if (cloudflare === undefined) {
+    eveProgress(options, "checking Cloudflare access and exact target");
     try {
       cloudflare = await readEveCloudflareTarget(
         {
@@ -2747,6 +2949,13 @@ export async function runEveControlPlane(
   request: EveCliExecutionRequest,
   options: EvePreflightOptions = {},
 ): Promise<void> {
+  const startedAt = Date.now();
+  if (humanOutput(options)) {
+    emitLine(
+      options,
+      `eden ${request.command} — ${request.name} (${request.environment})`,
+    );
+  }
   const lock = request.command === "deploy"
     ? await acquireEveTargetLock(
       request.projectRoot,
@@ -2760,10 +2969,9 @@ export async function runEveControlPlane(
   let lockReleased = true;
   try {
     collected = await collectEvePreflight(request, options);
+    const eveVersion = collected.candidate?.eveVersion;
     if (!collected.result.ok) {
-      (options.stdout ?? (() => undefined))(
-        redactEveRuntimeOutput(JSON.stringify(collected.result)),
-      );
+      emitEveResult(options, collected.result, startedAt, eveVersion);
       throw new EveCliError({
         code: request.command === "deploy"
           ? "EVE_DEPLOY_CHECKS_FAILED"
@@ -2775,18 +2983,14 @@ export async function runEveControlPlane(
       });
     }
     if (request.command === "preflight") {
-      (options.stdout ?? (() => undefined))(
-        redactEveRuntimeOutput(JSON.stringify(collected.result)),
-      );
+      emitEveResult(options, collected.result, startedAt, eveVersion);
     } else {
       const deploymentResult = await runEveDeployment(
         request,
         options,
         collected,
       );
-      (options.stdout ?? (() => undefined))(
-        redactEveRuntimeOutput(JSON.stringify(deploymentResult)),
-      );
+      emitEveResult(options, deploymentResult, startedAt, eveVersion);
       if (!deploymentResult.ok) {
         const status = deploymentResult.deployment?.status;
         throw new EveCliError({
@@ -2834,9 +3038,12 @@ export interface EveDestroyOutcome {
 
 interface EveDestroyRecord {
   readonly identity: {
+    readonly projectId?: unknown;
+    readonly generationId?: unknown;
     readonly workerName?: unknown;
     readonly containerApplicationName?: unknown;
     readonly stableContainerInstanceName?: unknown;
+    readonly containerImage?: unknown;
     readonly accountId?: unknown;
     readonly environment?: unknown;
     readonly name?: unknown;
@@ -2844,9 +3051,12 @@ interface EveDestroyRecord {
 }
 
 type VerifiedEveDestroyIdentity = {
+  readonly projectId?: string;
+  readonly generationId?: string;
   readonly workerName: string;
   readonly containerApplicationName: string;
   readonly stableContainerInstanceName: string;
+  readonly containerImage?: string;
   readonly accountId: string;
   readonly environment: string;
   readonly name: string;
@@ -2994,9 +3204,29 @@ async function parseEveDestroyRecord(
   if (identity.environment !== environment || identity.name !== name) {
     return undefined;
   }
+  const verified: VerifiedEveDestroyIdentity = {
+    workerName: identity.workerName as string,
+    containerApplicationName: identity.containerApplicationName as string,
+    stableContainerInstanceName:
+      identity.stableContainerInstanceName as string,
+    accountId: identity.accountId as string,
+    environment,
+    name,
+    ...(typeof identity.projectId === "string" && identity.projectId.length > 0
+      ? { projectId: identity.projectId }
+      : {}),
+    ...(typeof identity.generationId === "string" &&
+        identity.generationId.length > 0
+      ? { generationId: identity.generationId }
+      : {}),
+    ...(typeof identity.containerImage === "string" &&
+        identity.containerImage.length > 0
+      ? { containerImage: identity.containerImage }
+      : {}),
+  };
   return {
     recordPath,
-    identity: identity as VerifiedEveDestroyIdentity,
+    identity: verified,
   };
 }
 
@@ -3026,13 +3256,56 @@ async function defaultDestroyTargetRead(
     request.containerApplicationName,
   );
   const firstContainer = entries === undefined ? undefined : entries[0];
+  const ownedImages = request.registryImages;
+  let registryImagesPresent: readonly string[] | undefined;
+  if (ownedImages !== undefined && ownedImages.length > 0) {
+    const images = await readWranglerJson([
+      "containers",
+      "images",
+      "list",
+      "--json",
+    ]);
+    const present = registryImageNames(images.value);
+    if (!images.failed && present !== undefined) {
+      registryImagesPresent = ownedImages.filter((image) =>
+        present.has(image)
+      );
+    }
+  }
   return {
     workerExists,
     ...(firstContainer === undefined
       ? {}
       : { containerApplicationId: firstContainer.id }),
     ...(accountId === undefined ? {} : { accountId }),
+    ...(registryImagesPresent === undefined
+      ? {}
+      : { registryImagesPresent }),
   };
+}
+
+/**
+ * `wrangler containers images list --json` reports `[{name, tags}]` entries
+ * with the account prefix already stripped from the repository name. The set
+ * carries `repository:tag` refs for the owned tags Eden publishes.
+ */
+function registryImageNames(value: unknown): ReadonlySet<string> | undefined {
+  const collection = jsonCollection(value);
+  if (collection === undefined) return undefined;
+  const names = new Set<string>();
+  for (const entry of collection) {
+    if (typeof entry !== "object" || entry === null || !("name" in entry)) {
+      return undefined;
+    }
+    const name = entry.name;
+    const tags = "tags" in entry ? entry.tags : undefined;
+    if (typeof name !== "string" || !Array.isArray(tags)) return undefined;
+    for (const tag of tags) {
+      if (typeof tag !== "string") return undefined;
+      names.add(`${name}:${tag}`);
+    }
+  }
+  return names;
 }
 
 async function defaultWorkerDelete(
@@ -3064,28 +3337,173 @@ async function defaultContainerDelete(
   return "indeterminate";
 }
 
-async function verifyEveAbsence(
-  request: EveDestroyCloudflareReadRequest,
-  options: EvePreflightOptions,
-): Promise<boolean> {
-  const reader = options.destroyCloudflareRead ?? defaultDestroyTargetRead;
-  const observed = await reader({
-    workerName: request.workerName,
-    containerApplicationName: request.containerApplicationName,
-  });
-  return !observed.workerExists &&
-    observed.containerApplicationId === undefined;
+async function defaultRegistryImageDelete(
+  request: { readonly image: string },
+): Promise<"deleted" | "absent" | "indeterminate"> {
+  const result = await runWranglerWithInput(
+    ["containers", "images", "delete", request.image, "--skip-confirmation"],
+    process.cwd(),
+  );
+  if (result.exitCode === 0) return "deleted";
+  if (/(?:does not exist|not found|404)/iu.test(result.stderr)) {
+    return "absent";
+  }
+  return "indeterminate";
+}
+
+/**
+ * The exact `<repository>:${EVE_REGISTRY_IMAGE_TAG}` ref this generation's
+ * deployment record proves Eden pushed, or undefined. Ownership holds only
+ * when the recorded digest reference points at the repository derived from
+ * the same identity that produced it; a digest-bearing reference to any other
+ * repository was published outside Eden's push and is never owned here.
+ */
+function ownedRegistryImageRef(
+  identity: VerifiedEveDestroyIdentity,
+  environment: EveCliEnvironment,
+  name: string,
+  accountId: string,
+): string | undefined {
+  if (
+    identity.projectId === undefined ||
+    identity.generationId === undefined ||
+    identity.containerImage === undefined ||
+    identity.accountId !== accountId
+  ) {
+    return undefined;
+  }
+  const repository = `eden-eve-${
+    stableDeploymentKey(
+      identity.projectId,
+      identity.accountId,
+      environment,
+      name,
+    )
+  }-${identity.generationId}`;
+  const expected =
+    `registry.cloudflare.com/${identity.accountId}/${repository}@`;
+  if (
+    !identity.containerImage.startsWith(expected) ||
+    imageDigestFromReference(identity.containerImage) === undefined
+  ) {
+    return undefined;
+  }
+  return `${repository}:${EVE_REGISTRY_IMAGE_TAG}`;
+}
+
+/**
+ * The exact image ref an indeterminate deploy attempt provably pushed. The
+ * retained attempt evidence names the target's repository; the account and
+ * target key must match the verified destroy record.
+ */
+async function attemptRegistryImageRef(
+  attemptPath: string,
+  accountId: string,
+  targetKey: string,
+): Promise<string | undefined> {
+  const raw = await readFile(attemptPath, "utf8").catch(() => undefined);
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const prefix = `eden-eve-${targetKey}-`;
+  if ("imageRepository" in parsed &&
+      typeof parsed.imageRepository === "string" &&
+      parsed.imageRepository.startsWith(prefix) &&
+      (!("targetKey" in parsed) || parsed.targetKey === targetKey) &&
+      "accountId" in parsed &&
+      parsed.accountId === accountId) {
+    return `${parsed.imageRepository}:${EVE_REGISTRY_IMAGE_TAG}`;
+  }
+  if ("imageReference" in parsed &&
+      typeof parsed.imageReference === "string" &&
+      imageDigestFromReference(parsed.imageReference) !== undefined) {
+    const repository = parsed.imageReference.split("@")[0];
+    const expected = `registry.cloudflare.com/${accountId}/${prefix}`;
+    if (
+      repository !== undefined &&
+      repository.startsWith(expected) &&
+      (!("targetKey" in parsed) || parsed.targetKey === targetKey)
+    ) {
+      return `${repository.slice(`registry.cloudflare.com/${accountId}/`.length)}:${EVE_REGISTRY_IMAGE_TAG}`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Every registry image tag this exact target provably owns: the recorded
+ * digest references in matching deployment records plus the repository
+ * evidence retained by indeterminate pushes. Never derived by prefix-matching
+ * the registry; each ref is computed from the immutable generation records.
+ */
+async function collectEveDestroyRegistryImages(
+  projectRoot: string,
+  environment: EveCliEnvironment,
+  name: string,
+  record: VerifiedEveDestroyIdentity,
+): Promise<readonly string[]> {
+  const generationsRoot = join(
+    projectRoot,
+    ".eden",
+    "eve-deploy",
+    "generations",
+  );
+  const entries = await readdir(generationsRoot).catch(() => []);
+  const images = new Set<string>();
+  const targetKey = record.projectId === undefined
+    ? undefined
+    : stableDeploymentKey(
+      record.projectId,
+      record.accountId,
+      environment,
+      name,
+    );
+  for (const entry of entries) {
+    const generationRoot = join(generationsRoot, entry);
+    const parsed = await parseEveDestroyRecord(
+      join(generationRoot, "deployment.json"),
+      environment,
+      name,
+    );
+    const deployedImage = parsed === undefined
+      ? undefined
+      : ownedRegistryImageRef(
+        parsed.identity,
+        environment,
+        name,
+        record.accountId,
+      );
+    if (deployedImage !== undefined) images.add(deployedImage);
+    if (targetKey === undefined) continue;
+    const attemptImage = await attemptRegistryImageRef(
+      join(generationRoot, "deployment-attempt.json"),
+      record.accountId,
+      targetKey,
+    );
+    if (attemptImage !== undefined) images.add(attemptImage);
+  }
+  return [...images];
 }
 
 export async function runEveDestroy(
   request: EveCliExecutionRequest,
   options: EvePreflightOptions = {},
 ): Promise<void> {
+  const startedAt = Date.now();
+  if (humanOutput(options)) {
+    emitLine(
+      options,
+      `eden destroy — ${request.name} (${request.environment})`,
+    );
+  }
   const checks: EvePreflightCheck[] = [];
   const emit = (outcome: EveDestroyOutcome): void => {
-    (options.stdout ?? (() => undefined))(
-      redactEveRuntimeOutput(JSON.stringify(outcome)),
-    );
+    emitEveDestroyOutcome(options, outcome, startedAt);
   };
   const fail = (code: string, message: string): never => {
     throw new EveCliError({ code, message, source: "eve destroy" });
@@ -3158,11 +3576,23 @@ async function runEveDestroyLocked(
       ),
     );
 
+    eveProgress(options, "verifying the immutable ownership record");
+    const ownedRegistryImages = await collectEveDestroyRegistryImages(
+      request.projectRoot,
+      request.environment,
+      request.name,
+      record.identity,
+    );
+
+    const readTarget = (): Promise<EveDestroyTargetRead> =>
+      Promise.resolve(reader({
+        workerName: expectedWorker,
+        containerApplicationName: expectedContainer,
+        registryImages: ownedRegistryImages,
+      }));
     const reader = options.destroyCloudflareRead ?? defaultDestroyTargetRead;
-    const before = await reader({
-      workerName: expectedWorker,
-      containerApplicationName: expectedContainer,
-    });
+    eveProgress(options, "reading the exact remote inventory");
+    const before = await readTarget();
     if (
       before.accountId !== record.identity.accountId
     ) {
@@ -3171,7 +3601,13 @@ async function runEveDestroyLocked(
         "The authenticated account does not own the recorded deployment account.",
       );
     }
-    if (!before.workerExists && before.containerApplicationId === undefined) {
+    if (
+      !before.workerExists &&
+      before.containerApplicationId === undefined &&
+      (ownedRegistryImages.length === 0 ||
+        (before.registryImagesPresent !== undefined &&
+          before.registryImagesPresent.length === 0))
+    ) {
       emit({
         ok: true,
         status: "absent",
@@ -3191,6 +3627,7 @@ async function runEveDestroyLocked(
 
     const deleteWorker = options.deleteWorker ?? defaultWorkerDelete;
     if (before.workerExists) {
+      eveProgress(options, `deleting Worker ${expectedWorker}`);
       const workerResult = await deleteWorker({ name: expectedWorker });
       if (workerResult === "indeterminate") {
         emit({
@@ -3223,6 +3660,7 @@ async function runEveDestroyLocked(
 
     const deleteContainer = options.deleteContainer ?? defaultContainerDelete;
     if (before.containerApplicationId !== undefined) {
+      eveProgress(options, `deleting Container application ${expectedContainer}`);
       const containerResult = await deleteContainer({
         applicationId: before.containerApplicationId,
       });
@@ -3257,15 +3695,31 @@ async function runEveDestroyLocked(
         ),
       );
     }
+    const imageDeletes = new Map<string, "deleted" | "absent" | "indeterminate">();
+    if (ownedRegistryImages.length > 0) {
+      const deleteRegistryImage =
+        options.deleteRegistryImage ?? defaultRegistryImageDelete;
+      const deletable = before.registryImagesPresent === undefined
+        ? ownedRegistryImages
+        : ownedRegistryImages.filter((image) =>
+          before.registryImagesPresent?.includes(image) === true
+        );
+      if (deletable.length > 0) {
+        eveProgress(
+          options,
+          `deleting ${deletable.length} registry image${
+            deletable.length === 1 ? "" : "s"
+          }`,
+        );
+      }
+      for (const image of deletable) {
+        imageDeletes.set(image, await deleteRegistryImage({ image }));
+      }
+    }
 
-    const absent = await verifyEveAbsence(
-      {
-        workerName: expectedWorker,
-        containerApplicationName: expectedContainer,
-      },
-      options,
-    );
-    if (!absent) {
+    eveProgress(options, "verifying the exact target is absent");
+    const after = await readTarget();
+    if (after.workerExists || after.containerApplicationId !== undefined) {
       emit({
         ok: false,
         status: "failed",
@@ -3284,6 +3738,40 @@ async function runEveDestroyLocked(
       fail(
         "EVE_DESTROY_ABSENCE_UNPROVEN",
         "The exact target could not be proven absent after deletion.",
+      );
+    }
+    const retainedImages = ownedRegistryImages.filter((image) =>
+      after.registryImagesPresent === undefined
+        ? imageDeletes.get(image) === "indeterminate"
+        : after.registryImagesPresent.includes(image)
+    );
+    if (ownedRegistryImages.length > 0) {
+      checks.push(
+        retainedImages.length === 0
+          ? check(
+            "VAL-LIFE-006-REGISTRY",
+            "passed",
+            "Every registry image tag recorded for this exact target was deleted or proven absent.",
+          )
+          : check(
+            "VAL-LIFE-006-REGISTRY",
+            "failed",
+            `The exact target's registry image(s) remain after destroy: ${retainedImages.join(", ")}.`,
+            "Retry eden destroy with the same selectors, or remove only the listed image refs with wrangler containers images delete.",
+          ),
+      );
+    }
+    if (retainedImages.length > 0) {
+      emit({
+        ok: false,
+        status: "failed",
+        environment: request.environment,
+        name: request.name,
+        checks,
+      });
+      fail(
+        "EVE_DESTROY_IMAGES_RETAINED",
+        `The exact Worker and Container are absent, but registry image(s) remain: ${retainedImages.join(", ")}.`,
       );
     }
     checks.push(

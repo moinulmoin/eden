@@ -992,10 +992,7 @@ export async function runOwnedProcess({
   const stderrParts = [];
   const stdoutState = { bytes: 0, truncated: false };
   const stderrState = { bytes: 0, truncated: false };
-  const childEnv =
-    env === undefined
-      ? { ...process.env, EDEN_BEARER_SECRET: undefined }
-      : env;
+  const childEnv = env === undefined ? process.env : env;
   let child;
   let timedOut = false;
   let aborted = false;
@@ -1197,10 +1194,7 @@ export function spawnOwnedProcess({
   try {
     const child = spawn(file, args, {
       cwd,
-      env:
-        env === undefined
-          ? { ...process.env, EDEN_BEARER_SECRET: undefined }
-          : env,
+      env: env === undefined ? process.env : env,
       detached: process.platform !== "win32",
       argv0: reservation.marker,
       stdio,

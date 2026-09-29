@@ -119,6 +119,9 @@ async function writeSuccessfulBuild(
 
 async function writeFakeDockerCommand(
   root: string,
+  options: {
+    readonly buildStderr?: string;
+  } = {},
 ): Promise<{ readonly command: string; readonly log: string }> {
   const command = join(root, "fake-docker.cjs");
   const log = join(root, "docker-args.jsonl");
@@ -132,6 +135,12 @@ fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
 const removedMarker = ${JSON.stringify(`${log}.removed`)};
 if (args[0] === "version") process.stdout.write("29.4.0\\n");
 else if (args[0] === "build") {
+  const buildStderr = ${JSON.stringify(options.buildStderr ?? "")};
+  if (buildStderr.length > 0) {
+    process.stderr.write(buildStderr);
+    process.exitCode = 1;
+    return;
+  }
   const iidfile = args[args.indexOf("--iidfile") + 1];
   fs.writeFileSync(iidfile, "sha256:${"2".repeat(64)}\\n");
 } else if (args[0] === "image" && args[1] === "inspect") {
@@ -970,5 +979,303 @@ describe("Eve project snapshot/build boundary", () => {
     expect(result.returnCode).toBe("SOURCE_RACE");
     expect(createHash("sha256").update(await readFile(join(prior, "CURRENT"))).digest("hex"))
       .toBe(priorDigest);
+  });
+
+  test("copies the project pnpm workspace policy into the image before both frozen installs", async () => {
+    const root = await createRoot("eden-eve-package-workspace-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    await writeFile(
+      join(root, "pnpm-workspace.yaml"),
+      "minimumReleaseAgeExclude:\n  - eve@0.66.3\n",
+      "utf8",
+    );
+    const { builder } = fakeBuilder(writeSuccessfulBuild);
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      builder,
+    });
+
+    expect(result.status).toBe("ready");
+    const dockerfile = await readFile(
+      join(artifacts, "generation-one/container/Dockerfile"),
+      "utf8",
+    );
+    const firstInstall = dockerfile.indexOf(
+      "corepack pnpm install --frozen-lockfile --config.node-linker=hoisted",
+    );
+    const policyCopy = dockerfile.indexOf(
+      'COPY ["package.json","pnpm-lock.yaml","pnpm-workspace.yaml","./"]',
+    );
+    expect(firstInstall).toBeGreaterThan(-1);
+    expect(policyCopy).toBeGreaterThan(-1);
+    expect(policyCopy).toBeLessThan(firstInstall);
+    const secondInstall = dockerfile.indexOf(
+      "corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted",
+    );
+    expect(secondInstall).toBeGreaterThan(firstInstall);
+  });
+
+  test("omits the workspace policy source when the project has no pnpm-workspace.yaml", async () => {
+    const root = await createRoot("eden-eve-package-no-workspace-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const { builder } = fakeBuilder(writeSuccessfulBuild);
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      builder,
+    });
+
+    expect(result.status).toBe("ready");
+    const dockerfile = await readFile(
+      join(artifacts, "generation-one/container/Dockerfile"),
+      "utf8",
+    );
+    expect(dockerfile).toContain(
+      'COPY ["package.json","pnpm-lock.yaml","./"]',
+    );
+    expect(dockerfile).not.toContain("pnpm-workspace.yaml");
+  });
+
+  test("carries the validated authored source closure into the runtime stage", async () => {
+    const root = await createRoot("eden-eve-package-source-closure-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    await mkdir(join(root, "agent/tools"), { recursive: true });
+    await writeFile(join(root, "agent/agent.ts"), "export default {};\n", "utf8");
+    await writeFile(join(root, "agent/tools/echo.ts"), "export default {};\n", "utf8");
+    await mkdir(join(root, "agents/worker"), { recursive: true });
+    await writeFile(join(root, "agents/worker/agent.ts"), "export default {};\n", "utf8");
+    await writeFile(join(root, ".env"), "RUNTIME_SECRET=do-not-copy\n", "utf8");
+    await writeFile(join(root, "deploy.pem"), "-----BEGIN PRIVATE KEY-----\n", "utf8");
+    await mkdir(join(root, ".eve"), { recursive: true });
+    await writeFile(join(root, ".eve/state.json"), "{}\n", "utf8");
+    const { builder } = fakeBuilder(writeSuccessfulBuild);
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      runtimeConfig: {
+        inputIdentity: "runtime-input-v1",
+        variableNames: ["MODEL_API_KEY"],
+        redactionRegistered: true,
+      },
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      builder,
+    });
+
+    expect(result.status).toBe("ready");
+    const dockerfile = await readFile(
+      join(artifacts, "generation-one/container/Dockerfile"),
+      "utf8",
+    );
+    for (const entry of [
+      "agent",
+      "agents",
+      "src",
+      "package.json",
+      "pnpm-lock.yaml",
+    ]) {
+      expect(dockerfile).toContain(
+        `COPY --from=builder ["/workspace/${entry}","/app/${entry}"]`,
+      );
+    }
+    expect(dockerfile).not.toContain('"/app/.env"');
+    expect(dockerfile).not.toContain('"/app/deploy.pem"');
+    expect(dockerfile).not.toContain('"/app/.eve"');
+    expect(dockerfile).not.toContain('"/app/node_modules"');
+    const snapshotPath = result.snapshot?.path as string;
+    await expect(readFile(join(snapshotPath, ".eve/state.json"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("surfaces the pnpm release-age policy failure instead of lockfile ambiguity", async () => {
+    const root = await createRoot("eden-eve-package-release-age-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      buildStderr:
+        "ERROR: process \"/bin/sh -c corepack pnpm install --frozen-lockfile\" did not complete: " +
+        "ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION  eve@0.66.3 was published at " +
+        "2026-09-24T20:43:44.000Z, within the minimumReleaseAge cutoff\n",
+    });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "DEPENDENCY_AMBIGUITY",
+      deployable: false,
+    });
+    expect(result.error?.subject).toBe("ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION");
+    expect(result.error?.reason).toContain("minimumReleaseAge");
+    expect(result.error?.remediation).toContain("minimumReleaseAgeExclude");
+    expect(result.error?.remediation).not.toContain("Regenerate pnpm-lock.yaml");
+  });
+
+  test("reports the actual pnpm error code when the frozen install fails", async () => {
+    const root = await createRoot("eden-eve-package-pnpm-error-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      buildStderr:
+        "ERROR: process \"/bin/sh -c corepack pnpm install --frozen-lockfile\" did not complete: " +
+        "ERR_PNPM_UNEXPECTED_STORE  Unexpected store location\n",
+    });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "DEPENDENCY_AMBIGUITY",
+      deployable: false,
+    });
+    expect(result.error?.subject).toBe("ERR_PNPM_UNEXPECTED_STORE");
+    expect(result.error?.reason).toContain("ERR_PNPM_UNEXPECTED_STORE");
+    expect(result.error?.reason).not.toContain("changing or bypassing the lockfile");
+  });
+
+  test("classifies a failing eve build step as Eve build failure, not pnpm install", async () => {
+    const root = await createRoot("eden-eve-package-eve-build-step-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      buildStderr:
+        '#14 [builder 4/7] RUN corepack enable   && corepack prepare pnpm@11.21.0 --activate   && test "$(corepack pnpm --version)" = "11.21.0"   && corepack pnpm install --frozen-lockfile --config.node-linker=hoisted\n' +
+        "#14 CACHED\n" +
+        "#16 [builder 7/7] RUN test -x ./node_modules/.bin/eve   && ./node_modules/.bin/eve build\n" +
+        "#16 0.512 Error: Cannot find package 'just-bash' imported from /workspace/node_modules/eve/dist/src/sandbox/providers/default.js\n" +
+        '#16 ERROR: process "/bin/sh -c test -x ./node_modules/.bin/eve   && ./node_modules/.bin/eve build" did not complete successfully: exit code: 1\n' +
+        '------\n > [builder 7/7] RUN test -x ./node_modules/.bin/eve   && ./node_modules/.bin/eve build:\n------\n' +
+        'ERROR: process "/bin/sh -c test -x ./node_modules/.bin/eve   && ./node_modules/.bin/eve build" did not complete successfully: exit code: 1\n',
+    });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "EVE_BUILD_FAILED",
+      deployable: false,
+    });
+    expect(result.error?.subject).toBe("eve build");
+    expect(result.error?.reason).toContain("just-bash");
+    expect(result.error?.remediation).toContain("just-bash");
+    expect(result.error?.remediation).toContain("production dependency");
+  });
+
+  test("classifies a frozen-lockfile mismatch inside the install step", async () => {
+    const root = await createRoot("eden-eve-package-lockfile-mismatch-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      buildStderr:
+        '#14 [builder 4/7] RUN corepack enable   && corepack prepare pnpm@11.21.0 --activate   && test "$(corepack pnpm --version)" = "11.21.0"   && corepack pnpm install --frozen-lockfile --config.node-linker=hoisted\n' +
+        '#14 1.102 ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with "frozen-lockfile" because pnpm-lock.yaml is not up to date with package.json\n' +
+        '#14 ERROR: process "/bin/sh -c corepack enable   && corepack prepare pnpm@11.21.0 --activate   && test \\"$(corepack pnpm --version)\\" = \\"11.21.0\\"   && corepack pnpm install --frozen-lockfile --config.node-linker=hoisted" did not complete successfully: exit code: 1\n' +
+        'ERROR: process "/bin/sh -c corepack enable   && corepack prepare pnpm@11.21.0 --activate   && test \\"$(corepack pnpm --version)\\" = \\"11.21.0\\"   && corepack pnpm install --frozen-lockfile --config.node-linker=hoisted" did not complete successfully: exit code: 1\n',
+    });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "DEPENDENCY_AMBIGUITY",
+      deployable: false,
+    });
+    expect(result.error?.subject).toBe("frozen pnpm install");
+    expect(result.error?.remediation).toContain("Regenerate pnpm-lock.yaml");
+  });
+
+  test("surfaces the ignored-builds pnpm policy failure with its own remediation", async () => {
+    const root = await createRoot("eden-eve-package-ignored-builds-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      buildStderr:
+        '#21 [runtime-deps 2/2] RUN rm -rf node_modules   && corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted\n' +
+        "#21 2.040 ERR_PNPM_IGNORED_BUILDS  Ignored build scripts: @mongodb-js/zstd, node-liblzma.\n" +
+        '#21 ERROR: process "/bin/sh -c rm -rf node_modules   && corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted" did not complete successfully: exit code: 1\n',
+    });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "DEPENDENCY_AMBIGUITY",
+      deployable: false,
+    });
+    expect(result.error?.subject).toBe("ERR_PNPM_IGNORED_BUILDS");
+    expect(result.error?.remediation).toContain("allowBuilds");
+    expect(result.error?.remediation).toContain("pnpm-workspace.yaml");
   });
 });

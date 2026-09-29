@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -17,6 +18,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import {
   EDEN_CLI_COMMANDS,
   EveCliError,
+  deriveEveTargetName,
   isEdenCliCommand,
   parseEveArguments,
   runEdenCli,
@@ -95,7 +97,7 @@ afterEach(async () => {
 });
 
 describe("top-level Eden Deploy commands", () => {
-  test("advertises Deploy first and keeps Agent explicit", async () => {
+  test("advertises the Deploy command surface", async () => {
     const output: string[] = [];
 
     await expect(
@@ -105,15 +107,13 @@ describe("top-level Eden Deploy commands", () => {
     ).resolves.toBe(0);
 
     expect(output.join("\n")).toMatch(/preflight|deploy|destroy/u);
-    expect(output.join("\n")).toMatch(/agent/u);
     expect(output.join("\n")).not.toMatch(/eden eve/u);
     expect(EDEN_CLI_COMMANDS).toEqual([
       "preflight",
       "deploy",
       "destroy",
-      "agent",
     ]);
-    expect(isEdenCliCommand("agent")).toBe(true);
+    expect(isEdenCliCommand("agent")).toBe(false);
     expect(isEdenCliCommand("eve")).toBe(false);
   });
 
@@ -148,14 +148,6 @@ describe("top-level Eden Deploy commands", () => {
       await expect(
         runEdenCli(helpArgs, {
           stdout: (line) => output.push(line),
-          processRunner: {
-            spawn() {
-              throw new Error("help must not start a child");
-            },
-          },
-          dryRunRunner: async () => {
-            throw new Error("help must not run an Agent dry-run");
-          },
         }),
       ).resolves.toBe(0);
 
@@ -164,41 +156,11 @@ describe("top-level Eden Deploy commands", () => {
     },
   );
 
-  test("keeps Eve parsing separate from Agent execution", async () => {
-    const root = await createRoot();
-    let agentBuildInvoked = false;
-    const errors: string[] = [];
-
-    await expect(
-      runEdenCli(
-        ["preflight",
-        "--project",
-        root,
-        "--env",
-        "preview",
-        "--name",
-        "eve-namespace-test",],
-        {
-          cwd: root,
-          stderr: (line) => errors.push(line),
-          dryRunRunner: async () => {
-            agentBuildInvoked = true;
-            return { exitCode: 0, stdout: "", stderr: "" };
-          },
-        },
-      ),
-    ).resolves.toBe(1);
-
-    expect(agentBuildInvoked).toBe(false);
-    expect(errors.join("\n")).not.toMatch(/COMMAND_UNKNOWN/u);
-  });
 
   test("passes only canonical selectors and an opaque env-file path to Eve", async () => {
     const root = await createRoot();
     const parent = join(root, "..");
     const requests: unknown[] = [];
-    let agentSpawned = false;
-    let agentDryRun = false;
 
     await expect(
       runEdenCli(
@@ -215,16 +177,6 @@ describe("top-level Eden Deploy commands", () => {
           eveRunner: async (request) => {
             requests.push(request);
           },
-          processRunner: {
-            spawn() {
-              agentSpawned = true;
-              throw new Error("Agent process runner must not receive Eve work");
-            },
-          },
-          dryRunRunner: async () => {
-            agentDryRun = true;
-            return { exitCode: 0, stdout: "", stderr: "" };
-          },
         },
       ),
     ).resolves.toBe(0);
@@ -239,11 +191,9 @@ describe("top-level Eden Deploy commands", () => {
         envFile: "/tmp/opaque-runtime.env",
       },
     ]);
-    expect(agentSpawned).toBe(false);
-    expect(agentDryRun).toBe(false);
   });
 
-  test("redacts arbitrary Eve runner failures without Agent fallback", async () => {
+  test("redacts arbitrary Eve runner failures", async () => {
     const root = await createRoot();
     const errors: string[] = [];
     const secret = "eve-runner-secret-marker";
@@ -284,7 +234,8 @@ describe("top-level Eden Deploy commands", () => {
         "--env",
         "preview",
         "--name",
-        "eve-concrete-preflight",],
+        "eve-concrete-preflight",
+        "--json",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -329,7 +280,8 @@ describe("top-level Eden Deploy commands", () => {
         "--env",
         "preview",
         "--name",
-        "eve-read-only",],
+        "eve-read-only",
+        "--json",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -532,7 +484,8 @@ describe("top-level Eden Deploy commands", () => {
         "--env",
         "production",
         "--name",
-        "eve-conflict",],
+        "eve-conflict",
+        "--json",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -744,29 +697,93 @@ describe("top-level Eden Deploy commands", () => {
     expect(await readFile(sourcePath, "utf8")).toBe("export const value = 2;\n");
   });
 
-  test.each(["preflight", "deploy", "destroy"] as const)(
-    "requires every explicit selector for %s",
-    (command) => {
-      const required = {
-        project: ["--env", "preview", "--name", "eve-required"],
-        env: ["--project", "/tmp/eve-project", "--name", "eve-required"],
-        name: ["--project", "/tmp/eve-project", "--env", "preview"],
-      } as const;
+  test("defaults preflight and deploy to cwd, preview, and a derived name", () => {
+    for (const command of ["preflight", "deploy"] as const) {
+      expect(parseEveArguments([command])).toEqual({
+        kind: "invocation",
+        command,
+        projectRoot: ".",
+        environment: "preview",
+      });
+    }
+  });
 
-      for (const [missing, suffix] of Object.entries(required)) {
-        let error: unknown;
-        try {
-          parseEveArguments([command, ...suffix]);
-        } catch (caught: unknown) {
-          error = caught;
-        }
-        expect(error).toBeInstanceOf(EveCliError);
-        expect(error).toMatchObject({
-          code: `EVE_${missing.toUpperCase()}_REQUIRED`,
-        });
+  test.each(["destroy", "deploy --env production"] as const)(
+    "requires an explicit --name for %s",
+    (selection) => {
+      const args = selection === "destroy"
+        ? ["destroy"]
+        : ["deploy", "--env", "production"];
+      let error: unknown;
+      try {
+        parseEveArguments(args);
+      } catch (caught: unknown) {
+        error = caught;
       }
+      expect(error).toBeInstanceOf(EveCliError);
+      expect(error).toMatchObject({ code: "EVE_NAME_REQUIRED" });
     },
   );
+
+  test("accepts destroy and production deploy with an explicit --name", () => {
+    expect(parseEveArguments(["destroy", "--name", "eve-preview"]))
+      .toEqual({
+        kind: "invocation",
+        command: "destroy",
+        projectRoot: ".",
+        environment: "preview",
+        name: "eve-preview",
+      });
+    expect(
+      parseEveArguments(
+        ["deploy", "--env", "production", "--name", "eve-production"],
+      ),
+    ).toEqual({
+      kind: "invocation",
+      command: "deploy",
+      projectRoot: ".",
+      environment: "production",
+      name: "eve-production",
+    });
+  });
+
+  test("derives deterministic collision-safe Worker names", () => {
+    expect(deriveEveTargetName("@my-org/My Eve_App"))
+      .toBe(deriveEveTargetName("@my-org/My Eve_App"));
+    const derived = deriveEveTargetName("@my-org/My Eve_App");
+    expect(derived).toMatch(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u);
+    expect(derived.startsWith("my-org-my-eve-app-")).toBe(true);
+    // Distinct raw names that sanitize to the same slug stay distinct.
+    expect(deriveEveTargetName("my_app"))
+      .not.toBe(deriveEveTargetName("my app"));
+    expect(
+      deriveEveTargetName(`${"a".repeat(80)}-eve-project`),
+    ).toMatch(/^[a-z0-9-]{1,63}$/u);
+    expect(() => deriveEveTargetName("!!!")).toThrowError(
+      expect.objectContaining({ code: "EVE_NAME_DERIVATION_FAILED" }),
+    );
+  });
+
+  test("no-flag deploy resolves the project name from package.json", async () => {
+    const root = await createRoot();
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({ name: "@my-org/My Eve_App", private: true }),
+      "utf8",
+    );
+    let observed: { name?: string; projectRoot?: string; environment?: string } = {};
+    await expect(
+      runEdenCli(["deploy"], {
+        cwd: root,
+        eveRunner: async (request) => {
+          observed = request;
+        },
+      }),
+    ).resolves.toBe(0);
+    expect(observed.environment).toBe("preview");
+    expect(observed.projectRoot).toBe(await realpath(root));
+    expect(observed.name).toBe(deriveEveTargetName("@my-org/My Eve_App"));
+  });
 
   test("parses both environments and scopes env-file to preflight/deploy", () => {
     expect(
@@ -938,7 +955,8 @@ describe("top-level Eden Deploy commands", () => {
         "--name",
         "eve-deploy-fixture",
         "--env-file",
-        envFile,],
+        envFile,
+        "--json",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -1012,6 +1030,9 @@ describe("top-level Eden Deploy commands", () => {
               expect(request.hostConfig.worker.workers_dev).toBe(true);
               expect(request.hostConfig.worker.containers).toHaveLength(1);
               expect(request.hostConfig.worker.containers[0]?.max_instances).toBe(1);
+              expect(request.hostConfig.worker.containers[0]?.instance_type).toBe(
+                "basic",
+              );
               expect(request.hostConfig.worker.vars.EVE_PUBLIC_ORIGIN).toBe(
                 "https://eve-deploy-fixture.account.workers.dev",
               );
@@ -1157,7 +1178,148 @@ describe("top-level Eden Deploy commands", () => {
     expect(errors.join("\n")).toContain("DEPLOY_INDETERMINATE");
     expect(errors.join("\n")).not.toContain("ambiguous cleanup");
   });
+
+  test("parses --json on every command", () => {
+    for (const command of ["preflight", "deploy", "destroy"] as const) {
+      const parsed = parseEveArguments([
+        command,
+        "--name",
+        "eve-json-mode",
+        "--json",
+      ]);
+      expect(parsed).toMatchObject({
+        kind: "invocation",
+        command,
+        json: true,
+      });
+    }
+    expect(
+      parseEveArguments(["preflight", "--name", "eve-plain"]),
+    ).not.toHaveProperty("json");
+  });
+
+  test("prints a human preflight summary by default", async () => {
+    const root = await createRoot();
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({
+        name: "eve-human-preflight",
+        private: true,
+        packageManager: "pnpm@11.21.0",
+      }),
+      "utf8",
+    );
+    await writeFile(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-human-preflight",],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+            builder: fakeBuilder(),
+            hostRequirements: {
+              architecture: "linux/amd64",
+              world: "supported",
+              sandbox: "supported",
+              privileged: false,
+              devices: "none",
+              kernel: "supported",
+              network: "supported",
+              durableLocalFilesystem: false,
+            },
+            runtimeRunner: async () => ({
+              ok: true,
+              checks: [
+                {
+                  id: "VAL-BUILD-005",
+                  status: "passed",
+                  message: "Image passed.",
+                },
+                {
+                  id: "VAL-BUILD-006",
+                  status: "passed",
+                  message: "Eve start passed.",
+                },
+                {
+                  id: "VAL-BUILD-007",
+                  status: "passed",
+                  message: "Health passed.",
+                },
+              ],
+              imageDigest: `sha256:${"f".repeat(64)}`,
+              cleanup: runtimeCleanup,
+            }),
+            cloudflareRead: async () => ({
+              accountAccess: "available",
+              containerAccess: "available",
+              target: { state: "absent" },
+            }),
+          },
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const text = output.join("\n");
+    expect(output[0]).toBe(
+      "eden preflight — eve-human-preflight (preview)",
+    );
+    expect(text).toContain("... packaging project");
+    expect(text).toContain("✓ VAL-CLI-004");
+    expect(text).toContain("✓ eve-human-preflight (preview) — preflight passed");
+    expect(text).not.toContain('"command"');
+    expect(() => JSON.parse(text)).toThrow();
+  });
+
+  test("prints the failing check id, reason, and remediation on preflight failure", async () => {
+    const root = await createRoot();
+    const output: string[] = [];
+    const errors: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-human-failure",],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          stderr: (line) => errors.push(line),
+        },
+      ),
+    ).resolves.toBe(1);
+
+    const text = output.join("\n");
+    expect(text).toContain("✗ VAL-");
+    expect(text).toContain("→");
+    expect(text).toContain("✗ preflight failed — first failing check:");
+    expect(errors.join("\n")).toContain("EVE_PREFLIGHT_FAILED");
+  });
 });
+
+
+const destroyTargetKey = (() => {
+  const digest = createHash("sha256")
+    .update("proj\naccount-test\npreview\neve-destroy-fixture", "utf8")
+    .digest("hex")
+    .slice(0, 24);
+  return `preview-eve-destroy-fixture-${digest}`;
+})();
+const destroyRegistryImage =
+  `eden-eve-${destroyTargetKey}-gen-destroy-1:candidate`;
 
 describe("eden destroy", () => {
   async function createDeployedFixture(): Promise<{
@@ -1214,7 +1376,7 @@ describe("eden destroy", () => {
           workerName: "eve-destroy-fixture",
           containerApplicationName: "eve-destroy-fixture-container",
           stableContainerInstanceName: "eve-destroy-fixture-instance",
-          containerImage: `registry.cloudflare.com/account-test/eden-eve@sha256:${"b".repeat(64)}`,
+          containerImage: `registry.cloudflare.com/account-test/eden-eve-${destroyTargetKey}-gen-destroy-1@sha256:${"b".repeat(64)}`,
           runtimeVariableNames: [],
         },
       }),
@@ -1260,7 +1422,8 @@ describe("eden destroy", () => {
         "--env",
         "preview",
         "--name",
-        "eve-destroy-fixture",],
+        "eve-destroy-fixture",
+        "--json",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -1270,6 +1433,7 @@ describe("eden destroy", () => {
               return {
                 workerExists: false,
                 containerApplicationId: undefined,
+                registryImagesPresent: [],
                 accountId: "account-test",
               };
             },
@@ -1281,12 +1445,13 @@ describe("eden destroy", () => {
     expect(output.join("\n")).toContain('"status":"absent"');
   });
 
-  test("deletes only the recorded Worker and Container, verifies absence, then clears CURRENT", async () => {
+  test("deletes only the recorded Worker, Container, and registry image, verifies absence, then clears CURRENT", async () => {
     const { root } = await createDeployedFixture();
     const output: string[] = [];
     const operations: string[] = [];
     let exists = true;
     let containerId: string | undefined = "container-123";
+    let imagePresent = true;
     await expect(
       runEdenCli(
         ["destroy",
@@ -1295,7 +1460,8 @@ describe("eden destroy", () => {
         "--env",
         "preview",
         "--name",
-        "eve-destroy-fixture",],
+        "eve-destroy-fixture",
+        "--json",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -1305,6 +1471,9 @@ describe("eden destroy", () => {
               ...(containerId === undefined
                 ? {}
                 : { containerApplicationId: containerId }),
+              registryImagesPresent: imagePresent
+                ? [destroyRegistryImage]
+                : [],
               accountId: "account-test",
             }),
             deleteWorker: async ({ name }) => {
@@ -1317,6 +1486,11 @@ describe("eden destroy", () => {
               containerId = undefined;
               return "deleted";
             },
+            deleteRegistryImage: async ({ image }) => {
+              operations.push(`image:${image}`);
+              imagePresent = false;
+              return "deleted";
+            },
           },
         },
       ),
@@ -1324,6 +1498,7 @@ describe("eden destroy", () => {
     expect(operations).toEqual([
       "worker:eve-destroy-fixture",
       "container:container-123",
+      `image:${destroyRegistryImage}`,
     ]);
     expect(output.join("\n")).toContain('"status":"destroyed"');
     await expect(
@@ -1343,6 +1518,116 @@ describe("eden destroy", () => {
     ).resolves.toContain("deployed");
   });
 
+  test("deletes the aborted-push generation image recorded in indeterminate evidence", async () => {
+    const { root } = await createDeployedFixture();
+    const abortedRoot = join(
+      root,
+      ".eden",
+      "eve-deploy",
+      "generations",
+      "gen-destroy-0",
+    );
+    await mkdir(abortedRoot, { recursive: true });
+    const abortedImage = `eden-eve-${destroyTargetKey}-gen-destroy-0:candidate`;
+    await writeFile(
+      join(abortedRoot, "deployment-attempt.json"),
+      JSON.stringify({
+        version: 1,
+        status: "indeterminate",
+        generationId: "gen-destroy-0",
+        accountId: "account-test",
+        targetKey: destroyTargetKey,
+        imageRepository: `eden-eve-${destroyTargetKey}-gen-destroy-0`,
+        imageDigest: `sha256:${"c".repeat(64)}`,
+      }),
+      "utf8",
+    );
+    const output: string[] = [];
+    const deletedImages: string[] = [];
+    const presentImages = new Set([destroyRegistryImage, abortedImage]);
+    await expect(
+      runEdenCli(
+        ["destroy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-destroy-fixture",
+        "--json",],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            destroyCloudflareRead: async () => ({
+              workerExists: false,
+              containerApplicationId: undefined,
+              registryImagesPresent: [...presentImages],
+              accountId: "account-test",
+            }),
+            deleteRegistryImage: async ({ image }) => {
+              deletedImages.push(image);
+              presentImages.delete(image);
+              return "deleted";
+            },
+          },
+        },
+      ),
+    ).resolves.toBe(0);
+    expect(new Set(deletedImages)).toEqual(
+      new Set([destroyRegistryImage, abortedImage]),
+    );
+    expect(output.join("\n")).toContain('"status":"destroyed"');
+    expect(output.join("\n")).toContain("VAL-LIFE-006-REGISTRY");
+  });
+
+  test("reports the recorded image left behind when registry deletion is indeterminate", async () => {
+    const { root } = await createDeployedFixture();
+    const output: string[] = [];
+    const errors: string[] = [];
+    await expect(
+      runEdenCli(
+        ["destroy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-destroy-fixture",
+        "--json",],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          stderr: (line) => errors.push(line),
+          eveControlPlane: {
+            destroyCloudflareRead: async () => ({
+              workerExists: false,
+              containerApplicationId: undefined,
+              accountId: "account-test",
+            }),
+            deleteRegistryImage: async () => "indeterminate",
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(output.join("\n")).toContain('"status":"failed"');
+    expect(output.join("\n")).toContain(destroyRegistryImage);
+    expect(errors.join("\n")).toContain("EVE_DESTROY_IMAGES_RETAINED");
+    expect(errors.join("\n")).toContain(destroyRegistryImage);
+    await expect(
+      lstat(
+        join(
+          root,
+          ".eden",
+          "eve-deploy",
+          "targets",
+          "preview-eve-destroy-fixture",
+          "CURRENT",
+        ),
+      ),
+    ).resolves.toBeDefined();
+  });
+
   test("returns indeterminate without clearing CURRENT when the Worker deletion is ambiguous", async () => {
     const { root } = await createDeployedFixture();
     const output: string[] = [];
@@ -1355,7 +1640,8 @@ describe("eden destroy", () => {
         "--env",
         "preview",
         "--name",
-        "eve-destroy-fixture",],
+        "eve-destroy-fixture",
+        "--json",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -1399,7 +1685,8 @@ describe("eden destroy", () => {
         "--env",
         "preview",
         "--name",
-        "eve-destroy-fixture",],
+        "eve-destroy-fixture",
+        "--json",],
         {
           cwd: root,
           stdout: (line) => output.push(line),
@@ -1430,5 +1717,68 @@ describe("eden destroy", () => {
         ),
       ),
     ).resolves.toBeDefined();
+  });
+
+  test("prints a human destroy summary by default", async () => {
+    const { root } = await createDeployedFixture();
+    const output: string[] = [];
+    let exists = true;
+    let containerId: string | undefined = "container-123";
+    let imagePresent = true;
+    await expect(
+      runEdenCli(
+        ["destroy",
+        "--project",
+        root,
+        "--env",
+        "preview",
+        "--name",
+        "eve-destroy-fixture",],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            destroyCloudflareRead: async () => ({
+              workerExists: exists,
+              ...(containerId === undefined
+                ? {}
+                : { containerApplicationId: containerId }),
+              registryImagesPresent: imagePresent
+                ? [destroyRegistryImage]
+                : [],
+              accountId: "account-test",
+            }),
+            deleteWorker: async () => {
+              exists = false;
+              return "deleted";
+            },
+            deleteContainer: async () => {
+              containerId = undefined;
+              return "deleted";
+            },
+            deleteRegistryImage: async () => {
+              imagePresent = false;
+              return "deleted";
+            },
+          },
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const text = output.join("\n");
+    expect(output[0]).toBe(
+      "eden destroy — eve-destroy-fixture (preview)",
+    );
+    expect(text).toContain("... deleting Worker eve-destroy-fixture");
+    expect(text).toContain("✓ VAL-LIFE-006-WORKER");
+    expect(text).toContain("✓ VAL-LIFE-006-CONTAINER");
+    expect(text).toContain("✓ VAL-LIFE-006-REGISTRY");
+    expect(output.filter((line) => line.startsWith("✓ VAL-LIFE-006 "))).toHaveLength(1);
+    expect(text).toContain(
+      "✓ destroyed eve-destroy-fixture (preview)",
+    );
+    expect(text).toContain("retained: local deployment records");
+    expect(text).not.toContain('"status"');
+    expect(() => JSON.parse(text)).toThrow();
   });
 });

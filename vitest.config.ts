@@ -35,17 +35,14 @@ export default defineConfig({
           include: [
             "test/**/*.test.mjs",
             "packages/**/test/**/*.test.ts",
-            "examples/**/test/**/*.test.ts",
           ],
           exclude: [
-            "packages/runtime-cloudflare/test/**",
             "**/node_modules/**",
           ],
           maxWorkers: 1,
           minWorkers: 1,
         },
       },
-      "./packages/runtime-cloudflare/vitest.config.ts",
     ],
   },
 });

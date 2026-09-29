@@ -10,6 +10,7 @@ export default tseslint.config(
       "**/.wrangler/**",
       "**/.eden/**",
       "**/*.d.ts",
+      "video/**",
     ],
   },
   {

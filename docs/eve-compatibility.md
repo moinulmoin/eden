@@ -5,15 +5,33 @@ project rather than an Eden mock or Eve's private repository test harness.
 
 The standalone fixture under `validation/eve-compat/minimal/` currently pins:
 
-- Eve `0.47.3`
-- AI SDK `7.0.58`
-- Zod `4.4.3`
+- Eve `0.66.3`
+- AI SDK `7.0.105` (Eve 0.66.3 requires `ai: ^7.0.105`)
+- Zod `4.5.4`
+- just-bash `3.4.2` (Eve 0.66.3's optional `just-bash: ^3.1.0` peer)
 - pnpm `11.21.0`
 - Node 24 or newer
 
 Update the fixture, its lockfile, and this document together when advancing the
 tested Eve line. Do not replace the exact Eve pin with `latest` in a release
 gate.
+
+The fixture carries its own `pnpm-workspace.yaml`. When the tested Eve release
+is younger than pnpm's `minimumReleaseAge` window, the fixture names that exact
+pin in `minimumReleaseAgeExclude` there; the runner deliberately does not use
+`--ignore-workspace`, so the exception also applies inside Eden's generated
+image, which copies `pnpm-workspace.yaml` before both frozen installs.
+
+Eve's default `eve init` scaffold selects the `just-bash` sandbox provider but
+does not declare it: a fresh scaffold must add `just-bash` as a production
+dependency (the fixture pins `3.4.2`, the release Eve 0.66.3's `^3.1.0`
+optional peer resolves) or `eve build` inside Eden's isolated builder —
+which has no Docker daemon or `/dev/kvm` — fails with
+`Cannot find package 'just-bash'`. The fixture's `pnpm-workspace.yaml` also
+lists `@mongodb-js/zstd` and `node-liblzma` under
+`ignoredOptionalDependencies` so the frozen installs skip just-bash's optional
+native archives. This is a scaffold-side project dependency, not an
+Eden workaround.
 
 The synthetic compatibility turn uses this ordered AI Gateway model chain:
 
@@ -42,7 +60,8 @@ The repository-owned runner:
 3. runs the fixture's real `eve build`;
 4. starts the real production server with `eve start` on an owned local port;
 5. requires the documented `/eve/v1/health` ready response;
-6. requires `/eve/v1/info` to reject missing auth and accept the fixture bearer;
+6. requires `/eve/v1/info` to reject missing auth and accept the fixture bearer
+   against the agent-info `version: 5` contract;
 7. terminates the complete owned process tree and verifies cleanup.
 
 When `AI_GATEWAY_API_KEY` is present, the same runner also invokes Eve's public
@@ -80,8 +99,12 @@ eden preflight \
 Require all of the following evidence:
 
 - immutable fixture snapshot and exact frozen pnpm install;
+- the project `pnpm-workspace.yaml` (when present) applied inside the image for
+  both frozen installs, so local pnpm policy behaves the same in the build;
 - project-local Eve executable and `eve build` output;
-- Linux/amd64 runtime image;
+- Linux/amd64 runtime image carrying the authored project source (the
+  `package.json` manifest plus `agent/`/`agents/`/flat layouts) so `eve start`
+  resolves the project context;
 - the real `eve start --host 0.0.0.0 --port 8080` process;
 - ready health from the booted image;
 - exact boot-container and disposable-image cleanup;
@@ -114,7 +137,7 @@ the remote eval:
 curl --fail --silent "$DEPLOY_URL/eve/v1/health"
 
 EVE_EVAL_AUTH_TOKEN="$EVE_COMPAT_AUTH_TOKEN" \
-  pnpm --dir "$FIXTURE" --ignore-workspace exec eve eval \
+  pnpm --dir "$FIXTURE" exec eve eval \
     --strict --url "$DEPLOY_URL"
 ```
 

@@ -19,33 +19,29 @@ import {
 } from "./owned-process.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const { version: releaseVersion } = JSON.parse(
+  await readFile(join(repositoryRoot, "package.json"), "utf8"),
+);
 const workspacePackageDirectories = [
-  "packages/definitions",
-  "packages/compiler",
   "packages/runtime-cloudflare",
-  "packages/client",
   "packages/cli",
-  "examples/basic-agent",
 ];
-// Six package-local processes run serially. Repeated cold runs measured
-// 225.9s for this assertion and 96.0s for the separate compiler-filter
-// assertion. A 300s budget leaves at least a 74.1s margin for the slower
-// assertion while staying scoped to this portability regression instead of
-// masking unrelated hangs globally.
+// Two package-local processes run serially. A 300s budget leaves a wide margin
+// for the slower assertion while staying scoped to this portability regression
+// instead of masking unrelated hangs globally.
 const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS =
   Number.parseInt(
     process.env.EDEN_PACKAGE_TEST_SCRIPTS_TIMEOUT_MS ?? "",
     10,
   ) || 300_000;
-// The slowest observed compiler-filter child was 96.0s; retain a measured 54s
-// cushion for cold starts and serial load while still bounding one hung child
-// well inside the enclosing 300s assertion.
+// Retain a measured cushion for cold starts and serial load while still
+// bounding one hung child well inside the enclosing 300s assertion.
 const PACKAGE_TEST_PROCESS_TIMEOUT_MS =
   Number.parseInt(process.env.EDEN_PACKAGE_TEST_TIMEOUT_MS ?? "", 10) ||
   150_000;
-// Keep compiler output bounded while leaving a measured margin over the
-// harness default for six serial package logs. This is intentionally finite;
-// a noisy or stuck compiler must produce an explicit harness failure.
+// Keep child output bounded while leaving a measured margin over the harness
+// default for serial package logs. This is intentionally finite; a noisy or
+// stuck child must produce an explicit harness failure.
 const PACKAGE_TEST_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
 
 function resolveExecutable(name) {
@@ -196,30 +192,13 @@ function expectSuccessfulPackageChild(result, label) {
 
 const distributionPackages = [
   {
-    directory: "packages/definitions",
-    name: "@moinulmoin/eden-definitions",
-    requiredDistFiles: ["dist/index.js", "dist/index.d.ts"],
-  },
-  {
-    directory: "packages/compiler",
-    name: "@moinulmoin/eden-compiler",
-    requiredDistFiles: ["dist/index.js", "dist/index.d.ts"],
-    dependencies: {
-      "@moinulmoin/eden-definitions": "0.1.5",
-    },
-  },
-  {
     directory: "packages/runtime-cloudflare",
     name: "@moinulmoin/eden-runtime-cloudflare",
     requiredDistFiles: [
       "dist/index.js",
       "dist/index.d.ts",
-      "dist/test-worker.js",
       "dist/eden-eve-host-worker.mjs",
     ],
-    dependencies: {
-      "@moinulmoin/eden-definitions": "0.1.5",
-    },
   },
   {
     directory: "packages/cli",
@@ -227,8 +206,7 @@ const distributionPackages = [
     requiredDistFiles: ["dist/index.js", "dist/index.d.ts"],
     requiredRootFiles: ["README.md"],
     dependencies: {
-      "@moinulmoin/eden-compiler": "0.1.5",
-      "@moinulmoin/eden-runtime-cloudflare": "0.1.5",
+      "@moinulmoin/eden-runtime-cloudflare": releaseVersion,
     },
     bin: {
       eden: "./dist/index.js",
@@ -363,14 +341,14 @@ test.sequential(
 );
 
 test.sequential(
-  "the compiler test script works through a workspace filter",
+  "the runtime test script works through a workspace filter",
   async () => {
     const result = await runPnpm(
-      ["--filter", "@moinulmoin/eden-compiler", "run", "test"],
+      ["--filter", "@moinulmoin/eden-runtime-cloudflare", "run", "test"],
       repositoryRoot,
       { timeoutMs: PACKAGE_TEST_PROCESS_TIMEOUT_MS },
     );
-    expectSuccessfulPackageChild(result, "@moinulmoin/eden-compiler filter");
+    expectSuccessfulPackageChild(result, "@moinulmoin/eden-runtime-cloudflare filter");
   },
   PACKAGE_TEST_SCRIPTS_TIMEOUT_MS,
 );
@@ -545,7 +523,7 @@ test.sequential(
           await tarMember(tarball, "package/package.json", cleanRoom, label),
         );
         expect(packageJson.name).toBe(packageSpec.name);
-        expect(packageJson.version).toBe("0.1.5");
+        expect(packageJson.version).toBe(releaseVersion);
         expect(packageJson.private ?? false).toBe(false);
         expect(packageJson.license).toBe("Apache-2.0");
         expect(packageJson.bin).toEqual(packageSpec.bin);
@@ -617,23 +595,6 @@ test.sequential(
         "pnpm installed eden help",
       );
       expect(pnpmHelp.stdout).toContain("Usage: eden <command>");
-      const pnpmAgent = join(pnpmConsumer, "agent-project");
-      await mkdir(pnpmAgent);
-      const pnpmInit = await runInstalledEden(
-        pnpmConsumer,
-        ["agent", "init", "--project", pnpmAgent],
-        "pnpm installed eden agent init",
-        { nodeOwned: true },
-      );
-      expect(pnpmInit.stdout).toContain("Initialized Eden project");
-      const pnpmBuild = await runInstalledEden(
-        pnpmConsumer,
-        ["agent", "build", "--project", pnpmAgent],
-        "pnpm installed eden agent build",
-        { nodeOwned: true },
-      );
-      expect(pnpmBuild.code).toBe(0);
-      expect(await readdir(join(pnpmAgent, ".eden"))).toContain("CURRENT");
 
       expect(bunEntrypoint, "Bun is required for the installer proof").toBeDefined();
       const bunConsumer = await mkdtemp(join(cleanRoom, "bun-consumer-"));

@@ -165,15 +165,15 @@ describe("Eve runtime configuration", () => {
     });
   });
 
-  test("keeps ambient Agent/control-plane credentials out of explicit runtime startup", async () => {
+  test("keeps ambient control-plane credentials out of explicit runtime startup", async () => {
     const root = await createRoot();
     const marker = "explicit-runtime-marker-9f7c";
     const envPath = await writeEnv(
       root,
-      `EDEN_BEARER_SECRET=${marker}\nPROJECT_AUTH=${marker}-auth\n`,
+      `EDEN_CONTROL_PLANE_TOKEN=${marker}\nPROJECT_AUTH=${marker}-auth\n`,
     );
-    const previous = process.env.EDEN_BEARER_SECRET;
-    process.env.EDEN_BEARER_SECRET = "ambient-control-plane-marker";
+    const previous = process.env.EDEN_CONTROL_PLANE_TOKEN;
+    process.env.EDEN_CONTROL_PLANE_TOKEN = "ambient-control-plane-marker";
     try {
       const config = await parseEveRuntimeConfig(envPath);
       const injection = await prepareEveRuntimeInjection(config, {
@@ -196,15 +196,15 @@ describe("Eve runtime configuration", () => {
         },
       });
       expect(requestEnv).toMatchObject({
-        EDEN_BEARER_SECRET: marker,
+        EDEN_CONTROL_PLANE_TOKEN: marker,
         PROJECT_AUTH: `${marker}-auth`,
       });
       expect(requestEnv).not.toHaveProperty("ambient-control-plane-marker");
       expect(requestEnv).not.toHaveProperty("PATH");
       config.dispose();
     } finally {
-      if (previous === undefined) delete process.env.EDEN_BEARER_SECRET;
-      else process.env.EDEN_BEARER_SECRET = previous;
+      if (previous === undefined) delete process.env.EDEN_CONTROL_PLANE_TOKEN;
+      else process.env.EDEN_CONTROL_PLANE_TOKEN = previous;
     }
   });
 

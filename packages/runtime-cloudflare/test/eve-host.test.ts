@@ -43,6 +43,7 @@ describe("generic Eve Cloudflare host", () => {
         class_name: IDENTITY.containerClassName,
         image: config.worker.containers?.[0]?.image,
         image_build_context: "./container",
+        instance_type: "basic",
         max_instances: 1,
       },
     ]);

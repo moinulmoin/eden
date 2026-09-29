@@ -76,33 +76,20 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   const readme = await readRepositoryFile("README.md");
   const packageReadme = await readRepositoryFile("packages/cli/README.md");
   const deployDoc = await readRepositoryFile("docs/deploy.md");
-  const agentCliDoc = await readRepositoryFile("docs/agent-cli.md");
   const validationDoc = await readRepositoryFile("docs/validation.md");
   const workflow = await readRepositoryFile(".github/workflows/ci.yml");
-
-  const commandHeadings = [
-    ...agentCliDoc.matchAll(/^## `eden agent ([a-z]+)`$/gmu),
-  ].map((match) => match[1]);
-
-  expect(new Set(commandHeadings)).toEqual(
-    new Set(["init", "dev", "build", "deploy"]),
-  );
-  expect(commandHeadings).toHaveLength(4);
+  const { version } = JSON.parse(await readRepositoryFile("package.json"));
   for (const document of [readme, packageReadme]) {
-    expect(document).toContain("npm install --global @moinulmoin/eden@0.1.5");
-    expect(document).toContain("pnpm add --global @moinulmoin/eden@0.1.5");
-    expect(document).toContain("bun add --global @moinulmoin/eden@0.1.5");
+    expect(document).toContain(`npm install --global @moinulmoin/eden@${version}`);
+    expect(document).toContain(`pnpm add --global @moinulmoin/eden@${version}`);
+    expect(document).toContain(`bun add --global @moinulmoin/eden@${version}`);
     expect(document).toMatch(/Node `>=24\.17\.0`/u);
     expect(document).toContain("Docker or OrbStack");
     expect(document).toContain("npx wrangler@4.120.0 login");
     expect(document).toContain("eden deploy");
     expect(document).toContain("eden destroy");
-    expect(document).toContain("mkdir my-agent");
-    expect(document).toContain("eden agent init");
-    expect(document).toContain("pnpm install");
-    expect(document).toContain("corepack enable");
-    expect(document).toContain("runs its project-local Eve executable");
-    expect(document).toContain("wrangler delete my-agent-preview");
+    expect(document).toMatch(/pnpm (?:add --global|install)/);
+    expect(document).toMatch(/runs its project-local Eve\s+executable/);
     expect(document).not.toContain("openssl");
   }
   expect(readme).toContain("pnpm install --frozen-lockfile");
@@ -110,34 +97,20 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   expect(readme).toContain("Users install only `@moinulmoin/eden`;");
   expect(readme).toMatch(/Bun is supported as an installer only/i);
   expect(readme).toMatch(/Node `>=24\.17\.0` remains\s+the Eden runtime/i);
-  expect(agentCliDoc).toMatch(/AI Gateway[\s\S]*`default`/i);
-  expect(agentCliDoc).toContain("https://developers.cloudflare.com/ai-gateway/get-started/");
-  expect(validationDoc).toMatch(/AI Gateway[\s\S]*`default`/i);
-  expect(validationDoc).toContain("https://developers.cloudflare.com/ai-gateway/get-started/");
-  for (const document of [readme, agentCliDoc, validationDoc]) {
-    expect(document).not.toMatch(/eden-dev[\s\S]*AI Gateway/i);
-  }
   expect(workflow).toContain("permissions:\n  contents: read");
   expect(workflow).toContain("actions/checkout@11d5960a326750d5838078e36cf38b85af677262");
   expect(workflow).toContain("actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020");
   expect(workflow).toContain("oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6");
   expect(workflow).toContain("bun-version: 1.4.0");
   expect(readme).toMatch(/without (?:Turbo|Turborepo)/i);
-  expect(readme).toMatch(/127\.0\.0\.1:8797/);
-  expect(readme).toMatch(/127\.0\.0\.1:9297/);
-  expect(readme).toContain("EDEN_BEARER_SECRET");
   expect(deployDoc).toMatch(/Eve project/i);
   expect(deployDoc).toMatch(/--env-file/i);
-  expect(agentCliDoc).toMatch(/Durable Object/i);
-  expect(agentCliDoc).toMatch(/workerd/i);
-  expect(agentCliDoc).toMatch(/node:vm/i);
-  expect(validationDoc).toMatch(/cursor|startIndex/i);
-  expect(validationDoc).toMatch(/local validation/i);
+  expect(validationDoc).toMatch(/compat:eve:local/i);
   expect(validationDoc).toMatch(/deployed validation/i);
   expect(validationDoc).toMatch(/cleanup/i);
   expect(validationDoc).toMatch(/provisional limits/i);
-  expect(validationDoc).toMatch(/out of scope/i);
-  for (const document of [readme, deployDoc, agentCliDoc, validationDoc]) {
+  for (const document of [readme, packageReadme, deployDoc, validationDoc]) {
+    expect(document).not.toMatch(/eden agent\b/i);
     expect(document).not.toMatch(
       /eden (?:run|start|stop|shell|schedule|workflow)\b/i,
     );
@@ -155,7 +128,7 @@ test("exposes the Deploy-first root help and rejects unsupported commands", asyn
     }),
   ).resolves.toBe(0);
 
-  expect(help.join("\n")).toMatch(/preflight[\s\S]*deploy[\s\S]*destroy[\s\S]*agent/);
+  expect(help.join("\n")).toMatch(/preflight[\s\S]*deploy[\s\S]*destroy/);
   expect(help.join("\n")).not.toMatch(
     /^\s+(?:run|start|stop|shell|schedule)\s{2,}/imu,
   );
@@ -167,10 +140,10 @@ test("exposes the Deploy-first root help and rejects unsupported commands", asyn
       stderr: (line) => errors.push(line),
     }),
   ).resolves.toBe(1);
-  expect(errors.join("\n")).toMatch(/unknown|preflight|deploy|destroy|agent/i);
+  expect(errors.join("\n")).toMatch(/unknown|preflight|deploy|destroy/i);
 });
 
-test("ships Apache licensing, Eve attribution, and modified-derivative markers", async () => {
+test("ships Apache licensing and Cloudflare bundling attribution", async () => {
   await expect(access(join(repositoryRoot, "LICENSE"))).resolves.toBeUndefined();
   await expect(access(join(repositoryRoot, "NOTICE"))).resolves.toBeUndefined();
 
@@ -181,48 +154,15 @@ test("ships Apache licensing, Eve attribution, and modified-derivative markers",
   expect(license).toContain("END OF TERMS AND CONDITIONS");
 
   const notice = await readRepositoryFile("NOTICE");
-  expect(notice).toMatch(/Eve/i);
-  expect(notice).toContain("0b102bc90e7cf2c3e294f6ca3af86c307d449b1a");
+  expect(notice).toMatch(/@cloudflare\/containers/i);
   expect(notice).toMatch(/Apache-2\.0/i);
-  expect(notice).toMatch(/modified derivative/i);
-
-  const markedFiles = [
-    "packages/definitions/src/index.ts",
-    "packages/compiler/src/index.ts",
-    "packages/client/src/protocol.ts",
-    "packages/runtime-cloudflare/src/session-journal.ts",
-    "packages/runtime-cloudflare/src/model-normalizers.ts",
-  ];
-  for (const relativePath of markedFiles) {
-    const source = await readRepositoryFile(relativePath);
-    expect(source).toMatch(/Modified derivative of portable Eve concepts/i);
-    expect(source).toContain("0b102bc90e7cf2c3e294f6ca3af86c307d449b1a");
-  }
 });
 
 test("retains the exact release NOTICE", async () => {
   const notice = await readRepositoryFile("NOTICE");
   const expectedNotice = [
-    "eve",
-    "Copyright 2026 Vercel, Inc. and contributors",
-    "",
-    "This product includes software developed at Vercel, Inc.",
-    "(https://vercel.com/).",
-    "",
     "Eden",
     "Copyright 2026 Eden contributors",
-    "",
-    "This repository contains Eden-owned modified derivative implementations",
-    "informed by portable concepts from the Eve framework:",
-    "",
-    "  Eve, version 0.31.3",
-    "  https://github.com/vercel/eve",
-    "  reference commit: 0b102bc90e7cf2c3e294f6ca3af86c307d449b1a",
-    "",
-    "Eve is distributed under the Apache License, Version 2.0. The applicable",
-    "Apache-2.0 terms are included in LICENSE. This notice is retained for the",
-    "Eve attribution obligation; it does not grant ownership of Eden's original",
-    "implementation.",
     "",
     "Cloudflare Containers",
     "  @cloudflare/containers, version 0.3.7",
@@ -232,19 +172,6 @@ test("retains the exact release NOTICE", async () => {
     "`@cloudflare/containers`, distributed under MIT OR Apache-2.0. Eden",
     "redistributes that bundled software under the Apache-2.0 option included in",
     "LICENSE.",
-    "",
-    "The following Eden source files are marked in-file as modified derivatives of",
-    "portable Eve concepts:",
-    "",
-    "  packages/definitions/src/index.ts",
-    "  packages/compiler/src/index.ts",
-    "  packages/client/src/protocol.ts",
-    "  packages/runtime-cloudflare/src/session-journal.ts",
-    "  packages/runtime-cloudflare/src/model-normalizers.ts",
-    "",
-    "Eden does not include unmodified Eve source. The listed files are Eden-owned",
-    "modifications and must retain their in-file modified-derivative notices when",
-    "redistributed.",
   ].join("\n") + "\n";
 
   expect(notice).toBe(expectedNotice);
@@ -253,13 +180,13 @@ test("retains the exact release NOTICE", async () => {
 test(
   "targets every documented mutating Wrangler command explicitly",
   async () => {
-    const [readme, agentCliDoc, validationDoc] = await Promise.all([
+    const [readme, deployDoc, validationDoc] = await Promise.all([
       readRepositoryFile("README.md"),
-      readRepositoryFile("docs/agent-cli.md"),
+      readRepositoryFile("docs/deploy.md"),
       readRepositoryFile("docs/validation.md"),
     ]);
     const commands = extractDocumentedWranglerCommands(
-      `${readme}\n${agentCliDoc}\n${validationDoc}`,
+      `${readme}\n${deployDoc}\n${validationDoc}`,
     );
 
     const helpByCommand = new Map();

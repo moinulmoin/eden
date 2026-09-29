@@ -16,14 +16,6 @@ const dependencySections = [
 ];
 const releasePackages = [
   {
-    name: "@moinulmoin/eden-definitions",
-    directory: "packages/definitions",
-  },
-  {
-    name: "@moinulmoin/eden-compiler",
-    directory: "packages/compiler",
-  },
-  {
     name: "@moinulmoin/eden-runtime-cloudflare",
     directory: "packages/runtime-cloudflare",
   },

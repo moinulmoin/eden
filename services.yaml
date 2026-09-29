@@ -1,35 +1,9 @@
 commands:
   install: pnpm install --frozen-lockfile
-  test: pnpm run test && pnpm run conformance:local
+  test: pnpm run test
   build: pnpm run build
   typecheck: pnpm run typecheck
   lint: pnpm run lint
   cli_test: pnpm --filter @moinulmoin/eden run test
   cli_build: pnpm --filter @moinulmoin/eden run build
   runtime_test: pnpm --filter @moinulmoin/eden-runtime-cloudflare run test
-  compiler_test: pnpm --filter @moinulmoin/eden-compiler run test
-
-services:
-  eden-local:
-    port: 8797
-    depends_on: []
-    start: >-
-      test -n "${EDEN_BEARER_SECRET:?EDEN_BEARER_SECRET is required}" &&
-      pnpm run build &&
-      EDEN_HOST=127.0.0.1 EDEN_PORT=8797 EDEN_INSPECTOR_PORT=9297
-      node packages/cli/dist/index.js agent dev
-      --project examples/basic-agent
-    stop: >-
-      env -u EDEN_BEARER_SECRET
-      EDEN_HOST=127.0.0.1 EDEN_PORT=8797 EDEN_INSPECTOR_PORT=9297
-      node --input-type=module -e
-      'import("./packages/cli/dist/index.js").then(({ stopEdenDev }) =>
-      stopEdenDev({ cwd: process.cwd(), projectRoot: "examples/basic-agent" }))
-      .then((code) => { process.exitCode = code; })
-      .catch((error) => { console.error(error); process.exitCode = 1; })'
-    healthcheck: >-
-      test -n "${EDEN_BEARER_SECRET:?EDEN_BEARER_SECRET is required}" &&
-      printf 'header = "Authorization: Bearer %s"\n' "$EDEN_BEARER_SECRET" |
-      curl --config - --fail --silent --show-error
-      http://127.0.0.1:8797/eden/v1/health >/dev/null &&
-      nc -z 127.0.0.1 9297

@@ -1,7 +1,7 @@
 {
   "name": "@moinulmoin/eden-runtime-cloudflare",
-  "version": "0.1.5",
-  "description": "Cloudflare runtime for Eden Deploy and Eden Agent.",
+  "version": "0.2.0",
+  "description": "Cloudflare Worker/Container host runtime for Eden's Eve deployments.",
   "type": "module",
   "license": "Apache-2.0",
   "types": "./dist/index.d.ts",
@@ -19,12 +19,8 @@
     "LICENSE",
     "NOTICE"
   ],
-  "dependencies": {
-    "@moinulmoin/eden-definitions": "0.1.5"
-  },
   "devDependencies": {
     "@cloudflare/containers": "0.3.7",
-    "@cloudflare/vitest-pool-workers": "0.20.3",
     "@cloudflare/workers-types": "5.20260810.1"
   },
   "scripts": {

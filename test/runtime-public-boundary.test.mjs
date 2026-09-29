@@ -11,7 +11,6 @@ const execFileAsync = promisify(execFile);
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeRoot = join(repositoryRoot, "packages/runtime-cloudflare");
 const runtimeDist = join(runtimeRoot, "dist");
-const definitionsRoot = join(repositoryRoot, "packages/definitions");
 const temporaryRoots = [];
 
 async function createConsumerProject() {
@@ -22,73 +21,43 @@ async function createConsumerProject() {
     root,
     "node_modules/@moinulmoin/eden-runtime-cloudflare",
   );
-  const definitionsPackageRoot = join(
-    root,
-    "node_modules/@moinulmoin/eden-definitions",
-  );
   await mkdir(runtimePackageRoot, { recursive: true });
-  await mkdir(definitionsPackageRoot, { recursive: true });
   await cp(runtimeDist, join(runtimePackageRoot, "dist"), { recursive: true });
   await cp(join(runtimeRoot, "package.json"), join(runtimePackageRoot, "package.json"));
-  await cp(join(definitionsRoot, "dist"), join(definitionsPackageRoot, "dist"), {
-    recursive: true,
-  });
-  await cp(
-    join(definitionsRoot, "package.json"),
-    join(definitionsPackageRoot, "package.json"),
-  );
 
   await writeFile(
     join(root, "consumer.ts"),
     `import {
-  createRuntime,
-  type EdenEvent,
-  type EdenEventType,
-  type EdenModelResult,
-  type EdenRuntime,
+  createEveHostConfig,
+  generateEveHostWorkerSource,
+  resolveStableWorkersDevOrigin,
+  type EveHostConfig,
+  type EveReadinessGate,
 } from "@moinulmoin/eden-runtime-cloudflare";
 
-const runtime: EdenRuntime = createRuntime(
-  {
-    versions: {
-      runtime: "runtime",
-      agentBundle: "bundle",
-      manifest: "manifest",
-      protocol: "protocol",
-      schema: 1,
-    },
-  },
-  {
-    async createSession() {
-      return {
-        sessionId: "ses_public",
-        status: "new",
-        versions: {
-          runtime: "runtime",
-          agentBundle: "bundle",
-          manifest: "manifest",
-          protocol: "protocol",
-          schema: 1,
-        },
-        sqliteSchemaVersion: 3,
-      };
-    },
-    async readEvents() {
-      return [] as readonly EdenEvent<EdenEventType>[];
-    },
-  },
-);
+const origin: string = resolveStableWorkersDevOrigin({
+  workerName: "eden-eve-preview",
+  workersDevSubdomain: "account",
+});
 
-const result: EdenModelResult = {
-  text: "ok",
-  calls: [],
-  results: [],
-  finishReason: "stop",
-  correlation: { requestId: "req_public" },
-};
+const config: EveHostConfig = createEveHostConfig({
+  workerName: "eden-eve-preview",
+  containerApplicationName: "eden-eve-preview-container",
+  containerClassName: "EveHostContainer",
+  containerBindingName: "EVE_CONTAINER",
+  stableContainerInstanceName: "eden-eve-preview-instance",
+  deploymentId: "dep-public",
+  generationId: "gen-public",
+  stableWorkersDevOrigin: origin,
+  containerImage:
+    "registry.example/eve@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+});
 
-void runtime;
-void result;
+const source: string = generateEveHostWorkerSource({ config });
+const gate: EveReadinessGate | undefined = undefined;
+
+void source;
+void gate;
 `,
     "utf8",
   );
@@ -131,31 +100,22 @@ test("public declarations do not re-export internal Worker implementation module
     await readFile(join(runtimeRoot, "package.json"), "utf8"),
   );
   const rootDeclaration = await readFile(join(runtimeDist, "index.d.ts"), "utf8");
-  const schemaDeclaration = await readFile(
-    join(runtimeDist, "session-schema.d.ts"),
+  const hostRuntimeDeclaration = await readFile(
+    join(runtimeDist, "eve-host-runtime.d.ts"),
     "utf8",
   );
 
   expect(Object.keys(packageJson.exports)).toEqual(["."]);
   expect(rootDeclaration).not.toMatch(
-    /session-(?:schema|journal|checkpoint|jobs|state)|turn-runner|tool-harness|session\.js|http-host/,
+    /eve-host-runtime|@cloudflare\/containers|cloudflare:workers|DurableObject/,
   );
-  expect(rootDeclaration).not.toMatch(
-    /\bEdenSession\b|EdenWorkerEnvironment|DurableObject/,
+  expect(hostRuntimeDeclaration).not.toMatch(
+    /from ["'](?:@cloudflare\/workers-types|cloudflare:workers)["']/u,
   );
-  expect(schemaDeclaration).not.toMatch(
-    /@cloudflare\/workers-types|SqlStorage|DurableObject/,
-  );
-  expect(schemaDeclaration).toMatch(/interface SessionSchemaSql/);
+  expect(hostRuntimeDeclaration).not.toMatch(/SqlStorage|\bDurableObject\b/u);
 
   const require = createRequire(import.meta.url);
-  for (const subpath of [
-    "session",
-    "http-host",
-    "test-worker",
-    "session-schema",
-    "session-journal",
-  ]) {
+  for (const subpath of ["eve-host-runtime", "eve-host"]) {
     expect(() =>
       require.resolve(`@moinulmoin/eden-runtime-cloudflare/${subpath}`),
     ).toThrow(

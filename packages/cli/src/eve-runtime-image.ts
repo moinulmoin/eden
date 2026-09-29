@@ -29,6 +29,7 @@ import {
 
 import {
   EvePackagingError,
+  eveSnapshotSourceEntries,
   type EveNodeImage,
   type EvePackagingCheck,
   type EvePackagingCode,
@@ -596,7 +597,6 @@ async function captureRuntimeTree(
     }
   };
   await visit(canonicalRoot);
-  files.sort((left, right) => left.path.localeCompare(right.path));
   nativeModules.sort((left, right) => left.path.localeCompare(right.path));
   return {
     files,
@@ -899,15 +899,14 @@ async function writeRuntimeContext(
       join(runtimeContextPath, "node_modules"),
       { recursive: true },
     );
-    await cp(
-      join(candidate.snapshotRoot, "agent"),
-      join(runtimeContextPath, "agent"),
-      { recursive: true },
-    );
-    await cp(
-      join(candidate.snapshotRoot, "package.json"),
-      join(runtimeContextPath, "package.json"),
-    );
+    const sourceEntries = await eveSnapshotSourceEntries(candidate.snapshotRoot);
+    for (const entry of sourceEntries) {
+      await cp(
+        join(candidate.snapshotRoot, entry),
+        join(runtimeContextPath, entry),
+        { recursive: true },
+      );
+    }
     await rewriteContextLinks(
       join(candidate.snapshotRoot, "node_modules"),
       join(runtimeContextPath, "node_modules"),
@@ -937,13 +936,17 @@ async function writeRuntimeContext(
         "Discard the mixed-generation runtime context and rebuild from a quiescent candidate.",
       );
     }
+    const sourceCopyLines = sourceEntries
+      .map((entry) =>
+        `COPY --from=candidate ${JSON.stringify([`/candidate/${entry}`, `/workspace/${entry}`])}`
+      )
+      .join("\n");
     const dockerfile = `# syntax=docker/dockerfile:1
 FROM --platform=linux/amd64 ${imageReference(nodeImage)} AS candidate
-WORKDIR /workspace
-COPY .output /workspace/.output
-COPY node_modules /workspace/node_modules
-COPY agent /workspace/agent
-COPY package.json /workspace/package.json
+WORKDIR /candidate
+COPY .output /candidate/.output
+COPY node_modules /candidate/node_modules
+${sourceEntries.map((entry) => `COPY ${JSON.stringify([entry, `/candidate/${entry}`])}`).join("\n")}
 
 FROM --platform=linux/amd64 ${imageReference(nodeImage)} AS runtime
 WORKDIR /workspace
@@ -952,10 +955,9 @@ ENV HOST=0.0.0.0 \\
     PORT=8080 \\
     NITRO_PORT=8080 \\
     NODE_ENV=production
-COPY --from=candidate /workspace/.output /workspace/.output
-COPY --from=candidate /workspace/node_modules /workspace/node_modules
-COPY --from=candidate /workspace/agent /workspace/agent
-COPY --from=candidate /workspace/package.json /workspace/package.json
+COPY --from=candidate /candidate/.output /workspace/.output
+COPY --from=candidate /candidate/node_modules /workspace/node_modules
+${sourceCopyLines}
 EXPOSE 8080
 ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "8080"]
 `;

@@ -1,9 +1,9 @@
 # Deploy an existing Eve project
 
 Eden Deploy takes an existing Eve project directory and runs the real Eve
-application on Cloudflare. It does not translate the project into an Eden Agent
-or replace Eve's providers, databases, Workflow World, authentication,
-schedules, channels, or sandbox.
+application on Cloudflare. It does not rewrite the project or replace Eve's
+providers, databases, Workflow World, authentication, schedules, channels, or
+sandbox.
 
 Start with [installation and account setup](./install.md).
 
@@ -11,8 +11,8 @@ Start with [installation and account setup](./install.md).
 
 Eden runs the project's own `eve build`, starts the official project-local
 `eve start --host 0.0.0.0 --port 8080` supervisor inside one bounded Cloudflare
-Container (`max_instances: 1`), and routes the public surface through one
-generic Worker.
+Container (`instance_type: "basic"`, `max_instances: 1`), and routes the
+public surface through one generic Worker.
 
 Eden owns build orchestration, packaging, publication, deployment identity, and
 exact cleanup. Eve remains the application and workflow authority.
@@ -22,12 +22,18 @@ exact cleanup. Eve remains the application and workflow authority.
 Before deploying, confirm:
 
 - `eden --help` starts successfully.
-- `npx wrangler@4.120.0 whoami` shows the intended Cloudflare account.
+- `npx wrangler@4.120.0 whoami` shows the intended Cloudflare account on the
+  Workers Paid plan, which Containers requires.
 - Docker or OrbStack is running with Linux/amd64 support.
 - The selected Eve root contains `package.json` and `pnpm-lock.yaml`.
 - `package.json` has an exact `packageManager: "pnpm@..."` value.
 - The matching dependencies are installed and `node_modules/.bin/eve` resolves
   to the project-local Eve package.
+- The project declares `just-bash` as a production dependency (Eve `^3.1.0`;
+  for example `just-bash: "3.4.2"`). Eve's default sandbox falls back to
+  `just-bash` inside Eden's isolated builder, which has no Docker daemon or
+  `/dev/kvm`; without the declaration `eve build` fails with
+  `Cannot find package 'just-bash'`.
 - Every provider, credential, database, external API, and Workflow World
   required by the Eve project is reachable from Cloudflare.
 
@@ -46,8 +52,11 @@ native Windows are not supported.
 
 ## First successful preview deployment
 
-Use a unique lowercase Worker name for temporary validation and keep the same
-three selectors for deploy and destroy:
+With no flags, `eden deploy` and `eden preflight` use the current directory,
+the `preview` environment, and a target name derived deterministically from
+the project's `package.json` name. From the Eve project root, `eden deploy`
+is sufficient. For an explicit target, use a unique lowercase Worker name and
+keep the same selectors for deploy and destroy:
 
 ```sh
 PROJECT_ROOT="/absolute/path/to/my-eve-project"
@@ -116,9 +125,11 @@ eden deploy \
 
 Again, omit `--env-file` when it is not needed.
 
-A successful command prints the immutable generation identity and exact
-`workers.dev` URL. Eden promotes the generation only after the public
-`/eve/v1/health` route reports the expected ready identity.
+A successful command prints progress lines and a summary ending with the
+exact `workers.dev` URL on its own line. Eden promotes the generation only
+after the public `/eve/v1/health` route reports the expected ready identity.
+Pass `--json` to `preflight`, `deploy`, or `destroy` to print the
+machine-readable result object instead, for scripts and CI.
 
 Copy the printed URL:
 
@@ -149,6 +160,15 @@ identity, removes only that Worker and Container application, verifies bounded
 absence, and only then clears the target's `CURRENT` pointer. It never deletes
 by prefix or broad account search.
 
+Destroy also removes the managed-registry image tag
+(`eden-eve-<target>-<generation>:candidate` in `registry.cloudflare.com`) for
+every generation the ownership records prove this exact target pushed,
+including images retained by aborted pushes, then verifies each ref is gone.
+Any image left behind is reported in the destroy output with its exact
+`repository:tag` ref; remove only the listed refs with
+`npx wrangler@4.120.0 containers images delete <repository:tag>` and never
+filter by prefix.
+
 After a healthy deployment is promoted, `deploy` also verifies and removes its
 exact retained local Docker image and publication tags. The immutable
 generation label must match before Eden removes anything. An indeterminate
@@ -168,18 +188,22 @@ after the run:
 
 ```sh
 npx wrangler@4.120.0 containers list
+npx wrangler@4.120.0 containers images list
 ```
 
-Require zero new Worker or Container residue associated with `WORKER_NAME`.
-An unreachable URL alone is not sufficient cleanup evidence.
+Require zero new Worker, Container, or managed-registry image residue
+associated with `WORKER_NAME`. An unreachable URL alone is not sufficient
+cleanup evidence.
 
 Maintainers validating Eden against the current Eve release should also follow
 the [current Eve compatibility runbook](./eve-compatibility.md).
 
 ## Preview and production
 
-Every command requires explicit `--project`, `--env`, and `--name` selectors.
-`--env` accepts `preview` or `production`.
+`--project` defaults to the current directory and `--env` defaults to
+`preview`. `--env` accepts `preview` or `production`. `preflight` and
+`deploy` derive the target name from `package.json` when `--name` is omitted;
+`--env production` and `destroy` always require an explicit `--name`.
 
 Use preview first. Production is a separate explicit target for downstream
 users that intentionally operate preview and production deployments. A preview
@@ -194,11 +218,13 @@ provider or service silently.
 
 A preview deployment that boots Eve's local Workflow World proves health,
 startup, and fresh request handling only. Container-local disk and process
-memory are disposable: a Container restart reinitializes local World state.
+memory are wiped when the Container sleeps: a sleep or restart reinitializes
+local World state, and schedules do not fire while the Container sleeps.
 
 Production durability requires a project-configured, Cloudflare-reachable,
-durable Eve-compatible Workflow World. This release runs one logical Container
-instance and does not promise horizontal scaling or custom domains.
+durable Eve-compatible Workflow World such as Postgres (for example
+`@workflow/world-postgres`). This release runs one logical Container instance
+and does not promise horizontal scaling or custom domains.
 
 ## Common failures
 
@@ -210,14 +236,5 @@ instance and does not promise horizontal scaling or custom domains.
 | Cloudflare account or origin resolution fails | Run `npx wrangler@4.120.0 whoami` and confirm the intended account and workers.dev subdomain. |
 | Health never reaches ready | Inspect the Eve project's provider, Workflow World, and startup requirements; Eden does not replace them. |
 | Destroy refuses cleanup | Preserve the target records and inspect the reported ownership or identity mismatch. Never broaden deletion by prefix. |
-
-## Deploy, Adapt, and Agent
-
-- **Eden Deploy** hosts an existing Eve project as-is through `eden preflight`,
-  `eden deploy`, and `eden destroy`.
-- **Eden Adapt** is a separate future concern for deliberate per-primitive
-  migration of Vercel-specific pieces. Deploy never invokes it automatically.
-- **Eden Agent** is the separate authoring workflow documented in
-  [the Agent guide](./agent-cli.md).
 
 Return to the [documentation index](./README.md).

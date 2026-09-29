@@ -1,7 +1,7 @@
 # Install Eden
 
-This guide installs the public Eden CLI and prepares the local tools used by its
-two workflows.
+This guide installs the public Eden CLI and prepares the local tools used by
+Eden Deploy.
 
 ## Supported systems
 
@@ -25,27 +25,27 @@ upper Node major-version bound.
 
 ## Install the CLI
 
-Install only `@moinulmoin/eden`. npm resolves the compiler, definitions, and
-Cloudflare runtime companion packages automatically.
+Install only `@moinulmoin/eden`. npm resolves the Cloudflare runtime companion
+package automatically.
 
 Choose one installer.
 
 ### npm
 
 ```sh
-npm install --global @moinulmoin/eden@0.1.5
+npm install --global @moinulmoin/eden@0.2.0
 ```
 
 ### pnpm
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.1.5
+pnpm add --global @moinulmoin/eden@0.2.0
 ```
 
 ### Bun
 
 ```sh
-bun add --global @moinulmoin/eden@0.1.5
+bun add --global @moinulmoin/eden@0.2.0
 ```
 
 Bun is an installer only. Do not run Eden with `bunx --bun`.
@@ -56,12 +56,12 @@ Confirm the installed command:
 eden --help
 ```
 
-The help output must list `preflight`, `deploy`, `destroy`, and `agent`.
+The help output must list `preflight`, `deploy`, and `destroy`.
 
 ## Authenticate with Cloudflare
-
-Both remote workflows use Wrangler `4.120.0`. Authenticate the Cloudflare
-account that owns the target Workers:
+Deploying to Cloudflare uses Wrangler `4.120.0`. The account must be on the
+Workers Paid plan, which Cloudflare Containers requires. Authenticate the
+Cloudflare account that owns the target Workers:
 
 ```sh
 npx wrangler@4.120.0 login
@@ -76,7 +76,12 @@ npx wrangler@4.120.0 whoami
 Review the returned account before deploying. Eden never selects a different
 Cloudflare account silently.
 
-## Additional requirements for Eden Deploy
+On macOS, a stale `registry.cloudflare.com` keychain entry makes the managed
+registry login fail with `The specified item already exists in the keychain
+(-25299)`; remove it with
+`security delete-internet-password -s registry.cloudflare.com` and retry.
+
+## Additional requirements
 
 Deploying an existing Eve project also requires Docker or OrbStack with
 Linux/amd64 container support.
@@ -99,19 +104,7 @@ Eden does not add or replace those project-owned services.
 
 Continue with [Deploy an existing Eve project](./deploy.md).
 
-## Additional requirement for Eden Agent
 
-The generated Agent project pins pnpm `11.21.0`. Enable Corepack once before the
-first generated-project install:
-
-```sh
-corepack enable
-```
-
-After that one-time setup, use `pnpm` directly. Do not prefix every command with
-`corepack`.
-
-Continue with [Create and operate an Eden Agent](./agent-cli.md).
 
 ## Update Eden
 
@@ -162,8 +155,7 @@ bun remove --global @moinulmoin/eden
 ```
 
 Uninstalling the CLI does not delete Cloudflare resources. Remove an Eve
-deployment with `eden destroy` first. Remove a temporary Eden Agent Worker and
-its secret using the exact cleanup commands in [the Agent guide](./agent-cli.md).
+deployment with `eden destroy` first.
 
 ## Package-manager setup and PATH
 
@@ -181,6 +173,5 @@ problem; ownership of updates and uninstallation becomes ambiguous.
 
 ## Next step
 
-- Existing Eve project: [Deploy an existing Eve project](./deploy.md)
-- New Eden Agent: [Create and operate an Eden Agent](./agent-cli.md)
+- [Deploy an existing Eve project](./deploy.md)
 - All documentation: [Documentation index](./README.md)

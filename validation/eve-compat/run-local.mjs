@@ -55,7 +55,7 @@ async function availablePort() {
 async function run(args, label, timeoutMs = 600_000, env = childEnvironment) {
   const result = await runOwnedProcess({
     file: process.execPath,
-    args: [corepack, "pnpm", "--ignore-workspace", ...args],
+    args: [corepack, "pnpm", ...args],
     cwd: root,
     env,
     timeoutMs,
@@ -117,8 +117,8 @@ async function assertAuth(origin) {
   );
   const body = await authenticated.json();
   assert(
-    body !== null && typeof body === "object" && body.version === 4,
-    "Authenticated info did not return the Eve agent-info v4 contract.",
+    body !== null && typeof body === "object" && body.version === 5,
+    `Authenticated info did not return the Eve agent-info v5 contract: version=${body?.version}`,
   );
 }
 
@@ -137,7 +137,6 @@ const eve = spawnOwnedProcess({
   args: [
     corepack,
     "pnpm",
-    "--ignore-workspace",
     "exec",
     "eve",
     "start",
@@ -161,7 +160,7 @@ try {
   await assertAuth(origin);
 
   if (process.env.AI_GATEWAY_API_KEY === undefined) {
-    console.log("Eve 0.47.3 build, production boot, health, and bearer auth passed.");
+    console.log("Eve 0.66.3 build, production boot, health, and bearer auth passed.");
     console.log("Model/tool eval skipped: AI_GATEWAY_API_KEY is not set.");
   } else {
     await run(
@@ -173,7 +172,7 @@ try {
         EVE_EVAL_AUTH_TOKEN: authToken,
       },
     );
-    console.log("Eve 0.47.3 build, production boot, auth, and model/tool eval passed.");
+    console.log("Eve 0.66.3 build, production boot, auth, and model/tool eval passed.");
   }
 } catch (error) {
   failure = error;
