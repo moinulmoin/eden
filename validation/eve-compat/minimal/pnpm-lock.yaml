@@ -12,8 +12,8 @@ importers:
         specifier: 7.0.105
         version: 7.0.105(zod@4.5.4)
       eve:
-        specifier: 0.66.3
-        version: 0.66.3(ai@7.0.105(zod@4.5.4))(just-bash@3.4.2)
+        specifier: 0.68.0
+        version: 0.68.0(ai@7.0.105(zod@4.5.4))(just-bash@3.4.2)
       just-bash:
         specifier: 3.4.2
         version: 3.4.2
@@ -245,8 +245,8 @@ packages:
     resolution: {integrity: sha512-S8EFBKyznRwPVwayK187cYjvnpgC92xy+q0BIF++V965pfjMVVRbQ/HoTYGA/1EHmZ7E68k6Heq+4WnvVhOL5w==}
     hasBin: true
 
-  eve@0.66.3:
-    resolution: {integrity: sha512-oJkQdVrlmb1GFeaSUNY6IF71ttXjQdFnkKQP+84Qlvs/M+fUqMjGTqnwevQ+qFvc8KCswo3cbBohKOCGdgZPFg==}
+  eve@0.68.0:
+    resolution: {integrity: sha512-1cvxOdbfESdhZjAdhjUwFJSx0B6uWkbaEvwmau6vNhHNX9A+SZaathd79acDzQNYbOa+5WjsypOx4wa8KjKtgQ==}
     engines: {node: '>=24'}
     hasBin: true
     peerDependencies:
@@ -604,7 +604,7 @@ snapshots:
       httpxy: 0.5.5
       srvx: 1.0.5
 
-  eve@0.66.3(ai@7.0.105(zod@4.5.4))(just-bash@3.4.2):
+  eve@0.68.0(ai@7.0.105(zod@4.5.4))(just-bash@3.4.2):
     dependencies:
       ai: 7.0.105(zod@4.5.4)
       nitro: 3.0.260903-beta

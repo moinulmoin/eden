@@ -36,7 +36,7 @@ importers:
   packages/cli:
     dependencies:
       '@moinulmoin/eden-runtime-cloudflare':
-        specifier: 0.2.0
+        specifier: 0.2.1
         version: link:../runtime-cloudflare
       wrangler:
         specifier: 4.120.0

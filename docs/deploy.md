@@ -93,8 +93,8 @@ unless the project actually consumes them.
 Eden parses variable names, not secret values. Values flow through the protected
 deployment path into the Container environment and Cloudflare secrets. They are
 not placed in argv, image layers, generated artifacts, or normal logs.
-Reserved host variables such as `HOST`, `PORT`, `NITRO_*`, `NODE_ENV`, and
-Eden's identity variables are rejected.
+Reserved host variables such as `HOST`, `PORT`, `NITRO_*`, `NODE_ENV`,
+`NODE_EXTRA_CA_CERTS`, and Eden's identity variables are rejected.
 
 ### Optional read-only preflight
 
@@ -215,6 +215,18 @@ The Eve project's providers, models, credentials, databases, queues, external
 APIs, channels, schedules, sandbox, authentication, authorization, and
 configured Workflow World remain authoritative. Eden never substitutes a model
 provider or service silently.
+
+### Workflow queue routing
+
+Eden returns 404 for public requests to Workflow queue delivery routes
+(`/.well-known/workflow/v1/flow` and `/step`). Token-bearing
+`webhook/<token>` and `manifest.json` routes remain forwarded to Eve.
+The container's own requests to its exact public hostname are intercepted
+and delivered back into the same container over the internal port. Other
+outbound hosts go directly to the internet without Worker interception.
+HTTPS self-origin delivery trusts Cloudflare's runtime-mounted Containers CA.
+`WORKFLOW_LOCAL_BASE_URL` remains the public origin, preserving Eve-generated
+callback URLs.
 
 A preview deployment that boots Eve's local Workflow World proves health,
 startup, and fresh request handling only. Container-local disk and process

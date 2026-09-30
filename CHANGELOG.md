@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.1 — 2026-10-01
+
+### Security
+
+- The public Worker now returns 404 for Eve's Workflow queue delivery
+  routes (`/.well-known/workflow/v1/flow` and `/step`). They had no
+  authentication, and in 0.2.0 they were reachable from the internet. Queue
+  deliveries from the container to its own URL are now routed straight back
+  into the container, and only that host is intercepted. Webhook callbacks and
+  Eve's callback URLs are unchanged. **Upgrade and redeploy existing 0.2.0
+  deployments.**
+
+### Changed
+
+- Validated Eve 0.68.0 (was 0.66.3) with a real Cloudflare deploy, a real
+  model reply, and a tool call. The compatibility runner now reads the
+  installed Eve version and fails if it doesn't match the fixture pin.
+
 ## 0.2.0 — 2026-09-30
 
 Eden now has one job: deploy an existing Eve project to your own Cloudflare

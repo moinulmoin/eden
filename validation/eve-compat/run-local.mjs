@@ -1,6 +1,6 @@
 /* global console, fetch, process, setTimeout */
 
-import { accessSync, constants as fsConstants } from "node:fs";
+import { accessSync, constants as fsConstants, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -129,6 +129,14 @@ await run(
 await run(["run", "typecheck"], "eve-compat-typecheck");
 await run(["run", "build"], "eve-compat-build");
 
+const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
+const pinnedEve = readJson(join(root, "package.json")).dependencies.eve;
+const installedEve = readJson(join(root, "node_modules", "eve", "package.json")).version;
+assert(
+  installedEve === pinnedEve,
+  `Installed Eve ${installedEve} does not match the fixture pin ${pinnedEve}.`,
+);
+
 const port = await availablePort();
 const origin = `http://127.0.0.1:${port}`;
 const serverOutput = [];
@@ -160,7 +168,7 @@ try {
   await assertAuth(origin);
 
   if (process.env.AI_GATEWAY_API_KEY === undefined) {
-    console.log("Eve 0.66.3 build, production boot, health, and bearer auth passed.");
+    console.log(`Eve ${installedEve} build, production boot, health, and bearer auth passed.`);
     console.log("Model/tool eval skipped: AI_GATEWAY_API_KEY is not set.");
   } else {
     await run(
@@ -172,7 +180,7 @@ try {
         EVE_EVAL_AUTH_TOKEN: authToken,
       },
     );
-    console.log("Eve 0.66.3 build, production boot, auth, and model/tool eval passed.");
+    console.log(`Eve ${installedEve} build, production boot, auth, and model/tool eval passed.`);
   }
 } catch (error) {
   failure = error;

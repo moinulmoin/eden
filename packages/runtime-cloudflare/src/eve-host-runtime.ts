@@ -1,4 +1,4 @@
-import { Container } from "@cloudflare/containers";
+import { Container, ContainerProxy } from "@cloudflare/containers";
 
 import {
   EVE_HOST_DEFAULTS,
@@ -14,8 +14,67 @@ import {
   type EveHostContainerEnvironment,
   type EveHostForwardingMetadata,
   type EveHostReadinessEvidence,
+  isEveWorkflowInternalRoute,
   type EveReadinessGate,
 } from "./eve-host.js";
+
+export { ContainerProxy };
+
+const EVE_CLOUDFLARE_CONTAINERS_CA_PATH =
+  "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
+
+interface EveContainerLoopbackNamespace {
+  getByName(name: string): {
+    containerFetch(request: Request, port?: number): Promise<Response>;
+  };
+}
+
+/**
+ * Delivers the container's own HTTPS requests to its public workers.dev origin
+ * back into the container over the internal port instead of the public edge.
+ * The Workflow local World posts queue deliveries to
+ * `WORKFLOW_LOCAL_BASE_URL`, which must remain the public origin so Eve's
+ * externally visible callback URLs stay correct; re-routing that traffic
+ * inside the Worker lets the public Worker path refuse the unauthenticated
+ * queue endpoints without breaking delivery.
+ */
+export async function routeEveOutboundRequest(
+  request: Request,
+  env: EveHostContainerEnvironment,
+): Promise<Response> {
+  const publicOrigin = env.EVE_PUBLIC_ORIGIN;
+  const bindingName = env.EVE_CONTAINER_BINDING_NAME;
+  const instanceName = env.EVE_CONTAINER_INSTANCE_NAME;
+  if (
+    typeof publicOrigin !== "string" ||
+    typeof bindingName !== "string" ||
+    typeof instanceName !== "string"
+  ) {
+    throw new EveHostError(
+      "HOST_ORIGIN_UNAVAILABLE",
+      "The container loopback identity is unavailable to the outbound handler.",
+    );
+  }
+  assertStableOrigin(publicOrigin);
+  assertNonEmpty(bindingName, "Container binding name");
+  assertNonEmpty(instanceName, "Container instance name");
+  const hostname = new URL(request.url).hostname;
+  if (hostname !== new URL(publicOrigin).hostname) {
+    return fetch(request);
+  }
+  const namespace = (env as Record<string, unknown>)[bindingName] as
+    | EveContainerLoopbackNamespace
+    | undefined;
+  if (namespace === undefined) {
+    throw new EveHostError(
+      "HOST_READINESS_UNPROVEN",
+      "The configured Container binding is unavailable to the outbound handler.",
+    );
+  }
+  return namespace
+    .getByName(instanceName)
+    .containerFetch(request, EVE_HOST_DEFAULTS.internalPort);
+}
 
 /**
  * This module is the only Eve-host surface that depends on provider runtime
@@ -30,6 +89,7 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
   override defaultPort = EVE_HOST_DEFAULTS.internalPort;
   override requiredPorts = [EVE_HOST_DEFAULTS.internalPort];
   override sleepAfter = EVE_HOST_DEFAULTS.sleepAfter;
+  override interceptHttps = true;
   override enableInternet = true;
   override pingEndpoint = "localhost/eve/v1/health";
   readonly lifecycle = createEveHostLifecycleObserver();
@@ -69,6 +129,9 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
       WORKFLOW_LOCAL_BASE_URL: publicOrigin,
       EDEN_EVE_DEPLOYMENT_ID: deploymentId,
       EDEN_EVE_GENERATION_ID: generationId,
+      // Trust the runtime-mounted Cloudflare Containers CA so the intercepted
+      // HTTPS deliveries to the public origin below complete TLS.
+      NODE_EXTRA_CA_CERTS: EVE_CLOUDFLARE_CONTAINERS_CA_PATH,
       ...(env.EDEN_EVE_RUNTIME_REVISION === undefined
         ? {}
         : { EDEN_EVE_RUNTIME_REVISION: env.EDEN_EVE_RUNTIME_REVISION }),
@@ -173,6 +236,12 @@ export function createEveHostWorker(
   }
   return {
     async fetch(request, env): Promise<Response> {
+      // Queue deliveries to these endpoints arrive through the container's
+      // intercepted outbound loopback instead, so any request that reaches
+      // the public Worker fetch path is external and unauthenticated.
+      if (isEveWorkflowInternalRoute(new URL(request.url).pathname)) {
+        return new Response(null, { status: 404 });
+      }
       const namespace = (
         env as unknown as Record<string, EveContainerNamespace | undefined>
       )[options.containerBindingName];

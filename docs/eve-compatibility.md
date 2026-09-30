@@ -5,10 +5,10 @@ project rather than an Eden mock or Eve's private repository test harness.
 
 The standalone fixture under `validation/eve-compat/minimal/` currently pins:
 
-- Eve `0.66.3`
-- AI SDK `7.0.105` (Eve 0.66.3 requires `ai: ^7.0.105`)
+- Eve `0.68.0`
+- AI SDK `7.0.105` (Eve 0.68.0 requires `ai: ^7.0.105`)
 - Zod `4.5.4`
-- just-bash `3.4.2` (Eve 0.66.3's optional `just-bash: ^3.1.0` peer)
+- just-bash `3.4.2` (Eve 0.68.0's optional `just-bash: ^3.1.0` peer)
 - pnpm `11.21.0`
 - Node 24 or newer
 
@@ -24,7 +24,7 @@ image, which copies `pnpm-workspace.yaml` before both frozen installs.
 
 Eve's default `eve init` scaffold selects the `just-bash` sandbox provider but
 does not declare it: a fresh scaffold must add `just-bash` as a production
-dependency (the fixture pins `3.4.2`, the release Eve 0.66.3's `^3.1.0`
+dependency (the fixture pins `3.4.2`, which Eve 0.68.0's `^3.1.0`
 optional peer resolves) or `eve build` inside Eden's isolated builder —
 which has no Docker daemon or `/dev/kvm` — fails with
 `Cannot find package 'just-bash'`. The fixture's `pnpm-workspace.yaml` also

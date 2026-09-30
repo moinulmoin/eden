@@ -10,7 +10,11 @@ import {
   resolveStableWorkersDevOrigin,
   type EveContainerTransport,
 } from "../src/eve-host.js";
-import { EveHostContainer } from "../src/eve-host-runtime.js";
+import {
+  createEveHostWorker,
+  EveHostContainer,
+  routeEveOutboundRequest,
+} from "../src/eve-host-runtime.js";
 
 const IDENTITY = {
   workerName: "eden-eve-preview",
@@ -69,6 +73,7 @@ describe("generic Eve Cloudflare host", () => {
     expect(config.worker.vars).toEqual({
       EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
       EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+      EVE_CONTAINER_BINDING_NAME: IDENTITY.containerBindingName,
       EDEN_EVE_DEPLOYMENT_ID: IDENTITY.deploymentId,
       EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
       EVE_RUNTIME_VARIABLE_NAMES: ["EVE_AUTH_SECRET", "WORKFLOW_API_URL"],
@@ -90,11 +95,12 @@ describe("generic Eve Cloudflare host", () => {
     });
     const customSource = generateEveHostWorkerSource({ config: customConfig });
     expect(customSource).toContain(
-      "export { EveHostContainer as CustomEveContainer };",
+      "export { ContainerProxy, EveHostContainer as CustomEveContainer };",
     );
     expect(customSource).toContain('"containerBindingName":"CUSTOM_CONTAINER"');
+    expect(source).toContain("export { ContainerProxy, EveHostContainer };");
     expect(source).toContain(
-      'import { EveHostContainer, createEveHostWorker } from "./eden-eve-host-worker.mjs";',
+      'EveHostContainer.outboundByHost = { "eden-eve-preview.account.workers.dev": routeEveOutboundRequest };',
     );
     expect(source).not.toMatch(/@moinulmoin\/eden-runtime-cloudflare|node:/u);
   });
@@ -478,5 +484,128 @@ describe("generic Eve Cloudflare host", () => {
       { type: "stopped", at: 42, safeStatus: "runtime_signal:0" },
     ]);
     expect(EveHostContainer.prototype.fetch).toBeDefined();
+  });
+
+  test("refuses the Workflow queue-delivery subtree on the public Worker path", async () => {
+    const forwardedUrls: string[] = [];
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      workerName: IDENTITY.workerName,
+      containerBindingName: IDENTITY.containerBindingName,
+      stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
+      deploymentId: IDENTITY.deploymentId,
+      generationId: IDENTITY.generationId,
+    });
+    const env = {
+      EVE_CONTAINER: {
+        getByName: () => ({
+          fetch: async (request: Request) => {
+            forwardedUrls.push(request.url);
+            return new Response("forwarded");
+          },
+        }),
+      },
+    };
+
+    for (const path of [
+      "/.well-known/workflow/v1/flow",
+      "/.well-known/workflow/v1/flow?__health",
+      "/.well-known/workflow/v1/step",
+      "/.well-known/%77orkflow/v1/flow",
+      "/.well-known/workflow/v1/%66low",
+      "/.well-known/workflow/v1/FLOW/",
+      "/.well-known//workflow/v1/flow",
+    ]) {
+      const response = await worker.fetch(
+        new Request(`https://eden-eve-preview.account.workers.dev${path}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-vqs-queue-name": "__wkf_workflow_",
+            "x-vqs-message-id": "msg_forge",
+            "x-vqs-message-attempt": "1",
+          },
+          body: "{}",
+        }),
+        env,
+      );
+      expect(response.status).toBe(404);
+    }
+    expect(forwardedUrls).toEqual([]);
+
+    const webhook = await worker.fetch(
+      new Request(
+        "https://eden-eve-preview.account.workers.dev/.well-known/workflow/v1/webhook/token-123",
+        { method: "POST", body: "{}" },
+      ),
+      env,
+    );
+    expect(webhook.status).toBe(200);
+    expect(forwardedUrls).toEqual([
+      "https://eden-eve-preview.account.workers.dev/.well-known/workflow/v1/webhook/token-123",
+    ]);
+    const manifest = await worker.fetch(
+      new Request(
+        "https://eden-eve-preview.account.workers.dev/.well-known/workflow/v1/manifest.json",
+      ),
+      env,
+    );
+    expect(await manifest.text()).toBe("forwarded");
+
+    const api = await worker.fetch(
+      new Request("https://eden-eve-preview.account.workers.dev/eve/v1/info"),
+      env,
+    );
+    expect(api.status).toBe(200);
+    expect(await api.text()).toBe("forwarded");
+  });
+
+  test("routes container egress to the public origin back through the container", async () => {
+    const loopback: string[] = [];
+    const env = {
+      EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
+      EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+      EVE_CONTAINER_BINDING_NAME: IDENTITY.containerBindingName,
+      EDEN_EVE_DEPLOYMENT_ID: IDENTITY.deploymentId,
+      EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
+      EVE_CONTAINER: {
+        getByName: (name: string) => ({
+          containerFetch: async (request: Request, port?: number) => {
+            loopback.push(`${name}:${port}:${request.url}`);
+            return new Response("delivered inside");
+          },
+        }),
+      },
+    };
+    const container = new EveHostContainer(
+      {
+        container: { running: false },
+        storage: {
+          sql: { exec: () => [] },
+          kv: { get: () => undefined },
+        },
+        blockConcurrencyWhile: (callback: () => Promise<void>) => {
+          void callback().catch(() => {});
+        },
+      } as never,
+      env,
+    );
+    expect(container.envVars?.WORKFLOW_LOCAL_BASE_URL).toBe(
+      "https://eden-eve-preview.account.workers.dev",
+    );
+    expect(container.envVars?.NODE_EXTRA_CA_CERTS).toBe(
+      "/etc/cloudflare/certs/cloudflare-containers-ca.crt",
+    );
+    const response = await routeEveOutboundRequest(
+      new Request(
+        "https://eden-eve-preview.account.workers.dev/.well-known/workflow/v1/flow",
+        { method: "POST", body: "{}" },
+      ),
+      env as never,
+    );
+    expect(await response.text()).toBe("delivered inside");
+    expect(loopback).toEqual([
+      `${IDENTITY.stableContainerInstanceName}:8080:https://eden-eve-preview.account.workers.dev/.well-known/workflow/v1/flow`,
+    ]);
   });
 });

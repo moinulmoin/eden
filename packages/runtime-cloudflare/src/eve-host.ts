@@ -7,6 +7,19 @@ export const EVE_HOST_DEFAULTS = {
   sleepAfter: "24h",
 } as const;
 
+/** Queue deliveries are private; webhook and manifest routes stay forwarded. */
+export function isEveWorkflowInternalRoute(pathname: string): boolean {
+  let decodedPath = pathname;
+  try {
+    decodedPath = decodeURIComponent(pathname);
+  } catch {
+    // Malformed escapes cannot name a queue route in Eve's router.
+  }
+  return /^\/\.well-known\/workflow\/v1\/(?:flow|step)(?:\/|$)/iu.test(
+    decodedPath.replace(/\/+/gu, "/"),
+  );
+}
+
 export const EVE_HOST_OWNED_HEADERS = [
   "forwarded",
   "x-forwarded-for",
@@ -121,6 +134,7 @@ export interface EveHostWranglerConfig {
   readonly vars: {
     readonly EVE_PUBLIC_ORIGIN: string;
     readonly EVE_CONTAINER_INSTANCE_NAME: string;
+    readonly EVE_CONTAINER_BINDING_NAME: string;
     readonly EDEN_EVE_DEPLOYMENT_ID: string;
     readonly EDEN_EVE_GENERATION_ID: string;
     readonly EVE_RUNTIME_VARIABLE_NAMES: readonly string[];
@@ -303,6 +317,7 @@ export function createEveHostConfig(
       vars: {
         EVE_PUBLIC_ORIGIN: request.stableWorkersDevOrigin,
         EVE_CONTAINER_INSTANCE_NAME: request.stableContainerInstanceName,
+        EVE_CONTAINER_BINDING_NAME: request.containerBindingName,
         EDEN_EVE_DEPLOYMENT_ID: request.deploymentId,
         EDEN_EVE_GENERATION_ID: request.generationId,
         EVE_RUNTIME_VARIABLE_NAMES: request.runtimeVariableNames ?? [],
@@ -361,10 +376,12 @@ export function generateEveHostWorkerSource(
         }),
   };
   return [
-    `import { EveHostContainer, createEveHostWorker } from ${JSON.stringify(moduleSpecifier)};`,
+    `import { ContainerProxy, EveHostContainer, createEveHostWorker, routeEveOutboundRequest } from ${JSON.stringify(moduleSpecifier)};`,
     request.config.container.className === "EveHostContainer"
-      ? "export { EveHostContainer };"
-      : `export { EveHostContainer as ${request.config.container.className} };`,
+      ? "export { ContainerProxy, EveHostContainer };"
+      : `export { ContainerProxy, EveHostContainer as ${request.config.container.className} };`,
+    "",
+    `EveHostContainer.outboundByHost = { ${JSON.stringify(new URL(request.config.container.publicOrigin).hostname)}: routeEveOutboundRequest };`,
     "",
     `export default createEveHostWorker(${JSON.stringify(workerOptions)});`,
     "",
@@ -537,6 +554,7 @@ export interface EveHostContainerEnvironment {
   readonly EVE_RUNTIME_VARIABLE_NAMES?: readonly string[];
   readonly EVE_PUBLIC_ORIGIN?: string;
   readonly EVE_CONTAINER_INSTANCE_NAME?: string;
+  readonly EVE_CONTAINER_BINDING_NAME?: string;
   readonly EDEN_EVE_DEPLOYMENT_ID?: string;
   readonly EDEN_EVE_GENERATION_ID?: string;
   readonly EDEN_EVE_RUNTIME_REVISION?: string;
@@ -594,6 +612,7 @@ const RESERVED_EVE_HOST_VARIABLES = new Set([
   "PORT",
   "NITRO_PORT",
   "NODE_ENV",
+  "NODE_EXTRA_CA_CERTS",
   "WORKFLOW_LOCAL_BASE_URL",
   "EDEN_EVE_DEPLOYMENT_ID",
   "EDEN_EVE_GENERATION_ID",
