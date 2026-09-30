@@ -4,27 +4,27 @@ import { links } from "../links";
 ---
 
 <section class="hero">
-  <div class="wrap hero__grid">
-    <div class="hero__main">
-      <p class="hero__eyebrow mono">For Vercel Eve <span aria-hidden="true">→</span> your Cloudflare</p>
-      <div class="hero__title-wrap">
-        <h1 class="hero__title">Same project.<br />New home.</h1>
-        <a class="sticker" href="#stays" aria-label="No rewrite needed: see what stays yours">
-          <span class="sticker__top">No</span>
-          <span class="sticker__main">Rewrite</span>
-          <span class="sticker__bottom">needed</span>
-        </a>
-      </div>
+  <div class="wrap">
+    <p class="hero__eyebrow mono">Open-source CLI for Vercel Eve</p>
+    <div class="hero__title-wrap">
+      <h1 class="hero__title">Deploy your Eve agent <br class="hero__br" />to your own Cloudflare.</h1>
+      <a class="sticker" href="#stays" aria-label="No rewrite needed: see what stays yours">
+        <span class="sticker__top">No</span>
+        <span class="sticker__main">Rewrite</span>
+        <span class="sticker__bottom">needed</span>
+      </a>
     </div>
-    <div class="hero__pitch">
+    <div class="hero__row">
       <p class="hero__sub">
-        Eden deploys the Eve agent you already built to your own Cloudflare account. One command,
-        about two minutes, and your Eve source stays exactly as you wrote it.
+        One command builds the Eve project you already have and runs it in a Container on your
+        Cloudflare account. You get a live workers.dev URL. No rewrite.
       </p>
-      <CopyCommand command="npx @moinulmoin/eden deploy" label="Copy the deploy command" />
-      <div class="hero__links">
-        <a class="link-arrow" href={links.deployGuide}>Read the deploy guide <span aria-hidden="true">→</span></a>
-        <a class="link-muted" href="#requirements">What you need first</a>
+      <div class="hero__actions">
+        <CopyCommand command="npx @moinulmoin/eden deploy" label="Copy the deploy command" />
+        <div class="hero__links">
+          <a class="link-arrow" href={links.deployGuide}>Read the deploy guide <span aria-hidden="true">→</span></a>
+          <a class="link-muted" href="#requirements">What you need first</a>
+        </div>
       </div>
     </div>
   </div>
@@ -62,22 +62,11 @@ import { links } from "../links";
 
 <style>
   .hero {
-    padding: 80px 0 56px;
-  }
-
-  .hero__grid {
-    display: flex;
-    align-items: flex-end;
-    gap: 48px;
-  }
-
-  .hero__main {
-    flex: 1;
-    min-width: 0;
+    padding: 72px 0 56px;
   }
 
   .hero__eyebrow {
-    margin: 0 0 28px;
+    margin: 0 0 24px;
     font-size: 12px;
     letter-spacing: 0.12em;
     text-transform: uppercase;
@@ -86,28 +75,27 @@ import { links } from "../links";
 
   .hero__title-wrap {
     position: relative;
-    font-size: 118px;
+    font-size: 92px;
   }
 
   .hero__title {
     margin: 0;
     font-size: 1em;
     font-weight: 700;
-    line-height: 0.94;
-    letter-spacing: -0.055em;
-    white-space: nowrap;
+    line-height: 0.96;
+    letter-spacing: -0.05em;
   }
 
   .sticker {
     position: absolute;
-    left: 5em;
-    top: 1em;
+    right: 0;
+    top: 0.55em;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    width: 1.12em;
-    height: 1.12em;
+    width: 1.4em;
+    height: 1.4em;
     border: 2px solid var(--ink);
     border-radius: 50%;
     background: var(--accent);
@@ -125,38 +113,44 @@ import { links } from "../links";
 
   .sticker__top {
     font-family: var(--pixel);
-    font-size: 0.186em;
+    font-size: 0.24em;
     font-weight: 600;
     line-height: 1;
   }
 
   .sticker__main {
     font-family: var(--pixel);
-    font-size: 0.22em;
+    font-size: 0.28em;
     font-weight: 700;
     line-height: 1.1;
   }
 
   .sticker__bottom {
     font-family: var(--mono);
-    font-size: 0.095em;
+    font-size: 0.12em;
     text-transform: none;
   }
 
-  .hero__pitch {
-    display: flex;
-    flex-direction: column;
-    gap: 24px;
-    width: 400px;
-    flex: none;
-    padding-bottom: 6px;
+  .hero__row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 440px;
+    align-items: end;
+    gap: 64px;
+    margin-top: 40px;
   }
 
   .hero__sub {
+    max-width: 560px;
     margin: 0;
-    font-size: 18px;
+    font-size: 19px;
     line-height: 1.5;
     color: var(--text-2);
+  }
+
+  .hero__actions {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
   }
 
   .hero__links {
@@ -257,23 +251,18 @@ import { links } from "../links";
 
   @media (max-width: 1100px) {
     .hero__title-wrap {
-      font-size: 96px;
+      font-size: 72px;
     }
 
-    .hero__pitch {
-      width: 340px;
+    .hero__row {
+      grid-template-columns: minmax(0, 1fr) 400px;
+      gap: 40px;
     }
   }
 
   @media (max-width: 900px) {
     .hero {
       padding: 36px 0 40px;
-    }
-
-    .hero__grid {
-      flex-direction: column;
-      align-items: stretch;
-      gap: 28px;
     }
 
     .hero__eyebrow {
@@ -283,33 +272,36 @@ import { links } from "../links";
     }
 
     .hero__title-wrap {
-      font-size: clamp(40px, 12.6vw, 64px);
+      font-size: clamp(36px, 10.4vw, 56px);
+    }
+
+    .hero__br {
+      display: none;
     }
 
     .sticker {
-      left: 5.3em;
-      top: 0.9em;
-      width: 1.75em;
-      height: 1.75em;
+      top: 1.72em;
+      width: 1.8em;
+      height: 1.8em;
       border-width: 1.5px;
     }
 
     .sticker__top {
-      font-size: 0.29em;
+      font-size: 0.3em;
     }
 
     .sticker__main {
-      font-size: 0.33em;
+      font-size: 0.35em;
     }
 
     .sticker__bottom {
       font-size: 0.16em;
     }
 
-    .hero__pitch {
-      width: auto;
+    .hero__row {
+      grid-template-columns: minmax(0, 1fr);
       gap: 20px;
-      padding: 0;
+      margin-top: 22px;
     }
 
     .hero__sub {
@@ -317,7 +309,8 @@ import { links } from "../links";
     }
 
     .hero__links {
-      gap: 18px;
+      flex-wrap: wrap;
+      gap: 8px 18px;
     }
 
     .hero__links a {
@@ -341,6 +334,12 @@ import { links } from "../links";
 
     .sign {
       padding: 7px 12px;
+    }
+  }
+
+  @media (max-width: 380px) {
+    .sticker {
+      display: none;
     }
   }
 </style>
