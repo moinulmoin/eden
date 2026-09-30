@@ -1,0 +1,436 @@
+---
+import RotateCcw from "@lucide/astro/icons/rotate-ccw";
+import HeartPulse from "@lucide/astro/icons/heart-pulse";
+
+type Kind = "cmd" | "out" | "dim" | "ok" | "url" | "gap";
+type Run = {
+  id: string;
+  tab: string;
+  time: string;
+  status: string;
+  lines: [Kind, string][];
+};
+
+const url = "https://my-eve-agent-9e510242.moinulislammoin2019.workers.dev";
+
+// Transcripts come from the recorded 0.2.0 demo run (eden-deploy.gif); only check lines are trimmed.
+const runs: Run[] = [
+  {
+    id: "deploy",
+    tab: "eden deploy",
+    time: "112s",
+    status: "healthy · promoted",
+    lines: [
+      ["cmd", "eden deploy --env-file ~/.config/my-eve-agent.env"],
+      ["out", "eden deploy — my-eve-agent-9e510242 (preview)"],
+      ["dim", "... validating environment file"],
+      ["dim", "... packaging project — snapshot, frozen install, eve build"],
+      ["dim", "... checking Cloudflare access and exact target"],
+      ["dim", "... building linux/amd64 runtime image, booting eve, checking health"],
+      ["dim", "... pushing container image to the Cloudflare registry"],
+      ["dim", "... publishing Worker and Container application"],
+      ["dim", "✓ VAL-BUILD-001 — The exact pnpm pin and one matching regular root lockfile were verified."],
+      ["gap", ""],
+      ["ok", "deployed my-eve-agent-9e510242 (preview) · eve 0.66.3"],
+      ["url", url],
+      ["out", "  done in 112s"],
+    ],
+  },
+  {
+    id: "health",
+    tab: "curl /eve/v1/health",
+    time: "1.5s",
+    status: "ready",
+    lines: [
+      ["cmd", `export URL=${url}`],
+      ["cmd", "curl -s $URL/eve/v1/health"],
+      ["out", '{"ok":true,"status":"ready","workflowId":"workflow//eve//workflowEntry"}'],
+    ],
+  },
+  {
+    id: "destroy",
+    tab: "eden destroy",
+    time: "23s",
+    status: "absent · verified",
+    lines: [
+      ["cmd", "eden destroy --name my-eve-agent-9e510242"],
+      ["out", "eden destroy — my-eve-agent-9e510242 (preview)"],
+      ["dim", "... verifying the immutable ownership record"],
+      ["dim", "... reading the exact remote inventory"],
+      ["dim", "... deleting Worker my-eve-agent-9e510242"],
+      ["dim", "... deleting Container application my-eve-agent-9e510242-container"],
+      ["dim", "... deleting 1 registry image"],
+      ["dim", "... verifying the exact target is absent"],
+      ["dim", "✓ VAL-LIFE-006 — Exact absence was verified; clearing this target's CURRENT pointer only."],
+      ["gap", ""],
+      ["ok", "destroyed my-eve-agent-9e510242 (preview) in 23s"],
+      ["dim", "  retained: local deployment records under .eden/eve-deploy"],
+      ["cmd", "curl -s -o /dev/null -w '%{http_code}' $URL/eve/v1/health; echo ' <- gone'"],
+      ["out", "404 <- gone"],
+    ],
+  },
+];
+
+const escape = (text: string) =>
+  text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+function renderLines(lines: Run["lines"]) {
+  const body = lines
+    .map(([kind, text], n) => {
+      const prefix =
+        kind === "cmd" ? '<span class="ln__pre">› </span>' : kind === "ok" ? '<span class="ln__ok">✓ </span>' : "";
+      const content =
+        kind === "url" ? `  <a class="ln__url" href="${escape(text)}">${escape(text)}</a>` : escape(text);
+      return `<span class="ln ln--${kind}" style="--n:${n}">${prefix}${content}\n</span>`;
+    })
+    .join("");
+  const caret = `<span class="ln ln--cmd" style="--n:${lines.length}"><span class="ln__pre">› </span><span class="caret" aria-hidden="true"></span></span>`;
+  return body + caret;
+}
+---
+
+<section class="output dark" aria-labelledby="output-title">
+  <div class="wrap">
+    <div class="output__head">
+      <div>
+        <p class="output__eyebrow mono">A real run, not a mockup</p>
+        <h2 id="output-title" class="output__title">One command. About two minutes.</h2>
+      </div>
+      <button class="pill-btn output__replay" type="button" data-replay>
+        <RotateCcw class="icon" aria-hidden="true" />
+        Replay
+      </button>
+    </div>
+
+    <div class="term" data-term>
+      <div class="term__bar">
+        <span class="term__dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <div class="term__tabs" role="tablist" aria-label="Recorded commands">
+          {
+            runs.map((run, index) => (
+              <button
+                class="term__tab mono"
+                type="button"
+                role="tab"
+                id={`tab-${run.id}`}
+                aria-controls={`run-${run.id}`}
+                aria-selected={index === 0 ? "true" : "false"}
+                tabindex={index === 0 ? 0 : -1}
+                data-term-tab={run.id}
+              >
+                {run.tab}
+              </button>
+            ))
+          }
+        </div>
+        <span class="term__meta mono">eve 0.66.3 · check lines trimmed</span>
+      </div>
+
+      {
+        runs.map((run, index) => (
+          <div
+            class="term__run"
+            role="tabpanel"
+            id={`run-${run.id}`}
+            aria-labelledby={`tab-${run.id}`}
+            hidden={index !== 0}
+            data-term-run={run.id}
+            style={`--lines:${run.lines.length}`}
+          >
+            <pre class="term__out mono" set:html={renderLines(run.lines)} />
+            <div class="term__foot">
+              <span class="term__track" aria-hidden="true"><span class="term__fill" /></span>
+              <span class="term__time mono">{run.time}</span>
+              <span class="term__status mono">
+                <HeartPulse class="icon" size={13} aria-hidden="true" />
+                {run.status}
+              </span>
+            </div>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</section>
+
+<style>
+  .output {
+    padding: 40px 0 112px;
+  }
+
+  .output__head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 24px;
+    margin-bottom: 36px;
+  }
+
+  .output__eyebrow {
+    margin: 0 0 14px;
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  .output__title {
+    margin: 0;
+    font-size: 44px;
+    font-weight: 700;
+    letter-spacing: -0.04em;
+    line-height: 1.05;
+  }
+
+  .output__replay {
+    border-color: var(--console-line);
+    color: var(--console-text);
+    font-size: 14px;
+  }
+
+  .output__replay:hover {
+    border-color: var(--console-text);
+    box-shadow: 0 3px 0 var(--accent);
+  }
+
+  .output__replay:hover .icon {
+    transform: rotate(-200deg);
+  }
+
+  .output__replay .icon {
+    transition: transform 0.5s var(--ease-out);
+  }
+
+  .term {
+    overflow: hidden;
+    border: 1px solid var(--console-line);
+    border-radius: 20px;
+    background: var(--graphite);
+  }
+
+  .term__bar {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    height: 48px;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--console-line);
+  }
+
+  .term__dots {
+    display: flex;
+    gap: 8px;
+  }
+
+  .term__dots i {
+    width: 10px;
+    height: 10px;
+    background: #3a3a36;
+  }
+
+  .term__tabs {
+    display: flex;
+    gap: 4px;
+  }
+
+  .term__tab {
+    flex: none;
+    white-space: nowrap;
+    padding: 6px 12px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--console-dim);
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+  }
+
+  .term__tab:hover {
+    color: var(--console-text);
+  }
+
+  .term__tab[aria-selected="true"] {
+    background: var(--console-line);
+    color: var(--paper);
+  }
+
+  .term__meta {
+    justify-self: end;
+    font-size: 12px;
+    color: var(--console-dim);
+  }
+
+  .term__out {
+    margin: 0;
+    padding: 24px 28px 20px;
+    overflow-x: auto;
+    font-size: 14px;
+    line-height: 26px;
+    color: var(--console-text);
+    min-height: calc(14 * 26px + 44px);
+    scrollbar-width: thin;
+    scrollbar-color: #3a3a36 transparent;
+  }
+
+  .ln {
+    display: inline;
+  }
+
+  .ln--dim {
+    color: var(--console-dim);
+  }
+
+  .ln__pre {
+    color: var(--console-dim);
+  }
+
+  .ln__ok {
+    color: var(--accent);
+  }
+
+  .ln__url {
+    color: var(--accent);
+    text-underline-offset: 3px;
+  }
+
+  .caret {
+    display: inline-block;
+    width: 9px;
+    height: 17px;
+    vertical-align: -3px;
+    background: var(--accent);
+    animation: blink 0.9s steps(1) infinite;
+  }
+
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+
+  .term.is-playing .ln {
+    animation: line-in 0.28s var(--ease-out) both;
+    animation-delay: calc(var(--n) * 220ms);
+  }
+
+  @keyframes line-in {
+    from {
+      opacity: 0;
+    }
+  }
+
+  .term__foot {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 28px;
+    border-top: 1px solid var(--console-line);
+  }
+
+  .term__track {
+    flex: 1;
+    height: 6px;
+    overflow: hidden;
+    border-radius: 3px;
+    background: var(--console-line);
+  }
+
+  .term__fill {
+    display: block;
+    height: 100%;
+    border-radius: 3px;
+    background: var(--accent);
+    transform-origin: left;
+  }
+
+  .term.is-playing .term__fill {
+    animation: fill-bar linear both;
+    animation-duration: calc(var(--lines) * 220ms + 200ms);
+  }
+
+  @keyframes fill-bar {
+    from {
+      transform: scaleX(0);
+    }
+  }
+
+  .term__time {
+    font-size: 12px;
+    color: var(--console-text);
+  }
+
+  .term__status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 12px;
+  }
+
+  @media (max-width: 900px) {
+    .output {
+      padding: 28px 0 64px;
+    }
+
+    .output__head {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .output__title {
+      font-size: 30px;
+    }
+
+    .term__bar {
+      grid-template-columns: auto 1fr;
+      height: auto;
+      padding: 10px 14px;
+      gap: 10px;
+    }
+
+    .term__tabs {
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .term__tabs::-webkit-scrollbar {
+      display: none;
+    }
+
+    .term__tab {
+      padding: 5px 10px;
+      font-size: 11px;
+    }
+
+    .term__meta {
+      display: none;
+    }
+
+    .term__out {
+      padding: 16px 14px 12px;
+      font-size: 11px;
+      line-height: 20px;
+      min-height: calc(14 * 20px + 28px);
+    }
+
+    .caret {
+      width: 7px;
+      height: 13px;
+    }
+
+    .term__foot {
+      padding: 12px 14px;
+      gap: 10px;
+    }
+
+    .term__status {
+      display: none;
+    }
+  }
+</style>

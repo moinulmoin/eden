@@ -1,0 +1,230 @@
+---
+import BrainCircuit from "@lucide/astro/icons/brain-circuit";
+import Database from "@lucide/astro/icons/database";
+import RadioTower from "@lucide/astro/icons/radio-tower";
+import Box from "@lucide/astro/icons/box";
+import LockKeyhole from "@lucide/astro/icons/lock-keyhole";
+import EyeOff from "@lucide/astro/icons/eye-off";
+import Check from "@lucide/astro/icons/check";
+import ShieldCheck from "@lucide/astro/icons/shield-check";
+
+const rows = [
+  { icon: BrainCircuit, label: "Model providers and credentials" },
+  { icon: Database, label: "Databases, queues and external APIs" },
+  { icon: RadioTower, label: "Channels, schedules and auth" },
+  { icon: Box, label: "Sandbox and Workflow World" },
+];
+---
+
+<section class="section stays" id="stays" aria-labelledby="stays-title">
+  <div class="wrap stays__grid">
+    <div class="stays__copy">
+      <span class="tag">02 · What stays yours</span>
+      <h2 id="stays-title" class="section-title">Eve stays in charge.</h2>
+      <p class="stays__body">
+        Eden hosts the app. It doesn't rewrite your project or quietly swap its providers and services.
+        Everything your agent depends on keeps working the way you set it up.
+      </p>
+      <span class="stays__sticker">
+        <ShieldCheck class="icon" aria-hidden="true" />
+        Eden never edits your code
+      </span>
+    </div>
+
+    <ul class="owner card" data-reveal>
+      <li class="owner__head mono"><Check class="icon" size={13} aria-hidden="true" /> These stay in Eve</li>
+      {
+        rows.map(({ icon: Icon, label }) => (
+          <li class="owner__row">
+            <span class="icon-tile">
+              <Icon class="icon" aria-hidden="true" />
+            </span>
+            <span class="owner__label">{label}</span>
+            <span class="owner__chip mono">
+              <Check class="icon" size={13} aria-hidden="true" />
+              stays in Eve
+            </span>
+          </li>
+        ))
+      }
+      <li class="owner__row owner__row--secret">
+        <span class="icon-tile">
+          <LockKeyhole class="icon" aria-hidden="true" />
+        </span>
+        <span class="owner__label">Values from <code class="mono">--env-file</code></span>
+        <span class="owner__chip mono">
+          <EyeOff class="icon" size={13} aria-hidden="true" />
+          never in args, image layers or logs
+        </span>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<style>
+  .stays {
+    padding-top: 40px;
+  }
+
+  .stays__grid {
+    display: flex;
+    gap: 80px;
+  }
+
+  .stays__copy {
+    width: 400px;
+    flex: none;
+  }
+
+  .stays__body {
+    margin: 20px 0 28px;
+    font-size: 17px;
+    line-height: 1.55;
+    color: var(--text-2);
+  }
+
+  .stays__sticker {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    border-radius: 999px;
+    background: var(--ink);
+    color: var(--paper);
+    font-family: var(--pixel);
+    font-size: 18px;
+    font-weight: 600;
+    transform: rotate(-4deg);
+    transition: transform 0.5s var(--spring);
+  }
+
+  .stays__sticker:hover {
+    transform: rotate(2deg) scale(1.04);
+  }
+
+  .stays__sticker .icon {
+    color: var(--accent);
+  }
+
+  .owner {
+    flex: 1;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    list-style: none;
+  }
+
+  .owner__head {
+    display: none;
+  }
+
+  .owner__row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--rule);
+    transition: background 0.2s;
+  }
+
+  .owner__row:hover {
+    background: #fafaf8;
+  }
+
+  .owner__label {
+    flex: 1;
+    font-size: 17px;
+    font-weight: 500;
+  }
+
+  .owner__label code {
+    font-size: 0.9em;
+  }
+
+  .owner__chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border-radius: 999px;
+    background: var(--paper-2);
+    font-size: 12px;
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+
+  .owner__row--secret {
+    border-bottom: 0;
+    background: var(--ink);
+    color: var(--paper);
+  }
+
+  .owner__row--secret:hover {
+    background: var(--graphite);
+  }
+
+  .owner__row--secret .icon-tile {
+    background: var(--accent);
+  }
+
+  .owner__row--secret .owner__chip {
+    background: #f4812026;
+    color: var(--accent);
+  }
+
+  @media (max-width: 1100px) {
+    .stays__grid {
+      flex-direction: column;
+      gap: 40px;
+    }
+
+    .stays__copy {
+      width: auto;
+      max-width: 560px;
+    }
+  }
+
+  @media (max-width: 900px) {
+    .stays {
+      padding-top: 8px;
+    }
+
+    .stays__body {
+      font-size: 16px;
+    }
+
+    .owner__head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--rule);
+      background: var(--paper-2);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-2);
+    }
+
+    .owner__row {
+      padding: 14px 16px;
+      gap: 12px;
+    }
+
+    .owner__label {
+      font-size: 15px;
+    }
+
+    .owner__row:not(.owner__row--secret) .owner__chip {
+      display: none;
+    }
+
+    .owner__row--secret {
+      flex-wrap: wrap;
+    }
+
+    .owner__row--secret .owner__chip {
+      white-space: normal;
+    }
+  }
+</style>

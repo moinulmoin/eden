@@ -1,0 +1,35 @@
+---
+import Base from "../layouts/Base.astro";
+---
+
+<Base title="Not found · Eden" description="This page doesn't exist.">
+  <main class="lost wrap">
+    <p class="lost__code mono">404</p>
+    <h1>This path isn't in the garden.</h1>
+    <a class="pill-btn pill-btn--ink" href="/">Back to Eden</a>
+  </main>
+</Base>
+
+<style>
+  .lost {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 20px;
+    min-height: 100vh;
+    justify-content: center;
+  }
+
+  .lost__code {
+    margin: 0;
+    font-size: 14px;
+    color: var(--accent);
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(36px, 7vw, 72px);
+    letter-spacing: -0.045em;
+    line-height: 1;
+  }
+</style>

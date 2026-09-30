@@ -1,0 +1,233 @@
+---
+import ListChecks from "@lucide/astro/icons/list-checks";
+import Info from "@lucide/astro/icons/info";
+import Check from "@lucide/astro/icons/check";
+import Moon from "@lucide/astro/icons/moon";
+import CalendarX from "@lucide/astro/icons/calendar-x";
+import Box from "@lucide/astro/icons/box";
+import Package from "@lucide/astro/icons/package";
+import Copy from "@lucide/astro/icons/copy";
+
+const needs: { text: string; command?: string; code?: string }[] = [
+  { text: "macOS or Linux with Node 24.17 or newer" },
+  { text: "A Cloudflare account on Workers Paid, which Containers require" },
+  { text: "Wrangler signed in", command: "npx wrangler@4.120.0 login" },
+  { text: "Docker or OrbStack that builds linux/amd64" },
+  { text: "An Eve project with an exact pnpm pin and its root lockfile", code: '"packageManager": "pnpm@…"' },
+  { text: "just-bash as a production dependency", command: "pnpm add just-bash" },
+];
+
+const limits = [
+  { icon: Moon, text: "Disk and memory reset when the Container sleeps", note: "Keep durable state in a Workflow World such as Postgres" },
+  { icon: CalendarX, text: "Schedules don't fire while the Container sleeps" },
+  { icon: Box, text: "One 1 GiB Container instance", note: "No horizontal scaling or custom domains yet" },
+  { icon: Package, text: "pnpm projects only", note: "Bun lockfiles and native Windows aren't supported yet" },
+];
+---
+
+<section class="section" id="requirements" aria-labelledby="req-title">
+  <div class="wrap">
+    <div class="section-head">
+      <div>
+        <span class="tag">04 · Before you deploy</span>
+        <h2 id="req-title" class="section-title">What you need, and what to expect.</h2>
+      </div>
+    </div>
+
+    <div class="req">
+      <div class="req__panel card" data-reveal style="--i:0">
+        <div class="req__head">
+          <ListChecks class="icon" size={18} aria-hidden="true" />
+          <h3>You'll need</h3>
+          <span class="mono">6 things</span>
+        </div>
+        <ul>
+          {
+            needs.map(({ text, command, code }) => (
+              <li>
+                <span class="req__box" aria-hidden="true">
+                  <Check class="icon" size={14} />
+                </span>
+                <div class="req__copy">
+                  <span>{text}</span>
+                  {command && (
+                    <span class="req__code req__code--cmd mono">
+                      {command}
+                      <button type="button" data-copy={command} aria-label={`Copy ${command}`}>
+                        <Copy class="icon" size={11} aria-hidden="true" />
+                      </button>
+                    </span>
+                  )}
+                  {code && <code class="req__code mono">{code}</code>}
+                </div>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+
+      <div class="req__panel req__panel--limits card" data-reveal style="--i:1">
+        <div class="req__head">
+          <Info class="icon" size={18} aria-hidden="true" />
+          <h3>Honest limits</h3>
+          <span class="mono">in 0.2.0</span>
+        </div>
+        <ul>
+          {
+            limits.map(({ icon: Icon, text, note }) => (
+              <li>
+                <span class="req__icon" aria-hidden="true">
+                  <Icon class="icon" size={14} />
+                </span>
+                <div class="req__copy">
+                  <span>{text}</span>
+                  {note && <span class="req__note mono">{note}</span>}
+                </div>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .req {
+    display: flex;
+    align-items: flex-start;
+    gap: 32px;
+  }
+
+  .req__panel {
+    flex: 1;
+    padding: 8px 24px 12px;
+  }
+
+  .req__panel--limits {
+    background: var(--paper-2);
+  }
+
+  .req__head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 16px 0;
+  }
+
+  .req__head h3 {
+    flex: 1;
+    margin: 0;
+    font-size: 17px;
+    font-weight: 600;
+  }
+
+  .req__head .mono {
+    font-size: 12px;
+    color: var(--text-3);
+  }
+
+  ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  li {
+    display: flex;
+    gap: 14px;
+    padding: 16px 0;
+    border-top: 1px solid var(--rule);
+  }
+
+  .req__box,
+  .req__icon {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    flex: none;
+    border-radius: 7px;
+  }
+
+  .req__box {
+    background: var(--ink);
+    color: var(--paper);
+  }
+
+  .req__icon {
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    color: var(--text-2);
+  }
+
+  .req__copy {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 16px;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+
+  .req__code {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 10px;
+    border-radius: 8px;
+    background: var(--paper-2);
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-2);
+  }
+
+  .req__code--cmd {
+    padding-right: 6px;
+    background: var(--ink);
+    color: var(--console-text);
+  }
+
+  .req__code button {
+    display: grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    border: 0;
+    border-radius: 5px;
+    background: var(--console-line);
+    color: var(--console-dim);
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+  }
+
+  .req__code button:hover,
+  .req__code button.is-copied {
+    background: var(--accent);
+    color: var(--ink);
+  }
+
+  .req__note {
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.5;
+    color: var(--text-2);
+  }
+
+  @media (max-width: 900px) {
+    .req {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 28px;
+    }
+
+    .req__panel {
+      padding: 4px 16px 8px;
+    }
+
+    .req__copy {
+      font-size: 15px;
+    }
+  }
+</style>

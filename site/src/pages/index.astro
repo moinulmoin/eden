@@ -1,0 +1,34 @@
+---
+import Base from "../layouts/Base.astro";
+import Nav from "../components/Nav.astro";
+import Hero from "../components/Hero.astro";
+import DeployOutput from "../components/DeployOutput.astro";
+import HowItRuns from "../components/HowItRuns.astro";
+import Stays from "../components/Stays.astro";
+import Commands from "../components/Commands.astro";
+import Requirements from "../components/Requirements.astro";
+import FinalCta from "../components/FinalCta.astro";
+import Footer from "../components/Footer.astro";
+---
+
+<Base
+  title="Eden: deploy your Eve agent to your own Cloudflare"
+  description="Eden deploys an existing Vercel Eve project to your own Cloudflare account with one command. No rewrite, and your Eve source stays exactly as you wrote it."
+>
+  <Nav />
+  <main>
+    <Hero />
+    <DeployOutput />
+    <HowItRuns />
+    <Stays />
+    <Commands />
+    <Requirements />
+    <FinalCta />
+  </main>
+  <Footer />
+</Base>
+
+<script>
+  import "../scripts/garden";
+  import "../scripts/page";
+</script>

@@ -1,0 +1,148 @@
+---
+import ArrowDownRight from "@lucide/astro/icons/arrow-down-right";
+import GithubMark from "./GithubMark.astro";
+import { links } from "../links";
+---
+
+<header class="nav">
+  <div class="wrap nav__inner">
+    <a class="brand" href="/" aria-label="Eden home">
+      <span class="brand__sun" aria-hidden="true"></span>
+      <span class="brand__word">eden</span>
+    </a>
+    <a class="release" href={links.releases}>
+      <span class="pulse" aria-hidden="true"></span>
+      <span>v0.2.0 is out</span>
+    </a>
+    <nav class="nav__links" aria-label="Sections">
+      <a href="#how">How it works</a>
+      <a href="#commands">Commands</a>
+      <a href="#requirements">Requirements</a>
+      <a href={links.docs}>Docs</a>
+    </nav>
+    <div class="nav__actions">
+      <a class="pill-btn nav__gh" href={links.github}>
+        <GithubMark />
+        GitHub
+      </a>
+      <a class="pill-btn pill-btn--ink" href="#get-started">
+        <span class="nav__cta-long">Deploy your agent</span>
+        <span class="nav__cta-short">Deploy</span>
+        <ArrowDownRight class="icon" aria-hidden="true" />
+      </a>
+    </div>
+  </div>
+</header>
+
+<style>
+  .nav {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: #f5f5f3e6;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .nav__inner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: 72px;
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    text-decoration: none;
+  }
+
+  .brand__sun {
+    width: 14px;
+    height: 14px;
+    background: var(--accent);
+    transition: transform 0.4s var(--spring);
+  }
+
+  .brand:hover .brand__sun {
+    transform: rotate(90deg) scale(1.15);
+  }
+
+  .brand__word {
+    font-family: var(--pixel);
+    font-size: 30px;
+    font-weight: 600;
+    line-height: 1;
+  }
+
+  .release {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    margin-left: 4px;
+    padding: 5px 12px 5px 10px;
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    background: var(--white);
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-2);
+    text-decoration: none;
+    transition: border-color 0.2s;
+  }
+
+  .release:hover {
+    border-color: var(--ink);
+  }
+
+  .nav__links {
+    display: flex;
+    gap: 32px;
+    margin: 0 auto;
+  }
+
+  .nav__links a {
+    font-size: 14px;
+    color: var(--text-2);
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+
+  .nav__links a:hover {
+    color: var(--ink);
+  }
+
+  .nav__actions {
+    display: flex;
+    gap: 10px;
+  }
+
+  .nav__actions .pill-btn {
+    padding: 9px 15px;
+    font-size: 14px;
+  }
+
+  .nav__cta-short {
+    display: none;
+  }
+
+  @media (max-width: 900px) {
+    .nav__inner {
+      height: 64px;
+      justify-content: space-between;
+    }
+
+    .release,
+    .nav__links,
+    .nav__gh,
+    .nav__cta-long {
+      display: none;
+    }
+
+    .nav__cta-short {
+      display: inline;
+    }
+  }
+</style>

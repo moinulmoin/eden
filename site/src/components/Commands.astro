@@ -1,0 +1,284 @@
+---
+import SearchCheck from "@lucide/astro/icons/search-check";
+import Rocket from "@lucide/astro/icons/rocket";
+import Trash from "@lucide/astro/icons/trash";
+import Braces from "@lucide/astro/icons/braces";
+import Copy from "@lucide/astro/icons/copy";
+import Check from "@lucide/astro/icons/check";
+
+const commands = [
+  {
+    command: "eden preflight",
+    icon: SearchCheck,
+    detail:
+      "Read-only check of your Eve project, Cloudflare access and target name. Optional; deploy runs the same checks.",
+    preview: "# read-only: nothing on Cloudflare changes",
+  },
+  {
+    command: "eden deploy",
+    icon: Rocket,
+    detail: "Builds, publishes and health-checks one exact target. Preview by default, named from package.json.",
+    preview: "✓ deployed my-eve-agent-9e510242 (preview) → https://my-eve-agent-9e510242.<you>.workers.dev",
+  },
+  {
+    command: "eden destroy --name",
+    icon: Trash,
+    detail:
+      "Removes one exact Eden-owned deployment after checking its ownership record. Never touches look-alikes.",
+    preview: "✓ destroyed my-eve-agent-9e510242 (preview) in 23s",
+  },
+];
+---
+
+<section class="section commands dark" id="commands" aria-labelledby="commands-title">
+  <div class="wrap">
+    <div class="section-head">
+      <div>
+        <span class="tag tag--light">03 · The whole CLI</span>
+        <h2 id="commands-title" class="section-title">Three commands. That's it.</h2>
+      </div>
+      <span class="json mono"><Braces class="icon" size={14} aria-hidden="true" /> every command takes --json</span>
+    </div>
+
+    <ul class="cmd-list">
+      {
+        commands.map(({ command, icon: Icon, detail, preview }, i) => (
+          <li class="cmd-row" data-reveal style={`--i:${i}`} tabindex="0" data-copy-row={command}>
+            <div class="cmd-row__top">
+              <div class="cmd-row__cmd">
+                <span class="cmd-row__icon">
+                  <Icon class="icon" aria-hidden="true" />
+                </span>
+                <code class="mono">{command}</code>
+              </div>
+              <p class="cmd-row__detail">{detail}</p>
+              <button class="cmd-row__copy" type="button" data-copy={command} aria-label={`Copy ${command}`}>
+                <Copy class="icon icon-copy" aria-hidden="true" />
+                <Check class="icon icon-done" aria-hidden="true" />
+              </button>
+            </div>
+            <div class="cmd-row__preview" aria-hidden="true">
+              <div class="cmd-row__preview-inner mono">
+                <span>{preview}</span>
+                <kbd>⏎ copy</kbd>
+              </div>
+            </div>
+          </li>
+        ))
+      }
+    </ul>
+  </div>
+</section>
+
+<style>
+  .json {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border: 1px solid var(--console-line);
+    border-radius: 10px;
+    font-size: 12px;
+    color: var(--console-dim);
+  }
+
+  .cmd-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .cmd-row {
+    padding: 26px 28px;
+    border: 1px solid var(--console-line);
+    border-radius: 18px;
+    outline: none;
+    transition:
+      background 0.25s,
+      border-color 0.25s,
+      box-shadow 0.25s var(--ease-out),
+      opacity 0.6s var(--ease-out) calc(var(--i, 0) * 80ms),
+      translate 0.6s var(--ease-out) calc(var(--i, 0) * 80ms);
+  }
+
+  .cmd-row__top {
+    display: flex;
+    align-items: center;
+    gap: 40px;
+  }
+
+  .cmd-row__cmd {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: 420px;
+    flex: none;
+  }
+
+  .cmd-row__cmd code {
+    font-size: 24px;
+    font-weight: 500;
+  }
+
+  .cmd-row__icon {
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    flex: none;
+    border-radius: 12px;
+    background: var(--console-line);
+    transition: background 0.25s, color 0.25s;
+  }
+
+  .cmd-row__icon .icon {
+    width: 18px;
+    height: 18px;
+  }
+
+  .cmd-row__detail {
+    flex: 1;
+    margin: 0;
+    font-size: 16px;
+    line-height: 1.55;
+    color: var(--console-text);
+  }
+
+  .cmd-row__copy {
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    flex: none;
+    border: 1px solid var(--console-line);
+    border-radius: 12px;
+    background: transparent;
+    color: var(--console-dim);
+    opacity: 0.5;
+    cursor: pointer;
+    transition: opacity 0.2s, border-color 0.2s, color 0.2s;
+  }
+
+  .cmd-row__copy .icon-done {
+    display: none;
+  }
+
+  .cmd-row__copy.is-copied .icon-copy {
+    display: none;
+  }
+
+  .cmd-row__copy.is-copied .icon-done {
+    display: block;
+  }
+
+  .cmd-row__preview {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 0.3s var(--ease-out);
+  }
+
+  .cmd-row__preview-inner {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-height: 0;
+    overflow: hidden;
+    font-size: 13px;
+    color: var(--console-text);
+  }
+
+  .cmd-row__preview-inner span {
+    flex: 1;
+  }
+
+  .cmd-row__preview-inner kbd {
+    padding: 3px 8px;
+    border: 1px solid var(--console-line);
+    border-radius: 6px;
+    box-shadow: 0 2px 0 var(--console-line);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--console-dim);
+  }
+
+  .cmd-row:hover,
+  .cmd-row:focus-visible {
+    border-color: var(--accent);
+    background: var(--graphite);
+    box-shadow: 0 6px 0 var(--accent);
+  }
+
+  .cmd-row:hover .cmd-row__icon,
+  .cmd-row:focus-visible .cmd-row__icon {
+    background: var(--accent);
+    color: var(--ink);
+  }
+
+  .cmd-row:hover .cmd-row__copy,
+  .cmd-row:focus-visible .cmd-row__copy {
+    opacity: 1;
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .cmd-row:hover .cmd-row__preview,
+  .cmd-row:focus-visible .cmd-row__preview {
+    grid-template-rows: 1fr;
+  }
+
+  .cmd-row:hover .cmd-row__preview-inner,
+  .cmd-row:focus-visible .cmd-row__preview-inner {
+    margin-top: 16px;
+    padding: 12px 16px;
+    border-radius: 12px;
+    background: var(--ink);
+  }
+
+  @media (max-width: 1100px) {
+    .cmd-row__cmd {
+      width: 320px;
+    }
+  }
+
+  @media (max-width: 900px) {
+    .cmd-row {
+      padding: 18px 16px;
+    }
+
+    .cmd-row__top {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 12px;
+    }
+
+    .cmd-row__cmd {
+      width: auto;
+      gap: 12px;
+    }
+
+    .cmd-row__cmd code {
+      font-size: 18px;
+    }
+
+    .cmd-row__detail {
+      font-size: 15px;
+    }
+
+    .cmd-row__copy {
+      display: none;
+    }
+
+    .cmd-row__preview-inner {
+      font-size: 11px;
+      line-height: 1.5;
+      word-break: break-all;
+    }
+
+    .cmd-row__preview-inner kbd {
+      display: none;
+    }
+  }
+</style>

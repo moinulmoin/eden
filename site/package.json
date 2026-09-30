@@ -1,0 +1,20 @@
+{
+  "name": "@moinulmoin/eden-site",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The Eden landing page.",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "deploy": "astro build && wrangler deploy"
+  },
+  "dependencies": {
+    "@lucide/astro": "1.48.0",
+    "astro": "7.3.5"
+  },
+  "devDependencies": {
+    "wrangler": "4.120.0"
+  }
+}

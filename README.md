@@ -173,6 +173,9 @@ After the build, invoke the source-checkout CLI with:
 node packages/cli/dist/index.js --help
 ```
 
+The landing page at eden.ideaplexa.com lives in `site/` (Astro). Run it with
+`pnpm --filter @moinulmoin/eden-site dev`.
+
 ## Documentation
 
 - [Documentation index](./docs/README.md): find every guide

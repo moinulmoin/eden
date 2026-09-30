@@ -1,0 +1,145 @@
+---
+import { links } from "../links";
+
+const columns = [
+  {
+    heading: "Product",
+    items: [
+      { label: "Deploy guide", href: links.deployGuide },
+      { label: "Install", href: links.install },
+      { label: "Eve compatibility", href: links.compatibility },
+    ],
+  },
+  {
+    heading: "Project",
+    items: [
+      { label: "GitHub", href: links.github },
+      { label: "npm", href: links.npm },
+      { label: "Releases", href: links.releases },
+    ],
+  },
+];
+---
+
+<footer class="footer dark">
+  <div class="wrap">
+    <div class="footer__top">
+      <p class="footer__word" aria-hidden="true">eden</p>
+      <nav class="footer__cols" aria-label="Footer">
+        {
+          columns.map((column) => (
+            <div class="footer__col">
+              <p class="mono">{column.heading}</p>
+              {column.items.map((item) => (
+                <a href={item.href}>{item.label}</a>
+              ))}
+            </div>
+          ))
+        }
+      </nav>
+    </div>
+    <div class="footer__meta mono">
+      <span>Apache-2.0 · Built by Moinul Moin at <a href={links.ideaplexa}>Ideaplexa</a></span>
+      <span>Not affiliated with Vercel or Cloudflare</span>
+    </div>
+  </div>
+</footer>
+
+<style>
+  .footer {
+    padding: 24px 0 40px;
+  }
+
+  .footer__top {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 40px;
+  }
+
+  .footer__word {
+    margin: 0;
+    font-family: var(--pixel);
+    font-size: 300px;
+    font-weight: 700;
+    line-height: 0.85;
+    letter-spacing: -0.02em;
+    color: var(--paper);
+    user-select: none;
+  }
+
+  .footer__cols {
+    display: flex;
+    gap: 56px;
+    padding-bottom: 28px;
+  }
+
+  .footer__col {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .footer__col p {
+    margin: 0;
+    font-size: 11px;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--console-dim);
+  }
+
+  .footer__col a {
+    font-size: 15px;
+    color: var(--console-text);
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+
+  .footer__col a:hover {
+    color: var(--accent);
+  }
+
+  .footer__meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 24px;
+    padding-top: 20px;
+    border-top: 1px solid var(--console-line);
+    font-size: 12px;
+    color: var(--console-dim);
+  }
+
+  .footer__meta a {
+    color: var(--console-text);
+    text-underline-offset: 3px;
+  }
+
+  @media (max-width: 1100px) {
+    .footer__word {
+      font-size: 200px;
+    }
+  }
+
+  @media (max-width: 900px) {
+    .footer__top {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 28px;
+    }
+
+    .footer__word {
+      font-size: 132px;
+    }
+
+    .footer__cols {
+      gap: 48px;
+      padding: 0;
+    }
+
+    .footer__meta {
+      flex-direction: column;
+      gap: 6px;
+    }
+  }
+</style>

@@ -1,0 +1,286 @@
+---
+import FolderCode from "@lucide/astro/icons/folder-code";
+import Hammer from "@lucide/astro/icons/hammer";
+import Globe from "@lucide/astro/icons/globe";
+import Container from "@lucide/astro/icons/container";
+import Cloud from "@lucide/astro/icons/cloud";
+---
+
+<section class="section how" id="how" aria-labelledby="how-title">
+  <div class="wrap">
+    <div class="section-head">
+      <div>
+        <span class="tag">01 · How it runs</span>
+        <h2 id="how-title" class="section-title">Your real Eve server,<br />in a Cloudflare Container.</h2>
+      </div>
+      <p class="section-intro">
+        Eden doesn't translate your agent into something else. It builds the Eve app you run locally
+        and hosts that same server on your account.
+      </p>
+    </div>
+
+    <ol class="diagram">
+      <li class="node card" data-reveal style="--i:0">
+        <div class="node__top">
+          <span class="icon-tile"><FolderCode class="icon" aria-hidden="true" /></span>
+          <span class="node__step mono">01 · your machine</span>
+        </div>
+        <h3 class="node__title mono">Eve project</h3>
+        <p class="node__detail">Your agent code, pinned pnpm and root lockfile. Eden doesn't edit them.</p>
+      </li>
+      <li class="flow flow--wire diagram__wire" aria-hidden="true"></li>
+      <li class="node card" data-reveal style="--i:1">
+        <div class="node__top">
+          <span class="icon-tile"><Hammer class="icon" aria-hidden="true" /></span>
+          <span class="node__step mono">02 · local docker</span>
+        </div>
+        <h3 class="node__title mono">Eden builder</h3>
+        <p class="node__detail">Frozen install, your own Eve build, a linux/amd64 runtime image.</p>
+      </li>
+      <li class="flow flow--wire diagram__wire" aria-hidden="true"></li>
+      <li class="zone">
+        <span class="zone__label mono"><Cloud class="icon" size={13} aria-hidden="true" /> Your Cloudflare account</span>
+        <ol class="zone__row">
+          <li class="node card" data-reveal style="--i:2">
+            <div class="node__top">
+              <span class="icon-tile"><Globe class="icon" aria-hidden="true" /></span>
+              <span class="node__step mono">03 · edge</span>
+            </div>
+            <h3 class="node__title mono">Worker</h3>
+            <p class="node__detail">Serves your workers.dev URL and routes requests inward.</p>
+          </li>
+          <li class="flow flow--wire diagram__wire diagram__wire--short" aria-hidden="true"></li>
+          <li class="node card node--hot" data-reveal style="--i:3">
+            <div class="node__top">
+              <span class="icon-tile"><Container class="icon" aria-hidden="true" /></span>
+              <span class="node__step mono">04 · 1 GiB</span>
+            </div>
+            <h3 class="node__title mono">Container</h3>
+            <p class="node__detail">Your real Node/Nitro Eve server, started by Eve itself.</p>
+          </li>
+        </ol>
+      </li>
+    </ol>
+
+    <div class="gate" data-reveal style="--i:4">
+      <span class="pulse" aria-hidden="true"></span>
+      <code class="gate__req mono"><b>GET</b> /eve/v1/health <span>→ 200</span></code>
+      <p>Eden promotes the deployment only after the new URL answers healthy.</p>
+    </div>
+  </div>
+</section>
+
+<style>
+  .diagram,
+  .zone__row {
+    display: flex;
+    align-items: center;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .diagram__wire {
+    flex: 1;
+    min-width: 24px;
+  }
+
+  .diagram__wire--short {
+    flex: none;
+    width: 36px;
+  }
+
+  .node {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    width: 232px;
+    min-height: 196px;
+    padding: 20px 20px 22px;
+    border-radius: 18px;
+    box-shadow: 0 5px 0 var(--ink);
+    transition:
+      transform 0.25s var(--ease-out),
+      box-shadow 0.25s var(--ease-out),
+      opacity 0.6s var(--ease-out) calc(var(--i, 0) * 80ms),
+      translate 0.6s var(--ease-out) calc(var(--i, 0) * 80ms);
+  }
+
+  .node.is-in:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 9px 0 var(--ink);
+  }
+
+  .zone .node {
+    width: 212px;
+  }
+
+  .node__top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .node .icon-tile {
+    width: 36px;
+    height: 36px;
+  }
+
+  .node__step {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+
+  .node__title {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .node__detail {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text-2);
+  }
+
+  .node--hot {
+    background: var(--ink);
+    box-shadow: 0 5px 0 var(--accent);
+  }
+
+  .node--hot.is-in:hover {
+    box-shadow: 0 9px 0 var(--accent);
+  }
+
+  .node--hot .icon-tile {
+    background: var(--accent);
+  }
+
+  .node--hot .node__title {
+    color: var(--paper);
+  }
+
+  .node--hot .node__step {
+    color: var(--console-dim);
+  }
+
+  .node--hot .node__detail {
+    color: var(--console-text);
+  }
+
+  .zone {
+    position: relative;
+    padding: 26px 20px 20px;
+    border: 2px solid var(--accent);
+    border-radius: 26px;
+    background: #f4812012;
+  }
+
+  .zone__label {
+    position: absolute;
+    top: -13px;
+    left: 18px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  .gate {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-top: 56px;
+    padding: 16px 20px;
+    border: 1px solid var(--rule);
+    border-radius: 16px;
+    background: var(--white);
+  }
+
+  .gate__req {
+    padding: 6px 10px;
+    border-radius: 8px;
+    background: var(--ink);
+    color: var(--paper);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .gate__req b {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .gate__req span {
+    color: var(--console-dim);
+  }
+
+  .gate p {
+    margin: 0;
+    font-size: 15px;
+  }
+
+  @media (max-width: 1100px) {
+    .node,
+    .zone .node {
+      width: 200px;
+    }
+  }
+
+  @media (max-width: 900px) {
+    .diagram,
+    .zone__row {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .diagram__wire,
+    .diagram__wire--short {
+      flex: none;
+      align-self: center;
+      width: 4px;
+      height: 36px;
+      min-width: 0;
+      background-image: repeating-linear-gradient(
+        180deg,
+        #f4812059 0,
+        var(--accent) var(--packet),
+        transparent var(--packet),
+        transparent var(--spacing)
+      );
+      background-size: 100% var(--spacing);
+      animation-name: flow-y;
+    }
+
+    .node,
+    .zone .node {
+      width: auto;
+      min-height: 0;
+    }
+
+    .zone {
+      padding: 28px 14px 14px;
+    }
+
+    .gate {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 12px;
+      margin-top: 32px;
+    }
+
+    .gate p {
+      font-size: 14px;
+      line-height: 1.5;
+    }
+  }
+</style>

@@ -1,0 +1,22 @@
+---
+import Copy from "@lucide/astro/icons/copy";
+import Check from "@lucide/astro/icons/check";
+
+interface Props {
+  command: string;
+  label?: string;
+  class?: string;
+}
+
+const { command, label = "Copy command", class: className } = Astro.props;
+---
+
+<div class:list={["cmd", className]} data-cmd>
+  <span class="cmd__prompt" aria-hidden="true">$</span>
+  <code class="cmd__text" data-cmd-text>{command}</code>
+  <button class="copy-btn" type="button" data-copy={command} aria-label={label}>
+    <Copy class="icon icon-copy" size={15} aria-hidden="true" />
+    <Check class="icon icon-done" size={15} aria-hidden="true" />
+    <span class="copy-btn__label" data-copy-label>Copy</span>
+  </button>
+</div>

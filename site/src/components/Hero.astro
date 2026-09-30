@@ -1,0 +1,346 @@
+---
+import CopyCommand from "./CopyCommand.astro";
+import { links } from "../links";
+---
+
+<section class="hero">
+  <div class="wrap hero__grid">
+    <div class="hero__main">
+      <p class="hero__eyebrow mono">For Vercel Eve <span aria-hidden="true">→</span> your Cloudflare</p>
+      <div class="hero__title-wrap">
+        <h1 class="hero__title">Same project.<br />New home.</h1>
+        <a class="sticker" href="#stays" aria-label="No rewrite needed: see what stays yours">
+          <span class="sticker__top">No</span>
+          <span class="sticker__main">Rewrite</span>
+          <span class="sticker__bottom">needed</span>
+        </a>
+      </div>
+    </div>
+    <div class="hero__pitch">
+      <p class="hero__sub">
+        Eden deploys the Eve agent you already built to your own Cloudflare account. One command,
+        about two minutes, and your Eve source stays exactly as you wrote it.
+      </p>
+      <CopyCommand command="npx @moinulmoin/eden deploy" label="Copy the deploy command" />
+      <div class="hero__links">
+        <a class="link-arrow" href={links.deployGuide}>Read the deploy guide <span aria-hidden="true">→</span></a>
+        <a class="link-muted" href="#requirements">What you need first</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="garden" data-garden-host>
+  <canvas
+    class="garden__canvas"
+    data-garden
+    data-sun-x="0.76"
+    data-sun-y="0.52"
+    data-sun-r="0.3"
+    data-pixel="6"
+    data-mobile-sun-x="0.7"
+    data-mobile-sun-y="0.56"
+    data-mobile-sun-r="0.27"
+    aria-hidden="true"></canvas>
+  <div class="garden__route" role="img" aria-label="Route: your Eve project, through eden deploy, to your Cloudflare workers.dev URL">
+    <span class="sign">
+      <span class="sign__label mono">~/my-eve-agent</span>
+      <span class="sign__sub mono">your Eve code, unchanged</span>
+    </span>
+    <span class="flow garden__line" aria-hidden="true"></span>
+    <span class="sign sign--chip mono"><span class="sign__prompt">$</span> eden deploy</span>
+    <span class="flow garden__line" aria-hidden="true"></span>
+    <span class="sign sign--dest">
+      <span class="pulse" aria-hidden="true"></span>
+      <span class="sign__text">
+        <span class="sign__label mono">*.workers.dev</span>
+        <span class="sign__sub mono">your Cloudflare account</span>
+      </span>
+    </span>
+  </div>
+</div>
+
+<style>
+  .hero {
+    padding: 80px 0 56px;
+  }
+
+  .hero__grid {
+    display: flex;
+    align-items: flex-end;
+    gap: 48px;
+  }
+
+  .hero__main {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .hero__eyebrow {
+    margin: 0 0 28px;
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-2);
+  }
+
+  .hero__title-wrap {
+    position: relative;
+    font-size: 118px;
+  }
+
+  .hero__title {
+    margin: 0;
+    font-size: 1em;
+    font-weight: 700;
+    line-height: 0.94;
+    letter-spacing: -0.055em;
+    white-space: nowrap;
+  }
+
+  .sticker {
+    position: absolute;
+    left: 5em;
+    top: 1em;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 1.12em;
+    height: 1.12em;
+    border: 2px solid var(--ink);
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--ink);
+    text-decoration: none;
+    text-transform: uppercase;
+    transform: rotate(12deg);
+    transition: transform 0.5s var(--spring);
+  }
+
+  .sticker:hover,
+  .sticker:focus-visible {
+    transform: rotate(-4deg) scale(1.06);
+  }
+
+  .sticker__top {
+    font-family: var(--pixel);
+    font-size: 0.186em;
+    font-weight: 600;
+    line-height: 1;
+  }
+
+  .sticker__main {
+    font-family: var(--pixel);
+    font-size: 0.22em;
+    font-weight: 700;
+    line-height: 1.1;
+  }
+
+  .sticker__bottom {
+    font-family: var(--mono);
+    font-size: 0.095em;
+    text-transform: none;
+  }
+
+  .hero__pitch {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    width: 400px;
+    flex: none;
+    padding-bottom: 6px;
+  }
+
+  .hero__sub {
+    margin: 0;
+    font-size: 18px;
+    line-height: 1.5;
+    color: var(--text-2);
+  }
+
+  .hero__links {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+  }
+
+  /* Garden band */
+
+  .garden {
+    position: relative;
+    height: 460px;
+    background:
+      radial-gradient(circle at 76% 48%, var(--accent) 0 138px, transparent 139px),
+      linear-gradient(to top, var(--ink) 0 22%, transparent 22%);
+    overflow: hidden;
+  }
+
+  .garden__canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    image-rendering: pixelated;
+  }
+
+  .garden__route {
+    position: absolute;
+    --edge: max(var(--gutter), calc((100% - var(--max)) / 2));
+    left: var(--edge);
+    right: calc(var(--edge) + 92px);
+    top: 69%;
+    display: flex;
+    align-items: center;
+    transform: translateY(-50%);
+  }
+
+  .garden__line {
+    flex: 1;
+    height: 10px;
+    margin: 0 -2px;
+  }
+
+  .sign {
+    position: relative;
+    z-index: 1;
+    display: inline-flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 14px;
+    border: 1.5px solid var(--ink);
+    border-radius: 10px;
+    background: var(--paper);
+    white-space: nowrap;
+  }
+
+  .sign__label {
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .sign__sub {
+    font-size: 11px;
+    color: var(--text-2);
+  }
+
+  .sign--chip {
+    flex-direction: row;
+    gap: 8px;
+    padding: 10px 16px;
+    border: 2px solid var(--paper);
+    border-radius: 999px;
+    background: var(--ink);
+    color: var(--paper);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .sign__prompt {
+    color: var(--console-dim);
+  }
+
+  .sign--dest {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px 8px 14px;
+    border: 2px solid var(--accent);
+  }
+
+  .sign__text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  @media (max-width: 1100px) {
+    .hero__title-wrap {
+      font-size: 96px;
+    }
+
+    .hero__pitch {
+      width: 340px;
+    }
+  }
+
+  @media (max-width: 900px) {
+    .hero {
+      padding: 36px 0 40px;
+    }
+
+    .hero__grid {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 28px;
+    }
+
+    .hero__eyebrow {
+      margin-bottom: 18px;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+    }
+
+    .hero__title-wrap {
+      font-size: clamp(40px, 12.6vw, 64px);
+    }
+
+    .sticker {
+      left: 5.3em;
+      top: 0.9em;
+      width: 1.75em;
+      height: 1.75em;
+      border-width: 1.5px;
+    }
+
+    .sticker__top {
+      font-size: 0.29em;
+    }
+
+    .sticker__main {
+      font-size: 0.33em;
+    }
+
+    .sticker__bottom {
+      font-size: 0.16em;
+    }
+
+    .hero__pitch {
+      width: auto;
+      gap: 20px;
+      padding: 0;
+    }
+
+    .hero__sub {
+      font-size: 16px;
+    }
+
+    .hero__links {
+      gap: 18px;
+    }
+
+    .hero__links a {
+      font-size: 14px;
+    }
+
+    .garden {
+      height: 360px;
+    }
+
+    .garden__route {
+      right: var(--edge);
+      top: 71%;
+    }
+
+    .sign--chip,
+    .garden__line + .sign--chip + .garden__line,
+    .sign__sub {
+      display: none;
+    }
+
+    .sign {
+      padding: 7px 12px;
+    }
+  }
+</style>

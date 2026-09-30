@@ -1,0 +1,204 @@
+---
+import Star from "@lucide/astro/icons/star";
+import ArrowRight from "@lucide/astro/icons/arrow-right";
+import CopyCommand from "./CopyCommand.astro";
+import { links } from "../links";
+
+const managers = [
+  { id: "npm", command: "npm install --global @moinulmoin/eden", short: "npm i -g @moinulmoin/eden" },
+  { id: "pnpm", command: "pnpm add --global @moinulmoin/eden", short: "pnpm add -g @moinulmoin/eden" },
+  { id: "bun", command: "bun add --global @moinulmoin/eden", short: "bun add -g @moinulmoin/eden" },
+];
+---
+
+<section class="sunset" id="get-started" aria-labelledby="cta-title" data-garden-host>
+  <canvas
+    class="sunset__canvas"
+    data-garden
+    data-sun-x="0.87"
+    data-sun-y="0.5"
+    data-sun-r="0.27"
+    data-pixel="6"
+    data-mobile-sun-x="0.5"
+    data-mobile-sun-y="0.86"
+    data-mobile-sun-r="0.12"
+    aria-hidden="true"></canvas>
+  <div class="cta">
+    <span class="cta__pill mono"><span class="pulse" aria-hidden="true"></span>Eve's new home is one command away</span>
+    <h2 id="cta-title" class="cta__title">Deploy the Eve agent <br class="cta__br" />you already have.</h2>
+    <div class="cta__install" data-pm>
+      <div class="cta__tabs" role="tablist" aria-label="Package manager">
+        {
+          managers.map((pm, index) => (
+            <button
+              class="cta__tab mono"
+              type="button"
+              role="tab"
+              aria-selected={index === 0 ? "true" : "false"}
+              data-pm-tab={pm.id}
+              data-command={pm.command}
+              data-short={pm.short}
+            >
+              {pm.id}
+            </button>
+          ))
+        }
+      </div>
+      <CopyCommand command={managers[0]!.command} label="Copy the install command" class="cta__cmd" />
+    </div>
+    <div class="cta__actions">
+      <a class="pill-btn pill-btn--white" href={links.github}>
+        <Star class="icon" aria-hidden="true" />
+        Star on GitHub
+      </a>
+      <a class="pill-btn pill-btn--ink" href={links.deployGuide}>
+        Read the deploy guide
+        <ArrowRight class="icon" aria-hidden="true" />
+      </a>
+    </div>
+  </div>
+</section>
+
+<style>
+  .sunset {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    min-height: 640px;
+    padding: 64px 20px 150px;
+    overflow: hidden;
+    background:
+      radial-gradient(circle at 87% 50%, var(--accent) 0 172px, transparent 173px),
+      linear-gradient(to top, var(--ink) 0 22%, transparent 22%);
+  }
+
+  .sunset__canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    image-rendering: pixelated;
+  }
+
+  .cta {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 28px;
+    width: 760px;
+    max-width: 100%;
+    align-self: flex-start;
+    padding: 44px 48px 40px;
+    border: 2px solid var(--ink);
+    border-radius: 28px;
+    background: var(--paper);
+    box-shadow: 0 10px 0 var(--ink);
+  }
+
+  .cta__pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 12px;
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    background: var(--white);
+    font-size: 12px;
+    color: var(--text-2);
+  }
+
+  .cta__title {
+    margin: 0;
+    font-size: 60px;
+    font-weight: 700;
+    line-height: 0.98;
+    letter-spacing: -0.05em;
+    text-align: center;
+  }
+
+  .cta__install {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 100%;
+  }
+
+  .cta__tabs {
+    display: inline-flex;
+    align-self: flex-start;
+    gap: 4px;
+    padding: 4px;
+    border-radius: 12px;
+    background: var(--paper-2);
+  }
+
+  .cta__tab {
+    padding: 6px 14px;
+    border: 1px solid transparent;
+    border-radius: 9px;
+    background: transparent;
+    font-size: 13px;
+    color: var(--text-2);
+    cursor: pointer;
+    transition: background 0.18s var(--ease-out), color 0.18s, border-color 0.18s;
+  }
+
+  .cta__tab[aria-selected="true"] {
+    border-color: var(--rule);
+    background: var(--white);
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .cta__cmd {
+    height: 58px;
+    padding-left: 18px;
+    font-size: 16px;
+  }
+
+  .cta__actions {
+    display: flex;
+    gap: 12px;
+  }
+
+  @media (max-width: 900px) {
+    .sunset {
+      min-height: 900px;
+      padding: 236px 16px 180px;
+    }
+
+    .cta {
+      gap: 20px;
+      padding: 28px 20px 24px;
+    }
+
+    .cta__pill {
+      font-size: 11px;
+    }
+
+    .cta__title {
+      font-size: 38px;
+      letter-spacing: -0.047em;
+      line-height: 1;
+    }
+
+    .cta__br {
+      display: none;
+    }
+
+    .cta__cmd {
+      height: 52px;
+      padding-left: 14px;
+      font-size: 13px;
+    }
+
+    .cta__actions {
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+  }
+</style>

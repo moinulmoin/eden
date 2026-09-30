@@ -9,6 +9,7 @@ export default tseslint.config(
       "**/.output/**",
       "**/.wrangler/**",
       "**/.eden/**",
+      "**/.astro/**",
       "**/*.d.ts",
       "video/**",
     ],
