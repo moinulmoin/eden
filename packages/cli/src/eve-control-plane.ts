@@ -75,6 +75,7 @@ import {
 } from "./eve-runtime-config.js";
 import type {
   EveHostConfig,
+  EveScheduleCronEntry,
 } from "@moinulmoin/eden-runtime-cloudflare";
 
 const execFileAsync = promisify(execFile);
@@ -139,6 +140,11 @@ export interface EveDeploymentMetadata {
   readonly runtimeVariableNames: readonly string[];
   readonly evidenceRetained: true;
 }
+export interface EvePreflightWarning {
+  readonly id: string;
+  readonly message: string;
+  readonly remediation?: string;
+}
 
 export interface EvePreflightResult {
   readonly command: "eve preflight" | "eve deploy";
@@ -146,6 +152,7 @@ export interface EvePreflightResult {
   readonly environment: EveCliEnvironment;
   readonly name: string;
   readonly checks: readonly EvePreflightCheck[];
+  readonly warnings: readonly EvePreflightWarning[];
   readonly candidate: EvePreflightCandidate | null;
   readonly deployment?: EveDeploymentMetadata;
 }
@@ -200,6 +207,7 @@ export interface EvePreflightRuntimeRunnerRequest {
   readonly publicOrigin?: string;
   readonly runtimeInjection?: EveRuntimeInjection;
   readonly retainImage?: boolean;
+  readonly workflowWorld?: string;
 }
 
 export type EvePreflightRuntimeRunner = (
@@ -428,6 +436,7 @@ interface EvePreflightCollection {
   readonly projectId?: string;
   readonly runtimeEvidence?: EvePreflightRuntimeEvidence;
   readonly cloudflare?: EveCloudflareReadResult;
+  readonly schedules?: readonly EveScheduleCronEntry[];
 }
 
 function safeText(value: string): string {
@@ -495,6 +504,263 @@ function allChecksClear(checks: readonly EvePreflightCheck[]): boolean {
   );
 }
 
+/**
+ * Path, inside the built snapshot, of the manifest `eve build` writes with the
+ * resolved agent configuration. `config.experimental.workflow.world` is the
+ * field Eve itself resolves at build time; absent/`local`/
+ * `@workflow/world-local` mean Eve's container-local default World.
+ */
+const EVE_COMPILED_MANIFEST_PATH =
+  ".output/.eve/compile/compiled-agent-manifest.json";
+
+async function readCompiledWorldSpecifier(
+  candidate: EveProjectBuildCandidate,
+): Promise<string | undefined> {
+  try {
+    const manifest = JSON.parse(
+      await readFile(
+        join(candidate.snapshotRoot, EVE_COMPILED_MANIFEST_PATH),
+        "utf8",
+      ),
+    ) as unknown;
+    const world = (
+      manifest as {
+        readonly config?: {
+          readonly experimental?: {
+            readonly workflow?: { readonly world?: unknown };
+          };
+        };
+      } | null
+    )?.config?.experimental?.workflow?.world;
+    return typeof world === "string" ? world : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Reads authored schedules out of the compiled manifest `eve build` writes.
+ * Root `schedules` covers file and extension-mounted schedules; declared
+ * subagents cannot carry schedules, so only the root array is consulted.
+ */
+async function readCompiledSchedules(
+  candidate: EveProjectBuildCandidate,
+): Promise<readonly EveScheduleCronEntry[]> {
+  try {
+    const manifest = JSON.parse(
+      await readFile(
+        join(candidate.snapshotRoot, EVE_COMPILED_MANIFEST_PATH),
+        "utf8",
+      ),
+    ) as unknown;
+    const schedules = (
+      manifest as {
+        readonly schedules?: readonly {
+          readonly name?: unknown;
+          readonly cron?: unknown;
+        }[];
+      } | null
+    )?.schedules;
+    if (!Array.isArray(schedules)) return [];
+    return schedules.flatMap((schedule) =>
+      typeof schedule.name === "string" && typeof schedule.cron === "string"
+        ? [{ name: schedule.name, cron: schedule.cron }]
+        : []);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Mirrors Eve's own `assertWorkflowWorldCompatibility`
+ * (dist/src/internal/workflow/world-compatibility.js): Eve derives the
+ * expected Workflow line from its installed manifest's `@workflow/core`
+ * dependency, reads the selected World's manifest for a `@workflow/core` or
+ * `@workflow/world` dependency, and fails only on a definite line mismatch —
+ * different major, or both prerelease tags present and different.
+ */
+function parseWorkflowVersionLine(
+  range: string,
+): { readonly major: number; readonly prereleaseTag?: string } | undefined {
+  const match =
+    /(\d+)\.(?:\d+|x|\*)(?:\.(?:\d+|x|\*))?(?:-([0-9A-Za-z.-]+))?/u.exec(
+      range.trim(),
+    );
+  if (match === null) return undefined;
+  const major = Number(match[1]);
+  if (!Number.isInteger(major)) return undefined;
+  return {
+    major,
+    ...(match[2] === undefined
+      ? {}
+      : { prereleaseTag: match[2].split(".")[0] }),
+  };
+}
+
+async function readInstalledManifest(
+  snapshotRoot: string,
+  packageName: string,
+): Promise<
+  | {
+    readonly devDependencies?: Readonly<Record<string, string>>;
+    readonly dependencies?: Readonly<Record<string, string>>;
+    readonly peerDependencies?: Readonly<Record<string, string>>;
+  }
+  | undefined
+> {
+  try {
+    return JSON.parse(
+      await readFile(
+        join(snapshotRoot, "node_modules", packageName, "package.json"),
+        "utf8",
+      ),
+    ) as {
+      readonly devDependencies?: Readonly<Record<string, string>>;
+      readonly dependencies?: Readonly<Record<string, string>>;
+      readonly peerDependencies?: Readonly<Record<string, string>>;
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Fails deploy/preflight when the selected `@workflow/world-postgres` would
+ * trip Eve's runtime World-compatibility rejection. Unreadable manifests
+ * mirror Eve's own behavior (skip); Eve is the runtime authority.
+ */
+async function checkEveWorldPairing(
+  candidate: EveProjectBuildCandidate,
+  world: string | undefined,
+): Promise<EvePreflightCheck | undefined> {
+  if (world !== "@workflow/world-postgres") return undefined;
+  const eveManifest = await readInstalledManifest(
+    candidate.snapshotRoot,
+    "eve",
+  );
+  const expectedRange = eveManifest === undefined
+    ? undefined
+    : [
+      eveManifest.devDependencies,
+      eveManifest.dependencies,
+      eveManifest.peerDependencies,
+    ]
+      .map((deps) => deps?.["@workflow/core"])
+      .find((value): value is string =>
+        typeof value === "string" && value.trim().length > 0
+      );
+  if (expectedRange === undefined) return undefined;
+  const worldManifest = await readInstalledManifest(
+    candidate.snapshotRoot,
+    world,
+  );
+  const declared = worldManifest === undefined
+    ? undefined
+    : ["@workflow/core", "@workflow/world"]
+      .map(
+        (name) => ({
+          packageName: name,
+          range: worldManifest.dependencies?.[name] ??
+            worldManifest.peerDependencies?.[name],
+        }),
+      )
+      .find(
+        (entry): entry is { packageName: string; range: string } =>
+          typeof entry.range === "string" && entry.range.trim().length > 0,
+      );
+  if (declared === undefined) return undefined;
+  const declaredLine = parseWorkflowVersionLine(declared.range);
+  const expectedLine = parseWorkflowVersionLine(expectedRange);
+  if (declaredLine === undefined || expectedLine === undefined) {
+    return undefined;
+  }
+  const mismatch = declaredLine.major !== expectedLine.major ||
+    (declaredLine.prereleaseTag !== undefined &&
+      expectedLine.prereleaseTag !== undefined &&
+      declaredLine.prereleaseTag !== expectedLine.prereleaseTag);
+  if (mismatch) {
+    return check(
+      "EVE_WORLD_PAIRING",
+      "failed",
+      `The installed @workflow/world-postgres targets ${declared.packageName} ${declared.range}, but the project's Eve bundles @workflow/core ${expectedRange}; Eve rejects this World at runtime.`,
+      `Install the @workflow/world-postgres release whose ${declared.packageName} dependency matches the Eve-bundled @workflow/core ${expectedRange} line (e.g. \`pnpm add @workflow/world-postgres@<matching-version>\`); see docs/deploy.md#durable-state-postgres-world.`,
+    );
+  }
+  return check(
+    "EVE_WORLD_PAIRING",
+    "passed",
+    `The installed @workflow/world-postgres ${declared.packageName} dependency ${declared.range} pairs with the Eve-bundled @workflow/core ${expectedRange}.`,
+  );
+}
+
+/**
+ * Returns a generic reason when the URL targets a transaction-mode pooler.
+ * Never returns URL content; only a safe classification of the host/port.
+ */
+function pooledPostgresReason(
+  connectionString: string | undefined,
+): string | undefined {
+  if (connectionString === undefined) return undefined;
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    return undefined;
+  }
+  if (url.hostname.includes("-pooler")) {
+    return "a transaction-mode pooler host";
+  }
+  if (url.port === "6543") {
+    return "a transaction-mode pooler port";
+  }
+  return undefined;
+}
+
+/**
+ * Non-blocking World warnings. The container wipes its disk on sleep, so the
+ * default local World loses pending approvals and sessions; and a pooled
+ * Postgres URL breaks the World streamer, which relies on LISTEN/NOTIFY.
+ */
+async function collectEveWorldWarnings(
+  candidate: EveProjectBuildCandidate | undefined,
+  runtimeConfig: EveRuntimeConfig | undefined,
+): Promise<EvePreflightWarning[]> {
+  const warnings: EvePreflightWarning[] = [];
+  if (candidate !== undefined) {
+    const world = await readCompiledWorldSpecifier(candidate);
+    if (
+      world === undefined ||
+      world === "local" ||
+      world === "@workflow/world-local"
+    ) {
+      warnings.push({
+        id: "EVE_WORLD_LOCAL",
+        message:
+          "This project uses Eve's default local Workflow World; workflow state lives on the container disk and is lost when the container sleeps.",
+        remediation:
+          "Configure a durable Workflow World such as @workflow/world-postgres; see docs/deploy.md#durable-state-postgres-world.",
+      });
+    }
+  }
+  if (runtimeConfig !== undefined) {
+    const pooledReason = runtimeConfig.withProtectedValues((values) =>
+      pooledPostgresReason(
+        values.WORKFLOW_POSTGRES_URL ?? values.DATABASE_URL,
+      )
+    );
+    if (pooledReason !== undefined) {
+      warnings.push({
+        id: "EVE_WORLD_POSTGRES_POOLED",
+        message:
+          `The configured Postgres connection uses ${pooledReason}; transaction-mode poolers accept LISTEN but never deliver notifications, so live session streaming hangs.`,
+        remediation:
+          "Use the direct, unpooled Postgres URL for WORKFLOW_POSTGRES_URL (on Neon, the unpooled host without -pooler); see docs/deploy.md#durable-state-postgres-world.",
+      });
+    }
+  }
+  return warnings;
+}
+
 /** True when the caller asked for the human progress/summary output. */
 function humanOutput(options: EvePreflightOptions): boolean {
   return options.outputFormat === "human";
@@ -548,6 +814,12 @@ function humanEveResultLines(
   eveVersion: string | undefined,
 ): readonly string[] {
   const lines: string[] = [...eveCheckLines(result.checks)];
+  for (const warning of result.warnings) {
+    lines.push(`! ${warning.id} — ${safeText(warning.message)}`);
+    if (warning.remediation !== undefined) {
+      lines.push(`  → ${safeText(warning.remediation)}`);
+    }
+  }
   const elapsed = formatEveElapsed(startedAt);
   const commandLabel = result.command === "eve deploy" ? "deploy" : "preflight";
   if (result.ok) {
@@ -1037,6 +1309,9 @@ async function defaultRuntimeRunner(
       ...(request.runtimeInjection === undefined
         ? {}
         : { runtimeInjection: request.runtimeInjection }),
+      ...(request.workflowWorld === undefined
+        ? {}
+        : { workflowWorld: request.workflowWorld }),
       retainImage: request.retainImage ?? false,
     };
     result = await buildEveRuntimeImage(imageRequest);
@@ -2032,6 +2307,10 @@ async function runEveDeployment(
       ...(identity.runtimeRevisionHandle === undefined
         ? {}
         : { runtimeRevisionHandle: identity.runtimeRevisionHandle }),
+      schedules: collected.schedules ?? [],
+      ...(process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER === undefined
+        ? {}
+        : { containerSleepAfter: process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER }),
     });
   } catch (error: unknown) {
     throw deploymentFailure(
@@ -2429,6 +2708,7 @@ async function collectEvePreflight(
   options: EvePreflightOptions,
 ): Promise<EvePreflightCollection> {
   let runtimeConfig: EveRuntimeConfig | undefined;
+  const warnings: EvePreflightWarning[] = [];
   const checks: EvePreflightCheck[] = [];
   if (request.envFile !== undefined) {
     eveProgress(options, "validating environment file");
@@ -2473,6 +2753,9 @@ async function collectEvePreflight(
           "The explicit environment file contains no reserved Eve host-variable collision.",
         ),
       );
+      warnings.push(
+        ...(await collectEveWorldWarnings(undefined, runtimeConfig)),
+      );
     }
   } catch (error: unknown) {
     checks.push(
@@ -2512,6 +2795,7 @@ async function collectEvePreflight(
         environment: request.environment,
         name: request.name,
         checks,
+        warnings,
         candidate: null,
       },
       runtimeConfig,
@@ -2636,6 +2920,7 @@ async function collectEvePreflight(
         environment: request.environment,
         name: request.name,
         checks,
+        warnings,
         candidate: null,
       },
       runtimeConfig,
@@ -2643,6 +2928,57 @@ async function collectEvePreflight(
   }
 
   const candidate = packaging.candidate;
+  const workflowWorld = await readCompiledWorldSpecifier(candidate);
+  warnings.push(
+    ...(await collectEveWorldWarnings(candidate, undefined)),
+  );
+  const schedules = await readCompiledSchedules(candidate);
+  // The runtime package is imported lazily so `eden` commands that never
+  // reach deploy checks stay fast; the module specifier is fixed.
+  const { parseEveScheduleCron } = await import(
+    "@moinulmoin/eden-runtime-cloudflare"
+  );
+  const expressible = schedules.filter(
+    (schedule) => parseEveScheduleCron(schedule.cron) !== undefined,
+  );
+  const unexpressible = schedules.filter(
+    (schedule) => parseEveScheduleCron(schedule.cron) === undefined,
+  );
+  if (unexpressible.length > 0) {
+    warnings.push({
+      id: "EVE_SCHEDULE_UNSUPPORTED",
+      message:
+        `Schedule ${unexpressible.map((schedule) => schedule.name).join(", ")} uses a cron expression Cloudflare wake triggers cannot evaluate, so it only fires while the Container is already awake.`,
+      remediation:
+        "Use a standard 5-field cron expression (minute hour day-of-month month day-of-week) for schedules that must fire while the Container sleeps.",
+    });
+  }
+  if (expressible.length > 0) {
+    checks.push(
+      check(
+        "EVE-SCHEDULES",
+        "passed",
+        `schedules: ${expressible.length} (wake via Cloudflare Cron)`,
+      ),
+    );
+  }
+  const worldPairing = await checkEveWorldPairing(candidate, workflowWorld);
+  if (worldPairing !== undefined) checks.push(worldPairing);
+  if (!allChecksClear(checks)) {
+    await discardPackagingImage();
+    return {
+      result: {
+        command: request.command === "deploy" ? "eve deploy" : "eve preflight",
+        ok: false,
+        environment: request.environment,
+        name: request.name,
+        checks,
+        warnings,
+        candidate: candidateMetadata(candidate, undefined),
+      },
+      runtimeConfig,
+    };
+  }
   let cloudflare: EveCloudflareReadResult | undefined;
   let publicOrigin: string | undefined;
   if (request.command === "deploy") {
@@ -2678,6 +3014,7 @@ async function collectEvePreflight(
           environment: request.environment,
           name: request.name,
           checks,
+          warnings,
           candidate: candidateMetadata(candidate, undefined),
         },
         runtimeConfig,
@@ -2704,6 +3041,7 @@ async function collectEvePreflight(
           environment: request.environment,
           name: request.name,
           checks,
+          warnings,
           candidate: candidateMetadata(candidate, undefined),
         },
         runtimeConfig,
@@ -2778,6 +3116,7 @@ async function collectEvePreflight(
         ...(publicOrigin === undefined ? {} : { publicOrigin }),
         retainImage: request.command === "deploy",
         ...(runtimeInjection === undefined ? {} : { runtimeInjection }),
+        ...(workflowWorld === undefined ? {} : { workflowWorld }),
       });
       checks.push(...runtimeEvidence.checks);
       const requiredRuntimeChecks = [
@@ -2893,6 +3232,7 @@ async function collectEvePreflight(
         environment: request.environment,
         name: request.name,
         checks,
+        warnings,
         candidate: candidateResult,
       },
       runtimeConfig,
@@ -2932,6 +3272,7 @@ async function collectEvePreflight(
           environment: request.environment,
           name: request.name,
           checks,
+          warnings,
           candidate: candidateResult,
         },
         runtimeConfig,
@@ -2947,6 +3288,7 @@ async function collectEvePreflight(
       environment: request.environment,
       name: request.name,
       checks,
+      warnings,
       candidate: candidateResult,
     },
     runtimeConfig,
@@ -2955,6 +3297,9 @@ async function collectEvePreflight(
       ? {}
       : { projectId: packaging.project.projectId }),
     ...(runtimeEvidence === undefined ? {} : { runtimeEvidence }),
+    // Only expressible schedules are wired into wake triggers; the rest were
+    // reported as EVE_SCHEDULE_UNSUPPORTED and fire only while awake.
+    schedules: expressible,
     cloudflare,
   };
 }

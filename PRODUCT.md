@@ -136,7 +136,7 @@ Plus whatever your agent itself needs: model keys, databases, external services.
 
 **1. Real sign-in.** A fresh `eve init` project only accepts Vercel-issued tokens in production. Off Vercel, that means every request except the health check gets a 401. Pick one of Eve's authenticators in `agent/channels/eve.ts`, for example `jwtHmac()`, `httpBasic()` or `oidc()`, or `none()` for a public demo. Eve's own self-hosting guide says the same.
 
-**2. Durable storage for real agents.** The container's disk is wiped whenever it sleeps. For agents that pause for approvals or keep long sessions, configure a durable Workflow World in `agent.ts`, such as the official Postgres World (`@workflow/world-postgres`) with a hosted Postgres database.
+**2. Durable memory for real agents.** The container's disk is wiped whenever it sleeps, so by default Eve forgets pending approvals and sessions. Three steps fix it: add the Postgres World package, select it in `agent.ts`, and put a direct Postgres URL in your env file. Any Postgres works (Neon, Supabase, Railway, your own server); use the direct address, not a pooled one. Eden runs the database setup for you during deploy. See [Durable state (Postgres World)](docs/deploy.md#durable-state-postgres-world).
 
 ---
 
@@ -145,15 +145,15 @@ Plus whatever your agent itself needs: model keys, databases, external services.
 Eden is free and open source (Apache-2.0). You pay Cloudflare directly, on your own account:
 
 - **Workers Paid:** $5/month, which includes some Container usage.
-- **Container time:** billed only while the container runs. At Cloudflare's published rates (checked September 2026), a `basic` container running all month comes to about $12/month including the $5 plan, plus CPU used. Eden lets the container sleep after 24 hours without requests, and it wakes on the next request.
+- **Container time:** billed only while the container runs. At Cloudflare's published rates (checked September 2026), a `basic` container running all month comes to about $12/month including the $5 plan, plus CPU used. Eden lets the container sleep after 24 hours without requests, and it wakes on the next request. Each scheduled run also wakes it, so an agent with daily or more frequent schedules is effectively always on.
 - **Your model usage** goes to your model provider, with your key.
 
 ---
 
 ## Honest limits
 
-- **Container disk is wiped on sleep.** Use a durable Workflow World (see above) for anything that must survive.
-- **Schedules don't run while the container sleeps.** They run while it's awake.
+- **Container disk is wiped on sleep.** Memory survives only with the Postgres World (three steps, above). Without it, Eden warns you on every deploy.
+- **Schedules use standard 5-field cron.** Those fire on time even while the container sleeps. Schedules with a seconds field or shortcuts like `@daily` only run while it's awake, and Eden warns about them.
 - **The agent's bash is simulated.** Inside a Cloudflare Container, Eve's default sandbox uses `just-bash`, a simulated shell with a virtual filesystem, not a full Linux VM. Agents that need real tools such as `python` or `git` in their sandbox aren't a fit yet.
 - **One container instance per deployment.** No automatic scaling.
 - **`workers.dev` URL only.** Eden doesn't set up custom domains.
@@ -168,8 +168,8 @@ Eden is free and open source (Apache-2.0). You pay Cloudflare directly, on your 
 |---|---|---|
 | Deploy | `eve deploy` or `git push` | `npx @moinulmoin/eden deploy` from your machine |
 | Where it runs | Vercel Functions and Workflow | Your real Eve server in a Cloudflare Container on your account |
-| Durable storage | Managed by Vercel | Bring a Workflow World, such as Postgres |
-| Schedules | Managed by Vercel | Run while the container is awake |
+| Durable storage | Managed by Vercel | Your Postgres, three steps; Eden sets up the database |
+| Schedules | Vercel Cron | Cloudflare Cron wakes the container; fires while asleep |
 | Sign-in | Vercel sign-in built in | Configure an Eve authenticator |
 | Models | AI Gateway built in | Any provider with your key, or Gateway with a key |
 | Sandbox | Vercel Sandbox | Simulated bash (`just-bash`) |
@@ -185,6 +185,8 @@ Pick Vercel when you want Eve's full managed platform. Pick Eden when you want y
 
 - A real `eden deploy` to Cloudflare served a real model reply with a tool call, and `eden destroy` then left no Worker, container or image behind.
 - Validated with real Cloudflare deploys on **Eve 0.66.3** and **Eve 0.68.0**: build, production boot, health, sign-in, and a real model and tool call.
+- **Memory across a container replacement:** with the Postgres World, an approval requested before the container was destroyed and replaced was approved afterwards and the run finished. Without it, the approval was lost.
+- **Schedules while asleep:** a schedule every 3 minutes fired exactly once per tick while the container slept between ticks.
 - Eden's own release gates run build, typecheck, lint, tests and the Eve compatibility check on every change.
 
 ---

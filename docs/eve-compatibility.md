@@ -167,5 +167,6 @@ turn crosses the deployed workflow callback path.
 It does not prove production durability, horizontal scaling, every Eve authored
 slot, every provider, schedule dispatch, or process-replacement recovery. Eve's
 local Workflow World and Container-local filesystem remain disposable. A
-production project still needs its own Cloudflare-reachable durable Workflow
-World and representative application-specific tests.
+production project still needs the tested durable Postgres World setup in
+[deploy.md](deploy.md#durable-state-postgres-world) and representative
+application-specific tests.

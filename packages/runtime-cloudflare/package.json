@@ -1,6 +1,6 @@
 {
   "name": "@moinulmoin/eden-runtime-cloudflare",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Cloudflare Worker/Container host runtime for Eden's Eve deployments.",
   "type": "module",
   "license": "Apache-2.0",

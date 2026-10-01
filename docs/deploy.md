@@ -231,12 +231,126 @@ callback URLs.
 A preview deployment that boots Eve's local Workflow World proves health,
 startup, and fresh request handling only. Container-local disk and process
 memory are wiped when the Container sleeps: a sleep or restart reinitializes
-local World state, and schedules do not fire while the Container sleeps.
+local World state. Schedules still fire while the Container sleeps (see
+"Schedules" below).
 
 Production durability requires a project-configured, Cloudflare-reachable,
 durable Eve-compatible Workflow World such as Postgres (for example
-`@workflow/world-postgres`). This release runs one logical Container instance
+`@workflow/world-postgres`). See
+[Durable state (Postgres World)](#durable-state-postgres-world) for the exact
+tested setup. This release runs one logical Container instance
 and does not promise horizontal scaling or custom domains.
+
+## Schedules
+
+Authored Eve schedules (`agent/schedules/*`) keep firing while the Container
+sleeps. When `eve build` reports schedules, Eden adds one every-minute
+Cloudflare Cron Trigger to the generated Worker. Each minute the Worker
+checks whether any schedule's next tick lands within the next four minutes;
+when one does it issues an internal wake request to the Container so Eve's
+own in-process Nitro scheduler fires the tick itself — each schedule runs
+exactly once per cron tick, evaluated in UTC like on Vercel.
+
+Standard 5-field cron expressions (`minute hour day-of-month month
+day-of-week`) are supported — the same subset Eve documents and Vercel Cron
+evaluates. A schedule using anything else (for example a seconds field or an
+`@daily` shortcut) cannot be evaluated ahead of time, so `eden deploy` warns
+and that schedule only fires while the Container is already awake.
+
+Because the every-minute trigger exists to wake the Container, a project
+with schedules pays one scheduled invocation per minute (~43k/month), which
+is well inside the Workers Paid allocation.
+
+For testing sleep behavior, `EDEN_EVE_CONTAINER_SLEEP_AFTER=<duration>`
+(for example `90s`) overrides the Container's `sleepAfter` at deploy time.
+
+## Durable state (Postgres World)
+
+Container-local disk and process memory are wiped whenever the Container
+sleeps or is replaced, so Eve's default local Workflow World loses pending
+approvals and in-flight sessions. Eden has tested the Postgres World
+(`@workflow/world-postgres`) end to end: a pending tool approval survived a
+full `eden destroy` + `eden deploy` container replacement. This section is
+the tested recipe; other durable Worlds are project-owned and untested here.
+
+Any Postgres reachable from Cloudflare works — for example a Neon project or
+a Supabase project. Cloudflare itself has no hosted Postgres; the database
+is always external.
+
+The connection URL **must be a direct, unpooled connection that supports
+`LISTEN`/`NOTIFY`**. The World delivers live session events over Postgres
+`LISTEN`/`pg_notify`. Transaction-mode poolers — Neon's `-pooler` host
+(PgBouncer) and Supabase's pooler on port 6543 — accept `LISTEN` but never
+deliver notifications, so `GET /eve/v1/session/<id>/stream` returns headers
+and then hangs forever even though events persist in the database. On Neon
+use the `DATABASE_URL_UNPOOLED` value (the host without `-pooler`); on
+Supabase use the direct connection on port 5432. Sessions still execute
+against a pooled URL — only live streaming silently breaks — so this is
+easy to miss; `eden preflight` warns when it sees a pooled URL.
+
+### 1. Add the version-paired dependency
+
+Eve pins and validates its World at `eve build`, so the Postgres World
+version must match the `@workflow/world` version your Eve release bundles.
+Eve `0.68.0` bundles `@workflow/world` `5.0.0-beta.39` and pairs with:
+
+```sh
+pnpm add @workflow/world-postgres@5.0.0-beta.47
+```
+
+For other Eve versions, install the `@workflow/world-postgres` release whose
+`@workflow/world` dependency matches the one Eve bundles; `eden preflight`
+and `eden deploy` fail with an `EVE_WORLD_PAIRING` check when the installed
+release would not pair.
+
+### 2. Select the World in `agent.ts`
+
+```ts
+export default {
+  // …
+  experimental: { workflow: { world: "@workflow/world-postgres" } },
+};
+```
+
+This field is resolved at `eve build`; `WORKFLOW_TARGET_WORLD` is ignored by
+the Eve runtime plugin.
+
+### 3. Environment file
+
+Create the `--env-file` **outside the project root** — a file inside the
+project is snapshotted into the image and the deploy fails with
+`SECRET_EXCLUSION_FAILED`:
+
+```text
+WORKFLOW_POSTGRES_URL=postgres://<direct-unpooled-host>/<database>
+```
+
+Use the direct URL described above; `WORKFLOW_POSTGRES_URL` falls back to
+`DATABASE_URL` when unset. Nothing else is needed: Eden sets
+`CBOR_NATIVE_ACCELERATION_DISABLED` in the container image itself, exempts
+the optional `cbor-extract` native addon (cbor-x then uses its pure-JS path),
+and runs the World's idempotent schema migration (`node_modules/.bin/bootstrap`,
+drizzle migrations + graphile-worker schema) inside the disposable deploy
+container against the env-file URL before publishing. A migration failure
+fails the deploy with `EVE-WORLD_MIGRATION_FAILED`.
+
+### 4. Deploy and verify
+
+```sh
+eden deploy --project "$PROJECT_ROOT" --env preview \
+  --name "$WORKER_NAME" --env-file "$ENV_FILE"
+```
+
+Verify durability, not just health:
+
+```sh
+curl --fail --silent "$DEPLOY_URL/eve/v1/health"          # status: "ready"
+curl -N "$DEPLOY_URL/eve/v1/session/<id>/stream"          # must emit NDJSON, not just headers
+```
+
+Then start a turn that parks on an approval, run `eden destroy` + `eden
+deploy`, and confirm the pending approval is still resolvable. If the stream
+hangs with headers only, the URL is pooled — fix step 3.
 
 ## Common failures
 

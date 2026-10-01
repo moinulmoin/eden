@@ -18,8 +18,8 @@ const needs: { text: string; command?: string; code?: string }[] = [
 ];
 
 const limits = [
-  { icon: Moon, text: "Disk and memory reset when the Container sleeps", note: "Keep durable state in a Workflow World such as Postgres" },
-  { icon: CalendarX, text: "Schedules don't fire while the Container sleeps" },
+  { icon: Moon, text: "Disk and memory reset when the Container sleeps", note: "Memory survives with the Postgres World: three steps, any direct Postgres" },
+  { icon: CalendarX, text: "Only 5-field cron schedules fire while it sleeps", note: "A Cloudflare Cron wakes the Container; others run while it's awake" },
   { icon: Box, text: "One 1 GiB Container instance", note: "No horizontal scaling or custom domains yet" },
   { icon: Package, text: "pnpm projects only", note: "Bun lockfiles and native Windows aren't supported yet" },
 ];
@@ -70,7 +70,7 @@ const limits = [
         <div class="req__head">
           <Info class="icon" size={18} aria-hidden="true" />
           <h3>Honest limits</h3>
-          <span class="mono">in 0.2.2</span>
+          <span class="mono">in 0.3.0</span>
         </div>
         <ul>
           {

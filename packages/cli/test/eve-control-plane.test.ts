@@ -1815,3 +1815,442 @@ describe("eden destroy", () => {
     expect(() => JSON.parse(text)).toThrow();
   });
 });
+
+describe("Workflow World warnings", () => {
+  async function writeFixtureProject(root: string): Promise<void> {
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({
+        name: "eve-world-warning-fixture",
+        private: true,
+        packageManager: "pnpm@11.21.0",
+      }),
+      "utf8",
+    );
+    await writeFile(
+      join(root, "pnpm-lock.yaml"),
+      "lockfileVersion: '9.0'\n",
+      "utf8",
+    );
+  }
+
+  function passingControlPlane(root: string, builder = fakeBuilder()) {
+    return {
+      artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+      builder,
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      } as const,
+      runtimeRunner: async () => ({
+        ok: true,
+        checks: [
+          { id: "VAL-BUILD-005", status: "passed" as const, message: "image ok" },
+          { id: "VAL-BUILD-006", status: "passed" as const, message: "boot ok" },
+          { id: "VAL-BUILD-007", status: "passed" as const, message: "health ok" },
+        ],
+        imageDigest: `sha256:${"a".repeat(64)}`,
+        cleanup: runtimeCleanup,
+      }),
+      cloudflareRead: async () => ({
+        accountAccess: "available" as const,
+        containerAccess: "available" as const,
+        target: { state: "absent" as const },
+      }),
+    };
+  }
+
+  test("warns when the compiled agent uses Eve's default local World", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-world-local", "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(root),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly warnings: readonly { readonly id: string }[];
+    };
+    expect(result.warnings.map((value) => value.id)).toContain(
+      "EVE_WORLD_LOCAL",
+    );
+  });
+
+  test("prints the local World warning in human output", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-world-local-human"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(root),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const text = output.join("\n");
+    expect(text).toContain("! EVE_WORLD_LOCAL");
+    expect(text).toContain("durable-state-postgres-world");
+    expect(text).toContain("preflight passed");
+  });
+
+  test("does not warn when the compiled agent selects a durable World", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-world-postgres", "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(
+            root,
+            fakeBuilder(async (request) => {
+              await mkdir(
+                join(request.snapshotRoot, ".output/.eve/compile"),
+                { recursive: true },
+              );
+              await writeFile(
+                join(
+                  request.snapshotRoot,
+                  ".output/.eve/compile/compiled-agent-manifest.json",
+                ),
+                JSON.stringify({
+                  config: {
+                    experimental: {
+                      workflow: { world: "@workflow/world-postgres" },
+                    },
+                  },
+                }),
+                "utf8",
+              );
+            }),
+          ),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly warnings: readonly { readonly id: string }[];
+    };
+    expect(result.warnings.map((value) => value.id)).not.toContain(
+      "EVE_WORLD_LOCAL",
+    );
+  });
+
+  test("reports expressible schedules and warns for unsupported crons", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const output: string[] = [];
+    let publishedTriggers: unknown;
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", "eve-scheduled", "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            ...passingControlPlane(
+              root,
+              fakeBuilder(async (request) => {
+                await mkdir(
+                  join(request.snapshotRoot, ".output/.eve/compile"),
+                  { recursive: true },
+                );
+                await writeFile(
+                  join(
+                    request.snapshotRoot,
+                    ".output/.eve/compile/compiled-agent-manifest.json",
+                  ),
+                  JSON.stringify({
+                    schedules: [
+                      { name: "digest", cron: "0 9 * * 1-5" },
+                      { name: "sweep", cron: "*/15 * * * *" },
+                      { name: "bad", cron: "@daily" },
+                    ],
+                  }),
+                  "utf8",
+                );
+              }),
+            ),
+            containerImageReference:
+              `registry.example/eve@sha256:${"a".repeat(64)}`,
+            cloudflareRead: async () => ({
+              accountAccess: "available" as const,
+              containerAccess: "available" as const,
+              accountId: "account-test",
+              workersDevSubdomain: "account",
+              target: { state: "absent" as const },
+            }),
+            publish: async (request) => {
+              publishedTriggers = request.hostConfig.worker.triggers;
+              return {
+                status: "published" as const,
+                identity: request.identity,
+                createdByAttempt: true,
+                ownershipProven: true as const,
+              };
+            },
+            health: async (request) => ({
+              status: "ready" as const,
+              identity: request.identity,
+            }),
+            discardRuntimeImage: async () => true,
+          },
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly checks: readonly { readonly id: string; readonly message: string }[];
+      readonly warnings: readonly { readonly id: string }[];
+      readonly ok: boolean;
+    };
+    expect(result.ok).toBe(true);
+    expect(
+      result.checks.find((value) => value.id === "EVE-SCHEDULES")?.message,
+    ).toBe("schedules: 2 (wake via Cloudflare Cron)");
+    expect(result.warnings.map((value) => value.id)).toContain(
+      "EVE_SCHEDULE_UNSUPPORTED",
+    );
+    expect(publishedTriggers).toEqual({ crons: ["* * * * *"] });
+  });
+
+  test("warns on a pooled Postgres URL without leaking it", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const envFile = join(await createRoot(), "runtime.env");
+    const secret = "pg-pooled-secret-marker-31b7";
+    await writeFile(
+      envFile,
+      `WORKFLOW_POSTGRES_URL=postgresql://eve:${secret}@ep-cool-pooler.eu-central-1.aws.neon.tech/eve\n`,
+      "utf8",
+    );
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-world-pooled", "--env-file", envFile, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(
+            root,
+            fakeBuilder(async (request) => {
+              await mkdir(
+                join(request.snapshotRoot, ".output/.eve/compile"),
+                { recursive: true },
+              );
+              await writeFile(
+                join(
+                  request.snapshotRoot,
+                  ".output/.eve/compile/compiled-agent-manifest.json",
+                ),
+                JSON.stringify({
+                  config: {
+                    experimental: {
+                      workflow: { world: "@workflow/world-postgres" },
+                    },
+                  },
+                }),
+                "utf8",
+              );
+            }),
+          ),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const text = output.join("\n");
+    const result = JSON.parse(output[0] as string) as {
+      readonly warnings: readonly { readonly id: string }[];
+    };
+    expect(result.warnings.map((value) => value.id)).toContain(
+      "EVE_WORLD_POSTGRES_POOLED",
+    );
+    expect(result.warnings.map((value) => value.id)).not.toContain(
+      "EVE_WORLD_LOCAL",
+    );
+    expect(text).not.toContain(secret);
+    expect(text).not.toContain("ep-cool-pooler");
+  });
+
+  test("does not warn on a direct Postgres URL", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const envFile = join(await createRoot(), "runtime.env");
+    await writeFile(
+      envFile,
+      "WORKFLOW_POSTGRES_URL=postgresql://db.internal.example.org:5432/eve\n",
+      "utf8",
+    );
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-world-direct", "--env-file", envFile, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(root),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly warnings: readonly { readonly id: string }[];
+    };
+    expect(result.warnings.map((value) => value.id)).not.toContain(
+      "EVE_WORLD_POSTGRES_POOLED",
+    );
+  });
+
+  function postgresWorldBuilder(options: {
+    readonly eveCore?: string;
+    readonly worldRange?: string;
+  }) {
+    return fakeBuilder(async (request) => {
+      await writeFile(
+        join(request.snapshotRoot, "node_modules/eve/package.json"),
+        JSON.stringify({
+          name: "eve",
+          version: "0.31.3",
+          bin: "bin/eve.js",
+          dependencies: { "@workflow/core": options.eveCore ?? "5.0.0-beta.57" },
+        }),
+        "utf8",
+      );
+      await mkdir(
+        join(request.snapshotRoot, ".output/.eve/compile"),
+        { recursive: true },
+      );
+      await writeFile(
+        join(
+          request.snapshotRoot,
+          ".output/.eve/compile/compiled-agent-manifest.json",
+        ),
+        JSON.stringify({
+          config: {
+            experimental: {
+              workflow: { world: "@workflow/world-postgres" },
+            },
+          },
+        }),
+        "utf8",
+      );
+      if (options.worldRange !== undefined) {
+        await mkdir(
+          join(request.snapshotRoot, "node_modules/@workflow/world-postgres"),
+          { recursive: true },
+        );
+        await writeFile(
+          join(
+            request.snapshotRoot,
+            "node_modules/@workflow/world-postgres/package.json",
+          ),
+          JSON.stringify({
+            name: "@workflow/world-postgres",
+            version: "5.0.0-beta.47",
+            dependencies: { "@workflow/world": options.worldRange },
+          }),
+          "utf8",
+        );
+      }
+    });
+  }
+
+  test("passes the pairing check when the World line matches Eve's", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-world-paired", "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(
+            root,
+            postgresWorldBuilder({ worldRange: "5.0.0-beta.39" }),
+          ),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly checks: readonly {
+        readonly id: string;
+        readonly status: string;
+      }[];
+    };
+    const pairing = result.checks.find((value) =>
+      value.id === "EVE_WORLD_PAIRING"
+    );
+    expect(pairing?.status).toBe("passed");
+  });
+
+  test("fails deploy pre-checks when the World line does not pair with Eve", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-world-mismatched", "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(
+            root,
+            postgresWorldBuilder({ worldRange: "6.0.0-beta.1" }),
+          ),
+        },
+      ),
+    ).resolves.toBe(1);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly ok: boolean;
+      readonly checks: readonly {
+        readonly id: string;
+        readonly status: string;
+        readonly remediation?: string;
+      }[];
+    };
+    expect(result.ok).toBe(false);
+    const pairing = result.checks.find((value) =>
+      value.id === "EVE_WORLD_PAIRING"
+    );
+    expect(pairing?.status).toBe("failed");
+    expect(pairing?.remediation).toContain("pnpm add @workflow/world-postgres@");
+  });
+});

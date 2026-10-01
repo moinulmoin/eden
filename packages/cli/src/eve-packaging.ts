@@ -43,6 +43,7 @@ export type EvePackagingCode =
   | "DOCKER_PLATFORM_BLOCKED"
   | "UNSUPPORTED_HOST_REQUIREMENT"
   | "EVE_HEALTH_FAILED"
+  | "WORLD_MIGRATION_FAILED"
   | "CLEANUP_UNVERIFIED"
   | "PACKAGE_VERIFICATION_FAILED";
 
@@ -326,6 +327,18 @@ export class EvePackagingError extends Error {
   }
 }
 
+// The Postgres World's `cbor-x` dependency declares `cbor-extract` as an
+// optional native accelerator whose prebuilt binary cannot load in the
+// runtime image. pnpm's CLI cannot exempt a single package from
+// strict-dep-builds, so the Dockerfile passes
+// `--config.strict-dep-builds=false` and then runs
+// IGNORED_BUILDS_GUARD, which restores the strict failure for every ignored
+// build script except cbor-extract. Eden never runs dependency build scripts
+// either way, `--frozen-lockfile` stays honest, cbor-extract's .node binary is
+// exempt from the ldd check, and the runtime stage sets
+// CBOR_NATIVE_ACCELERATION_DISABLED.
+const IGNORED_BUILDS_GUARD =
+  `node -e 'const m=JSON.parse(require("fs").readFileSync("node_modules/.modules.yaml","utf8"));const b=(m.ignoredBuilds||[]).filter((p)=>!p.startsWith("cbor-extract@"));if(b.length){console.error("ERR_PNPM_IGNORED_BUILDS Ignored build scripts: "+b.join(", "));process.exit(1)}'`;
 const INSTALL_COMMAND = [
   "corepack",
   "pnpm",
@@ -1388,7 +1401,8 @@ RUN corepack enable \\
   && corepack prepare pnpm@${options.packageManagerVersion} --activate \\
   && test "$(corepack pnpm --version)" = "${options.packageManagerVersion}" \\
   && test "$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)" = "${options.lockfileSha256}" \\
-  && corepack pnpm install --frozen-lockfile --config.node-linker=hoisted
+  && corepack pnpm install --frozen-lockfile --config.node-linker=hoisted --config.strict-dep-builds=false \\
+  && ${IGNORED_BUILDS_GUARD}
 RUN test "$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)" = "${options.lockfileSha256}"
 COPY . ./
 RUN test -x ./node_modules/.bin/eve \\
@@ -1396,7 +1410,8 @@ RUN test -x ./node_modules/.bin/eve \\
 
 FROM builder AS runtime-deps
 RUN rm -rf node_modules \\
-  && corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted \\
+  && corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted --config.strict-dep-builds=false \\
+  && ${IGNORED_BUILDS_GUARD} \\
   && for l in node_modules/.bin/*; do t=$(readlink "$l") || continue; case "$t" in /*) ln -sfn "$(realpath --relative-to=node_modules/.bin "$t")" "$l" ;; esac; done
 
 FROM --platform=linux/amd64 ${image} AS runtime
@@ -1831,7 +1846,7 @@ function classifyPnpmInstallFailure(stderr: string): EvePackagingError | undefin
     return new EvePackagingError({
       code: "DEPENDENCY_AMBIGUITY",
       subject: "ERR_PNPM_IGNORED_BUILDS",
-      reason: "The isolated pinned pnpm install refused dependency build scripts that the project pnpm policy neither allows nor ignores.",
+      reason: "The isolated pinned pnpm install refused dependency build scripts that the project pnpm policy neither allows nor ignores (the known-optional cbor-extract addon is already exempted by Eden).",
       remediation: "Name the dependency under allowBuilds or ignoredBuiltDependencies in the project pnpm-workspace.yaml and retry.",
     });
   }

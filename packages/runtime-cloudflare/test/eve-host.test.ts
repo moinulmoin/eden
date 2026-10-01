@@ -6,7 +6,10 @@ import {
   createEveHostProxy,
   createEveReadinessGate,
   createTrustedEveRequest,
+  eveScheduleCronFiresWithin,
+  expandEveCronField,
   generateEveHostWorkerSource,
+  parseEveScheduleCron,
   resolveStableWorkersDevOrigin,
   type EveContainerTransport,
 } from "../src/eve-host.js";
@@ -607,5 +610,182 @@ describe("generic Eve Cloudflare host", () => {
     expect(loopback).toEqual([
       `${IDENTITY.stableContainerInstanceName}:8080:https://eden-eve-preview.account.workers.dev/.well-known/workflow/v1/flow`,
     ]);
+  });
+});
+
+describe("Eve schedule wake triggers", () => {
+  const SCHEDULED_ENV = {
+    EVE_CONTAINER: {
+      getByName: () => ({
+        fetch: async (request: Request) =>
+          new Response(`wake:${request.url}`),
+      }),
+    },
+  };
+
+  test("emits one every-minute cron trigger only when schedules exist", () => {
+    const withSchedules = createEveHostConfig({
+      ...IDENTITY,
+      stableWorkersDevOrigin:
+        "https://eden-eve-preview.account.workers.dev",
+      containerImage:
+        "registry.example/eve@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      schedules: [
+        { name: "digest", cron: "0 9 * * 1-5" },
+        { name: "sweep", cron: "*/15 * * * *" },
+      ],
+    });
+    expect(withSchedules.worker.triggers).toEqual({
+      crons: ["* * * * *"],
+    });
+    expect(withSchedules.container.schedules).toHaveLength(2);
+    const source = generateEveHostWorkerSource({ config: withSchedules });
+    expect(source).toContain('"schedules"');
+    expect(source).toContain('"0 9 * * 1-5"');
+
+    const without = createEveHostConfig({
+      ...IDENTITY,
+      stableWorkersDevOrigin:
+        "https://eden-eve-preview.account.workers.dev",
+      containerImage:
+        "registry.example/eve@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    expect(without.worker.triggers).toBeUndefined();
+    expect(without.container.schedules).toEqual([]);
+    expect(generateEveHostWorkerSource({ config: without })).not.toContain(
+      '"schedules"',
+    );
+  });
+
+  test("rejects schedule crons the wake trigger cannot evaluate", () => {
+    for (const cron of ["@daily", "*/30 * * * * *", "0 0 L * *"]) {
+      expect(() =>
+        createEveHostConfig({
+          ...IDENTITY,
+          stableWorkersDevOrigin:
+            "https://eden-eve-preview.account.workers.dev",
+          containerImage:
+            "registry.example/eve@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          schedules: [{ name: "bad", cron }],
+        }),
+      ).toThrow(/cron expression/u);
+      expect(parseEveScheduleCron(cron)).toBeUndefined();
+    }
+  });
+
+  test("parses the standard 5-field subset with Vixie dom/dow semantics", () => {
+    expect(expandEveCronField("*/15", 0)?.has(45)).toBe(true);
+    expect(expandEveCronField("9-17", 1)?.has(12)).toBe(true);
+    expect(expandEveCronField("mon-fri", 4)?.has(3)).toBe(true);
+    expect(expandEveCronField("jan,jun", 3)?.has(6)).toBe(true);
+    expect(expandEveCronField("7", 4)?.has(0)).toBe(true);
+    expect(parseEveScheduleCron("0 9 * * 1-5")).not.toBeUndefined();
+
+    const friday9 = Date.parse("2026-10-02T09:00:00Z");
+    expect(eveScheduleCronFiresWithin("0 9 * * 1-5", friday9)).toBe(true);
+    expect(
+      eveScheduleCronFiresWithin(
+        "0 9 * * 1-5",
+        friday9 - 4 * 60_000,
+      ),
+    ).toBe(true);
+    expect(
+      eveScheduleCronFiresWithin(
+        "0 9 * * 1-5",
+        friday9 - 5 * 60_000,
+      ),
+    ).toBe(false);
+    expect(
+      eveScheduleCronFiresWithin("0 9 * * 1-5", friday9 + 120_000),
+    ).toBe(false);
+    expect(eveScheduleCronFiresWithin("*/5 * * * *", friday9)).toBe(true);
+  });
+
+  test("the scheduled handler wakes the container only inside the lead window", async () => {
+    const wakeUrls: string[] = [];
+    const env = {
+      EVE_CONTAINER: {
+        getByName: () => ({
+          fetch: async (request: Request) => {
+            wakeUrls.push(request.url);
+            return new Response("ok");
+          },
+        }),
+      },
+    };
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      workerName: IDENTITY.workerName,
+      containerBindingName: IDENTITY.containerBindingName,
+      stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
+      deploymentId: IDENTITY.deploymentId,
+      generationId: IDENTITY.generationId,
+      schedules: [{ name: "digest", cron: "0 9 * * 1-5" }],
+    });
+    const waited: Promise<unknown>[] = [];
+    const ctx = {
+      waitUntil: (task: Promise<unknown>) => {
+        waited.push(task);
+      },
+    };
+
+    const farTick = Date.parse("2026-10-02T10:00:00Z");
+    worker.scheduled?.(
+      { cron: "* * * * *", scheduledTime: farTick },
+      env,
+      ctx,
+    );
+    expect(waited).toEqual([]);
+
+    const nearTick = Date.parse("2026-10-02T08:57:00Z");
+    worker.scheduled?.(
+      { cron: "* * * * *", scheduledTime: nearTick },
+      env,
+      ctx,
+    );
+    expect(waited).toHaveLength(1);
+    await Promise.all(waited);
+    expect(wakeUrls).toEqual([
+      "https://eden-eve-preview.account.workers.dev/eve/v1/health",
+    ]);
+  });
+
+  test("omits the scheduled handler when no schedules exist", () => {
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      workerName: IDENTITY.workerName,
+      containerBindingName: IDENTITY.containerBindingName,
+      stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
+      deploymentId: IDENTITY.deploymentId,
+      generationId: IDENTITY.generationId,
+    });
+    expect(worker.scheduled).toBeUndefined();
+    expect(SCHEDULED_ENV.EVE_CONTAINER.getByName).toBeTypeOf("function");
+  });
+
+  test("schedules do not loosen the internal-route refusal", async () => {
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      workerName: IDENTITY.workerName,
+      containerBindingName: IDENTITY.containerBindingName,
+      stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
+      deploymentId: IDENTITY.deploymentId,
+      generationId: IDENTITY.generationId,
+      schedules: [{ name: "digest", cron: "*/5 * * * *" }],
+    });
+    const response = await worker.fetch(
+      new Request(
+        "https://eden-eve-preview.account.workers.dev/.well-known/workflow/v1/flow",
+        { method: "POST", body: "{}" },
+      ),
+      {
+        EVE_CONTAINER: {
+          getByName: () => ({
+            fetch: async () => new Response("forwarded"),
+          }),
+        },
+      },
+    );
+    expect(response.status).toBe(404);
   });
 });

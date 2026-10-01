@@ -47,7 +47,8 @@ broaden to similarly named resources.
 - One logical Container instance per deployment; no horizontal scaling or
   custom domains.
 - Container-local memory and disk are disposable. Production durability
-  requires a project-configured, Cloudflare-reachable durable Workflow World.
+  requires the tested Postgres World setup in
+  [deploy.md](deploy.md#durable-state-postgres-world).
 
 ## Cleanup
 

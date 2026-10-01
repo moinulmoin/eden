@@ -1,5 +1,10 @@
 export {
   EVE_HOST_DEFAULTS,
+  EVE_SCHEDULE_WAKE_LEAD_MS,
+  EVE_SCHEDULE_WAKE_TRIGGER_CRON,
+  eveScheduleCronFiresWithin,
+  expandEveCronField,
+  parseEveScheduleCron,
   EVE_HOST_OWNED_HEADERS,
   EveHostError,
   createEveHostConfig,
@@ -17,6 +22,7 @@ export type {
   EveHostContainerConfig,
   EveHostContainerEnvironment,
   EveHostErrorCode,
+  EveScheduleCronEntry,
   EveHostForwardingMetadata,
   EveHostIdentity,
   EveHostLifecycleEvent,

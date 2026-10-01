@@ -7,6 +7,191 @@ export const EVE_HOST_DEFAULTS = {
   sleepAfter: "24h",
 } as const;
 
+export const EVE_SCHEDULE_WAKE_TRIGGER_CRON = "* * * * *";
+/**
+ * How far ahead of a tick the every-minute wake trigger starts the Container.
+ * A sleeping Container cold-starts in well under a minute on a warm image; the
+ * wider window absorbs slow starts without missing the tick.
+ */
+export const EVE_SCHEDULE_WAKE_LEAD_MS = 240_000;
+const EVE_SCHEDULE_WAKE_GRACE_MS = 60_000;
+const MINUTE_MS = 60_000;
+
+/**
+ * One authored Eve schedule reduced to the fields the host needs. `cron` is the
+ * 5-field expression from the compiled manifest.
+ */
+export interface EveScheduleCronEntry {
+  readonly name: string;
+  readonly cron: string;
+}
+
+const EVE_CRON_FIELD_BOUNDS = [
+  { min: 0, max: 59 }, // minute
+  { min: 0, max: 23 }, // hour
+  { min: 1, max: 31 }, // day of month
+  { min: 1, max: 12 }, // month
+  { min: 0, max: 7 }, // day of week (0 and 7 are Sunday)
+] as const;
+
+const EVE_CRON_MONTH_NAMES: Readonly<Record<string, number>> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+const EVE_CRON_DAY_NAMES: Readonly<Record<string, number>> = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+};
+
+function parseCronValue(
+  token: string,
+  bounds: { readonly min: number; readonly max: number },
+  fieldIndex: number,
+): number | undefined {
+  const names = fieldIndex === 3
+    ? EVE_CRON_MONTH_NAMES
+    : fieldIndex === 4
+      ? EVE_CRON_DAY_NAMES
+      : undefined;
+  const named = names?.[token.toLowerCase()];
+  const value = named !== undefined
+    ? named
+    : /^[0-9]+$/u.test(token)
+      ? Number.parseInt(token, 10)
+      : Number.NaN;
+  if (!Number.isInteger(value) || value < bounds.min || value > bounds.max) {
+    return undefined;
+  }
+  return fieldIndex === 4 && value === 7 ? 0 : value;
+}
+
+/**
+ * Expands one cron field (`*`, `*\/n`, `a-b/n`, `a,b,...`) into the set of
+ * matching unit values. Returns undefined when the field uses syntax outside
+ * the standard 5-field subset Eve documents (e.g. `?`, `L`, `W`, `#`).
+ */
+export function expandEveCronField(
+  field: string,
+  fieldIndex: number,
+): ReadonlySet<number> | undefined {
+  const bounds = EVE_CRON_FIELD_BOUNDS[fieldIndex];
+  if (bounds === undefined) return undefined;
+  const values = new Set<number>();
+  for (const part of field.split(",")) {
+    const stepMatch = /^(.+)\/([0-9]+)$/u.exec(part);
+    const rangeText = stepMatch?.[1] ?? part;
+    const step = stepMatch === null ? 1 : Number.parseInt(stepMatch[2] ?? "", 10);
+    if (!Number.isInteger(step) || step < 1) return undefined;
+    let low: number;
+    let high: number;
+    if (rangeText === "*" || rangeText === "?") {
+      low = bounds.min;
+      high = bounds.max;
+    } else {
+      const rangeMatch = /^([A-Za-z0-9]+)-([A-Za-z0-9]+)$/u.exec(rangeText);
+      const lowToken = rangeMatch === null ? rangeText : rangeMatch[1];
+      const lowValue = lowToken === undefined
+        ? undefined
+        : parseCronValue(lowToken, bounds, fieldIndex);
+      if (lowValue === undefined) return undefined;
+      low = lowValue;
+      const highToken = rangeMatch?.[2];
+      const highValue = highToken === undefined
+        ? undefined
+        : parseCronValue(highToken, bounds, fieldIndex);
+      high = rangeMatch === null
+        ? (stepMatch === null ? lowValue : bounds.max)
+        : highValue ?? -1;
+      if (high < low) return undefined;
+    }
+    for (let value = low; value <= high; value += step) {
+      values.add(fieldIndex === 4 && value === 7 ? 0 : value);
+    }
+  }
+  return values;
+}
+
+interface ParsedEveCron {
+  readonly minute: ReadonlySet<number>;
+  readonly hour: ReadonlySet<number>;
+  readonly dayOfMonth: ReadonlySet<number>;
+  readonly month: ReadonlySet<number>;
+  readonly dayOfWeek: ReadonlySet<number>;
+  readonly domRestricted: boolean;
+  readonly dowRestricted: boolean;
+}
+
+/**
+ * Parses a standard 5-field cron expression (minute granularity, UTC, Vixie
+ * day-of-month/day-of-week OR semantics — the same evaluation Vercel and
+ * croner use for Eve schedules). Returns undefined for anything else: named
+ * `@` schedules, seconds-prefixed 6-field expressions, or unsupported syntax.
+ */
+export function parseEveScheduleCron(cron: string): ParsedEveCron | undefined {
+  const fields = cron.trim().split(/\s+/u);
+  const [minuteField, hourField, domField, monthField, dowField] = fields;
+  if (
+    fields.length !== 5 || minuteField === undefined || hourField === undefined ||
+    domField === undefined || monthField === undefined || dowField === undefined
+  ) return undefined;
+  const minute = expandEveCronField(minuteField, 0);
+  const hour = expandEveCronField(hourField, 1);
+  const dayOfMonth = expandEveCronField(domField, 2);
+  const month = expandEveCronField(monthField, 3);
+  const dayOfWeek = expandEveCronField(dowField, 4);
+  if (
+    minute === undefined || hour === undefined || dayOfMonth === undefined ||
+    month === undefined || dayOfWeek === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    minute,
+    hour,
+    dayOfMonth,
+    month,
+    dayOfWeek,
+    domRestricted: domField !== "*",
+    dowRestricted: dowField !== "*",
+  };
+}
+
+function cronMatches(parsed: ParsedEveCron, atMs: number): boolean {
+  const at = new Date(atMs);
+  if (!parsed.minute.has(at.getUTCMinutes())) return false;
+  if (!parsed.hour.has(at.getUTCHours())) return false;
+  if (!parsed.month.has(at.getUTCMonth() + 1)) return false;
+  const dom = parsed.dayOfMonth.has(at.getUTCDate());
+  const dow = parsed.dayOfWeek.has(at.getUTCDay());
+  if (parsed.domRestricted && parsed.dowRestricted) return dom || dow;
+  return dom && dow;
+}
+
+/**
+ * True when the schedule's next tick lands inside the wake window: at or just
+ * after `nowMs` through `nowMs + leadMs` (Cloudflare Cron Triggers are
+ * minute-aligned UTC, matching Eve's minute-granularity schedules).
+ */
+export function eveScheduleCronFiresWithin(
+  cron: string,
+  nowMs: number,
+  leadMs: number = EVE_SCHEDULE_WAKE_LEAD_MS,
+): boolean {
+  const parsed = parseEveScheduleCron(cron);
+  if (parsed === undefined) return false;
+  const firstCandidate =
+    Math.floor((nowMs - EVE_SCHEDULE_WAKE_GRACE_MS) / MINUTE_MS) * MINUTE_MS;
+  const lastCandidate =
+    Math.floor((nowMs + leadMs) / MINUTE_MS) * MINUTE_MS;
+  for (
+    let candidate = firstCandidate;
+    candidate <= lastCandidate;
+    candidate += MINUTE_MS
+  ) {
+    if (cronMatches(parsed, candidate)) return true;
+  }
+  return false;
+}
+
 /** Queue deliveries are private; webhook and manifest routes stay forwarded. */
 export function isEveWorkflowInternalRoute(pathname: string): boolean {
   let decodedPath = pathname;
@@ -123,6 +308,13 @@ export interface EveHostConfigRequest extends EveHostIdentity {
   readonly containerImageBuildContext?: string;
   readonly runtimeVariableNames?: readonly string[];
   readonly runtimeRevisionHandle?: string;
+  /**
+   * Compiled authored schedules. Entries whose cron cannot be expressed are
+   * rejected here; the caller reports that as a deploy warning.
+   */
+  readonly schedules?: readonly EveScheduleCronEntry[];
+  /** Overrides the Container `sleepAfter` (e.g. "30s") for testing. */
+  readonly containerSleepAfter?: string;
 }
 
 export interface EveHostWranglerConfig {
@@ -139,7 +331,9 @@ export interface EveHostWranglerConfig {
     readonly EDEN_EVE_GENERATION_ID: string;
     readonly EVE_RUNTIME_VARIABLE_NAMES: readonly string[];
     readonly EDEN_EVE_RUNTIME_REVISION?: string;
+    readonly EDEN_EVE_CONTAINER_SLEEP_AFTER?: string;
   };
+  readonly triggers?: { readonly crons: readonly string[] };
   readonly containers: readonly [
     {
       readonly name: string;
@@ -176,6 +370,7 @@ export interface EveHostContainerConfig {
   readonly deploymentId: string;
   readonly generationId: string;
   readonly runtimeRevisionHandle?: string;
+  readonly schedules: readonly EveScheduleCronEntry[];
 }
 
 export interface EveHostConfig {
@@ -295,6 +490,23 @@ export function createEveHostConfig(
     }
   }
 
+  const schedules = request.schedules ?? [];
+  for (const schedule of schedules) {
+    if (parseEveScheduleCron(schedule.cron) === undefined) {
+      throw new EveHostError(
+        "HOST_READINESS_UNPROVEN",
+        `The schedule ${schedule.name} uses a cron expression the wake trigger cannot express.`,
+      );
+    }
+  }
+  if (request.containerSleepAfter !== undefined) {
+    if (!/^[0-9]+(?:ms|s|m|h|d)?$/u.test(request.containerSleepAfter)) {
+      throw new EveHostError(
+        "HOST_READINESS_UNPROVEN",
+        "The Container sleepAfter override is not a parseable duration.",
+      );
+    }
+  }
   const container = {
     name: request.containerApplicationName,
     class_name: request.containerClassName,
@@ -324,7 +536,13 @@ export function createEveHostConfig(
         ...(request.runtimeRevisionHandle === undefined
           ? {}
           : { EDEN_EVE_RUNTIME_REVISION: request.runtimeRevisionHandle }),
+        ...(request.containerSleepAfter === undefined
+          ? {}
+          : { EDEN_EVE_CONTAINER_SLEEP_AFTER: request.containerSleepAfter }),
       },
+      ...(schedules.length === 0
+        ? {}
+        : { triggers: { crons: [EVE_SCHEDULE_WAKE_TRIGGER_CRON] } }),
       containers: [container],
       durable_objects: {
         bindings: [
@@ -353,6 +571,7 @@ export function createEveHostConfig(
       ...(request.runtimeRevisionHandle === undefined
         ? {}
         : { runtimeRevisionHandle: request.runtimeRevisionHandle }),
+      schedules,
     },
   };
 }
@@ -374,6 +593,9 @@ export function generateEveHostWorkerSource(
           runtimeRevisionHandle:
             request.config.container.runtimeRevisionHandle,
         }),
+    ...(request.config.container.schedules.length === 0
+      ? {}
+      : { schedules: request.config.container.schedules }),
   };
   return [
     `import { ContainerProxy, EveHostContainer, createEveHostWorker, routeEveOutboundRequest } from ${JSON.stringify(moduleSpecifier)};`,
@@ -558,6 +780,7 @@ export interface EveHostContainerEnvironment {
   readonly EDEN_EVE_DEPLOYMENT_ID?: string;
   readonly EDEN_EVE_GENERATION_ID?: string;
   readonly EDEN_EVE_RUNTIME_REVISION?: string;
+  readonly EDEN_EVE_CONTAINER_SLEEP_AFTER?: string;
 }
 
 export interface EveHostReadinessEvidence {

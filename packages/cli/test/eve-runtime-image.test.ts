@@ -671,6 +671,164 @@ describe("Eve runtime image boundary", () => {
     expect(dockerfile).not.toContain("do-not-copy");
   });
 
+  test("disables the cbor native addon and exempts its musl binary from the ldd check", async () => {
+    const root = await createRoot("eden-eve-runtime-image-cbor-");
+    const candidate = await writeCandidate(root);
+    const fakeDocker = await writeFakeDocker(root);
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+      healthPort: 4316,
+      retainImage: false,
+      fetchHealth: async () => new Response(
+        JSON.stringify({ status: "ready" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result.status).toBe("ready");
+    const dockerfile = await readFile(
+      join(candidate.generationRoot, "container/runtime.Dockerfile"),
+      "utf8",
+    );
+    expect(dockerfile).toContain("CBOR_NATIVE_ACCELERATION_DISABLED=true");
+    const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const ldd = dockerArgs.find((args) =>
+      args[0] === "exec" && args.some((arg) => arg.includes("ldd"))
+    );
+    expect(ldd).toBeDefined();
+    expect(ldd?.some((arg) => arg.includes("-not -path '*cbor-extract*'")))
+      .toBe(true);
+  });
+
+  test("runs the Postgres World migration inside the boot container", async () => {
+    const root = await createRoot("eden-eve-runtime-image-migration-");
+    const candidate = await writeCandidate(root);
+    const fakeDocker = await writeFakeDocker(root);
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+      healthPort: 4317,
+      retainImage: false,
+      workflowWorld: "@workflow/world-postgres",
+      fetchHealth: async () => new Response(
+        JSON.stringify({ status: "ready" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result.status).toBe("ready");
+
+    const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const bootstrap = dockerArgs.find((args) =>
+      args[0] === "exec" &&
+      args.includes("./node_modules/.bin/bootstrap")
+    );
+    expect(bootstrap).toBeDefined();
+    expect(bootstrap).toContain("--env-file");
+    expect(bootstrap).toContain("/dev/stdin");
+    expect(
+      bootstrap?.some((arg) => arg.includes("WORKFLOW_POSTGRES_URL")),
+    ).toBe(false);
+    const lddIndex = dockerArgs.findIndex((args) =>
+      args[0] === "exec" && args.some((arg) => arg.includes("ldd"))
+    );
+    expect(dockerArgs.indexOf(bootstrap as string[])).toBeGreaterThan(lddIndex);
+    const cborProbe = dockerArgs.find((args) =>
+      args[0] === "exec" && args.includes("sh") &&
+      args.some((arg) => arg.includes("cbor-x"))
+    );
+    expect(cborProbe).toBeDefined();
+  });
+
+  test("fails with WORLD_MIGRATION_FAILED when the Postgres World setup fails", async () => {
+    const root = await createRoot("eden-eve-runtime-image-migration-fail-");
+    const candidate = await writeCandidate(root);
+    const fakeDocker = await writeFakeDocker(root);
+    const command = join(root, "fail-docker.cjs");
+    const base = await readFile(fakeDocker.command, "utf8");
+    await writeFile(
+      command,
+      base.replace(
+        'if (args[0] === "exec") {',
+        'if (args[0] === "exec" && args.includes("./node_modules/.bin/bootstrap")) { process.stderr.write("migration refused\\n"); process.exit(1); } if (args[0] === "exec") {',
+      ),
+      { encoding: "utf8", mode: 0o700 },
+    );
+    await chmod(command, 0o700);
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: command,
+      healthPort: 4318,
+      retainImage: false,
+      workflowWorld: "@workflow/world-postgres",
+      fetchHealth: async () => new Response(
+        JSON.stringify({ status: "ready" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "WORLD_MIGRATION_FAILED",
+      deployable: false,
+    });
+    expect(result.checks.map((value) => value.id)).toContain(
+      "WORLD_MIGRATION_FAILED",
+    );
+  });
+
   test("validates the output closure when sibling package names collide under locale ordering", async () => {
     const root = await createRoot("eden-eve-runtime-image-ordering-");
     const candidate = await writeCandidate(root, {

@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.0 — 2026-10-01
+
+Real agents on your own Cloudflare: memory survives sleep, and schedules
+fire while the Container sleeps.
+
+### Added
+
+- **Durable agent state with the Postgres Workflow World**, in three steps:
+  add `@workflow/world-postgres` (the version paired with your Eve), select
+  it in `agent.ts`, and put a direct (unpooled) `WORKFLOW_POSTGRES_URL` in
+  your env file. Eden handles the rest during deploy: it runs the database
+  migration (idempotent, with the URL passed only through the environment),
+  disables the `cbor-extract` native addon that can't load in the image, and
+  checks the World version against your Eve exactly the way Eve does
+  (`EVE_WORLD_PAIRING`). Proven on Cloudflare: a pending approval survived a
+  full container replacement and the live stream delivered events.
+  See [docs/deploy.md](docs/deploy.md#durable-state-postgres-world).
+- **Schedules fire while the Container sleeps.** When `eve build` reports
+  schedules, the Worker gets an every-minute Cloudflare Cron Trigger that
+  wakes the Container shortly before each tick, so Eve's own scheduler runs
+  every tick exactly once. Schedules that can't be evaluated ahead of time
+  (seconds fields, `@daily`-style shortcuts) produce `EVE_SCHEDULE_UNSUPPORTED`
+  and only run while the Container is awake. See
+  [docs/deploy.md](docs/deploy.md#schedules).
+- Warnings, in human output and in the `--json` result (`warnings`), never
+  failing the run and never including URL content: `EVE_WORLD_LOCAL` (state
+  is lost on sleep) and `EVE_WORLD_POSTGRES_POOLED` (transaction-mode
+  poolers break live session streaming).
+
+### Changed
+
+- Image installs tolerate pnpm's ignored build script for `cbor-extract`
+  only; any other ignored dependency build script still fails with
+  `ERR_PNPM_IGNORED_BUILDS`.
+
 ## 0.2.2 — 2026-10-01
 
 ### Fixed

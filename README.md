@@ -16,19 +16,19 @@ its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.2.2
+npm install --global @moinulmoin/eden@0.3.0
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.2.2
+pnpm add --global @moinulmoin/eden@0.3.0
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.2.2
+bun add --global @moinulmoin/eden@0.3.0
 ```
 
 Confirm the installation:
@@ -136,10 +136,14 @@ The Eve project remains responsible for its:
 
 ### Limits
 
-- Container disk and process memory are wiped when the Container sleeps.
-  Durable state needs a project-configured, Cloudflare-reachable Workflow
-  World such as Postgres (for example `@workflow/world-postgres`).
-- Schedules do not fire while the Container sleeps.
+- Container disk and process memory are wiped when the Container sleeps;
+  Eve's default local Workflow World loses state, and Eden warns about it.
+  Durable state takes three steps with the Postgres World (any direct,
+  unpooled Postgres); see
+  [docs/deploy.md](docs/deploy.md#durable-state-postgres-world).
+- Schedules with standard 5-field cron fire while the Container sleeps (a
+  Cloudflare Cron Trigger wakes it); others only run while it is awake. See
+  [docs/deploy.md](docs/deploy.md#schedules).
 - One logical Container instance (`basic`, 1 GiB); no horizontal scaling or
   custom domains in this release.
 

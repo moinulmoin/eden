@@ -164,6 +164,14 @@ export interface EveRuntimeImageRequest {
   readonly publicOrigin?: string;
   readonly runtimeInjection?: EveRuntimeInjection;
   /**
+   * The Workflow World specifier resolved by `eve build`
+   * (`config.experimental.workflow.world`). When it selects a known durable
+   * World with a one-time schema setup, Eden runs that setup inside the boot
+   * probe — idempotently, before health — so the deployed container finds the
+   * schema already present.
+   */
+  readonly workflowWorld?: string;
+  /**
    * Preflight must remove its disposable runtime image after health proof.
    * Deploy may retain the exact image for the publication handoff.
    */
@@ -954,7 +962,8 @@ ENV HOST=0.0.0.0 \\
     NITRO_HOST=0.0.0.0 \\
     PORT=8080 \\
     NITRO_PORT=8080 \\
-    NODE_ENV=production
+    NODE_ENV=production \
+    CBOR_NATIVE_ACCELERATION_DISABLED=true
 COPY --from=candidate /candidate/.output /workspace/.output
 COPY --from=candidate /candidate/node_modules /workspace/node_modules
 ${sourceCopyLines}
@@ -1661,8 +1670,44 @@ export async function buildEveRuntimeImage(
       state.containerId,
       "sh",
       "-ceu",
-      "set -o noglob; status=0; for module in $(find /workspace/node_modules -type f -name '*.node'); do if ldd \"$module\" 2>&1 | grep -q 'not found'; then echo \"unloadable native module: $module\" >&2; status=1; fi; done; exit $status",
+      "set -o noglob; status=0; for module in $(find /workspace/node_modules -type f -name '*.node' -not -path '*cbor-extract*'); do if ldd \"$module\" 2>&1 | grep -q 'not found'; then echo \"unloadable native module: $module\" >&2; status=1; fi; done; exit $status",
     ]);
+    if (request.workflowWorld === "@workflow/world-postgres") {
+      // The Postgres World ships an idempotent setup binary (drizzle
+      // `migrate()` plus graphile-worker `workerUtils.migrate()`; both skip
+      // already-applied work) that must run once per database before Eve
+      // consumes the schema. Running it inside the disposable boot
+      // container, before health and publish, exercises the exact deployed
+      // node_modules against the env-file URL while the URL only ever
+      // travels through `--env-file /dev/stdin` — never argv, logs, or the
+      // image.
+      const worldSetupEnvironment = `${Object.entries(runtimeEnvironment)
+        .map(([name, value]) => `${name}=${value}`)
+        .join("\n")}\n`;
+      try {
+        await dockerWithInput(state, [
+          "exec",
+          "--env-file",
+          "/dev/stdin",
+          state.containerId,
+          "./node_modules/.bin/bootstrap",
+        ], worldSetupEnvironment);
+        await docker(state, [
+          "exec",
+          state.containerId,
+          "sh",
+          "-ceu",
+          "cd node_modules/@workflow/world-postgres && node -e \"const {encode,decode}=require('cbor-x');if(decode(encode({ok:true})).ok!==true)process.exit(1)\"",
+        ]);
+      } catch {
+        throw packagingError(
+          "WORLD_MIGRATION_FAILED",
+          "@workflow/world-postgres setup",
+          "The Postgres World schema migration or cbor-x codec check failed inside the disposable Eve container.",
+          "Confirm WORKFLOW_POSTGRES_URL in --env-file is the direct, unpooled database URL reachable from this machine, then retry; the migration is idempotent.",
+        );
+      }
+    }
     await pollEveHealth(
       healthPort,
       timeoutMs,

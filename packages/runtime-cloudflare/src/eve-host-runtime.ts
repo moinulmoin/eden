@@ -2,18 +2,21 @@ import { Container, ContainerProxy } from "@cloudflare/containers";
 
 import {
   EVE_HOST_DEFAULTS,
+  EVE_SCHEDULE_WAKE_LEAD_MS,
   EveHostError,
   assertNonEmpty,
   assertStableOrigin,
   createEveHostLifecycleObserver,
   createEveReadinessGate,
   createTrustedEveRequest,
+  eveScheduleCronFiresWithin,
   IDENTIFIER_PATTERN,
   readProtectedRuntimeVariables,
   WORKER_NAME_PATTERN,
   type EveHostContainerEnvironment,
   type EveHostForwardingMetadata,
   type EveHostReadinessEvidence,
+  type EveScheduleCronEntry,
   isEveWorkflowInternalRoute,
   type EveReadinessGate,
 } from "./eve-host.js";
@@ -87,8 +90,8 @@ type EveHostContainerContext = ConstructorParameters<typeof Container>[0];
 
 export class EveHostContainer extends Container<EveHostContainerEnvironment> {
   override defaultPort = EVE_HOST_DEFAULTS.internalPort;
+  override sleepAfter: string | number = EVE_HOST_DEFAULTS.sleepAfter;
   override requiredPorts = [EVE_HOST_DEFAULTS.internalPort];
-  override sleepAfter = EVE_HOST_DEFAULTS.sleepAfter;
   override interceptHttps = true;
   override enableInternet = true;
   override pingEndpoint = "localhost/eve/v1/health";
@@ -136,6 +139,13 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
         ? {}
         : { EDEN_EVE_RUNTIME_REVISION: env.EDEN_EVE_RUNTIME_REVISION }),
     };
+    const sleepAfterOverride = env.EDEN_EVE_CONTAINER_SLEEP_AFTER;
+    if (sleepAfterOverride !== undefined) {
+      // `env` is only readable after `super()`, so the override is applied in
+      // the constructor body; the base class reads `this.sleepAfter` again on
+      // every subsequent activity renewal.
+      this.sleepAfter = sleepAfterOverride;
+    }
     this.readiness = createEveReadinessGate({
       startAndWaitForPorts: (options) =>
         this.startAndWaitForPorts(options),
@@ -203,6 +213,7 @@ export interface EveHostWorkerOptions extends EveHostForwardingMetadata {
   readonly workerName: string;
   readonly containerBindingName: string;
   readonly stableContainerInstanceName: string;
+  readonly schedules?: readonly EveScheduleCronEntry[];
 }
 
 /**
@@ -211,6 +222,11 @@ export interface EveHostWorkerOptions extends EveHostForwardingMetadata {
  */
 export interface EveHostWorkerHandler {
   fetch(request: Request, env: EveHostWorkerEnvironment): Promise<Response>;
+  scheduled?(
+    event: { readonly cron: string; readonly scheduledTime: number },
+    env: EveHostWorkerEnvironment,
+    ctx: { waitUntil(task: Promise<unknown>): void },
+  ): void;
 }
 
 interface EveContainerNamespace {
@@ -234,6 +250,19 @@ export function createEveHostWorker(
       "The Container binding name is not valid.",
     );
   }
+  const schedules = options.schedules ?? [];
+  const resolveContainer = (env: EveHostWorkerEnvironment) => {
+    const namespace = (
+      env as unknown as Record<string, EveContainerNamespace | undefined>
+    )[options.containerBindingName];
+    if (namespace === undefined) {
+      throw new EveHostError(
+        "HOST_READINESS_UNPROVEN",
+        "The configured Container binding is unavailable.",
+      );
+    }
+    return namespace.getByName(options.stableContainerInstanceName);
+  };
   return {
     async fetch(request, env): Promise<Response> {
       // Queue deliveries to these endpoints arrive through the container's
@@ -242,18 +271,7 @@ export function createEveHostWorker(
       if (isEveWorkflowInternalRoute(new URL(request.url).pathname)) {
         return new Response(null, { status: 404 });
       }
-      const namespace = (
-        env as unknown as Record<string, EveContainerNamespace | undefined>
-      )[options.containerBindingName];
-      if (namespace === undefined) {
-        throw new EveHostError(
-          "HOST_READINESS_UNPROVEN",
-          "The configured Container binding is unavailable.",
-        );
-      }
-      const container = namespace.getByName(
-        options.stableContainerInstanceName,
-      );
+      const container = resolveContainer(env);
       const forwarded = createTrustedEveRequest(request, {
         publicOrigin: options.publicOrigin,
         deploymentId: options.deploymentId,
@@ -285,5 +303,32 @@ export function createEveHostWorker(
         headers,
       });
     },
+    ...(schedules.length === 0
+      ? {}
+      : {
+          scheduled(event, env, ctx) {
+            const due = schedules.some((schedule) =>
+              eveScheduleCronFiresWithin(
+                schedule.cron,
+                event.scheduledTime,
+                EVE_SCHEDULE_WAKE_LEAD_MS,
+              ));
+            if (!due) return;
+            // Wake only: the in-process Nitro runner inside the container
+            // fires the tick itself, so the schedule runs exactly once.
+            ctx.waitUntil(
+              resolveContainer(env)
+                .fetch(new Request(
+                  new URL(EVE_HOST_DEFAULTS.healthPath, options.publicOrigin),
+                ))
+                .catch((error: unknown) => {
+                  console.error(
+                    "The scheduled wake request failed:",
+                    error instanceof Error ? error.message : "unknown",
+                  );
+                }),
+            );
+          },
+        }),
   };
 }
