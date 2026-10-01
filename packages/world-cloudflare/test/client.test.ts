@@ -21,7 +21,7 @@ afterEach(async () => {
 
 function startRpcStub(): Promise<string> {
   server = createServer((req, res) => {
-    const { promise, resolve } = Promise.withResolvers<void>();
+    const { resolve } = Promise.withResolvers<void>();
     void (async () => {
       const parts: Buffer[] = [];
       for await (const c of req) parts.push(c);
