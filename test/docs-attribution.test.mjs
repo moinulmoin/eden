@@ -172,6 +172,14 @@ test("retains the exact release NOTICE", async () => {
     "`@cloudflare/containers`, distributed under MIT OR Apache-2.0. Eden",
     "redistributes that bundled software under the Apache-2.0 option included in",
     "LICENSE.",
+    "",
+    "Workflow SDK",
+    "  @workflow/world-postgres, version 5.0.0-beta.47",
+    "  https://github.com/vercel/workflow",
+    "",
+    "Eden's Cloudflare World storage implementation",
+    "(`@moinulmoin/eden-world-cloudflare`) is adapted from the Workflow SDK",
+    "PostgreSQL World, distributed under the Apache License, Version 2.0.",
   ].join("\n") + "\n";
 
   expect(notice).toBe(expectedNotice);

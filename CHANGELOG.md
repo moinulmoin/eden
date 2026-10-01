@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0 — 2026-10-01
+
+### Added
+
+- **Experimental: durable state with no database.** New package
+  `@moinulmoin/eden-world-cloudflare`, a Workflow World backed by one
+  SQLite Durable Object on your own Cloudflare account. Add the package and
+  select it in `agent.ts`; Eden provisions the Durable Object and wires
+  everything else. Durable Object alarms deliver queued workflow work and
+  wake the Container. The World's endpoint is private to the Container;
+  public `/__eden/world/*` requests return 404. Passes Workflow's official
+  World conformance suite (`@workflow/world-testing`), and on Cloudflare a
+  pending approval survived a Container restart and the run completed.
+  See [docs/deploy.md](docs/deploy.md#durable-state-on-cloudflare-no-database).
+- **Known limitation:** `eden destroy` deletes this state, and updating an
+  agent currently requires destroy then deploy. State survives sleep and
+  restarts, not code updates. Use the Postgres World if you need state across
+  updates.
+- **Not yet verified:** automatic Container sleep with this World. In the
+  live test the Container stayed awake 45 seconds after the last client
+  disconnected (30-second sleep setting); the cause is under investigation.
+  Client stream cancellation was checked and stops polling.
+
 ## 0.3.0 — 2026-10-01
 
 Real agents on your own Cloudflare: memory survives sleep, and schedules

@@ -437,6 +437,7 @@ interface EvePreflightCollection {
   readonly runtimeEvidence?: EvePreflightRuntimeEvidence;
   readonly cloudflare?: EveCloudflareReadResult;
   readonly schedules?: readonly EveScheduleCronEntry[];
+  readonly workflowWorld?: string;
 }
 
 function safeText(value: string): string {
@@ -625,15 +626,16 @@ async function readInstalledManifest(
 }
 
 /**
- * Fails deploy/preflight when the selected `@workflow/world-postgres` would
- * trip Eve's runtime World-compatibility rejection. Unreadable manifests
+ * Fails deploy/preflight when a known durable World would trip Eve's runtime
+ * World-compatibility rejection. Unreadable manifests
  * mirror Eve's own behavior (skip); Eve is the runtime authority.
  */
 async function checkEveWorldPairing(
   candidate: EveProjectBuildCandidate,
   world: string | undefined,
 ): Promise<EvePreflightCheck | undefined> {
-  if (world !== "@workflow/world-postgres") return undefined;
+  if (world !== "@workflow/world-postgres" &&
+      world !== "@moinulmoin/eden-world-cloudflare") return undefined;
   const eveManifest = await readInstalledManifest(
     candidate.snapshotRoot,
     "eve",
@@ -682,14 +684,14 @@ async function checkEveWorldPairing(
     return check(
       "EVE_WORLD_PAIRING",
       "failed",
-      `The installed @workflow/world-postgres targets ${declared.packageName} ${declared.range}, but the project's Eve bundles @workflow/core ${expectedRange}; Eve rejects this World at runtime.`,
-      `Install the @workflow/world-postgres release whose ${declared.packageName} dependency matches the Eve-bundled @workflow/core ${expectedRange} line (e.g. \`pnpm add @workflow/world-postgres@<matching-version>\`); see docs/deploy.md#durable-state-postgres-world.`,
+      `The installed ${world} targets ${declared.packageName} ${declared.range}, but the project's Eve bundles @workflow/core ${expectedRange}; Eve rejects this World at runtime.`,
+      `Install the ${world} release whose ${declared.packageName} dependency matches the Eve-bundled @workflow/core ${expectedRange} line; see docs/deploy.md.`,
     );
   }
   return check(
     "EVE_WORLD_PAIRING",
     "passed",
-    `The installed @workflow/world-postgres ${declared.packageName} dependency ${declared.range} pairs with the Eve-bundled @workflow/core ${expectedRange}.`,
+    `The installed ${world} ${declared.packageName} dependency ${declared.range} pairs with the Eve-bundled @workflow/core ${expectedRange}.`,
   );
 }
 
@@ -2308,6 +2310,9 @@ async function runEveDeployment(
         ? {}
         : { runtimeRevisionHandle: identity.runtimeRevisionHandle }),
       schedules: collected.schedules ?? [],
+      ...(collected.workflowWorld === undefined
+        ? {}
+        : { workflowWorld: collected.workflowWorld }),
       ...(process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER === undefined
         ? {}
         : { containerSleepAfter: process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER }),
@@ -2929,6 +2934,9 @@ async function collectEvePreflight(
 
   const candidate = packaging.candidate;
   const workflowWorld = await readCompiledWorldSpecifier(candidate);
+  if (workflowWorld === "@moinulmoin/eden-world-cloudflare") {
+    checks.push(check("EVE-WORLD", "passed", "world: Cloudflare Durable Object"));
+  }
   warnings.push(
     ...(await collectEveWorldWarnings(candidate, undefined)),
   );
@@ -3301,6 +3309,7 @@ async function collectEvePreflight(
     // reported as EVE_SCHEDULE_UNSUPPORTED and fire only while awake.
     schedules: expressible,
     cloudflare,
+    ...(workflowWorld === undefined ? {} : { workflowWorld }),
   };
 }
 

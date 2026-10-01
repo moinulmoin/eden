@@ -18,6 +18,7 @@ export const EVE_RESERVED_HOST_VARIABLES = Object.freeze([
   "NODE_ENV",
   "NODE_EXTRA_CA_CERTS",
   "WORKFLOW_LOCAL_BASE_URL",
+  "EDEN_WORLD_URL",
   "EDEN_EVE_DEPLOYMENT_ID",
   "EDEN_EVE_GENERATION_ID",
 ]) as readonly [
@@ -28,6 +29,7 @@ export const EVE_RESERVED_HOST_VARIABLES = Object.freeze([
   "NODE_ENV",
   "NODE_EXTRA_CA_CERTS",
   "WORKFLOW_LOCAL_BASE_URL",
+  "EDEN_WORLD_URL",
   "EDEN_EVE_DEPLOYMENT_ID",
   "EDEN_EVE_GENERATION_ID",
 ];
@@ -490,7 +492,8 @@ export class EveRuntimeConfig {
     this.assertUsable();
     for (const name of Object.keys(hostEnvironment)) {
       if (
-        !(EVE_RESERVED_HOST_VARIABLES as readonly string[]).includes(name)
+        !(EVE_RESERVED_HOST_VARIABLES as readonly string[]).includes(name) &&
+        name !== "CBOR_NATIVE_ACCELERATION_DISABLED"
       ) {
         throw new EveRuntimeConfigError({
           code: "EVE_RUNTIME_INJECTION_INVALID",

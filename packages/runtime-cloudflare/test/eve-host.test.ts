@@ -1,4 +1,6 @@
 import { describe, expect, test } from "vitest";
+import { createRequire } from "node:module";
+import { NodeSqliteAdapter } from "../../world-cloudflare/src/core/node-sqlite.js";
 
 import {
   EVE_HOST_DEFAULTS,
@@ -16,6 +18,7 @@ import {
 import {
   createEveHostWorker,
   EveHostContainer,
+  EdenWorldDurableObject,
   routeEveOutboundRequest,
 } from "../src/eve-host-runtime.js";
 
@@ -28,6 +31,56 @@ const IDENTITY = {
   deploymentId: "dep-test",
   generationId: "gen-test",
 };
+
+describe("durable World queue acknowledgements", () => {
+  test.each(["body-error", "continuation"] as const)(
+    "preserves an unacknowledged queue message after %s",
+    async (responseKind) => {
+      const sql = new NodeSqliteAdapter();
+      const { encode } = createRequire(
+        import.meta.resolve("@moinulmoin/eden-world-cloudflare"),
+      )("cbor-x") as { encode(value: unknown): Uint8Array };
+      let alarm: number | null = null;
+      const object = new EdenWorldDurableObject({
+        storage: {
+          sql,
+          transactionSync: sql.transactionSync.bind(sql),
+          setAlarm: async (at: number) => { alarm = at; },
+          deleteAlarm: async () => { alarm = null; },
+        },
+        blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(),
+      } as never, {
+        EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
+        EVE_CONTAINER_BINDING_NAME: "EVE_CONTAINER",
+        EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+        EVE_CONTAINER: {
+          getByName: () => ({
+            containerFetch: async () => responseKind === "body-error"
+              ? new Response(new ReadableStream({
+                  start(controller) { controller.error(new Error("transport interrupted")); },
+                }))
+              : Response.json({ timeoutSeconds: 2 }),
+          }),
+        },
+      });
+      try {
+        await object.fetch(new Request("https://world.invalid/rpc", {
+          method: "POST",
+          body: encode({ op: "queue.enqueue", args: ["workflow", { runId: "proof" }] }) as Uint8Array<ArrayBuffer>,
+        }));
+        await object.alarm();
+        const row = sql.exec(
+          "SELECT completed,attempt,due_at FROM workflow_queue_messages",
+        ).toArray()[0];
+        expect(row?.completed).toBe(0);
+        expect(row?.attempt).toBe(2);
+        expect(alarm).toBe(row?.due_at);
+      } finally {
+        sql.close();
+      }
+    },
+  );
+});
 
 describe("generic Eve Cloudflare host", () => {
   test("builds one private named Worker/Container graph with one stable identity", () => {
@@ -518,6 +571,11 @@ describe("generic Eve Cloudflare host", () => {
       "/.well-known/workflow/v1/%66low",
       "/.well-known/workflow/v1/FLOW/",
       "/.well-known//workflow/v1/flow",
+      "/__eden/world/rpc",
+      "/__eden/%77orld/rpc",
+      "/%5f%5feden/world/rpc",
+      "/__eden//world/rpc",
+      "/__eden/world/other",
     ]) {
       const response = await worker.fetch(
         new Request(`https://eden-eve-preview.account.workers.dev${path}`, {

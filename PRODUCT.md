@@ -138,6 +138,8 @@ Plus whatever your agent itself needs: model keys, databases, external services.
 
 **2. Durable memory for real agents.** The container's disk is wiped whenever it sleeps, so by default Eve forgets pending approvals and sessions. Three steps fix it: add the Postgres World package, select it in `agent.ts`, and put a direct Postgres URL in your env file. Any Postgres works (Neon, Supabase, Railway, your own server); use the direct address, not a pooled one. Eden runs the database setup for you during deploy. See [Durable state (Postgres World)](docs/deploy.md#durable-state-postgres-world).
 
+**Experimental, no database at all:** add `@moinulmoin/eden-world-cloudflare` and select it in `agent.ts`. Memory lives in a Durable Object on your own Cloudflare account, and Eden sets it up. It passes Workflow's official World test suite, and on Cloudflare a pending approval survived a container restart. Two caveats for now: updating your agent (destroy, then deploy) erases this memory, and automatic container sleep with it isn't verified yet. Use Postgres if you need memory across updates. See [Durable state on Cloudflare](docs/deploy.md#durable-state-on-cloudflare-no-database).
+
 ---
 
 ## What it costs

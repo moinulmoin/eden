@@ -1125,6 +1125,12 @@ function runtimeContainerEnvironment(
     ...(request.publicOrigin === undefined
       ? {}
       : { WORKFLOW_LOCAL_BASE_URL: request.publicOrigin }),
+    ...(request.workflowWorld === "@moinulmoin/eden-world-cloudflare"
+      ? {
+          EDEN_WORLD_URL: `${request.publicOrigin ?? "http://localhost:8080"}/__eden/world/rpc`,
+          CBOR_NATIVE_ACCELERATION_DISABLED: "true",
+        }
+      : {}),
   };
 }
 

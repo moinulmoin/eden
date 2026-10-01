@@ -1,17 +1,16 @@
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const workspaceDirectories = [
-  "packages/runtime-cloudflare",
-  "packages/cli",
-];
-const publicPackageNames = new Set([
-  "@moinulmoin/eden-runtime-cloudflare",
-  "@moinulmoin/eden",
-]);
+const workspaceDirectories = (await readdir(join(repositoryRoot, "packages"), { withFileTypes: true }))
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => `packages/${entry.name}`);
+const publicPackageNames = new Set(await Promise.all(
+  workspaceDirectories.map(async (directory) =>
+    (await readJson(join(directory, "package.json"))).name),
+));
 
 async function readJson(relativePath) {
   return JSON.parse(await readFile(join(repositoryRoot, relativePath), "utf8"));

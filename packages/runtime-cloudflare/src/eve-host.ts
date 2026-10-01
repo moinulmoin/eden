@@ -192,15 +192,15 @@ export function eveScheduleCronFiresWithin(
   return false;
 }
 
-/** Queue deliveries are private; webhook and manifest routes stay forwarded. */
+/** Queue and World RPC routes are private; webhooks and manifests stay forwarded. */
 export function isEveWorkflowInternalRoute(pathname: string): boolean {
   let decodedPath = pathname;
   try {
     decodedPath = decodeURIComponent(pathname);
   } catch {
-    // Malformed escapes cannot name a queue route in Eve's router.
+    // A malformed escape cannot identify an internal route.
   }
-  return /^\/\.well-known\/workflow\/v1\/(?:flow|step)(?:\/|$)/iu.test(
+  return /^\/(?:\.well-known\/workflow\/v1\/(?:flow|step)|__eden\/world)(?:\/|$)/iu.test(
     decodedPath.replace(/\/+/gu, "/"),
   );
 }
@@ -315,6 +315,7 @@ export interface EveHostConfigRequest extends EveHostIdentity {
   readonly schedules?: readonly EveScheduleCronEntry[];
   /** Overrides the Container `sleepAfter` (e.g. "30s") for testing. */
   readonly containerSleepAfter?: string;
+  readonly workflowWorld?: string;
 }
 
 export interface EveHostWranglerConfig {
@@ -332,6 +333,7 @@ export interface EveHostWranglerConfig {
     readonly EVE_RUNTIME_VARIABLE_NAMES: readonly string[];
     readonly EDEN_EVE_RUNTIME_REVISION?: string;
     readonly EDEN_EVE_CONTAINER_SLEEP_AFTER?: string;
+    readonly EDEN_EVE_WORLD_CLOUDFLARE?: true;
   };
   readonly triggers?: { readonly crons: readonly string[] };
   readonly containers: readonly [
@@ -345,17 +347,15 @@ export interface EveHostWranglerConfig {
     },
   ];
   readonly durable_objects: {
-    readonly bindings: readonly [
-      {
-        readonly name: string;
-        readonly class_name: string;
-      },
-    ];
+    readonly bindings: readonly {
+      readonly name: string;
+      readonly class_name: string;
+    }[];
   };
   readonly migrations: readonly [
     {
       readonly tag: "v1";
-      readonly new_sqlite_classes: readonly [string];
+      readonly new_sqlite_classes: readonly string[];
     },
   ];
 }
@@ -539,6 +539,9 @@ export function createEveHostConfig(
         ...(request.containerSleepAfter === undefined
           ? {}
           : { EDEN_EVE_CONTAINER_SLEEP_AFTER: request.containerSleepAfter }),
+        ...(request.workflowWorld === "@moinulmoin/eden-world-cloudflare"
+          ? { EDEN_EVE_WORLD_CLOUDFLARE: true as const }
+          : {}),
       },
       ...(schedules.length === 0
         ? {}
@@ -550,12 +553,20 @@ export function createEveHostConfig(
             name: request.containerBindingName,
             class_name: request.containerClassName,
           },
+          ...(request.workflowWorld === "@moinulmoin/eden-world-cloudflare"
+            ? [{ name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" }]
+            : []),
         ],
       },
       migrations: [
         {
           tag: "v1",
-          new_sqlite_classes: [request.containerClassName],
+          new_sqlite_classes: [
+            request.containerClassName,
+            ...(request.workflowWorld === "@moinulmoin/eden-world-cloudflare"
+              ? ["EdenWorldDurableObject"]
+              : []),
+          ],
         },
       ],
     },
@@ -603,6 +614,9 @@ export function generateEveHostWorkerSource(
       ? "export { ContainerProxy, EveHostContainer };"
       : `export { ContainerProxy, EveHostContainer as ${request.config.container.className} };`,
     "",
+    ...(request.config.worker.vars.EDEN_EVE_WORLD_CLOUDFLARE
+      ? [`export { EdenWorldDurableObject } from ${JSON.stringify(moduleSpecifier)};`]
+      : []),
     `EveHostContainer.outboundByHost = { ${JSON.stringify(new URL(request.config.container.publicOrigin).hostname)}: routeEveOutboundRequest };`,
     "",
     `export default createEveHostWorker(${JSON.stringify(workerOptions)});`,
@@ -781,6 +795,7 @@ export interface EveHostContainerEnvironment {
   readonly EDEN_EVE_GENERATION_ID?: string;
   readonly EDEN_EVE_RUNTIME_REVISION?: string;
   readonly EDEN_EVE_CONTAINER_SLEEP_AFTER?: string;
+  readonly EDEN_EVE_WORLD_CLOUDFLARE?: boolean;
 }
 
 export interface EveHostReadinessEvidence {
@@ -837,6 +852,7 @@ const RESERVED_EVE_HOST_VARIABLES = new Set([
   "NODE_ENV",
   "NODE_EXTRA_CA_CERTS",
   "WORKFLOW_LOCAL_BASE_URL",
+  "EDEN_WORLD_URL",
   "EDEN_EVE_DEPLOYMENT_ID",
   "EDEN_EVE_GENERATION_ID",
   "EDEN_EVE_RUNTIME_REVISION",

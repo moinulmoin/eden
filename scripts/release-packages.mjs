@@ -16,6 +16,10 @@ const dependencySections = [
 ];
 const releasePackages = [
   {
+    name: "@moinulmoin/eden-world-cloudflare",
+    directory: "packages/world-cloudflare",
+  },
+  {
     name: "@moinulmoin/eden-runtime-cloudflare",
     directory: "packages/runtime-cloudflare",
   },

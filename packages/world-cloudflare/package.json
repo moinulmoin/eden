@@ -1,0 +1,55 @@
+{
+  "name": "@moinulmoin/eden-world-cloudflare",
+  "version": "0.4.0",
+  "description": "Cloudflare Durable Object SQLite World for Eve workflows.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "types": "./dist/index.d.ts",
+  "module": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.js"
+    }
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "dependencies": {
+    "@workflow/errors": "5.0.0-beta.24",
+    "@workflow/world": "5.0.0-beta.39",
+    "@workflow/world-local": "5.0.0-beta.48",
+    "cbor-x": "1.6.4",
+    "ulid": "3.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.0",
+    "@workflow/world-testing": "5.0.0-beta.57"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false",
+    "lint": "eslint src --max-warnings 0",
+    "prepack": "pnpm run build",
+    "test": "vitest run --config vitest.config.ts --passWithNoTests --maxWorkers=1",
+    "test:server": "node test/server.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moinulmoin/eden.git",
+    "directory": "packages/world-cloudflare"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24.17.0"
+  }
+}

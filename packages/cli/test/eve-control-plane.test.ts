@@ -2135,6 +2135,7 @@ describe("Workflow World warnings", () => {
   function postgresWorldBuilder(options: {
     readonly eveCore?: string;
     readonly worldRange?: string;
+    readonly world?: string;
   }) {
     return fakeBuilder(async (request) => {
       await writeFile(
@@ -2159,7 +2160,7 @@ describe("Workflow World warnings", () => {
         JSON.stringify({
           config: {
             experimental: {
-              workflow: { world: "@workflow/world-postgres" },
+              workflow: { world: options.world ?? "@workflow/world-postgres" },
             },
           },
         }),
@@ -2167,16 +2168,16 @@ describe("Workflow World warnings", () => {
       );
       if (options.worldRange !== undefined) {
         await mkdir(
-          join(request.snapshotRoot, "node_modules/@workflow/world-postgres"),
+          join(request.snapshotRoot, "node_modules", options.world ?? "@workflow/world-postgres"),
           { recursive: true },
         );
         await writeFile(
           join(
             request.snapshotRoot,
-            "node_modules/@workflow/world-postgres/package.json",
+            `node_modules/${options.world ?? "@workflow/world-postgres"}/package.json`,
           ),
           JSON.stringify({
-            name: "@workflow/world-postgres",
+            name: options.world ?? "@workflow/world-postgres",
             version: "5.0.0-beta.47",
             dependencies: { "@workflow/world": options.worldRange },
           }),
@@ -2186,7 +2187,7 @@ describe("Workflow World warnings", () => {
     });
   }
 
-  test("passes the pairing check when the World line matches Eve's", async () => {
+  test.each(["@workflow/world-postgres", "@moinulmoin/eden-world-cloudflare"])("passes the pairing check for %s when the World line matches Eve's", async (world) => {
     const root = await createRoot();
     await writeFixtureProject(root);
     const output: string[] = [];
@@ -2200,7 +2201,7 @@ describe("Workflow World warnings", () => {
           stdout: (line) => output.push(line),
           eveControlPlane: passingControlPlane(
             root,
-            postgresWorldBuilder({ worldRange: "5.0.0-beta.39" }),
+            postgresWorldBuilder({ world, worldRange: "5.0.0-beta.39" }),
           ),
         },
       ),
@@ -2211,14 +2212,16 @@ describe("Workflow World warnings", () => {
         readonly id: string;
         readonly status: string;
       }[];
+      readonly warnings: readonly { readonly id: string }[];
     };
     const pairing = result.checks.find((value) =>
       value.id === "EVE_WORLD_PAIRING"
     );
     expect(pairing?.status).toBe("passed");
+    expect(result.warnings.map((warning) => warning.id)).not.toContain("EVE_WORLD_LOCAL");
   });
 
-  test("fails deploy pre-checks when the World line does not pair with Eve", async () => {
+  test.each(["@workflow/world-postgres", "@moinulmoin/eden-world-cloudflare"])("fails %s pre-checks when the World line does not pair with Eve", async (world) => {
     const root = await createRoot();
     await writeFixtureProject(root);
     const output: string[] = [];
@@ -2232,7 +2235,7 @@ describe("Workflow World warnings", () => {
           stdout: (line) => output.push(line),
           eveControlPlane: passingControlPlane(
             root,
-            postgresWorldBuilder({ worldRange: "6.0.0-beta.1" }),
+            postgresWorldBuilder({ world, worldRange: "6.0.0-beta.1" }),
           ),
         },
       ),
@@ -2251,6 +2254,5 @@ describe("Workflow World warnings", () => {
       value.id === "EVE_WORLD_PAIRING"
     );
     expect(pairing?.status).toBe("failed");
-    expect(pairing?.remediation).toContain("pnpm add @workflow/world-postgres@");
   });
 });

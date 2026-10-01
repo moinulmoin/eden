@@ -4,8 +4,9 @@
     "rootDir": "src",
     "outDir": "dist",
     "tsBuildInfoFile": "dist/tsconfig.tsbuildinfo",
-    "types": ["@cloudflare/workers-types"]
+    "types": ["node"]
   },
   "include": ["src"],
-  "references": [{ "path": "../world-cloudflare" }]
+  "exclude": ["src/**/*.test.ts"],
+  "references": []
 }

@@ -59,7 +59,7 @@ jobs:
           EDEN_PACKAGE_TEST_TIMEOUT_MS: "600000"
           EDEN_PACKAGE_TEST_SCRIPTS_TIMEOUT_MS: "900000"
 
-      - name: Prepare exact release tarballs
+      - name: Prepare exact release tarballs (World, runtime, CLI)
         run: >-
           node scripts/release-packages.mjs prepare
           "${{ steps.version.outputs.value }}" release-tarballs
@@ -90,6 +90,7 @@ jobs:
           retry npx --yes --package="@moinulmoin/eden@$VERSION" eden --help
           retry pnpm dlx "@moinulmoin/eden@$VERSION" --help
           retry bunx --package "@moinulmoin/eden@$VERSION" eden --help
+          retry npm view "@moinulmoin/eden-world-cloudflare@$VERSION" dist.integrity
 
   release:
     needs: publish

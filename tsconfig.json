@@ -1,6 +1,7 @@
 {
   "files": [],
   "references": [
+    { "path": "./packages/world-cloudflare" },
     { "path": "./packages/runtime-cloudflare" },
     { "path": "./packages/cli" }
   ]

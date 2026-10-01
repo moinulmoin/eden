@@ -22,11 +22,10 @@ const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const { version: releaseVersion } = JSON.parse(
   await readFile(join(repositoryRoot, "package.json"), "utf8"),
 );
-const workspacePackageDirectories = [
-  "packages/runtime-cloudflare",
-  "packages/cli",
-];
-// Two package-local processes run serially. A 300s budget leaves a wide margin
+const workspacePackageDirectories = (await readdir(join(repositoryRoot, "packages"), { withFileTypes: true }))
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => `packages/${entry.name}`);
+// Package-local processes run serially. A 300s budget leaves a wide margin
 // for the slower assertion while staying scoped to this portability regression
 // instead of masking unrelated hangs globally.
 const PACKAGE_TEST_SCRIPTS_TIMEOUT_MS =
@@ -191,6 +190,11 @@ function expectSuccessfulPackageChild(result, label) {
 }
 
 const distributionPackages = [
+  {
+    directory: "packages/world-cloudflare",
+    name: "@moinulmoin/eden-world-cloudflare",
+    requiredDistFiles: ["dist/index.js", "dist/index.d.ts", "dist/core/index.js", "dist/core/index.d.ts"],
+  },
   {
     directory: "packages/runtime-cloudflare",
     name: "@moinulmoin/eden-runtime-cloudflare",

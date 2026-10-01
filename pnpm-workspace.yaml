@@ -3,6 +3,8 @@ packages:
   - "site"
 linkWorkspacePackages: true
 allowBuilds:
+  '@swc/core': false
+  cbor-extract: false
   esbuild: true
   workerd: true
 minimumReleaseAgeExclude:

@@ -264,6 +264,45 @@ is well inside the Workers Paid allocation.
 For testing sleep behavior, `EDEN_EVE_CONTAINER_SLEEP_AFTER=<duration>`
 (for example `90s`) overrides the Container's `sleepAfter` at deploy time.
 
+## Durable state on Cloudflare (no database)
+
+**Experimental.** With Eve `0.68.0`, add `@moinulmoin/eden-world-cloudflare`
+to the agent project's production dependencies and select it in `agent.ts`:
+
+```ts
+experimental: {
+  workflow: { world: "@moinulmoin/eden-world-cloudflare" },
+},
+```
+
+Eden provisions one SQLite-backed Durable Object on your Cloudflare account.
+Workflow state and stream chunks live outside the Container's disposable disk;
+queue alarms wake the Container for workflow delivery. No database URL or
+external database account is required. Eden supplies `EDEN_WORLD_URL` and
+`CBOR_NATIVE_ACCELERATION_DISABLED=true` automatically. The World RPC endpoint
+is private to intercepted Container requests; public `/__eden/world/*` requests
+return 404.
+
+`eden destroy` permanently deletes this state along with the Worker. It is not
+a restart mechanism: preserve the Worker and Durable Object when restarting a
+Container. Cloudflare's [Worker deletion contract](https://developers.cloudflare.com/api/typescript/resources/workers/subresources/scripts/methods/delete/)
+deletes the Worker's Durable Object namespaces; no `deleted_classes` migration
+is needed when deleting the whole Worker.
+
+**Limitation: updates erase this state.** `eden deploy` does not update an
+existing target, so shipping new agent code today means `eden destroy` then
+`eden deploy`, and that deletes the Durable Object's data. State survives
+Container sleep and restarts, not redeploys. If you need state to survive
+code updates, use the Postgres World below; its data lives outside the
+Worker.
+
+**Not yet verified: automatic sleep.** In the live test, a Container using
+this World was still running 45 seconds after its last client disconnected,
+with a 30-second sleep setting. Durability across a real Container restart is
+proven; whether and when the Container auto-sleeps with this World is not.
+Budget for an always-on Container (about $12/month at Cloudflare's published
+rates) until this is confirmed.
+
 ## Durable state (Postgres World)
 
 Container-local disk and process memory are wiped whenever the Container

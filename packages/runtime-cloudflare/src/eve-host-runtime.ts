@@ -1,4 +1,5 @@
 import { Container, ContainerProxy } from "@cloudflare/containers";
+import { WorldCore } from "@moinulmoin/eden-world-cloudflare/core";
 
 import {
   EVE_HOST_DEFAULTS,
@@ -30,6 +31,79 @@ interface EveContainerLoopbackNamespace {
   getByName(name: string): {
     containerFetch(request: Request, port?: number): Promise<Response>;
   };
+}
+
+/** The deployment's single SQLite-backed Workflow World. */
+export class EdenWorldDurableObject {
+  private readonly core: WorldCore;
+
+  constructor(ctx: DurableObjectState, env: EveHostContainerEnvironment) {
+    this.core = new WorldCore({
+      sql: {
+        exec: ctx.storage.sql.exec.bind(ctx.storage.sql),
+        transactionSync: ctx.storage.transactionSync.bind(ctx.storage),
+      },
+      scheduleAlarm: async (atMs) => {
+        if (atMs === null) await ctx.storage.deleteAlarm();
+        else await ctx.storage.setAlarm(atMs);
+      },
+      delivery: {
+        deliver: async (message) => {
+          const origin = env.EVE_PUBLIC_ORIGIN;
+          const binding = env.EVE_CONTAINER_BINDING_NAME;
+          const instance = env.EVE_CONTAINER_INSTANCE_NAME;
+          if (typeof origin !== "string" || typeof binding !== "string" ||
+              typeof instance !== "string") {
+            throw new Error("The World queue Container identity is unavailable.");
+          }
+          const namespace = env[binding] as EveContainerLoopbackNamespace;
+          const response = await namespace.getByName(instance).containerFetch(
+            new Request(new URL(`/.well-known/workflow/v1/${message.path}`, origin), {
+              method: "POST",
+              headers: {
+                ...message.headers,
+                "content-type": "application/json",
+                "x-vqs-queue-name": message.queueName,
+                "x-vqs-message-id": message.messageId,
+                "x-vqs-message-attempt": String(message.attempt),
+              },
+              body: message.body as Uint8Array<ArrayBuffer>,
+            }),
+            EVE_HOST_DEFAULTS.internalPort,
+          );
+          // Body transport errors must remain retryable; an HTTP status alone
+          // is not an acknowledgement of a streamed Container response.
+          const body = await response.text();
+          let result: { timeoutSeconds?: number } | null = null;
+          try {
+            result = JSON.parse(body) as { timeoutSeconds?: number };
+          } catch {
+            // World-local also accepts successful non-JSON responses.
+          }
+          const timeout = result?.timeoutSeconds;
+          return {
+            ok: response.ok && timeout === undefined,
+            ...(typeof timeout === "number" && timeout >= 0
+              ? { retryAfterMs: timeout * 1_000 }
+              : {}),
+          };
+        },
+      },
+    });
+    void ctx.blockConcurrencyWhile(async () => this.core.migrate());
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.method !== "POST") return new Response(null, { status: 405 });
+    const result = await this.core.handleRpc(new Uint8Array(await request.arrayBuffer()));
+    return new Response(result as Uint8Array<ArrayBuffer>, {
+      headers: { "content-type": "application/cbor" },
+    });
+  }
+
+  async alarm(): Promise<void> {
+    await this.core.runAlarm();
+  }
 }
 
 /**
@@ -64,6 +138,14 @@ export async function routeEveOutboundRequest(
   const hostname = new URL(request.url).hostname;
   if (hostname !== new URL(publicOrigin).hostname) {
     return fetch(request);
+  }
+  if (new URL(request.url).pathname === "/__eden/world/rpc") {
+    const world = env.EDEN_WORLD as {
+      idFromName(name: string): unknown;
+      get(id: unknown): { fetch(request: Request): Promise<Response> };
+    } | undefined;
+    if (world === undefined) return new Response(null, { status: 404 });
+    return world.get(world.idFromName("world")).fetch(request);
   }
   const namespace = (env as Record<string, unknown>)[bindingName] as
     | EveContainerLoopbackNamespace
@@ -131,6 +213,12 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
       NODE_ENV: "production",
       WORKFLOW_LOCAL_BASE_URL: publicOrigin,
       EDEN_EVE_DEPLOYMENT_ID: deploymentId,
+      ...(env.EDEN_EVE_WORLD_CLOUDFLARE
+        ? {
+            EDEN_WORLD_URL: `${publicOrigin}/__eden/world/rpc`,
+            CBOR_NATIVE_ACCELERATION_DISABLED: "true",
+          }
+        : {}),
       EDEN_EVE_GENERATION_ID: generationId,
       // Trust the runtime-mounted Cloudflare Containers CA so the intercepted
       // HTTPS deliveries to the public origin below complete TLS.
