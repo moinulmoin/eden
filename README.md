@@ -16,19 +16,19 @@ its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.4.0
+npm install --global @moinulmoin/eden@0.4.1
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.4.0
+pnpm add --global @moinulmoin/eden@0.4.1
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.4.0
+bun add --global @moinulmoin/eden@0.4.1
 ```
 
 Confirm the installation:

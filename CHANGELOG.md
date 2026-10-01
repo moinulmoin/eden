@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 — 2026-10-01
+
+Release of 0.4.0's contents. No code changes. The first publish of the new
+`@moinulmoin/eden-world-cloudflare` package was done by hand to bootstrap
+npm trusted publishing, and its tarball bytes differ from the CI build, so the
+release pipeline correctly refused to publish 0.4.0 of the other packages.
+All three packages are published at 0.4.1 by CI with provenance.
+`@moinulmoin/eden-world-cloudflare@0.4.0` is the same code without provenance.
+
 ## 0.4.0 — 2026-10-01
 
 ### Added
