@@ -35,6 +35,17 @@ fire while the Container sleeps.
   only; any other ignored dependency build script still fails with
   `ERR_PNPM_IGNORED_BUILDS`.
 
+### Fixed
+
+- **Linux:** `--env-file` values no longer reach the local boot check through
+  `--env-file /dev/stdin`. On Linux, the stdin of a process Node spawns is a
+  socket that `/dev/stdin` cannot open, so preflight and deploy failed there
+  whenever an env file was used. Eden now passes `--env NAME` (names only)
+  with values in the Docker CLI's own environment; values still never reach
+  argv, logs, or the image. `PATH`, `HOME`, `DOCKER_HOST`, and
+  `DOCKER_CONTEXT` are rejected as env-file names because they would replace
+  the local Docker CLI's own settings.
+
 ## 0.2.2 — 2026-10-01
 
 ### Fixed

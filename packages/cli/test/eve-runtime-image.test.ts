@@ -27,6 +27,7 @@ import {
   validateEveHostRequirements,
   type EveRuntimeImageRequest,
 } from "../src/eve-runtime-image.js";
+import type { EveRuntimeInjection } from "../src/eve-runtime-config.js";
 
 const roots: string[] = [];
 
@@ -761,8 +762,6 @@ describe("Eve runtime image boundary", () => {
       args.includes("./node_modules/.bin/bootstrap")
     );
     expect(bootstrap).toBeDefined();
-    expect(bootstrap).toContain("--env-file");
-    expect(bootstrap).toContain("/dev/stdin");
     expect(
       bootstrap?.some((arg) => arg.includes("WORKFLOW_POSTGRES_URL")),
     ).toBe(false);
@@ -775,6 +774,72 @@ describe("Eve runtime image boundary", () => {
       args.some((arg) => arg.includes("cbor-x"))
     );
     expect(cborProbe).toBeDefined();
+  });
+
+  test("forwards env-file values to the boot container by name, never through argv or stdin", async () => {
+    const root = await createRoot("eden-eve-runtime-image-env-");
+    const candidate = await writeCandidate(root);
+    const fakeDocker = await writeFakeDocker(root);
+    const envLog = join(root, "docker-env.jsonl");
+    const command = join(root, "env-docker.cjs");
+    const base = await readFile(fakeDocker.command, "utf8");
+    await writeFile(
+      command,
+      base.replace(
+        'const imageId =',
+        `fs.appendFileSync(${JSON.stringify(envLog)}, JSON.stringify(process.env.OPAQUE_RUNTIME ?? null) + "\\n");\nconst imageId =`,
+      ),
+      { encoding: "utf8", mode: 0o700 },
+    );
+    await chmod(command, 0o700);
+    const marker = "env-passthrough-secret-5d1c";
+    const runtimeInjection = {
+      runLocal: async ({ hostEnvironment, run }) =>
+        run({ env: { ...hostEnvironment, OPAQUE_RUNTIME: marker } }),
+    } as Pick<EveRuntimeInjection, "runLocal"> as EveRuntimeInjection;
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: command,
+      healthPort: 4317,
+      retainImage: false,
+      runtimeInjection,
+      fetchHealth: async () => new Response(
+        JSON.stringify({ status: "ready" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result.status).toBe("ready");
+    const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const envValues = (await readFile(envLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string | null);
+    const bootIndex = dockerArgs.findIndex((args) => args[0] === "run");
+    expect(dockerArgs[bootIndex]).toEqual(
+      expect.arrayContaining(["--env", "OPAQUE_RUNTIME"]),
+    );
+    expect(envValues[bootIndex]).toBe(marker);
+    expect(dockerArgs.flat().join(" ")).not.toContain(marker);
+    expect(dockerArgs.flat()).not.toContain("/dev/stdin");
   });
 
   test("fails with WORLD_MIGRATION_FAILED when the Postgres World setup fails", async () => {

@@ -3,7 +3,6 @@ import {
 } from "node:crypto";
 import {
   execFile,
-  spawn,
 } from "node:child_process";
 import {
   cp,
@@ -1093,50 +1092,30 @@ function safeDockerEnvironment(): NodeJS.ProcessEnv {
   };
 }
 
+/**
+ * Runs the Docker CLI. `environment` values reach the CLI process only, so
+ * `--env NAME` arguments (names, never values) can forward runtime secrets
+ * into a container without them touching argv, logs, or files. `--env-file
+ * /dev/stdin` is not used: on Linux, Node's spawned stdin is a socket that
+ * `/dev/stdin` cannot open.
+ */
 async function docker(
   state: DockerState,
   args: readonly string[],
-  options: { readonly maxBuffer?: number } = {},
+  options: {
+    readonly maxBuffer?: number;
+    readonly environment?: Readonly<Record<string, string>>;
+  } = {},
 ): Promise<{ readonly stdout: string; readonly stderr: string }> {
   return execFileAsync(state.command, [...args], {
-    env: state.env,
+    env: { ...state.env, ...options.environment },
     cwd: state.generationRoot,
     maxBuffer: options.maxBuffer ?? 4 * 1024 * 1024,
   });
 }
 
-async function dockerWithInput(
-  state: DockerState,
-  args: readonly string[],
-  input: string,
-): Promise<{ readonly stdout: string; readonly stderr: string }> {
-  return new Promise((resolveResult, rejectResult) => {
-    const child = spawn(state.command, [...args], {
-      cwd: state.generationRoot,
-      env: state.env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    child.once("error", rejectResult);
-    child.once("close", (code) => {
-      if (code === 0) {
-        resolveResult({ stdout, stderr });
-      } else {
-        const error = new Error(stderr || "The Docker operation failed.");
-        Object.assign(error, { stdout, stderr, code });
-        rejectResult(error);
-      }
-    });
-    child.stdin.end(input);
-  });
-}
+/** Names that must keep the local Docker CLI's own values. */
+const DOCKER_CLI_OWNED_VARIABLES = ["PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT"];
 
 function runtimeContainerEnvironment(
   request: EveRuntimeImageRequest,
@@ -1606,6 +1585,19 @@ export async function buildEveRuntimeImage(
         hostEnvironment: runtimeContainerEnvironment(request),
         run: (startRequest) => startRequest.env,
       });
+    if (request.runtimeInjection !== undefined) {
+      const collision = Object.keys(runtimeEnvironment).find((name) =>
+        DOCKER_CLI_OWNED_VARIABLES.includes(name)
+      );
+      if (collision !== undefined) {
+        throw packagingError(
+          "DOCKER_PLATFORM_BLOCKED",
+          "runtime variable name",
+          `The runtime variable ${collision} would replace the local Docker CLI's own ${collision}.`,
+          `Rename ${collision} in --env-file; ${DOCKER_CLI_OWNED_VARIABLES.join(", ")} are reserved for the local Docker CLI.`,
+        );
+      }
+    }
     const bootArgs = [
       "run",
       "--detach",
@@ -1620,18 +1612,16 @@ export async function buildEveRuntimeImage(
           "--env",
           `${name}=${value}`,
         ])
-        : ["--env-file", "/dev/stdin"]),
+        : Object.keys(runtimeEnvironment).flatMap((name) => ["--env", name])),
       state.imageId,
     ] as const;
-    const boot = request.runtimeInjection === undefined
-      ? await docker(state, bootArgs)
-      : await dockerWithInput(
-        state,
-        bootArgs,
-        `${Object.entries(runtimeEnvironment)
-          .map(([name, value]) => `${name}=${value}`)
-          .join("\n")}\n`,
-      );
+    const boot = await docker(
+      state,
+      bootArgs,
+      request.runtimeInjection === undefined
+        ? {}
+        : { environment: runtimeEnvironment },
+    );
     state.containerId = boot.stdout.trim();
     bootContainerId = state.containerId;
     if (state.containerId.length === 0) {
@@ -1678,20 +1668,15 @@ export async function buildEveRuntimeImage(
       // already-applied work) that must run once per database before Eve
       // consumes the schema. Running it inside the disposable boot
       // container, before health and publish, exercises the exact deployed
-      // node_modules against the env-file URL while the URL only ever
-      // travels through `--env-file /dev/stdin` — never argv, logs, or the
-      // image.
-      const worldSetupEnvironment = `${Object.entries(runtimeEnvironment)
-        .map(([name, value]) => `${name}=${value}`)
-        .join("\n")}\n`;
+      // node_modules against the env-file URL. `docker exec` inherits the
+      // environment the container booted with, so the URL never appears in
+      // argv, logs, or the image.
       try {
-        await dockerWithInput(state, [
+        await docker(state, [
           "exec",
-          "--env-file",
-          "/dev/stdin",
           state.containerId,
           "./node_modules/.bin/bootstrap",
-        ], worldSetupEnvironment);
+        ]);
         await docker(state, [
           "exec",
           state.containerId,
