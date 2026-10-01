@@ -861,6 +861,18 @@ async function readWorkersDevSubdomain(
   }
 }
 
+/**
+ * Container applications in the account that belong to this exact target.
+ * Eden names a target's Container application `<name>-container`; containers
+ * owned by anything else in the account never count.
+ */
+export function exactTargetContainerEntries(
+  value: unknown,
+  name: string,
+): readonly { readonly id: string; readonly name: string }[] | undefined {
+  return exactContainerEntries(value, boundedResourceName(name, "container"));
+}
+
 async function defaultCloudflareRead(
   request: EveCloudflareReadRequest,
 ): Promise<EveCloudflareReadResult> {
@@ -872,7 +884,6 @@ async function defaultCloudflareRead(
     "--per-page",
     "100",
   ]);
-  const containerCollection = jsonCollection(containers.value);
   const deployments = await readWranglerJson([
     "deployments",
     "list",
@@ -884,7 +895,10 @@ async function defaultCloudflareRead(
   const accountAccess = account.failed || accountId === undefined
     ? "unavailable"
     : "available";
-  const containerEntries = exactContainerEntries(containers.value, request.name);
+  const containerEntries = exactTargetContainerEntries(
+    containers.value,
+    request.name,
+  );
   const containerAccess = containers.failed || containerEntries === undefined
     ? "unavailable"
     : "available";
@@ -918,7 +932,7 @@ async function defaultCloudflareRead(
   }
   if (
     deploymentEntries.length === 0 &&
-    containerCollection?.length === 0
+    containerEntries?.length === 0
   ) {
     return {
       accountAccess,
@@ -2750,7 +2764,7 @@ async function collectEvePreflight(
       "building linux/amd64 runtime image, booting eve, checking health",
     );
     try {
-      if (runtimeConfig !== undefined && request.command === "preflight") {
+      if (runtimeConfig !== undefined) {
         runtimeInjection = await prepareEveRuntimeInjection(runtimeConfig, {
           mode: "preflight",
         });

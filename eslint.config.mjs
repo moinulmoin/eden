@@ -11,6 +11,7 @@ export default tseslint.config(
       "**/.eden/**",
       "**/.astro/**",
       "**/*.d.ts",
+      "videos/**",
     ],
   },
   {

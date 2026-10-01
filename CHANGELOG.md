@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2 — 2026-10-01
+
+### Fixed
+
+- `eden deploy` and `eden preflight` no longer refuse a new target just
+  because the Cloudflare account already has other Containers, including
+  another Eden agent. The target check now looks only for this target's own
+  `<name>-container` application.
+- The local boot check during `eden deploy` now receives the `--env-file`
+  values, as `eden preflight` already did. Agents that need runtime
+  configuration at boot (for example a Postgres Workflow World URL) no longer
+  fail deploy with a health error. Values still never reach command
+  arguments, image layers, or logs.
+
 ## 0.2.1 — 2026-10-01
 
 ### Security

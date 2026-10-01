@@ -28,6 +28,7 @@ import type {
   EvePreflightRuntimeRunnerRequest,
 } from "../src/index.js";
 import type { EveProjectBuilderRequest } from "../src/eve-packaging.js";
+import { exactTargetContainerEntries } from "../src/eve-control-plane.js";
 
 const roots: string[] = [];
 
@@ -372,7 +373,9 @@ describe("top-level Eden Deploy commands", () => {
     expect(await readFile(join(root, "pnpm-lock.yaml"))).toEqual(lockfileBefore);
   });
 
-  test("uses disposable local protected injection and redacts explicit runtime values", async () => {
+  test.each(["preflight", "deploy"] as const)(
+    "%s boot probe gets disposable protected injection and redacts explicit runtime values",
+    async (command) => {
     const root = await createRoot();
     await writeFile(
       join(root, "package.json"),
@@ -384,7 +387,7 @@ describe("top-level Eden Deploy commands", () => {
       "utf8",
     );
     await writeFile(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
-    const envFile = join(root, "runtime.env");
+    const envFile = join(await createRoot(), "runtime.env");
     const marker = "preflight-secret-marker-6f9a";
     await writeFile(envFile, `OPAQUE_RUNTIME=${marker}\n`, "utf8");
     const before = await readFile(envFile);
@@ -394,7 +397,7 @@ describe("top-level Eden Deploy commands", () => {
 
     await expect(
       runEdenCli(
-        ["preflight",
+        [command,
         "--project",
         root,
         "--env",
@@ -446,6 +449,8 @@ describe("top-level Eden Deploy commands", () => {
               return {
                 accountAccess: "available",
                 containerAccess: "available",
+                accountId: "account-test",
+                workersDevSubdomain: "account",
                 target: { state: "absent" },
               };
             },
@@ -457,8 +462,9 @@ describe("top-level Eden Deploy commands", () => {
     expect(injectedEnvironment?.OPAQUE_RUNTIME).toBe(marker);
     expect(output.join("\n")).not.toContain(marker);
     expect(await readFile(envFile)).toEqual(before);
-    expect(remoteReadCount).toBe(0);
-  });
+    if (command === "preflight") expect(remoteReadCount).toBe(0);
+    },
+  );
 
   test("fails closed on an exact target conflict without a mutation seam", async () => {
     const root = await createRoot();
@@ -1320,6 +1326,33 @@ const destroyTargetKey = (() => {
 })();
 const destroyRegistryImage =
   `eden-eve-${destroyTargetKey}-gen-destroy-1:candidate`;
+
+describe("exact target Container inventory", () => {
+  test("ignores the account's other Containers and matches only <name>-container", () => {
+    const inventory = [
+      { id: "c-other-app", name: "autoseopilot-container" },
+      { id: "c-other-eden", name: "my-eve-agent-11111111-container" },
+      { id: "c-bare-name", name: "my-eve-agent-9e510242" },
+    ];
+
+    expect(exactTargetContainerEntries(inventory, "my-eve-agent-9e510242")).toEqual([]);
+    expect(
+      exactTargetContainerEntries(
+        [...inventory, { id: "c-target", name: "my-eve-agent-9e510242-container" }],
+        "my-eve-agent-9e510242",
+      ),
+    ).toEqual([{ id: "c-target", name: "my-eve-agent-9e510242-container" }]);
+  });
+
+  test("stays unproven when a full page has no exact match", () => {
+    const fullPage = Array.from({ length: 100 }, (_, index) => ({
+      id: `c-${index}`,
+      name: `unrelated-${index}-container`,
+    }));
+
+    expect(exactTargetContainerEntries(fullPage, "my-eve-agent-9e510242")).toBeUndefined();
+  });
+});
 
 describe("eden destroy", () => {
   async function createDeployedFixture(): Promise<{
