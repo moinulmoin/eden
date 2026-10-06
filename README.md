@@ -16,19 +16,19 @@ its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.4.1
+npm install --global @moinulmoin/eden@0.5.0
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.4.1
+pnpm add --global @moinulmoin/eden@0.5.0
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.4.1
+bun add --global @moinulmoin/eden@0.5.0
 ```
 
 Confirm the installation:
@@ -152,7 +152,7 @@ The Eve project remains responsible for its:
 | Command | Purpose |
 | --- | --- |
 | `eden preflight` | Inspect an Eve candidate without remote mutation |
-| `eden deploy` | Deploy an existing Eve project to one exact target |
+| `eden deploy` | Deploy an Eve project to one exact target, or update a target Eden owns in place (state is kept) |
 | `eden destroy` | Remove one exact Eden-owned Eve deployment |
 
 Run `eden <command> --help` for command-specific options.

@@ -170,6 +170,29 @@ export async function routeEveOutboundRequest(
 
 type EveHostContainerContext = ConstructorParameters<typeof Container>[0];
 
+/**
+ * Durable Object storage key recording which deployment last started the
+ * Container. Cloudflare does not roll DO-managed Container instances onto a
+ * new image when the Worker redeploys — the image is selected at
+ * `ctx.container.start()` — so an in-place update must restart the running
+ * instance itself before new code is served.
+ */
+const EVE_HOST_CONTAINER_DEPLOYMENT_KEY =
+  "eden.eve.host.started-deployment";
+
+/** Restart attempts are rate-limited under this key: during the
+ * Worker-active-before-image-rollout window a restart still launches the old
+ * image, so retries must wait for the rollout. */
+const EVE_HOST_CONTAINER_RESTART_ATTEMPT_KEY =
+  "eden.eve.host.restart-attempted-at";
+
+/** Compares image references by their generation-scoped repository name so
+ * digest and tag spellings of the same pushed image match. */
+function containerRepositoryName(image: string): string {
+  return (image.split("@")[0] ?? "").split(":")[0] ?? "";
+}
+
+
 export class EveHostContainer extends Container<EveHostContainerEnvironment> {
   override defaultPort = EVE_HOST_DEFAULTS.internalPort;
   override sleepAfter: string | number = EVE_HOST_DEFAULTS.sleepAfter;
@@ -179,9 +202,17 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
   override pingEndpoint = "localhost/eve/v1/health";
   readonly lifecycle = createEveHostLifecycleObserver();
   private readinessStarted = false;
-  private readinessEvidence: EveHostReadinessEvidence | undefined;
+  /** Evidence is cached only under the deployment whose image was verified. */
+  private readinessEvidence:
+    | { readonly deploymentId: string | undefined; readonly evidence: EveHostReadinessEvidence }
+    | undefined;
+  /**
+   * Bumped whenever the Container stops or is reset. Readiness work captures
+   * the epoch it started under and may only record a marker or cache
+   * evidence if no stop happened in between.
+   */
+  private readinessEpoch = 0;
   private readonly readiness: EveReadinessGate;
-
   constructor(
     ctx: EveHostContainerContext,
     env: EveHostContainerEnvironment,
@@ -202,7 +233,6 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
     }
     assertStableOrigin(publicOrigin);
     assertNonEmpty(deploymentId, "deployment identity");
-    assertNonEmpty(generationId, "generation identity");
     const runtimeEnv = readProtectedRuntimeVariables(env);
     this.envVars = {
       ...runtimeEnv,
@@ -242,25 +272,192 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
     });
   }
 
+  /**
+   * Compares the deployment the running Container was started under (stored
+   * in Durable Object storage, which survives Worker redeploys) against the
+   * deployment the *current* Worker stamps on the forwarded request. A
+   * stale Durable Object still detects the update because the header is
+   * stamped by new Worker code, not this code's environment.
+   *
+   * DO-managed Container instances are excluded from the application's fleet
+   * rollout — the image is only re-selected on the next
+   * `ctx.container.start()` — so an update must stop the instance itself.
+   * A missing marker means the running image cannot be trusted, so the
+   * container is restarted too (first update from runtimes that predate the
+   * marker). Restarts are rate-limited because Cloudflare activates a new
+   * Worker before the image rollout lands; starting in that window would
+   * re-launch the *old* image, so the deployment marker is only recorded
+   * after `inspect()` proves the running image is the expected one.
+   */
+  private async reconcileStartedDeployment(
+    requestDeploymentId: string | undefined,
+    requestImage: string | undefined,
+  ): Promise<void> {
+    // Requests without the Worker's deployment header (scheduled wakes on old
+    // Worker code, probes) cannot arbitrate drift; the Durable Object's own
+    // environment may itself be stale, so never fall back to it here.
+    if (requestDeploymentId === undefined) return;
+    const storage = this.ctx?.storage;
+    if (
+      storage === undefined ||
+      typeof storage.get !== "function" ||
+      typeof storage.put !== "function"
+    ) {
+      return;
+    }
+    const lastStarted = await storage.get<string>(
+      EVE_HOST_CONTAINER_DEPLOYMENT_KEY,
+    );
+    if (lastStarted === requestDeploymentId) return;
+    const runtime = this.ctx?.container;
+    if (runtime?.running !== true) return;
+    if (
+      requestImage !== undefined &&
+      (await this.containerServesImage(runtime, requestImage)) === true
+    ) {
+      // The running instance already provably serves this deployment's image
+      // (e.g. the rollout replaced it); safe to mark it as started.
+      await storage.put(EVE_HOST_CONTAINER_DEPLOYMENT_KEY, requestDeploymentId);
+      return;
+    }
+    const attemptedAt = await storage.get<number>(
+      EVE_HOST_CONTAINER_RESTART_ATTEMPT_KEY,
+    );
+    const now = Date.now();
+    if (attemptedAt !== undefined && now - attemptedAt < 30_000) return;
+    await storage.put(EVE_HOST_CONTAINER_RESTART_ATTEMPT_KEY, now);
+    this.lifecycle.record("replaced");
+    this.readinessEpoch += 1;
+    this.readinessStarted = false;
+    this.readinessEvidence = undefined;
+    this.readiness.reset();
+    await this.stop();
+    const stoppedAt = Date.now();
+    while (runtime.running && Date.now() - stoppedAt < 10_000) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  private async containerServesImage(
+    runtime: { readonly running: boolean },
+    expectedImage: string,
+  ): Promise<boolean | undefined> {
+    const inspect = (
+      runtime as {
+        inspect?: () => Promise<{ readonly image?: string } | null>;
+      }
+    ).inspect;
+    if (typeof inspect !== "function") return undefined;
+    let info: { readonly image?: string } | null;
+    try {
+      info = await inspect.call(runtime);
+    } catch {
+      return undefined;
+    }
+    if (info?.image === undefined) return undefined;
+    return containerRepositoryName(info.image) ===
+      containerRepositoryName(expectedImage);
+  }
+
+  /**
+   * Records the started deployment only when the running Container provably
+   * serves this deployment's image (`inspect()` matches the forwarded
+   * `x-eden-eve-image`). `false` or unknown (no `inspect`, a throwing call,
+   * or no image field) never records — a start inside the
+   * Worker-active-before-image-rollout window must not pin the old image.
+   * When the Worker stamps no image, the marker is recorded unverified,
+   * matching pre-drift behavior.
+   */
+  private async recordStartedDeployment(
+    requestDeploymentId: string | undefined,
+    requestImage: string | undefined,
+  ): Promise<boolean> {
+    if (requestDeploymentId === undefined) return true;
+    const storage = this.ctx?.storage;
+    if (
+      storage === undefined ||
+      typeof storage.get !== "function" ||
+      typeof storage.put !== "function"
+    ) {
+      return true;
+    }
+    const runtime = this.ctx?.container;
+    if (requestImage !== undefined) {
+      // A stopped (or stopping) instance can't prove which image it serves.
+      if (runtime?.running !== true) {
+        this.lifecycle.record("image_mismatch");
+        return false;
+      }
+      const verified = await this.containerServesImage(runtime, requestImage);
+      if (verified !== true) {
+        this.lifecycle.record("image_mismatch");
+        return false;
+      }
+    }
+    await storage.put(EVE_HOST_CONTAINER_DEPLOYMENT_KEY, requestDeploymentId);
+    return true;
+  }
+
+
   async ensureEveReady(
     signal: AbortSignal = new AbortController().signal,
+    requestDeploymentId?: string,
+    requestImage?: string,
   ): Promise<EveHostReadinessEvidence> {
-    if (this.readinessEvidence !== undefined) {
-      return this.readinessEvidence;
+    await this.reconcileStartedDeployment(requestDeploymentId, requestImage);
+    // Cached evidence only serves the deployment it was verified under;
+    // a request for a different deployment re-runs readiness.
+    if (
+      this.readinessEvidence !== undefined &&
+      this.readinessEvidence.deploymentId === requestDeploymentId
+    ) {
+      return this.readinessEvidence.evidence;
     }
     if (!this.readinessStarted) {
       this.readinessStarted = true;
       this.lifecycle.record("start_requested");
     }
+    const epoch = this.readinessEpoch;
     const evidence = await this.readiness(signal);
-    this.readinessEvidence = evidence;
+    if (
+      epoch === this.readinessEpoch &&
+      await this.recordStartedDeployment(requestDeploymentId, requestImage) &&
+      epoch === this.readinessEpoch
+    ) {
+      this.readinessEvidence = {
+        deploymentId: requestDeploymentId,
+        evidence,
+      };
+    }
     this.lifecycle.record("health_ready", evidence.healthStatus);
     return evidence;
   }
 
   override async fetch(request: Request): Promise<Response> {
-    await this.ensureEveReady(request.signal);
-    return super.fetch(request);
+    const requestDeploymentId =
+      request.headers.get("x-eden-eve-deployment-id") ?? undefined;
+    await this.ensureEveReady(
+      request.signal,
+      requestDeploymentId,
+      request.headers.get("x-eden-eve-image") ?? undefined,
+    );
+    const response = await super.fetch(request);
+    // Reporting the verified marker back lets deploy health-gate promotion on
+    // the served container actually running this generation's image.
+    if (
+      this.readinessEvidence !== undefined &&
+      this.readinessEvidence.deploymentId === requestDeploymentId &&
+      requestDeploymentId !== undefined
+    ) {
+      const headers = new Headers(response.headers);
+      headers.set("x-eden-eve-started-deployment", requestDeploymentId);
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    }
+    return response;
   }
 
   override onStart(): void {
@@ -274,6 +471,7 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
     readonly exitCode: number;
     readonly reason: "exit" | "runtime_signal";
   }): void {
+    this.readinessEpoch += 1;
     this.readinessStarted = false;
     this.readinessEvidence = undefined;
     this.readiness.reset();
@@ -281,6 +479,7 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
   }
 
   override onError(error: unknown): unknown {
+    this.readinessEpoch += 1;
     this.readinessStarted = false;
     this.readinessEvidence = undefined;
     this.readiness.reset();
@@ -365,6 +564,9 @@ export function createEveHostWorker(
         deploymentId: options.deploymentId,
         generationId: options.generationId,
         correlationId: globalThis.crypto.randomUUID(),
+        ...(options.containerImage === undefined
+          ? {}
+          : { containerImage: options.containerImage }),
         ...(options.runtimeRevisionHandle === undefined
           ? {}
           : { runtimeRevisionHandle: options.runtimeRevisionHandle }),
@@ -408,6 +610,17 @@ export function createEveHostWorker(
               resolveContainer(env)
                 .fetch(new Request(
                   new URL(EVE_HOST_DEFAULTS.healthPath, options.publicOrigin),
+                  {
+                    headers: {
+                      // Stamp the Worker's own deployment so a stale Durable
+                      // Object never falls back to its own environment when
+                      // deciding whether to restart the running Container.
+                      "x-eden-eve-deployment-id": options.deploymentId,
+                      ...(options.containerImage === undefined
+                        ? {}
+                        : { "x-eden-eve-image": options.containerImage }),
+                    },
+                  },
                 ))
                 .catch((error: unknown) => {
                   console.error(

@@ -16,6 +16,8 @@ export {
   resolveStableWorkersDevOrigin,
 } from "./eve-host.js";
 export type {
+  EveDurableBinding,
+  EveDurableMigration,
   EveContainerTransport,
   EveHostConfig,
   EveHostConfigRequest,

@@ -143,6 +143,40 @@ public interface to execute one representative request. Health proves startup;
 a normal application request proves that the project-owned providers and
 services work from the deployed environment.
 
+## Updating an agent
+
+Run `eden deploy` again with the same project, environment, and name. When
+Eden's immutable deployment record proves it owns the existing target (same
+account, project, and exact Worker and Container names), deploy becomes an
+update instead of failing with `VAL-CLI-007-TARGET-CONFLICT`:
+
+1. It builds and boot-checks the new image locally, exactly like a first
+   deploy.
+2. It pushes the image and republishes the same Worker and Container
+   application. Durable Object classes and their migration history are kept
+   (new migration tags are only appended), so state stored in the Cloudflare
+   World survives.
+3. The running Container restarts on the new image. Durable Object-managed
+   Containers don't take part in Cloudflare's application-wide rollouts, so
+   Eden's Worker detects the new deployment and restarts the instance itself.
+4. It health-checks the public URL, promotes the new generation, then deletes
+   the previous generation's registry image.
+
+The summary prints `✓ updated <name>` (in `--json`, `deployment.operation` is
+`update`). A target that exists but isn't provably Eden's still fails with
+`VAL-CLI-007-TARGET-CONFLICT`; production still requires an explicit `--name`.
+
+**In-flight runs resume on the new code.** On Vercel, Workflow pins each run
+to the deployment that started it. Off Vercel there's no pinning, so sessions,
+pending approvals, and sleeping steps that started before the update continue
+on the new code (`EVE_UPDATE_IN_FLIGHT`). Keep step names and input or state
+shapes backward-compatible until older runs finish, or let them finish before
+a breaking change. Switching Workflow Worlds between deploys is a data
+migration: existing state doesn't move with it (`EVE_UPDATE_WORLD_SWITCH`).
+
+With the Postgres World, state lives in your database, so it survives updates
+and also `destroy`.
+
 ## Exact cleanup
 
 Destroy with the same project, environment, and Worker name:
@@ -289,12 +323,10 @@ Container. Cloudflare's [Worker deletion contract](https://developers.cloudflare
 deletes the Worker's Durable Object namespaces; no `deleted_classes` migration
 is needed when deleting the whole Worker.
 
-**Limitation: updates erase this state.** `eden deploy` does not update an
-existing target, so shipping new agent code today means `eden destroy` then
-`eden deploy`, and that deletes the Durable Object's data. State survives
-Container sleep and restarts, not redeploys. If you need state to survive
-code updates, use the Postgres World below; its data lives outside the
-Worker.
+**Updates keep this state.** Running `eden deploy` again on a target Eden owns
+updates it in place (see [Updating an agent](#updating-an-agent)): the same
+Worker and Durable Object, so stored sessions and pending approvals survive.
+Only `eden destroy` deletes them.
 
 **Not yet verified: automatic sleep.** In the live test, a Container using
 this World was still running 45 seconds after its last client disconnected,

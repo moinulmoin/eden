@@ -8,6 +8,7 @@ import {
   realpath,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -25,9 +26,12 @@ import {
   type EveCliHelp,
 } from "../src/index.js";
 import type {
+  EveDeploymentHealthRequest,
+  EveDeploymentPublicationRequest,
   EvePreflightRuntimeRunnerRequest,
 } from "../src/index.js";
 import type { EveProjectBuilderRequest } from "../src/eve-packaging.js";
+import type { EveProjectBuilder } from "../src/eve-packaging.js";
 import { exactTargetContainerEntries } from "../src/eve-control-plane.js";
 
 const roots: string[] = [];
@@ -2254,5 +2258,685 @@ describe("Workflow World warnings", () => {
       value.id === "EVE_WORLD_PAIRING"
     );
     expect(pairing?.status).toBe("failed");
+  });
+});
+
+describe("eden deploy in-place update", () => {
+  const updateName = "eve-update-fixture";
+  const updateTargetKey = (() => {
+    const digest = createHash("sha256")
+      .update(`${updateName}\naccount-test\npreview\n${updateName}`, "utf8")
+      .digest("hex")
+      .slice(0, 24);
+    return `preview-${updateName}-${digest}`;
+  })();
+  const priorImage = `eden-eve-${updateTargetKey}-gen-prior:candidate`;
+  const priorImageReference =
+    `registry.cloudflare.com/account-test/eden-eve-${updateTargetKey}-gen-prior@sha256:${"b".repeat(64)}`;
+
+  async function writeProject(root: string): Promise<void> {
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({
+        name: updateName,
+        private: true,
+        packageManager: "pnpm@11.21.0",
+      }),
+      "utf8",
+    );
+    await writeFile(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+  }
+
+  function priorWorkerConfig(options: { readonly worldCloudflare?: boolean }) {
+    return {
+      name: updateName,
+      vars: options.worldCloudflare === true
+        ? { EDEN_EVE_WORLD_CLOUDFLARE: true }
+        : {},
+      durable_objects: {
+        bindings: [
+          { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+          ...(options.worldCloudflare === true
+            ? [{ name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" }]
+            : []),
+        ],
+      },
+      migrations: [
+        {
+          tag: "v1",
+          new_sqlite_classes: options.worldCloudflare === true
+            ? ["EveHostContainer", "EdenWorldDurableObject"]
+            : ["EveHostContainer"],
+        },
+      ],
+    };
+  }
+
+  /**
+   * The immutable record a real update reads: generation dir plus the
+   * CURRENT pointer at `targets/<env>-<name>/CURRENT`.
+   */
+  async function createOwnedTargetFixture(
+    root: string,
+    options: { readonly worldCloudflare?: boolean; readonly accountId?: string } = {},
+  ): Promise<{ readonly generationRoot: string }> {
+    const generationRoot = join(
+      root,
+      ".eden",
+      "eve-deploy",
+      "generations",
+      "gen-prior",
+    );
+    await mkdir(generationRoot, { recursive: true });
+    const targetRoot = join(
+      root,
+      ".eden",
+      "eve-deploy",
+      "targets",
+      `preview-${updateName}`,
+    );
+    await mkdir(targetRoot, { recursive: true });
+    await writeFile(
+      join(generationRoot, "deployment.json"),
+      JSON.stringify({
+        version: 1,
+        status: "deployed",
+        identity: {
+          projectId: updateName,
+          sourceDigest: `sha256:${"a".repeat(64)}`,
+          generationId: "gen-prior",
+          deploymentId: "eve-deploy-prior",
+          environment: "preview",
+          name: updateName,
+          accountId: options.accountId ?? "account-test",
+          workersDevSubdomain: "account",
+          stableWorkersDevOrigin:
+            `https://${updateName}.account.workers.dev`,
+          workerName: updateName,
+          containerApplicationName: `${updateName}-container`,
+          stableContainerInstanceName: `${updateName}-instance`,
+          containerImage: priorImageReference,
+          runtimeVariableNames: [],
+        },
+        worker: priorWorkerConfig(options),
+        container: {},
+      }),
+      "utf8",
+    );
+    await symlink(
+      relative(targetRoot, generationRoot),
+      join(targetRoot, "CURRENT"),
+    );
+    return { generationRoot };
+  }
+
+  function existingTargetRead() {
+    return async () => ({
+      accountAccess: "available" as const,
+      containerAccess: "available" as const,
+      accountId: "account-test",
+      workersDevSubdomain: "account",
+      target: {
+        state: "unowned" as const,
+        observed: { worker: true, container: true },
+        providerEvidence: {
+          containerImage: priorImageReference,
+          workerDeploymentId: "eve-deploy-prior",
+          settingsReadable: true,
+        },
+      },
+    });
+  }
+
+  function updateControlPlane(
+    root: string,
+    operations: string[],
+    options: {
+      readonly builder?: EveProjectBuilder;
+      readonly onPublish?: (request: EveDeploymentPublicationRequest) => void;
+    } = {},
+  ) {
+    const newDigest = `sha256:${"d".repeat(64)}`;
+    return {
+      artifactRoot: join(root, ".eden", "eve-artifacts", "generation-two"),
+      builder: options.builder ?? fakeBuilder(),
+      containerImageReference: `registry.example/eve@${newDigest}`,
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      } as const,
+      runtimeRunner: async () => ({
+        ok: true,
+        checks: [
+          { id: "VAL-BUILD-005", status: "passed" as const, message: "image ok" },
+          { id: "VAL-BUILD-006", status: "passed" as const, message: "boot ok" },
+          { id: "VAL-BUILD-007", status: "passed" as const, message: "health ok" },
+        ],
+        imageDigest: newDigest,
+        cleanup: { ...runtimeCleanup, imageRetained: true },
+      }),
+      cloudflareRead: existingTargetRead(),
+      publish: async (request: EveDeploymentPublicationRequest) => {
+        operations.push("publish");
+        options.onPublish?.(request);
+        return {
+          status: "published" as const,
+          identity: request.identity,
+          createdByAttempt: true,
+          ownershipProven: true as const,
+        };
+      },
+      health: async (request: EveDeploymentHealthRequest) => {
+        operations.push("health");
+        return { status: "ready" as const, identity: request.identity };
+      },
+      deleteRegistryImage: async ({ image }: { readonly image: string }) => {
+        operations.push(`delete-superseded-image:${image}`);
+        return "deleted" as const;
+      },
+      discardRuntimeImage: async () => {
+        operations.push("discard-runtime-image");
+        return true;
+      },
+    };
+  }
+
+  test("updates an Eden-owned target in place: republishes, promotes, then deletes the superseded image", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root);
+    const output: string[] = [];
+    const errors: string[] = [];
+    const operations: string[] = [];
+    let publishedMigrations: unknown;
+    let publishedImage: unknown;
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          stderr: (line) => errors.push(line),
+          eveControlPlane: updateControlPlane(root, operations, {
+            onPublish: (request) => {
+              publishedMigrations = request.hostConfig.worker.migrations;
+              publishedImage = request.identity.containerImage;
+            },
+          }),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly ok: boolean;
+      readonly deployment?: {
+        readonly operation: string;
+        readonly supersededGenerationId?: string;
+        readonly supersededImageReference?: string;
+      };
+      readonly checks: readonly { readonly id: string; readonly status: string }[];
+    };
+    expect(result.ok).toBe(true);
+    expect(result.deployment?.operation).toBe("update");
+    expect(result.deployment?.supersededGenerationId).toBe("gen-prior");
+    expect(result.deployment?.supersededImageReference).toBe(priorImageReference);
+    expect(publishedMigrations).toEqual([
+      { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+    ]);
+    expect(publishedImage).toBe(`registry.example/eve@sha256:${"d".repeat(64)}`);
+    expect(operations).toEqual([
+      "publish",
+      "health",
+      `delete-superseded-image:${priorImage}`,
+      "discard-runtime-image",
+    ]);
+    const current = await realpath(
+      join(
+        root,
+        ".eden",
+        "eve-deploy",
+        "targets",
+        `preview-${updateName}`,
+        "CURRENT",
+      ),
+    );
+    expect(current).toContain("generation-two");
+  });
+
+  test("still fails VAL-CLI-007-TARGET-CONFLICT when the existing target has no Eden record", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    const output: string[] = [];
+    const errors: string[] = [];
+    const operations: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          stderr: (line) => errors.push(line),
+          eveControlPlane: updateControlPlane(root, operations),
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(operations).toEqual([]);
+    const result = JSON.parse(output[0] as string) as {
+      readonly ok: boolean;
+      readonly checks: readonly { readonly id: string; readonly status: string }[];
+    };
+    expect(result.ok).toBe(false);
+    expect(
+      result.checks.find((value) => value.id === "VAL-CLI-007-TARGET-CONFLICT")
+        ?.status,
+    ).toBe("failed");
+    expect(errors.join("\n")).toContain("EVE_DEPLOY_CHECKS_FAILED");
+  });
+
+  test("keeps migration history append-only and appends v2 when the World class is first introduced", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root, { worldCloudflare: false });
+    const output: string[] = [];
+    const operations: string[] = [];
+    let publishedMigrations: unknown;
+    let publishedBindings: unknown;
+    let workerSource = "";
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: updateControlPlane(root, operations, {
+            builder: fakeBuilder(async (request) => {
+              await mkdir(
+                join(request.snapshotRoot, ".output/.eve/compile"),
+                { recursive: true },
+              );
+              await writeFile(
+                join(
+                  request.snapshotRoot,
+                  ".output/.eve/compile/compiled-agent-manifest.json",
+                ),
+                JSON.stringify({
+                  config: {
+                    experimental: {
+                      workflow: {
+                        world: "@moinulmoin/eden-world-cloudflare",
+                      },
+                    },
+                  },
+                }),
+                "utf8",
+              );
+            }),
+            onPublish: (request) => {
+              publishedMigrations = request.hostConfig.worker.migrations;
+              publishedBindings = request.hostConfig.worker.durable_objects.bindings;
+              workerSource = request.workerSource;
+            },
+          }),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    expect(publishedMigrations).toEqual([
+      { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+      { tag: "v2", new_sqlite_classes: ["EdenWorldDurableObject"] },
+    ]);
+    expect(publishedBindings).toEqual([
+      { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+      { name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" },
+    ]);
+    expect(workerSource).toContain("export { EdenWorldDurableObject }");
+    const result = JSON.parse(output[0] as string) as {
+      readonly warnings: readonly { readonly id: string }[];
+    };
+    expect(result.warnings.map((value) => value.id)).toEqual(
+      expect.arrayContaining(["EVE_UPDATE_IN_FLIGHT", "EVE_UPDATE_WORLD_SWITCH"]),
+    );
+  });
+
+  test("keeps the World class binding and migration when the update switches away from the Durable Object World", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root, { worldCloudflare: true });
+    const operations: string[] = [];
+    const output: string[] = [];
+    let publishedMigrations: unknown;
+    let publishedBindings: unknown;
+    let workerSource = "";
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: updateControlPlane(root, operations, {
+            onPublish: (request) => {
+              publishedMigrations = request.hostConfig.worker.migrations;
+              publishedBindings = request.hostConfig.worker.durable_objects.bindings;
+              workerSource = request.workerSource;
+            },
+          }),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    // No new class: the v1 tag is carried verbatim and EdenWorldDurableObject
+    // is never deleted — deleting the class would destroy its SQLite data.
+    expect(publishedMigrations).toEqual([
+      {
+        tag: "v1",
+        new_sqlite_classes: ["EveHostContainer", "EdenWorldDurableObject"],
+      },
+    ]);
+    expect(publishedBindings).toEqual([
+      { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+      { name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" },
+    ]);
+    expect(workerSource).toContain("export { EdenWorldDurableObject }");
+    const result = JSON.parse(output[0] as string) as {
+      readonly warnings: readonly { readonly id: string }[];
+    };
+    expect(result.warnings.map((value) => value.id)).toContain(
+      "EVE_UPDATE_WORLD_SWITCH",
+    );
+  });
+
+  test("prints 'updated' in the human summary for an in-place update", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root);
+    const output: string[] = [];
+    const operations: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", updateName],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: updateControlPlane(root, operations),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    expect(output.join("\n")).toContain(`✓ updated ${updateName} (preview)`);
+  });
+
+  test("refuses to update when the live Worker's stamped identity is not Eden's", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    // A stale local record still exists, but the remote Worker was recreated
+    // by something else and does not stamp Eden's recorded identity.
+    await createOwnedTargetFixture(root);
+    const output: string[] = [];
+    const operations: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            ...updateControlPlane(root, operations),
+            cloudflareRead: async () => ({
+              accountAccess: "available" as const,
+              containerAccess: "available" as const,
+              accountId: "account-test",
+              workersDevSubdomain: "account",
+              target: {
+                state: "unowned" as const,
+                observed: { worker: true, container: true },
+                providerEvidence: {
+                  containerImage: priorImageReference,
+                  workerDeploymentId: "foreign-deploy-not-in-records",
+                  settingsReadable: true,
+                },
+              },
+            }),
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(operations).toEqual([]);
+    const result = JSON.parse(output[0] as string) as {
+      readonly checks: readonly { readonly id: string; readonly status: string }[];
+    };
+    expect(
+      result.checks.find((value) => value.id === "VAL-CLI-007-TARGET-CONFLICT")
+        ?.status,
+    ).toBe("failed");
+  });
+
+  test("refuses to update when the live Worker proves no Eden identity at all", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root);
+    const output: string[] = [];
+    const operations: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            ...updateControlPlane(root, operations),
+            // A foreign Worker: no provider evidence matches the record.
+            cloudflareRead: async () => ({
+              accountAccess: "available" as const,
+              containerAccess: "available" as const,
+              accountId: "account-test",
+              workersDevSubdomain: "account",
+              target: {
+                state: "unowned" as const,
+                observed: { worker: true, container: true },
+                providerEvidence: { settingsReadable: true },
+              },
+            }),
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(operations).toEqual([]);
+    const result = JSON.parse(output[0] as string) as {
+      readonly checks: readonly { readonly id: string; readonly status: string }[];
+    };
+    expect(
+      result.checks.find((value) => value.id === "VAL-CLI-007-TARGET-CONFLICT")
+        ?.status,
+    ).toBe("failed");
+  });
+
+  test("refuses to update when Worker settings are unreadable, even if the Container image matches", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root);
+    const output: string[] = [];
+    const operations: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            ...updateControlPlane(root, operations),
+            // Eden's Container survives, but a same-name Worker replaced
+            // Eden's and its settings can't be read: the Container proves
+            // nothing about who owns the Worker.
+            cloudflareRead: async () => ({
+              accountAccess: "available" as const,
+              containerAccess: "available" as const,
+              accountId: "account-test",
+              workersDevSubdomain: "account",
+              target: {
+                state: "unowned" as const,
+                observed: { worker: true, container: true },
+                providerEvidence: {
+                  containerImage: priorImageReference,
+                  settingsReadable: false,
+                },
+              },
+            }),
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(operations).toEqual([]);
+    const result = JSON.parse(output[0] as string) as {
+      readonly checks: readonly { readonly id: string; readonly status: string }[];
+    };
+    expect(
+      result.checks.find((value) => value.id === "VAL-CLI-007-TARGET-CONFLICT")
+        ?.status,
+    ).toBe("failed");
+  });
+
+  test("a retry after a health-failed update keeps the already-published migration tag", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root);
+    // Simulate an update that published v2 (World class) but failed health:
+    // CURRENT still points at the v1 record while a newer failed record
+    // carries v2. The next update must emit v2's history, not regress to v1.
+    const failedRoot = join(
+      root,
+      ".eden",
+      "eve-deploy",
+      "generations",
+      "gen-failed-update",
+    );
+    await mkdir(failedRoot, { recursive: true });
+    await writeFile(
+      join(failedRoot, "deployment.json"),
+      JSON.stringify({
+        version: 1,
+        status: "failed",
+        identity: {
+          projectId: updateName,
+          sourceDigest: `sha256:${"c".repeat(64)}`,
+          generationId: "gen-failed-update",
+          deploymentId: "eve-deploy-failed",
+          environment: "preview",
+          name: updateName,
+          accountId: "account-test",
+          workersDevSubdomain: "account",
+          stableWorkersDevOrigin:
+            `https://${updateName}.account.workers.dev`,
+          workerName: updateName,
+          containerApplicationName: `${updateName}-container`,
+          stableContainerInstanceName: `${updateName}-instance`,
+          containerImage: priorImageReference,
+          runtimeVariableNames: [],
+        },
+        worker: {
+          name: updateName,
+          vars: { EDEN_EVE_WORLD_CLOUDFLARE: true },
+          durable_objects: {
+            bindings: [
+              { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+              { name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" },
+            ],
+          },
+          migrations: [
+            { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+            { tag: "v2", new_sqlite_classes: ["EdenWorldDurableObject"] },
+          ],
+        },
+        container: {},
+      }),
+      "utf8",
+    );
+    // Deterministic ordering: the failed record must sort newer than the
+    // CURRENT-pointed record without relying on wall-clock sleep.
+    const failedRecordPath = join(failedRoot, "deployment.json");
+    const priorRecordPath = join(
+      root,
+      ".eden",
+      "eve-deploy",
+      "generations",
+      "gen-prior",
+      "deployment.json",
+    );
+    const priorStats = await lstat(priorRecordPath);
+    const later = new Date(priorStats.mtimeMs + 60_000);
+    await utimes(failedRecordPath, later, later);
+    const output: string[] = [];
+    const operations: string[] = [];
+    let publishedMigrations: unknown;
+
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: updateControlPlane(root, operations, {
+            builder: fakeBuilder(async (request) => {
+              await mkdir(
+                join(request.snapshotRoot, ".output/.eve/compile"),
+                { recursive: true },
+              );
+              await writeFile(
+                join(
+                  request.snapshotRoot,
+                  ".output/.eve/compile/compiled-agent-manifest.json",
+                ),
+                JSON.stringify({
+                  config: {
+                    experimental: {
+                      workflow: {
+                        world: "@moinulmoin/eden-world-cloudflare",
+                      },
+                    },
+                  },
+                }),
+                "utf8",
+              );
+            }),
+            onPublish: (request) => {
+              publishedMigrations = request.hostConfig.worker.migrations;
+            },
+          }),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    // v2 stays in the emitted history; the World class is never re-declared
+    // under a replayed tag nor dropped from the list.
+    expect(publishedMigrations).toEqual([
+      { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+      { tag: "v2", new_sqlite_classes: ["EdenWorldDurableObject"] },
+    ]);
   });
 });

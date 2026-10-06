@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0 — 2026-10-06
+
+### Added
+
+- **Update an agent in place.** Running `eden deploy` again on a target Eden
+  owns (proved by its immutable deployment record: same account, project, and
+  exact Worker and Container names) now updates it instead of failing with
+  `VAL-CLI-007-TARGET-CONFLICT`. Eden republishes the same Worker and
+  Container application, keeps Durable Object classes and their migration
+  history (new tags are only appended), restarts the running Container on the
+  new image, health-checks, promotes, and then deletes the previous
+  generation's registry image. State in the Cloudflare World now survives
+  updates. Proven on Cloudflare: a pending approval made before an update
+  completed afterwards on the new code. The summary prints `✓ updated`, and
+  `--json` reports `deployment.operation`.
+- Warnings `EVE_UPDATE_IN_FLIGHT` (off Vercel, in-flight runs resume on the
+  new code; keep step names and state shapes compatible) and
+  `EVE_UPDATE_WORLD_SWITCH` (switching Workflow Worlds doesn't move existing
+  state).
+
+### Changed
+
+- A target that exists but isn't provably owned by Eden still fails with
+  `VAL-CLI-007-TARGET-CONFLICT`, and production still requires `--name`.
+
 ## 0.4.1 — 2026-10-01
 
 Release of 0.4.0's contents. No code changes. The first publish of the new

@@ -74,6 +74,8 @@ import {
   type EveRuntimeProtectedStore,
 } from "./eve-runtime-config.js";
 import type {
+  EveDurableBinding,
+  EveDurableMigration,
   EveHostConfig,
   EveScheduleCronEntry,
 } from "@moinulmoin/eden-runtime-cloudflare";
@@ -130,6 +132,12 @@ export type EveDeploymentStatus =
 
 export interface EveDeploymentMetadata {
   readonly status: EveDeploymentStatus;
+  /**
+   * `create` is a first deploy onto an absent target; `update` is an
+   * in-place redeploy of a provably Eden-owned target that keeps the Worker,
+   * Durable Object classes, and durable state.
+   */
+  readonly operation: "create" | "update";
   readonly targetKey: string;
   readonly deploymentId: string;
   readonly workerName: string;
@@ -137,6 +145,9 @@ export interface EveDeploymentMetadata {
   readonly stableContainerInstanceName: string;
   readonly stableWorkersDevOrigin: string;
   readonly imageReference: string;
+  /** Present on updates: the superseded generation and its registry image. */
+  readonly supersededGenerationId?: string;
+  readonly supersededImageReference?: string;
   readonly runtimeVariableNames: readonly string[];
   readonly evidenceRetained: true;
 }
@@ -168,6 +179,7 @@ export type EveCloudflareTargetState =
 export interface EveCloudflareReadRequest {
   readonly projectId: string;
   readonly sourceDigest: string;
+  readonly projectRoot: string;
   readonly environment: EveCliEnvironment;
   readonly name: string;
 }
@@ -184,6 +196,29 @@ export interface EveCloudflareReadResult {
     readonly message?: string;
     readonly remediation?: string;
     readonly identity?: EveDeploymentIdentityProof;
+    /**
+     * Which exact resources the read observed. `undefined` means the
+     * inventory could not be proven; `worker`/`container` booleans mean the
+     * exact names were present or absent without any ownership claim.
+     */
+    readonly observed?: {
+      readonly worker: boolean;
+      readonly container: boolean;
+    };
+    /**
+     * Provider-backed facts about the live target, read through the
+     * Cloudflare API (not self-asserted response headers, which any Worker
+     * can forge): the Container application's configured image and the
+     * `EDEN_EVE_DEPLOYMENT_ID` plain-text var Eden stamps into every Worker
+     * it publishes. `settingsReadable` tells the ownership resolver whether
+     * a missing var is evidence of a foreign Worker or just an unreadable
+     * settings call.
+     */
+    readonly providerEvidence?: {
+      readonly containerImage?: string;
+      readonly workerDeploymentId?: string;
+      readonly settingsReadable?: boolean;
+    };
   };
 }
 
@@ -236,7 +271,10 @@ export interface EveDeploymentIdentity {
   readonly runtimeRevisionHandle?: string;
 }
 
-export type EveDeploymentIdentityProof = Partial<EveDeploymentIdentity>;
+export type EveDeploymentIdentityProof = Partial<EveDeploymentIdentity> & {
+  /** The deployment the serving Container verifiably started under; set only by a deployed Eden host that proves its running image before stamping. */
+  readonly startedDeploymentId?: string;
+};
 
 export interface EveDeploymentPublicationRequest {
   readonly identity: EveDeploymentIdentity;
@@ -305,6 +343,7 @@ export type EveDeploymentHealthResult =
 export type EveDeploymentHealthRunner = (
   request: EveDeploymentHealthRequest,
 ) => EveDeploymentHealthResult | Promise<EveDeploymentHealthResult>;
+
 
 export interface EveImagePublicationRequest {
   readonly accountId: string;
@@ -436,6 +475,8 @@ interface EvePreflightCollection {
   readonly projectId?: string;
   readonly runtimeEvidence?: EvePreflightRuntimeEvidence;
   readonly cloudflare?: EveCloudflareReadResult;
+  /** The immutable record of the live deployment, present when the exact target is provably Eden-owned. */
+  readonly priorDeployment?: EveDeploymentRecord;
   readonly schedules?: readonly EveScheduleCronEntry[];
   readonly workflowWorld?: string;
 }
@@ -829,7 +870,7 @@ function humanEveResultLines(
       const url = result.deployment?.stableWorkersDevOrigin;
       lines.push(
         "",
-        `✓ deployed ${result.name} (${result.environment})` +
+        `✓ ${result.deployment?.operation === "update" ? "updated" : "deployed"} ${result.name} (${result.environment})` +
           (eveVersion === undefined ? "" : ` · eve ${eveVersion}`),
       );
       if (url !== undefined) lines.push(url);
@@ -852,7 +893,7 @@ function humanEveResultLines(
       `  → ${result.deployment.status === "indeterminate"
         ? "The outcome is indeterminate; inspect the retained ownership evidence before retrying the same exact target."
         : result.deployment.status === "deployed"
-          ? "The deployment is live; only local runtime-image cleanup failed, so do not retry the deployment."
+          ? "The deployment is live; only image cleanup failed (local runtime image or the superseded registry tag), so do not retry the deployment."
           : "The deployment failed before promotion; the exact target was not claimed."
       }`,
     );
@@ -1027,10 +1068,14 @@ function jsonCollection(value: unknown): readonly unknown[] | undefined {
 function exactContainerEntries(
   value: unknown,
   name: string,
-): readonly { readonly id: string; readonly name: string }[] | undefined {
+): readonly {
+  readonly id: string;
+  readonly name: string;
+  readonly image?: string;
+}[] | undefined {
   const collection = jsonCollection(value);
   if (collection === undefined) return undefined;
-  const entries: { id: string; name: string }[] = [];
+  const entries: { id: string; name: string; image?: string }[] = [];
   for (const entry of collection) {
     if (
       typeof entry !== "object" ||
@@ -1042,7 +1087,25 @@ function exactContainerEntries(
     }
     const id = (entry as { readonly id: string }).id;
     const entryName = (entry as { readonly name: string }).name;
-    if (entryName === name) entries.push({ id, name: entryName });
+    if (entryName === name) {
+      const configuration =
+        (entry as { readonly configuration?: unknown }).configuration;
+      const image =
+        typeof (entry as { readonly image?: unknown }).image === "string"
+          ? (entry as { readonly image: string }).image
+          : typeof configuration === "object" &&
+              configuration !== null &&
+              typeof (
+                configuration as { readonly image?: unknown }
+              ).image === "string"
+            ? (configuration as { readonly image: string }).image
+            : undefined;
+      entries.push({
+        id,
+        name: entryName,
+        ...(image === undefined ? {} : { image }),
+      });
+    }
   }
   if (entries.length === 0 && collection.length >= 100) {
     return undefined;
@@ -1143,7 +1206,7 @@ async function readWorkersDevSubdomain(
 export function exactTargetContainerEntries(
   value: unknown,
   name: string,
-): readonly { readonly id: string; readonly name: string }[] | undefined {
+): readonly { readonly id: string; readonly name: string; readonly image?: string }[] | undefined {
   return exactContainerEntries(value, boundedResourceName(name, "container"));
 }
 
@@ -1220,6 +1283,14 @@ async function defaultCloudflareRead(
       target: { state: "absent" },
     };
   }
+  const workerPresent = deploymentEntries.length > 0;
+  const containerPresent = (containerEntries?.length ?? 0) > 0;
+  const providerEvidence = await readProviderEvidence(
+    request.name,
+    accountId,
+    workerPresent,
+    containerPresent ? containerEntries?.[0]?.image : undefined,
+  );
   return {
     accountAccess,
     containerAccess,
@@ -1230,11 +1301,180 @@ async function defaultCloudflareRead(
       ? {}
       : { workersDevSubdomain }),
     target: {
-      state: "ambiguous",
+      // The read-only inventory proves the exact target exists but cannot
+      // prove who created it; Eden's immutable deployment record resolves
+      // ownership next.
+      state: "unowned",
+      observed: { worker: workerPresent, container: containerPresent },
+      ...(providerEvidence === undefined ? {} : { providerEvidence }),
       message:
-        "The exact target could not be proven absent or owned from the read-only Cloudflare inventory.",
+        "The exact Worker or Container target already exists, and the read-only inventory cannot prove Eden owns it.",
       remediation:
-        "Resolve the exact Worker and Container ownership state before deployment; no target was claimed or changed.",
+        "Deploy under a different --name or remove the conflicting Worker/Container yourself; Eden never adopts or replaces resources it cannot prove it created.",
+    },
+  };
+}
+
+/**
+ * Reads provider-backed facts about the live target: the Container
+ * application's configured image (from `wrangler containers list`) and the
+ * `EDEN_EVE_DEPLOYMENT_ID` plain-text var Eden stamps into every Worker it
+ * publishes (from the script settings API). Both are provider state — a
+ * foreign Worker can forge `x-eden-*` response headers but cannot set a var
+ * Eden recorded at publish time.
+ */
+async function readProviderEvidence(
+  workerName: string,
+  accountId: string | undefined,
+  workerPresent: boolean,
+  containerImage: string | undefined,
+): Promise<NonNullable<EveCloudflareReadResult["target"]["providerEvidence"]> | undefined> {
+  const evidence: {
+    containerImage?: string;
+    workerDeploymentId?: string;
+    settingsReadable?: boolean;
+  } = {
+    ...(containerImage === undefined ? {} : { containerImage }),
+  };
+  if (workerPresent && accountId !== undefined) {
+    const token = process.env.CLOUDFLARE_API_TOKEN ??
+      (await readWranglerOAuthToken());
+    if (token !== undefined) {
+      try {
+        const response = await fetch(
+          `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}/settings`,
+          {
+            headers: { authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(20_000),
+          },
+        );
+        if (response.ok) {
+          evidence.settingsReadable = true;
+          const parsed = (await response.json()) as {
+            readonly result?: {
+              readonly bindings?: readonly {
+                readonly type?: string;
+                readonly name?: string;
+                readonly text?: string;
+              }[];
+            };
+          };
+          const binding = parsed.result?.bindings?.find(
+            (value) =>
+              value.type === "plain_text" &&
+              value.name === "EDEN_EVE_DEPLOYMENT_ID",
+          );
+          if (typeof binding?.text === "string") {
+            evidence.workerDeploymentId = binding.text;
+          }
+        } else if (response.status !== 404) {
+          evidence.settingsReadable = false;
+        }
+      } catch {
+        evidence.settingsReadable = false;
+      }
+    }
+  }
+  return evidence;
+}
+
+
+/**
+ * Resolves `unowned` reads against Eden's immutable deployment records AND
+ * the live remote target. The local record proves Eden once created the
+ * target; the remote Worker's stamped identity proves it is still the one
+ * Eden deployed — a same-name Worker recreated by something else after the
+ * target was destroyed (or a forged local record) must never be upgraded to
+ * `owned`.
+ */
+async function resolveEveTargetOwnership(
+  request: EveCloudflareReadRequest,
+  result: EveCloudflareReadResult,
+): Promise<EveCloudflareReadResult> {
+  if (result.target.state !== "unowned") return result;
+  const record = await readEveDeploymentRecord(
+    request.projectRoot,
+    request.environment,
+    request.name,
+    result.accountId,
+    request.projectId === "unknown-project" ? undefined : request.projectId,
+  );
+  if (
+    record === undefined ||
+    record.identity.workerName !== request.name ||
+    record.identity.accountId !== result.accountId ||
+    (
+      request.projectId !== "unknown-project" &&
+      record.identity.projectId !== undefined &&
+      record.identity.projectId !== request.projectId
+    ) ||
+    (
+      result.target.observed?.container === true &&
+      record.identity.containerApplicationName !==
+        boundedResourceName(request.name, "container")
+    )
+  ) {
+    return result;
+  }
+  // Remote proof must come from provider state. A foreign Worker can echo
+  // `x-eden-*` response headers, but it cannot plant the plain-text var Eden
+  // publishes into script settings, nor point the Container application at an
+  // image digest Eden recorded. The Worker is proven only by its own settings:
+  // a matching Container image proves the Container, never the Worker, so
+  // unreadable settings fail closed.
+  const evidence = result.target.providerEvidence;
+  const recordedDeploymentIds = new Set(record.deploymentIds);
+  const workerProven = result.target.observed?.worker !== true ||
+    (
+      evidence?.settingsReadable === true &&
+      evidence.workerDeploymentId !== undefined &&
+      recordedDeploymentIds.has(evidence.workerDeploymentId)
+    );
+  const containerProven = result.target.observed?.container !== true ||
+    (
+      evidence?.containerImage !== undefined &&
+      record.images.includes(evidence.containerImage)
+    );
+  const remoteProven = evidence !== undefined && workerProven && containerProven;
+  if (!remoteProven) {
+    return {
+      ...result,
+      target: {
+        ...result.target,
+        message:
+          "The exact Worker or Container target exists, and although a local Eden record matches, provider state cannot prove it is the one Eden deployed — the target may have been recreated outside Eden.",
+        remediation:
+          "Inspect the Worker at its workers.dev origin and the recorded deployment history before redeploying; if it is not Eden's, deploy under a different --name or delete it yourself.",
+      },
+    };
+  }
+  const priorIdentity: EveDeploymentIdentityProof = {
+    workerName: record.identity.workerName,
+    containerApplicationName: record.identity.containerApplicationName,
+    stableContainerInstanceName: record.identity.stableContainerInstanceName,
+    accountId: record.identity.accountId,
+    environment: request.environment,
+    name: request.name,
+    ...(record.identity.projectId === undefined
+      ? {}
+      : { projectId: record.identity.projectId }),
+    ...(record.identity.generationId === undefined
+      ? {}
+      : { generationId: record.identity.generationId }),
+    ...(record.identity.containerImage === undefined
+      ? {}
+      : { containerImage: record.identity.containerImage }),
+  };
+  return {
+    ...result,
+    target: {
+      state: "owned",
+      identity: priorIdentity,
+      ...(result.target.observed === undefined
+        ? {}
+        : { observed: result.target.observed }),
+      message:
+        "The immutable deployment record proves Eden owns the exact target; deploy proceeds as an in-place update.",
     },
   };
 }
@@ -1243,9 +1483,10 @@ async function readEveCloudflareTarget(
   request: EveCloudflareReadRequest,
   options: EvePreflightOptions,
 ): Promise<EveCloudflareReadResult> {
-  return options.cloudflareRead === undefined
-    ? defaultCloudflareRead(request)
-    : options.cloudflareRead(request);
+  const result = options.cloudflareRead === undefined
+    ? await defaultCloudflareRead(request)
+    : await options.cloudflareRead(request);
+  return resolveEveTargetOwnership(request, result);
 }
 
 async function resolvedCloudflareOrigin(
@@ -1372,12 +1613,12 @@ function cloudflareChecks(
       : "Use an authenticated read-only adapter with account and Container access; preflight never uploads, publishes, or changes remote state.";
   const target = result.target;
   const targetPasses =
-    target.state === "absent" ||
-    (target.state === "owned" && target.matchesCandidate === true);
+    target.state === "absent" || target.state === "owned";
   const targetMessage = targetPasses
     ? target.state === "absent"
       ? "The exact target read is absent and is eligible without claiming ownership."
-      : "The exact target is already owned by this candidate identity; no ownership claim was attempted."
+      : target.message ??
+        "The exact target is provably Eden-owned; deploy proceeds as an in-place update."
     : target.message ??
       "The exact target read is unowned, mismatched, cross-environment, or ambiguous.";
   const targetRemediation = targetPasses
@@ -1829,6 +2070,10 @@ function responseIdentity(
   read("workerName", "x-eden-eve-worker-name");
   read("containerApplicationName", "x-eden-eve-container-application");
   read("stableContainerInstanceName", "x-eden-eve-container-instance");
+  const started = response.headers.get("x-eden-eve-started-deployment");
+  if (started !== null) {
+    (identity as Record<string, unknown>)["startedDeploymentId"] = started;
+  }
   read("containerImage", "x-eden-eve-container-image");
   return identity;
 }
@@ -1873,9 +2118,22 @@ function defaultHealthRunner(): EveDeploymentHealthRunner {
           (body as Record<string, unknown>).ready === true
         );
       if (ready) {
+        const observedIdentity = responseIdentity(response, body);
+        // A Worker activates before its image rollout completes; promotion
+        // must wait until the *served container* verifiably runs this
+        // generation's image (the host stamps the header only after
+        // inspecting the running instance).
+        if (
+          observedIdentity.startedDeploymentId !== request.identity.deploymentId
+        ) {
+          lastReason =
+            "The served Container has not verifiably started this deployment's image yet; waiting for the rollout to land.";
+          await wait();
+          continue;
+        }
         return {
           status: "ready",
-          identity: responseIdentity(response, body),
+          identity: observedIdentity,
         };
       }
       lastReason =
@@ -1888,6 +2146,7 @@ function defaultHealthRunner(): EveDeploymentHealthRunner {
     };
   };
 }
+
 
 interface EveTargetLock {
   readonly path: string;
@@ -1942,12 +2201,17 @@ async function releaseEveTargetLock(lock: EveTargetLock): Promise<boolean> {
   return (await lstat(lock.path).catch(() => undefined)) === undefined;
 }
 
+/**
+ * Atomically re-points the target's CURRENT symlink at a promoted immutable
+ * generation. The pointer key is `<environment>-<name>` — the same path
+ * `destroy` clears and the update ownership resolver reads.
+ */
 async function promoteEveTargetPointer(
   deploymentRoot: string,
-  targetKey: string,
+  pointerKey: string,
   generationRoot: string,
 ): Promise<string> {
-  const targetRoot = join(deploymentRoot, "targets", targetKey);
+  const targetRoot = join(deploymentRoot, "targets", pointerKey);
   const artifactBoundary = await realpath(dirname(deploymentRoot)).catch(
     () => undefined,
   );
@@ -1986,7 +2250,7 @@ async function promoteEveTargetPointer(
     throw new EveCliError({
       code: "EVE_DEPLOY_PROMOTION_FAILED",
       message: "The Eve target pointer directory could not be verified safely.",
-      source: targetKey,
+      source: pointerKey,
     });
   }
   const currentPath = join(targetRoot, "CURRENT");
@@ -2008,7 +2272,7 @@ async function promoteEveTargetPointer(
     throw new EveCliError({
       code: "EVE_DEPLOY_PROMOTION_FAILED",
       message: "The Eve target pointer did not resolve to the promoted generation.",
-      source: targetKey,
+      source: pointerKey,
     });
   }
   return currentPath;
@@ -2067,9 +2331,15 @@ function deploymentMetadata(
   identity: EveDeploymentIdentity,
   targetKey: string,
   status: EveDeploymentStatus,
+  operation: "create" | "update",
+  superseded?: {
+    readonly generationId?: string | undefined;
+    readonly containerImage?: string | undefined;
+  },
 ): EveDeploymentMetadata {
   return {
     status,
+    operation,
     targetKey,
     deploymentId: identity.deploymentId,
     workerName: identity.workerName,
@@ -2077,6 +2347,12 @@ function deploymentMetadata(
     stableContainerInstanceName: identity.stableContainerInstanceName,
     stableWorkersDevOrigin: identity.stableWorkersDevOrigin,
     imageReference: identity.containerImage,
+    ...(superseded?.generationId === undefined
+      ? {}
+      : { supersededGenerationId: superseded.generationId }),
+    ...(superseded?.containerImage === undefined
+      ? {}
+      : { supersededImageReference: superseded.containerImage }),
     runtimeVariableNames: identity.runtimeVariableNames,
     evidenceRetained: true,
   };
@@ -2110,6 +2386,63 @@ async function runEveDeployment(
     throw deploymentFailure(
       "EVE_DEPLOY_CHECKS_FAILED",
       "The inline Eve deploy checks did not return a complete immutable candidate.",
+    );
+  }
+
+  const isUpdate = cloudflare.target.state === "owned";
+  const operation = isUpdate ? "update" as const : "create" as const;
+  const prior = collected.priorDeployment;
+  if (isUpdate && prior === undefined) {
+    throw deploymentFailure(
+      "EVE_UPDATE_RECORD_UNAVAILABLE",
+      "The exact target is provably Eden-owned, but its immutable deployment record is unreadable; refusing to update without the recorded Durable Object history.",
+    );
+  }
+  if (isUpdate && prior?.durableObjects === undefined) {
+    throw deploymentFailure(
+      "EVE_UPDATE_RECORD_UNAVAILABLE",
+      "The prior deployment record does not carry a readable Durable Object history; refusing to update because replacing it could emit a divergent migration list.",
+    );
+  }
+  const priorIdentity = prior?.identity;
+  const priorDurableObjects = prior?.durableObjects;
+  const superseded = isUpdate
+    ? {
+      generationId: priorIdentity?.generationId,
+      containerImage: priorIdentity?.containerImage,
+    } as const
+    : undefined;
+  const resultWarnings =
+    collected.result.warnings as EvePreflightWarning[];
+  if (isUpdate) {
+    const world = collected.workflowWorld;
+    const durableWorld = world !== undefined &&
+      world !== "local" &&
+      world !== "@workflow/world-local";
+    if (durableWorld) {
+      resultWarnings.push({
+        id: "EVE_UPDATE_IN_FLIGHT",
+        message:
+          "This update replaces the running Container; durable World runs in flight resume on the new code — Cloudflare has no deployment pinning, so keep step names and payload shapes backward compatible.",
+        remediation:
+          "Let pending approvals and long runs settle before updating, or keep step names, queue names, and serialized payloads compatible across the change.",
+      });
+    }
+    if (
+      prior?.worldCloudflare !==
+        (world === "@moinulmoin/eden-world-cloudflare")
+    ) {
+      resultWarnings.push({
+        id: "EVE_UPDATE_WORLD_SWITCH",
+        message:
+          "The compiled Workflow World changed since the last deploy; existing sessions and pending approvals stay in the previous World and do not migrate to the new one.",
+        remediation:
+          "Existing Durable Object data is preserved (classes and bindings are never removed), but runs started before this update remain where they were created.",
+      });
+    }
+    eveProgress(
+      options,
+      "update: Durable Object data is preserved; the running Container restarts on its next request to serve the new image",
     );
   }
 
@@ -2313,6 +2646,13 @@ async function runEveDeployment(
       ...(collected.workflowWorld === undefined
         ? {}
         : { workflowWorld: collected.workflowWorld }),
+      // In-place updates carry the prior Durable Object bindings and
+      // migration history forward verbatim: classes are append-only, never
+      // re-declared, and never deleted (a deleted_classes migration destroys
+      // the data).
+      ...(isUpdate && priorDurableObjects !== undefined
+        ? { durableObjects: priorDurableObjects }
+        : {}),
       ...(process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER === undefined
         ? {}
         : { containerSleepAfter: process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER }),
@@ -2355,7 +2695,7 @@ async function runEveDeployment(
       "indeterminate",
       { evidence: "publication-threw-before-terminal-result" },
     );
-    const deployment = deploymentMetadata(identity, targetKey, "indeterminate");
+    const deployment = deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded);
     return {
       ...collected.result,
       ok: false,
@@ -2373,7 +2713,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
     };
   }
   if (
@@ -2395,7 +2735,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
       };
     }
     if (
@@ -2414,7 +2754,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
       };
     }
     if (
@@ -2439,7 +2779,7 @@ async function runEveDeployment(
         return {
           ...collected.result,
           ok: false,
-          deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+          deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
         };
       }
     }
@@ -2458,7 +2798,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "failed"),
+      deployment: deploymentMetadata(identity, targetKey, "failed", operation, superseded),
     };
   }
 
@@ -2480,7 +2820,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
     };
   }
   if (health.status === "indeterminate") {
@@ -2494,7 +2834,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
     };
   }
   const observedHealthIdentity = health.status === "ready"
@@ -2521,7 +2861,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
       };
     }
     if (
@@ -2539,7 +2879,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
       };
     }
     if (
@@ -2560,7 +2900,7 @@ async function runEveDeployment(
         return {
           ...collected.result,
           ok: false,
-          deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+          deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
         };
       }
     }
@@ -2579,7 +2919,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "failed"),
+      deployment: deploymentMetadata(identity, targetKey, "failed", operation, superseded),
     };
   }
 
@@ -2608,7 +2948,7 @@ async function runEveDeployment(
         return {
           ...collected.result,
           ok: false,
-          deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+          deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
         };
       }
       await writeEveDeploymentRecord(
@@ -2625,7 +2965,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "failed"),
+        deployment: deploymentMetadata(identity, targetKey, "failed", operation, superseded),
       };
     }
     await writeEveDeploymentRecord(
@@ -2642,7 +2982,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "indeterminate"),
+      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
     };
   }
   await writeEveDeploymentRecord(
@@ -2660,10 +3000,48 @@ async function runEveDeployment(
   );
   await promoteEveTargetPointer(
     join(request.projectRoot, ".eden", "eve-deploy"),
-    targetKey,
+    `${request.environment}-${request.name}`,
     candidate.generationRoot,
   );
   await options.afterPromotion?.();
+  let supersededImageCleanup: EvePreflightCheck | undefined;
+  if (isUpdate) {
+    // The superseded generation's registry repository is generation-scoped
+    // and no longer referenced once CURRENT promotes this generation; only
+    // then is it safe to delete.
+    const previousImage = priorIdentity === undefined
+      ? undefined
+      : ownedRegistryImageRef(
+        priorIdentity,
+        request.environment,
+        request.name,
+        accountId,
+      );
+    if (previousImage !== undefined) {
+      eveProgress(options, `deleting superseded registry image ${previousImage}`);
+      let deleted: "deleted" | "absent" | "indeterminate" = "indeterminate";
+      try {
+        deleted = await (options.deleteRegistryImage ??
+          defaultRegistryImageDelete)({ image: previousImage });
+      } catch {
+        deleted = "indeterminate";
+      }
+      supersededImageCleanup = deleted === "indeterminate"
+        ? check(
+          "VAL-LIFE-007",
+          "failed",
+          `The update is healthy and promoted, but the superseded registry image ${previousImage} could not be proven deleted.`,
+          `Remove only the recorded image ref ${previousImage}; do not retry or run broad registry cleanup.`,
+        )
+        : check(
+          "VAL-LIFE-007",
+          "passed",
+          deleted === "deleted"
+            ? "The superseded generation's registry image was deleted after promotion."
+            : "The superseded generation's registry image was already absent.",
+        );
+    }
+  }
   let runtimeImageCleanup: EvePreflightCheck | undefined;
   if (runtimeEvidence.cleanup.imageRetained) {
     if (options.retainRuntimeImage === true) {
@@ -2698,13 +3076,18 @@ async function runEveDeployment(
         );
     }
   }
+  const postPromotionChecks = [
+    ...(supersededImageCleanup === undefined ? [] : [supersededImageCleanup]),
+    ...(runtimeImageCleanup === undefined ? [] : [runtimeImageCleanup]),
+  ];
   return {
     ...collected.result,
-    ok: runtimeImageCleanup?.status !== "failed",
-    ...(runtimeImageCleanup === undefined
+    ok: runtimeImageCleanup?.status !== "failed" &&
+      supersededImageCleanup?.status !== "failed",
+    ...(postPromotionChecks.length === 0
       ? {}
-      : { checks: [...collected.result.checks, runtimeImageCleanup] }),
-    deployment: deploymentMetadata(identity, targetKey, "deployed"),
+      : { checks: [...collected.result.checks, ...postPromotionChecks] }),
+    deployment: deploymentMetadata(identity, targetKey, "deployed", operation, superseded),
   };
 }
 
@@ -2989,6 +3372,7 @@ async function collectEvePreflight(
   }
   let cloudflare: EveCloudflareReadResult | undefined;
   let publicOrigin: string | undefined;
+  let priorDeployment: EveDeploymentRecord | undefined;
   if (request.command === "deploy") {
     eveProgress(options, "checking Cloudflare access and exact target");
     try {
@@ -2996,6 +3380,7 @@ async function collectEvePreflight(
         {
           projectId: packaging.project?.projectId ?? "unknown-project",
           sourceDigest: candidate.sourceDigest,
+          projectRoot: request.projectRoot,
           environment: request.environment,
           name: request.name,
         },
@@ -3029,6 +3414,30 @@ async function collectEvePreflight(
       };
     }
     checks.push(...cloudflareChecks(cloudflare));
+    // An owned target also requires its immutable record so the update can
+    // carry the published Durable Object history forward append-only.
+    if (cloudflare.target.state === "owned") {
+      const record = await readEveDeploymentRecord(
+        request.projectRoot,
+        request.environment,
+        request.name,
+        cloudflare.accountId,
+        packaging.project?.projectId === "unknown-project"
+          ? undefined
+          : packaging.project?.projectId,
+      );
+      priorDeployment = record ?? undefined;
+      if (record === undefined || record.durableObjects === undefined) {
+        checks.push(
+          check(
+            "VAL-CLI-007-TARGET-CONFLICT",
+            "failed",
+            "The exact target is Eden-owned, but its immutable deployment record does not carry a readable Durable Object history.",
+            "Re-run the last successful deploy generation or destroy the exact target; updating without the recorded migration history could diverge Durable Object declarations.",
+          ),
+        );
+      }
+    }
     publicOrigin = await resolvedCloudflareOrigin(cloudflare, request.name);
     if (publicOrigin === undefined) {
       checks.push(
@@ -3254,6 +3663,7 @@ async function collectEvePreflight(
         {
           projectId: packaging.project?.projectId ?? "unknown-project",
           sourceDigest: candidate.sourceDigest,
+          projectRoot: request.projectRoot,
           environment: request.environment,
           name: request.name,
         },
@@ -3309,6 +3719,7 @@ async function collectEvePreflight(
     // reported as EVE_SCHEDULE_UNSUPPORTED and fire only while awake.
     schedules: expressible,
     cloudflare,
+    ...(priorDeployment === undefined ? {} : { priorDeployment }),
     ...(workflowWorld === undefined ? {} : { workflowWorld }),
   };
 }
@@ -3371,7 +3782,7 @@ export async function runEveControlPlane(
             status === "indeterminate"
               ? "The Eve deployment outcome is indeterminate; inspect the retained exact ownership evidence before retrying."
               : status === "deployed"
-                ? "The Eve deployment is healthy and promoted, but exact local runtime-image cleanup failed; do not retry the deployment."
+                ? "The Eve deployment is healthy and promoted, but exact image cleanup failed; do not retry the deployment."
               : "The Eve deployment failed before exact target promotion.",
         });
       }
@@ -3595,6 +4006,267 @@ async function parseEveDestroyRecord(
   return {
     recordPath,
     identity: verified,
+  };
+}
+
+/**
+ * The immutable deployment record an in-place update reads back: the exact
+ * identity plus the published Worker's Durable Object bindings, migration
+ * history, and whether the previous generation selected the Cloudflare World.
+ */
+interface EveDeploymentRecord {
+  readonly recordPath: string;
+  readonly generationRoot: string;
+  readonly identity: VerifiedEveDestroyIdentity;
+  readonly status: EveDeploymentStatus | undefined;
+  /** Every deploymentId this target's records have ever published, used to prove a live remote Worker is one Eden deployed. */
+  readonly deploymentIds: readonly string[];
+  /** Every Container image ref this target's records have published; the remote app's configured image must be one of them. */
+  readonly images: readonly string[];
+  /** True when the recorded Worker carried `EDEN_EVE_WORLD_CLOUDFLARE`. */
+  readonly worldCloudflare: boolean;
+  /**
+   * The Durable Object bindings and migration history of the newest record
+   * that carries them — even a `failed`/`indeterminate` one. A failed update
+   * may already have published its migration tags before health failed, so
+   * the next update must never regress to an older, CURRENT-pinned history
+   * (wrangler rejects old_tag > new_tag and would re-emit
+   * `new_sqlite_classes` for a live class). `undefined` means no record
+   * carries a readable history; the update then fails closed.
+   */
+  readonly durableObjects:
+    | {
+      readonly bindings: readonly EveDurableBinding[];
+      readonly migrations: readonly EveDurableMigration[];
+    }
+    | undefined;
+}
+
+/**
+ * Reads the immutable records for this target. The live identity comes from
+ * CURRENT first, then the newest `deployed` record, then the newest record
+ * of any status; the Durable Object history comes from the newest record
+ * that carries one, healthy or not, so a failed update's published tags are
+ * never dropped.
+ */
+async function readEveDeploymentRecord(
+  projectRoot: string,
+  environment: EveCliEnvironment,
+  name: string,
+  accountId?: string,
+  projectId?: string,
+): Promise<EveDeploymentRecord | undefined> {
+  const targetsRoot = join(
+    projectRoot,
+    ".eden",
+    "eve-deploy",
+    "targets",
+    `${environment}-${name}`,
+  );
+  const generationsRoot = join(
+    projectRoot,
+    ".eden",
+    "eve-deploy",
+    "generations",
+  );
+  const entries = await readdir(generationsRoot).catch(() => []);
+  const scanned: {
+    readonly record: Omit<
+      EveDeploymentRecord,
+      "generationRoot" | "deploymentIds" | "images"
+    > & { readonly deploymentId?: string | undefined };
+    readonly generationRoot: string;
+    readonly modifiedAt: number;
+  }[] = [];
+  const deploymentIds = new Set<string>();
+  const images = new Set<string>();
+  for (const entry of entries) {
+    const generationRoot = join(generationsRoot, entry);
+    const recordPath = join(generationRoot, "deployment.json");
+    const details = await lstat(recordPath).catch(() => undefined);
+    if (details === undefined || !details.isFile()) continue;
+    const parsed = await parseEveDeploymentRecord(
+      recordPath,
+      environment,
+      name,
+    );
+    if (parsed !== undefined) {
+      // Only records for this account and (when known) this project may
+      // arbitrate ownership or supply migration history.
+      if (
+        (accountId !== undefined && parsed.identity.accountId !== accountId) ||
+        (projectId !== undefined && parsed.identity.projectId !== projectId)
+      ) {
+        continue;
+      }
+      scanned.push({
+        record: parsed,
+        generationRoot,
+        modifiedAt: details.mtimeMs,
+      });
+      const deploymentId = parsed.deploymentId;
+      if (deploymentId !== undefined) deploymentIds.add(deploymentId);
+      if (typeof parsed.identity.containerImage === "string") {
+        images.add(parsed.identity.containerImage);
+      }
+    }
+  }
+  scanned.sort((left, right) => right.modifiedAt - left.modifiedAt);
+
+  const current = await lstat(join(targetsRoot, "CURRENT")).catch(
+    () => undefined,
+  );
+  let live = scanned.find(
+    (entry) => entry.record.status === "deployed",
+  ) ?? scanned[0];
+  if (current !== undefined && current.isSymbolicLink()) {
+    const generationRoot = await realpath(join(targetsRoot, "CURRENT")).catch(
+      () => undefined,
+    );
+    if (generationRoot !== undefined) {
+      const pinned = scanned.find(
+        (entry) => entry.generationRoot === generationRoot,
+      );
+      if (pinned !== undefined) {
+        live = pinned;
+      } else {
+        const parsed = await parseEveDeploymentRecord(
+          join(generationRoot, "deployment.json"),
+          environment,
+          name,
+        );
+        if (
+          parsed !== undefined &&
+          !(
+            (accountId !== undefined &&
+              parsed.identity.accountId !== accountId) ||
+            (projectId !== undefined &&
+              parsed.identity.projectId !== projectId)
+          )
+        ) {
+          live = { record: parsed, generationRoot, modifiedAt: 0 };
+        }
+      }
+    }
+  }
+  if (live === undefined) return undefined;
+  // Newest record carrying a usable DO history wins, regardless of its
+  // deployment outcome: a tag it published must never be replayed.
+  const historySource = scanned.find(
+    (entry) => entry.record.durableObjects !== undefined,
+  );
+  return {
+    recordPath: live.record.recordPath,
+    generationRoot: live.generationRoot,
+    identity: live.record.identity,
+    status: live.record.status,
+    deploymentIds: [...deploymentIds],
+    images: [...images],
+    worldCloudflare: live.record.worldCloudflare,
+    durableObjects: historySource?.record.durableObjects,
+  };
+}
+
+async function parseEveDeploymentRecord(
+  recordPath: string,
+  environment: EveCliEnvironment,
+  name: string,
+): Promise<(Omit<
+  EveDeploymentRecord,
+  "generationRoot" | "deploymentIds" | "images"
+> & { readonly deploymentId?: string | undefined }) | undefined> {
+  const base = await parseEveDestroyRecord(recordPath, environment, name);
+  if (base === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(recordPath, "utf8")) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const record = parsed as {
+    readonly status?: unknown;
+    readonly worker?: unknown;
+  };
+  const identityRaw = (parsed as { readonly identity?: unknown }).identity;
+  const deploymentId = typeof identityRaw === "object" &&
+      identityRaw !== null &&
+      typeof (identityRaw as { readonly deploymentId?: unknown })
+        .deploymentId === "string"
+    ? (identityRaw as { readonly deploymentId: string }).deploymentId
+    : undefined;
+  const status = typeof record.status === "string" &&
+    ["deployed", "failed", "indeterminate"].includes(record.status)
+    ? record.status as EveDeploymentStatus
+    : undefined;
+  const worker = typeof record.worker === "object" && record.worker !== null
+    ? record.worker
+    : undefined;
+  const rawBindings = worker !== undefined && "durable_objects" in worker &&
+      typeof worker.durable_objects === "object" &&
+      worker.durable_objects !== null &&
+      "bindings" in worker.durable_objects
+    ? (worker.durable_objects as { readonly bindings: unknown }).bindings
+    : undefined;
+  const rawMigrations = worker !== undefined && "migrations" in worker
+    ? worker.migrations
+    : undefined;
+  const rawVars = worker !== undefined && "vars" in worker &&
+      typeof worker.vars === "object" && worker.vars !== null
+    ? worker.vars as { readonly EDEN_EVE_WORLD_CLOUDFLARE?: unknown }
+    : undefined;
+  const bindings: EveDurableBinding[] = [];
+  const migrations: EveDurableMigration[] = [];
+  const durableObjectsValid = Array.isArray(rawBindings) &&
+    Array.isArray(rawMigrations);
+  if (durableObjectsValid) {
+    for (const binding of rawBindings as readonly unknown[]) {
+      if (
+        typeof binding !== "object" || binding === null ||
+        typeof (binding as EveDurableBinding).name !== "string" ||
+        typeof (binding as EveDurableBinding).class_name !== "string"
+      ) {
+        return {
+          recordPath,
+          identity: base.identity,
+          status,
+          deploymentId,
+          worldCloudflare: rawVars?.EDEN_EVE_WORLD_CLOUDFLARE === true,
+          durableObjects: undefined,
+        };
+      }
+      bindings.push(binding as EveDurableBinding);
+    }
+    for (const migration of rawMigrations as readonly unknown[]) {
+      if (
+        typeof migration !== "object" || migration === null ||
+        typeof (migration as EveDurableMigration).tag !== "string" ||
+        !Array.isArray(
+          (migration as EveDurableMigration).new_sqlite_classes,
+        ) ||
+        (migration as EveDurableMigration).new_sqlite_classes.some(
+          (className: unknown) => typeof className !== "string",
+        )
+      ) {
+        return {
+          recordPath,
+          identity: base.identity,
+          status,
+          deploymentId,
+          worldCloudflare: rawVars?.EDEN_EVE_WORLD_CLOUDFLARE === true,
+          durableObjects: undefined,
+        };
+      }
+      migrations.push(migration as EveDurableMigration);
+    }
+  }
+  return {
+    recordPath,
+    identity: base.identity,
+    status,
+    deploymentId,
+    worldCloudflare: rawVars?.EDEN_EVE_WORLD_CLOUDFLARE === true,
+    durableObjects: durableObjectsValid ? { bindings, migrations } : undefined,
   };
 }
 

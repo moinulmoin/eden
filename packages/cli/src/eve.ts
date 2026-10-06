@@ -111,7 +111,7 @@ Options:
 `,
   deploy: `Usage: eden deploy [--project <path>] [--env <preview|production>] [--name <name>] [--env-file <path>] [--json]
 
-Deploy the selected Eve project to one exact target after host checks pass.
+Deploy the selected Eve project to one exact target after host checks pass. When the exact target already exists and Eden's immutable record proves it owns it, deploy updates the Worker in place and keeps Durable Object data; a target Eden cannot prove it owns still fails the conflict check.
 
 Options:
   --project <path>     Eve project root (default: current directory)

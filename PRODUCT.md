@@ -138,7 +138,10 @@ Plus whatever your agent itself needs: model keys, databases, external services.
 
 **2. Durable memory for real agents.** The container's disk is wiped whenever it sleeps, so by default Eve forgets pending approvals and sessions. Three steps fix it: add the Postgres World package, select it in `agent.ts`, and put a direct Postgres URL in your env file. Any Postgres works (Neon, Supabase, Railway, your own server); use the direct address, not a pooled one. Eden runs the database setup for you during deploy. See [Durable state (Postgres World)](docs/deploy.md#durable-state-postgres-world).
 
-**Experimental, no database at all:** add `@moinulmoin/eden-world-cloudflare` and select it in `agent.ts`. Memory lives in a Durable Object on your own Cloudflare account, and Eden sets it up. It passes Workflow's official World test suite, and on Cloudflare a pending approval survived a container restart. Two caveats for now: updating your agent (destroy, then deploy) erases this memory, and automatic container sleep with it isn't verified yet. Use Postgres if you need memory across updates. See [Durable state on Cloudflare](docs/deploy.md#durable-state-on-cloudflare-no-database).
+**Experimental, no database at all:** add `@moinulmoin/eden-world-cloudflare` and select it in `agent.ts`. Memory lives in a Durable Object on your own Cloudflare account, and Eden sets it up. It passes Workflow's official World test suite, and on Cloudflare a pending approval survived both a container restart and an agent update. One caveat for now: automatic container sleep with it isn't verified yet. See [Durable state on Cloudflare](docs/deploy.md#durable-state-on-cloudflare-no-database).
+
+### Updating your agent
+Run `eden deploy` again. Eden recognises a deployment it owns and updates it in place: the same Worker, the same stored memory, the new code. Like on Vercel, your sessions and pending approvals survive. One difference: Vercel keeps old runs on the old code, while on Cloudflare they continue on the new code, so keep your tool and step names compatible until older runs finish. See [Updating an agent](docs/deploy.md#updating-an-agent).
 
 ---
 
@@ -168,9 +171,10 @@ Eden is free and open source (Apache-2.0). You pay Cloudflare directly, on your 
 
 | | Eve on Vercel | Eve on Cloudflare with Eden |
 |---|---|---|
-| Deploy | `eve deploy` or `git push` | `npx @moinulmoin/eden deploy` from your machine |
+| Deploy | `eve deploy` or `git push` | `npx @moinulmoin/eden deploy` from your machine; run it again to update |
 | Where it runs | Vercel Functions and Workflow | Your real Eve server in a Cloudflare Container on your account |
-| Durable storage | Managed by Vercel | Your Postgres, three steps; Eden sets up the database |
+| Durable storage | Managed by Vercel | Your Postgres in three steps, or experimental: a Durable Object on your account |
+| Updates | Old runs stay on the deployment that started them | Memory survives updates; older runs continue on the new code |
 | Schedules | Vercel Cron | Cloudflare Cron wakes the container; fires while asleep |
 | Sign-in | Vercel sign-in built in | Configure an Eve authenticator |
 | Models | AI Gateway built in | Any provider with your key, or Gateway with a key |
@@ -188,6 +192,7 @@ Pick Vercel when you want Eve's full managed platform. Pick Eden when you want y
 - A real `eden deploy` to Cloudflare served a real model reply with a tool call, and `eden destroy` then left no Worker, container or image behind.
 - Validated with real Cloudflare deploys on **Eve 0.66.3** and **Eve 0.68.0**: build, production boot, health, sign-in, and a real model and tool call.
 - **Memory across a container replacement:** with the Postgres World, an approval requested before the container was destroyed and replaced was approved afterwards and the run finished. Without it, the approval was lost.
+- **Memory across an update:** with the Cloudflare World, an approval requested before `eden deploy` updated the agent with new instructions was approved afterwards on the new code, and the run finished.
 - **Schedules while asleep:** a schedule every 3 minutes fired exactly once per tick while the container slept between ticks.
 - Eden's own release gates run build, typecheck, lint, tests and the Eve compatibility check on every change.
 

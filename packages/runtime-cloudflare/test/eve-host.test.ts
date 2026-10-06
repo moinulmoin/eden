@@ -847,3 +847,315 @@ describe("Eve schedule wake triggers", () => {
     expect(response.status).toBe(404);
   });
 });
+
+describe("in-place update Durable Object history", () => {
+  const CONTAINER_IMAGE =
+    "registry.example/eve@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+  test("carries prior bindings and migrations verbatim and appends v2 for a new class", () => {
+    const config = createEveHostConfig({
+      ...IDENTITY,
+      stableWorkersDevOrigin: "https://eden-eve-preview.account.workers.dev",
+      containerImage: CONTAINER_IMAGE,
+      workflowWorld: "@moinulmoin/eden-world-cloudflare",
+      durableObjects: {
+        bindings: [
+          { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+        ],
+        migrations: [
+          { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+        ],
+      },
+    });
+    // v1 is never re-emitted for an existing class; the new World class is
+    // appended under a fresh tag.
+    expect(config.worker.migrations).toEqual([
+      { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+      { tag: "v2", new_sqlite_classes: ["EdenWorldDurableObject"] },
+    ]);
+    expect(config.worker.durable_objects.bindings).toEqual([
+      { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+      { name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" },
+    ]);
+  });
+
+  test("keeps the World class binding and export when the World switches away", () => {
+    const config = createEveHostConfig({
+      ...IDENTITY,
+      stableWorkersDevOrigin: "https://eden-eve-preview.account.workers.dev",
+      containerImage: CONTAINER_IMAGE,
+      durableObjects: {
+        bindings: [
+          { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+          { name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" },
+        ],
+        migrations: [
+          {
+            tag: "v1",
+            new_sqlite_classes: ["EveHostContainer", "EdenWorldDurableObject"],
+          },
+        ],
+      },
+    });
+    expect(config.worker.vars.EDEN_EVE_WORLD_CLOUDFLARE).toBeUndefined();
+    expect(config.worker.migrations).toEqual([
+      {
+        tag: "v1",
+        new_sqlite_classes: ["EveHostContainer", "EdenWorldDurableObject"],
+      },
+    ]);
+    expect(config.worker.durable_objects.bindings).toContainEqual({
+      name: "EDEN_WORLD",
+      class_name: "EdenWorldDurableObject",
+    });
+    expect(generateEveHostWorkerSource({ config })).toContain(
+      "export { EdenWorldDurableObject }",
+    );
+  });
+
+  test("rejects malformed recorded migration history instead of rewriting it", () => {
+    expect(() =>
+      createEveHostConfig({
+        ...IDENTITY,
+        stableWorkersDevOrigin: "https://eden-eve-preview.account.workers.dev",
+        containerImage: CONTAINER_IMAGE,
+        durableObjects: {
+          migrations: [
+            { tag: "", new_sqlite_classes: [] },
+          ],
+        },
+      }),
+    ).toThrow(/migration history/u);
+  });
+
+  const NEW_IMAGE =
+    "registry.example/eden-eve-preview-eve-test-abc123-gen-new:candidate";
+  const OLD_IMAGE =
+    "registry.example/eden-eve-preview-eve-test-abc123-gen-prior@sha256:aa";
+  /**
+   * A test double whose `inspect()` reports `liveImage`, which flips to the
+   * expected new image only after `startAndWaitForPorts` runs — matching how
+   * a real instance swaps images at `ctx.container.start()`.
+   */
+  function driftContainer(
+    stored: Map<string, unknown>,
+    options: { readonly inspectImage?: string } = {},
+  ) {
+    const state = { running: false, liveImage: OLD_IMAGE };
+    const container = new EveHostContainer(
+      {
+        container: options.inspectImage === undefined
+          ? state
+          : {
+            get running() {
+              return state.running;
+            },
+            inspect: async () => ({ image: state.liveImage }),
+          },
+        storage: {
+          sql: { exec: () => [] },
+          kv: { get: () => undefined },
+          get: async (key: string) => stored.get(key),
+          put: async (key: string, value: unknown) => {
+            stored.set(key, value);
+          },
+        },
+        blockConcurrencyWhile: (callback: () => Promise<void>) => {
+          void callback().catch(() => {});
+        },
+      } as never,
+      {
+        EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
+        EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+        EVE_CONTAINER_BINDING_NAME: "EVE_CONTAINER",
+        EDEN_EVE_DEPLOYMENT_ID: "dep-old",
+        EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
+      },
+    );
+    let stopped = 0;
+    container.stop = async () => {
+      stopped += 1;
+      state.running = false;
+    };
+    container.startAndWaitForPorts = async () => {
+      state.running = true;
+      if (options.inspectImage !== undefined) {
+        state.liveImage = options.inspectImage;
+      }
+    };
+    container.containerFetch = async () =>
+      Response.json({ status: "ready" });
+    return { container, state, stops: () => stopped };
+  }
+
+  test("restarts a running Container whose marker predates the update", async () => {
+    const stored = new Map<string, unknown>([
+      ["eden.eve.host.started-deployment", "dep-old"],
+    ]);
+    const { container, state, stops } = driftContainer(stored, {
+      // The instance serves the new image once it restarts.
+      inspectImage:
+        "registry.example/eden-eve-preview-eve-test-abc123-gen-new@sha256:ff",
+    });
+    state.running = true;
+
+    await container.ensureEveReady(
+      new AbortController().signal,
+      "dep-test",
+      NEW_IMAGE,
+    );
+    expect(stops()).toBe(1);
+    expect(stored.get("eden.eve.host.started-deployment")).toBe("dep-test");
+    expect(container.lifecycle.events.map((event) => event.type)).toContain(
+      "replaced",
+    );
+
+    // A second request under the same deployment does not restart.
+    state.running = true;
+    await container.ensureEveReady(
+      new AbortController().signal,
+      "dep-test",
+      NEW_IMAGE,
+    );
+    expect(stops()).toBe(1);
+  });
+
+  test("restarts a running Container when no marker exists (pre-marker runtime)", async () => {
+    const stored = new Map<string, unknown>();
+    const { container, state, stops } = driftContainer(stored);
+    state.running = true;
+
+    await container.ensureEveReady(
+      new AbortController().signal,
+      "dep-test",
+    );
+    expect(stops()).toBe(1);
+    expect(stored.get("eden.eve.host.started-deployment")).toBe("dep-test");
+  });
+
+  test("does not record the deployment marker while the running image predates the rollout", async () => {
+    const stored = new Map<string, unknown>([
+      ["eden.eve.host.started-deployment", "dep-old"],
+    ]);
+    // inspect() keeps reporting the OLD image even after restart — the
+    // rollout has not landed yet — so the marker must not move forward.
+    const { container, state } = driftContainer(stored, {
+      inspectImage: OLD_IMAGE,
+    });
+    state.running = true;
+
+    await container.ensureEveReady(
+      new AbortController().signal,
+      "dep-test",
+      NEW_IMAGE,
+    );
+    expect(stored.get("eden.eve.host.started-deployment")).toBe("dep-old");
+    expect(container.lifecycle.events.map((event) => event.type)).toContain(
+      "image_mismatch",
+    );
+  });
+
+  test("a Container that stops after readiness never records the marker or caches readiness", async () => {
+    const stored = new Map<string, unknown>([
+      ["eden.eve.host.started-deployment", "dep-test-prior"],
+    ]);
+    const { container, state } = driftContainer(stored, {
+      inspectImage:
+        "registry.example/eden-eve-preview-eve-test-abc123-gen-new@sha256:ff",
+    });
+    // Readiness succeeds, then the instance stops (onStop fires) before the
+    // marker step.
+    container.containerFetch = async () => {
+      state.running = false;
+      container.onStop({ exitCode: 0, reason: "runtime_signal" });
+      return Response.json({ status: "ready" });
+    };
+
+    await container.ensureEveReady(
+      new AbortController().signal,
+      "dep-test",
+      NEW_IMAGE,
+    );
+    expect(stored.get("eden.eve.host.started-deployment")).toBe("dep-test-prior");
+    expect(container.lifecycle.events.map((event) => event.type)).toContain(
+      "stopped",
+    );
+
+    // No stale readiness: the next request must run readiness again.
+    let healthCalls = 0;
+    container.containerFetch = async () => {
+      healthCalls += 1;
+      return Response.json({ status: "ready" });
+    };
+    await container.ensureEveReady(
+      new AbortController().signal,
+      "dep-test",
+      NEW_IMAGE,
+    );
+    expect(healthCalls).toBeGreaterThan(0);
+    expect(stored.get("eden.eve.host.started-deployment")).toBe("dep-test");
+  });
+
+  test("a stop during readiness fails the request and never records the marker", async () => {
+    const stored = new Map<string, unknown>([
+      ["eden.eve.host.started-deployment", "dep-test-prior"],
+    ]);
+    const { container } = driftContainer(stored, {
+      inspectImage:
+        "registry.example/eden-eve-preview-eve-test-abc123-gen-new@sha256:ff",
+    });
+    // The instance stops (onStop) while readiness is still in flight, then a
+    // fresh instance comes up before the continuation resumes.
+    container.containerFetch = async () => {
+      container.onStop({ exitCode: 0, reason: "runtime_signal" });
+      await container.startAndWaitForPorts({} as never);
+      return Response.json({ status: "ready" });
+    };
+
+    await expect(
+      container.ensureEveReady(
+        new AbortController().signal,
+        "dep-test",
+        NEW_IMAGE,
+      ),
+    ).rejects.toThrow();
+    expect(stored.get("eden.eve.host.started-deployment")).toBe("dep-test-prior");
+  });
+
+  test("scheduled wake requests carry the Worker's deployment identity", async () => {
+    let wakeHeaders: Headers | undefined;
+    const env = {
+      EVE_CONTAINER: {
+        getByName: () => ({
+          fetch: async (request: Request) => {
+            wakeHeaders = request.headers;
+            return new Response("ok");
+          },
+        }),
+      },
+    };
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      workerName: IDENTITY.workerName,
+      containerBindingName: IDENTITY.containerBindingName,
+      stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
+      deploymentId: IDENTITY.deploymentId,
+      generationId: IDENTITY.generationId,
+      containerImage: "registry.example/eden-eve-gen-new:candidate",
+      schedules: [{ name: "digest", cron: "0 9 * * 1-5" }],
+    });
+    const waited: Promise<unknown>[] = [];
+    worker.scheduled?.(
+      { cron: "* * * * *", scheduledTime: Date.parse("2026-10-02T08:57:00Z") },
+      env,
+      { waitUntil: (task: Promise<unknown>) => waited.push(task) },
+    );
+    await Promise.all(waited);
+    expect(wakeHeaders?.get("x-eden-eve-deployment-id")).toBe(
+      IDENTITY.deploymentId,
+    );
+    expect(wakeHeaders?.get("x-eden-eve-image")).toBe(
+      "registry.example/eden-eve-gen-new:candidate",
+    );
+  });
+});

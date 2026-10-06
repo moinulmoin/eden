@@ -228,13 +228,13 @@ export const EVE_HOST_OWNED_HEADERS = [
   "x-eden-eve-callback-base",
   "x-eden-eve-deployment-id",
   "x-eden-eve-generation-id",
+  "x-eden-eve-image",
+  "x-eden-eve-started-deployment",
   "x-eden-eve-public-origin",
   "x-eden-eve-correlation-id",
   "x-eden-eve-container-name",
   "x-eden-eve-container-id",
   "x-eden-eve-runtime-revision",
-  "x-eden-deployment-id",
-  "x-eden-generation-id",
   "x-eden-container-name",
   "x-eden-container-id",
   "cf-container-target-port",
@@ -316,6 +316,33 @@ export interface EveHostConfigRequest extends EveHostIdentity {
   /** Overrides the Container `sleepAfter` (e.g. "30s") for testing. */
   readonly containerSleepAfter?: string;
   readonly workflowWorld?: string;
+  /**
+   * Durable Object state already published for this exact target. In-place
+   * updates carry the recorded binding and migration history forward
+   * verbatim: a class is only ever added once (`new_sqlite_classes` entries
+   * are append-only) and a class is never silently removed — a
+   * `deleted_classes` migration permanently destroys that class's data.
+   */
+  readonly durableObjects?: {
+    readonly bindings?: readonly EveDurableBinding[];
+    readonly migrations?: readonly EveDurableMigration[];
+  };
+}
+
+/** One `durable_objects.bindings` entry as it appears in wrangler config. */
+export interface EveDurableBinding {
+  readonly name: string;
+  readonly class_name: string;
+}
+
+/**
+ * One `migrations` entry as it appears in wrangler config. Only the
+ * `new_sqlite_classes` form Eden has ever emitted is modelled; entries are
+ * compared by tag and carried forward verbatim across in-place updates.
+ */
+export interface EveDurableMigration {
+  readonly tag: string;
+  readonly new_sqlite_classes: readonly string[];
 }
 
 export interface EveHostWranglerConfig {
@@ -347,17 +374,9 @@ export interface EveHostWranglerConfig {
     },
   ];
   readonly durable_objects: {
-    readonly bindings: readonly {
-      readonly name: string;
-      readonly class_name: string;
-    }[];
+    readonly bindings: readonly EveDurableBinding[];
   };
-  readonly migrations: readonly [
-    {
-      readonly tag: "v1";
-      readonly new_sqlite_classes: readonly string[];
-    },
-  ];
+  readonly migrations: readonly EveDurableMigration[];
 }
 
 export interface EveHostContainerConfig {
@@ -517,6 +536,81 @@ export function createEveHostConfig(
     max_instances: EVE_HOST_DEFAULTS.maxInstances,
     instance_type: EVE_HOST_DEFAULTS.instanceType,
   } as const;
+  const worldCloudflare =
+    request.workflowWorld === "@moinulmoin/eden-world-cloudflare";
+  const priorMigrations: EveDurableMigration[] = [];
+  for (const migration of request.durableObjects?.migrations ?? []) {
+    if (
+      typeof migration.tag !== "string" ||
+      migration.tag.length === 0 ||
+      !Array.isArray(migration.new_sqlite_classes) ||
+      migration.new_sqlite_classes.some(
+        (className) =>
+          typeof className !== "string" ||
+          !IDENTIFIER_PATTERN.test(className),
+      )
+    ) {
+      throw new EveHostError(
+        "HOST_READINESS_UNPROVEN",
+        "The recorded Durable Object migration history is not safely reusable; refusing to drop or rewrite prior tags.",
+      );
+    }
+    priorMigrations.push(migration);
+  }
+  const bindings: EveDurableBinding[] = [
+    {
+      name: request.containerBindingName,
+      class_name: request.containerClassName,
+    },
+    ...(worldCloudflare
+      ? [{ name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" }]
+      : []),
+  ];
+  for (const priorBinding of request.durableObjects?.bindings ?? []) {
+    if (
+      typeof priorBinding.name !== "string" ||
+      !IDENTIFIER_PATTERN.test(priorBinding.name) ||
+      typeof priorBinding.class_name !== "string" ||
+      !IDENTIFIER_PATTERN.test(priorBinding.class_name)
+    ) {
+      throw new EveHostError(
+        "HOST_READINESS_UNPROVEN",
+        "The recorded Durable Object bindings are not safely reusable; refusing to drop or rewrite prior bindings.",
+      );
+    }
+    // Only classes the generated Worker can export are carried; the World
+    // Durable Object's binding is retained across World switches so its class
+    // (and SQLite data) is never dropped or left without a namespace.
+    if (
+      priorBinding.class_name === "EdenWorldDurableObject" &&
+      bindings.every((binding) => binding.name !== priorBinding.name)
+    ) {
+      bindings.push(priorBinding);
+    }
+  }
+  const declaredClasses = new Set(
+    priorMigrations.flatMap((migration) => migration.new_sqlite_classes),
+  );
+  const newClasses = [
+    ...new Set(bindings.map((binding) => binding.class_name)),
+  ].filter((className) => !declaredClasses.has(className));
+  const migrations: EveDurableMigration[] = [...priorMigrations];
+  if (newClasses.length > 0) {
+    let sequence = priorMigrations.reduce(
+      (highest, migration) =>
+        /^v(\d+)$/u.test(migration.tag)
+          ? Math.max(highest, Number(migration.tag.slice(1)))
+          : highest,
+      0,
+    );
+    const usedTags = new Set(priorMigrations.map((migration) => migration.tag));
+    let tag = `v${sequence + 1}`;
+    while (usedTags.has(tag)) {
+      sequence += 1;
+      tag = `v${sequence + 1}`;
+    }
+    migrations.push({ tag, new_sqlite_classes: newClasses });
+  }
   return {
     worker: {
       ...(request.accountId === undefined
@@ -547,28 +641,8 @@ export function createEveHostConfig(
         ? {}
         : { triggers: { crons: [EVE_SCHEDULE_WAKE_TRIGGER_CRON] } }),
       containers: [container],
-      durable_objects: {
-        bindings: [
-          {
-            name: request.containerBindingName,
-            class_name: request.containerClassName,
-          },
-          ...(request.workflowWorld === "@moinulmoin/eden-world-cloudflare"
-            ? [{ name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" }]
-            : []),
-        ],
-      },
-      migrations: [
-        {
-          tag: "v1",
-          new_sqlite_classes: [
-            request.containerClassName,
-            ...(request.workflowWorld === "@moinulmoin/eden-world-cloudflare"
-              ? ["EdenWorldDurableObject"]
-              : []),
-          ],
-        },
-      ],
+      durable_objects: { bindings },
+      migrations,
     },
     container: {
       applicationName: request.containerApplicationName,
@@ -597,6 +671,7 @@ export function generateEveHostWorkerSource(
     containerBindingName: request.config.container.bindingName,
     deploymentId: request.config.container.deploymentId,
     generationId: request.config.container.generationId,
+    containerImage: request.config.worker.containers[0].image,
     stableContainerInstanceName: request.config.container.instanceName,
     ...(request.config.container.runtimeRevisionHandle === undefined
       ? {}
@@ -614,7 +689,13 @@ export function generateEveHostWorkerSource(
       ? "export { ContainerProxy, EveHostContainer };"
       : `export { ContainerProxy, EveHostContainer as ${request.config.container.className} };`,
     "",
-    ...(request.config.worker.vars.EDEN_EVE_WORLD_CLOUDFLARE
+    ...(request.config.worker.vars.EDEN_EVE_WORLD_CLOUDFLARE === true ||
+      request.config.worker.durable_objects.bindings.some(
+        (binding) => binding.class_name === "EdenWorldDurableObject",
+      ) ||
+      request.config.worker.migrations.some((migration) =>
+        migration.new_sqlite_classes.includes("EdenWorldDurableObject")
+      )
       ? [`export { EdenWorldDurableObject } from ${JSON.stringify(moduleSpecifier)};`]
       : []),
     `EveHostContainer.outboundByHost = { ${JSON.stringify(new URL(request.config.container.publicOrigin).hostname)}: routeEveOutboundRequest };`,
@@ -629,6 +710,8 @@ export interface EveHostForwardingMetadata {
   readonly deploymentId: string;
   readonly generationId: string;
   readonly correlationId: string;
+  /** The image this deployment's Worker config selects; the Durable Object verifies a running Container actually serves it before recording the deployment as started. */
+  readonly containerImage?: string;
   readonly runtimeRevisionHandle?: string;
 }
 
@@ -691,6 +774,9 @@ export function createTrustedEveRequest(
   headers.set("x-eden-eve-deployment-id", metadata.deploymentId);
   headers.set("x-eden-eve-generation-id", metadata.generationId);
   headers.set("x-eden-eve-correlation-id", metadata.correlationId);
+  if (metadata.containerImage !== undefined) {
+    headers.set("x-eden-eve-image", metadata.containerImage);
+  }
   if (metadata.runtimeRevisionHandle !== undefined) {
     headers.set(
       "x-eden-eve-runtime-revision",
@@ -754,6 +840,7 @@ export interface EveHostLifecycleEvent {
     | "health_ready"
     | "stopped"
     | "errored"
+    | "image_mismatch"
     | "replaced";
   readonly at: number;
   readonly safeStatus?: string;
