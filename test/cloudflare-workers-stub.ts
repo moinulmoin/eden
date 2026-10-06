@@ -1,8 +1,15 @@
-export class DurableObject {
-  constructor(
-    readonly ctx?: unknown,
-    readonly env?: unknown,
-  ) {}
+export class DurableObject<Env = unknown> {
+  declare readonly ctx: unknown;
+  declare readonly env: Env;
+  constructor(ctx?: unknown, env?: Env) {
+    Object.assign(this, { ctx, env });
+  }
 }
 
-export class WorkerEntrypoint {}
+export class WorkerEntrypoint<Env = unknown> {
+  declare readonly ctx: unknown;
+  declare readonly env: Env;
+  constructor(ctx?: unknown, env?: Env) {
+    Object.assign(this, { ctx, env });
+  }
+}

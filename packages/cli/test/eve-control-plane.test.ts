@@ -1039,10 +1039,15 @@ describe("top-level Eden Deploy commands", () => {
               expect(request.hostConfig.worker.name).toBe("eve-deploy-fixture");
               expect(request.hostConfig.worker.workers_dev).toBe(true);
               expect(request.hostConfig.worker.containers).toHaveLength(1);
-              expect(request.hostConfig.worker.containers[0]?.max_instances).toBe(1);
-              expect(request.hostConfig.worker.containers[0]?.instance_type).toBe(
-                "basic",
-              );
+              expect(
+                request.hostConfig.worker.containers[0]?.scheduling_policy,
+              ).toBe("durable_object");
+              expect(
+                request.hostConfig.worker.containers[0]?.images.eve.image,
+              ).toBe(request.identity.containerImage);
+              expect(request.hostConfig.worker.compatibility_flags).toEqual([
+                "enable_ctx_exports",
+              ]);
               expect(request.hostConfig.worker.vars.EVE_PUBLIC_ORIGIN).toBe(
                 "https://eve-deploy-fixture.account.workers.dev",
               );
@@ -1328,8 +1333,9 @@ const destroyTargetKey = (() => {
     .slice(0, 24);
   return `preview-eve-destroy-fixture-${digest}`;
 })();
+const destroyRegistryRepository = `eden-eve-${destroyTargetKey}-gen-destroy-1`;
 const destroyRegistryImage =
-  `eden-eve-${destroyTargetKey}-gen-destroy-1:candidate`;
+  `${destroyRegistryRepository}:candidate`;
 
 describe("exact target Container inventory", () => {
   test("ignores the account's other Containers and matches only <name>-container", () => {
@@ -1470,7 +1476,7 @@ describe("eden destroy", () => {
               return {
                 workerExists: false,
                 containerApplicationId: undefined,
-                registryImagesPresent: [],
+                registryTagsPresent: [],
                 accountId: "account-test",
               };
             },
@@ -1508,7 +1514,7 @@ describe("eden destroy", () => {
               ...(containerId === undefined
                 ? {}
                 : { containerApplicationId: containerId }),
-              registryImagesPresent: imagePresent
+              registryTagsPresent: imagePresent
                 ? [destroyRegistryImage]
                 : [],
               accountId: "account-test",
@@ -1523,8 +1529,8 @@ describe("eden destroy", () => {
               containerId = undefined;
               return "deleted";
             },
-            deleteRegistryImage: async ({ image }) => {
-              operations.push(`image:${image}`);
+            deleteRegistryRepository: async ({ repository }) => {
+              operations.push(`registry:${repository}`);
               imagePresent = false;
               return "deleted";
             },
@@ -1535,7 +1541,7 @@ describe("eden destroy", () => {
     expect(operations).toEqual([
       "worker:eve-destroy-fixture",
       "container:container-123",
-      `image:${destroyRegistryImage}`,
+      `registry:${destroyRegistryRepository}`,
     ]);
     expect(output.join("\n")).toContain('"status":"destroyed"');
     await expect(
@@ -1580,8 +1586,8 @@ describe("eden destroy", () => {
       "utf8",
     );
     const output: string[] = [];
-    const deletedImages: string[] = [];
-    const presentImages = new Set([destroyRegistryImage, abortedImage]);
+    const deletedRepositories: string[] = [];
+    const presentTags = new Set([destroyRegistryImage, abortedImage]);
     await expect(
       runEdenCli(
         ["destroy",
@@ -1599,20 +1605,25 @@ describe("eden destroy", () => {
             destroyCloudflareRead: async () => ({
               workerExists: false,
               containerApplicationId: undefined,
-              registryImagesPresent: [...presentImages],
+              registryTagsPresent: [...presentTags],
               accountId: "account-test",
             }),
-            deleteRegistryImage: async ({ image }) => {
-              deletedImages.push(image);
-              presentImages.delete(image);
+            deleteRegistryRepository: async ({ repository }) => {
+              deletedRepositories.push(repository);
+              for (const tag of [...presentTags]) {
+                if (tag.startsWith(`${repository}:`)) presentTags.delete(tag);
+              }
               return "deleted";
             },
           },
         },
       ),
     ).resolves.toBe(0);
-    expect(new Set(deletedImages)).toEqual(
-      new Set([destroyRegistryImage, abortedImage]),
+    expect(new Set(deletedRepositories)).toEqual(
+      new Set([
+        destroyRegistryRepository,
+        `eden-eve-${destroyTargetKey}-gen-destroy-0`,
+      ]),
     );
     expect(output.join("\n")).toContain('"status":"destroyed"');
     expect(output.join("\n")).toContain("VAL-LIFE-006-REGISTRY");
@@ -1642,15 +1653,15 @@ describe("eden destroy", () => {
               containerApplicationId: undefined,
               accountId: "account-test",
             }),
-            deleteRegistryImage: async () => "indeterminate",
+            deleteRegistryRepository: async () => "indeterminate",
           },
         },
       ),
     ).resolves.toBe(1);
     expect(output.join("\n")).toContain('"status":"failed"');
-    expect(output.join("\n")).toContain(destroyRegistryImage);
+    expect(output.join("\n")).toContain(destroyRegistryRepository);
     expect(errors.join("\n")).toContain("EVE_DESTROY_IMAGES_RETAINED");
-    expect(errors.join("\n")).toContain(destroyRegistryImage);
+    expect(errors.join("\n")).toContain(destroyRegistryRepository);
     await expect(
       lstat(
         join(
@@ -1780,7 +1791,7 @@ describe("eden destroy", () => {
               ...(containerId === undefined
                 ? {}
                 : { containerApplicationId: containerId }),
-              registryImagesPresent: imagePresent
+              registryTagsPresent: imagePresent
                 ? [destroyRegistryImage]
                 : [],
               accountId: "account-test",
@@ -1793,7 +1804,7 @@ describe("eden destroy", () => {
               containerId = undefined;
               return "deleted";
             },
-            deleteRegistryImage: async () => {
+            deleteRegistryRepository: async () => {
               imagePresent = false;
               return "deleted";
             },
@@ -2290,12 +2301,24 @@ describe("eden deploy in-place update", () => {
   function priorWorkerConfig(options: { readonly worldCloudflare?: boolean }) {
     return {
       name: updateName,
+      compatibility_date: "2026-04-01",
+      compatibility_flags: ["enable_ctx_exports"],
       vars: options.worldCloudflare === true
         ? { EDEN_EVE_WORLD_CLOUDFLARE: true }
         : {},
+      containers: [
+        {
+          name: `${updateName}-container`,
+          class_name: "EveHostDurableContainer",
+          scheduling_policy: "durable_object",
+          images: {
+            eve: { image: priorImageReference },
+          },
+        },
+      ],
       durable_objects: {
         bindings: [
-          { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+          { name: "EVE_CONTAINER", class_name: "EveHostDurableContainer" },
           ...(options.worldCloudflare === true
             ? [{ name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" }]
             : []),
@@ -2305,8 +2328,8 @@ describe("eden deploy in-place update", () => {
         {
           tag: "v1",
           new_sqlite_classes: options.worldCloudflare === true
-            ? ["EveHostContainer", "EdenWorldDurableObject"]
-            : ["EveHostContainer"],
+            ? ["EveHostDurableContainer", "EdenWorldDurableObject"]
+            : ["EveHostDurableContainer"],
         },
       ],
     };
@@ -2380,7 +2403,9 @@ describe("eden deploy in-place update", () => {
         state: "unowned" as const,
         observed: { worker: true, container: true },
         providerEvidence: {
-          containerImage: priorImageReference,
+          containerSchedulingPolicy: "durable_object",
+          containerNamespaceId: "namespace-do-test",
+          workerContainerNamespaceId: "namespace-do-test",
           workerDeploymentId: "eve-deploy-prior",
           settingsReadable: true,
         },
@@ -2436,8 +2461,12 @@ describe("eden deploy in-place update", () => {
         operations.push("health");
         return { status: "ready" as const, identity: request.identity };
       },
-      deleteRegistryImage: async ({ image }: { readonly image: string }) => {
-        operations.push(`delete-superseded-image:${image}`);
+      deleteRegistryRepository: async ({
+        repository,
+      }: {
+        readonly repository: string;
+      }) => {
+        operations.push(`delete-superseded-registry:${repository}`);
         return "deleted" as const;
       },
       discardRuntimeImage: async () => {
@@ -2489,13 +2518,13 @@ describe("eden deploy in-place update", () => {
     expect(result.deployment?.supersededGenerationId).toBe("gen-prior");
     expect(result.deployment?.supersededImageReference).toBe(priorImageReference);
     expect(publishedMigrations).toEqual([
-      { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+      { tag: "v1", new_sqlite_classes: ["EveHostDurableContainer"] },
     ]);
     expect(publishedImage).toBe(`registry.example/eve@sha256:${"d".repeat(64)}`);
     expect(operations).toEqual([
       "publish",
       "health",
-      `delete-superseded-image:${priorImage}`,
+      `delete-superseded-registry:${priorImage.replace(":candidate", "")}`,
       "discard-runtime-image",
     ]);
     const current = await realpath(
@@ -2595,11 +2624,11 @@ describe("eden deploy in-place update", () => {
     ).resolves.toBe(0);
 
     expect(publishedMigrations).toEqual([
-      { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+      { tag: "v1", new_sqlite_classes: ["EveHostDurableContainer"] },
       { tag: "v2", new_sqlite_classes: ["EdenWorldDurableObject"] },
     ]);
     expect(publishedBindings).toEqual([
-      { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+      { name: "EVE_CONTAINER", class_name: "EveHostDurableContainer" },
       { name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" },
     ]);
     expect(workerSource).toContain("export { EdenWorldDurableObject }");
@@ -2644,11 +2673,14 @@ describe("eden deploy in-place update", () => {
     expect(publishedMigrations).toEqual([
       {
         tag: "v1",
-        new_sqlite_classes: ["EveHostContainer", "EdenWorldDurableObject"],
+        new_sqlite_classes: [
+          "EveHostDurableContainer",
+          "EdenWorldDurableObject",
+        ],
       },
     ]);
     expect(publishedBindings).toEqual([
-      { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+      { name: "EVE_CONTAINER", class_name: "EveHostDurableContainer" },
       { name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" },
     ]);
     expect(workerSource).toContain("export { EdenWorldDurableObject }");
@@ -2709,7 +2741,9 @@ describe("eden deploy in-place update", () => {
                 state: "unowned" as const,
                 observed: { worker: true, container: true },
                 providerEvidence: {
-                  containerImage: priorImageReference,
+                  containerSchedulingPolicy: "durable_object",
+                  containerNamespaceId: "namespace-do-test",
+                  workerContainerNamespaceId: "namespace-do-test",
                   workerDeploymentId: "foreign-deploy-not-in-records",
                   settingsReadable: true,
                 },
@@ -2773,7 +2807,7 @@ describe("eden deploy in-place update", () => {
     ).toBe("failed");
   });
 
-  test("refuses to update when Worker settings are unreadable, even if the Container image matches", async () => {
+  test("refuses to update when Worker settings are unreadable, even if the Container namespace matches", async () => {
     const root = await createRoot();
     await writeProject(root);
     await createOwnedTargetFixture(root);
@@ -2801,7 +2835,9 @@ describe("eden deploy in-place update", () => {
                 state: "unowned" as const,
                 observed: { worker: true, container: true },
                 providerEvidence: {
-                  containerImage: priorImageReference,
+                  containerSchedulingPolicy: "durable_object",
+                  containerNamespaceId: "namespace-do-test",
+                  workerContainerNamespaceId: "namespace-do-test",
                   settingsReadable: false,
                 },
               },
@@ -2813,6 +2849,87 @@ describe("eden deploy in-place update", () => {
 
     expect(operations).toEqual([]);
     const result = JSON.parse(output[0] as string) as {
+      readonly checks: readonly { readonly id: string; readonly status: string }[];
+    };
+    expect(
+      result.checks.find((value) => value.id === "VAL-CLI-007-TARGET-CONFLICT")
+        ?.status,
+    ).toBe("failed");
+  });
+
+  test("proves a durable-object Container by namespace identity and fails closed when it is unreadable", async () => {
+    const namespaceId = "namespace-do-123";
+    const operations: string[] = [];
+    const buildRead = (
+      providerEvidence: Record<string, unknown>,
+    ) => async () => ({
+      accountAccess: "available" as const,
+      containerAccess: "available" as const,
+      accountId: "account-test",
+      workersDevSubdomain: "account",
+      target: {
+        state: "unowned" as const,
+        observed: { worker: true, container: true },
+        providerEvidence: {
+          workerDeploymentId: "eve-deploy-prior",
+          settingsReadable: true,
+          ...providerEvidence,
+        },
+      },
+    });
+
+    // Matching app/binding namespaces prove the durable-object Container
+    // even though `containers list` reports no image.
+    const matchedRoot = await createRoot();
+    await writeProject(matchedRoot);
+    await createOwnedTargetFixture(matchedRoot);
+    const matchedOutput: string[] = [];
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", matchedRoot, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: matchedRoot,
+          stdout: (line) => matchedOutput.push(line),
+          eveControlPlane: {
+            ...updateControlPlane(matchedRoot, operations),
+            cloudflareRead: buildRead({
+              containerSchedulingPolicy: "durable_object",
+              containerNamespaceId: namespaceId,
+              workerContainerNamespaceId: namespaceId,
+            }),
+          },
+        },
+      ),
+    ).resolves.toBe(0);
+    expect(operations).toContain("publish");
+
+    // A missing or mismatched namespace id fails closed.
+    const mismatchedRoot = await createRoot();
+    await writeProject(mismatchedRoot);
+    await createOwnedTargetFixture(mismatchedRoot);
+    const mismatchedOutput: string[] = [];
+    const mismatchedOperations: string[] = [];
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", mismatchedRoot, "--env", "preview",
+        "--name", updateName, "--json"],
+        {
+          cwd: mismatchedRoot,
+          stdout: (line) => mismatchedOutput.push(line),
+          eveControlPlane: {
+            ...updateControlPlane(mismatchedRoot, mismatchedOperations),
+            cloudflareRead: buildRead({
+              containerSchedulingPolicy: "durable_object",
+              containerNamespaceId: namespaceId,
+              workerContainerNamespaceId: "namespace-foreign",
+            }),
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(mismatchedOperations).toEqual([]);
+    const result = JSON.parse(mismatchedOutput[0] as string) as {
       readonly checks: readonly { readonly id: string; readonly status: string }[];
     };
     expect(
@@ -2860,15 +2977,27 @@ describe("eden deploy in-place update", () => {
         },
         worker: {
           name: updateName,
+          compatibility_date: "2026-04-01",
+          compatibility_flags: ["enable_ctx_exports"],
           vars: { EDEN_EVE_WORLD_CLOUDFLARE: true },
+          containers: [
+            {
+              name: `${updateName}-container`,
+              class_name: "EveHostDurableContainer",
+              scheduling_policy: "durable_object",
+              images: {
+                eve: { image: priorImageReference },
+              },
+            },
+          ],
           durable_objects: {
             bindings: [
-              { name: "EVE_CONTAINER", class_name: "EveHostContainer" },
+              { name: "EVE_CONTAINER", class_name: "EveHostDurableContainer" },
               { name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" },
             ],
           },
           migrations: [
-            { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+            { tag: "v1", new_sqlite_classes: ["EveHostDurableContainer"] },
             { tag: "v2", new_sqlite_classes: ["EdenWorldDurableObject"] },
           ],
         },
@@ -2935,8 +3064,9 @@ describe("eden deploy in-place update", () => {
     // v2 stays in the emitted history; the World class is never re-declared
     // under a replayed tag nor dropped from the list.
     expect(publishedMigrations).toEqual([
-      { tag: "v1", new_sqlite_classes: ["EveHostContainer"] },
+      { tag: "v1", new_sqlite_classes: ["EveHostDurableContainer"] },
       { tag: "v2", new_sqlite_classes: ["EdenWorldDurableObject"] },
     ]);
   });
 });
+

@@ -12,15 +12,15 @@ If you already have an Eve project, start with `eden deploy`.
 Use any one of these package managers:
 
 ```sh
-npm install --global @moinulmoin/eden@0.5.0
+npm install --global @moinulmoin/eden@0.6.0
 ```
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.5.0
+pnpm add --global @moinulmoin/eden@0.6.0
 ```
 
 ```sh
-bun add --global @moinulmoin/eden@0.5.0
+bun add --global @moinulmoin/eden@0.6.0
 ```
 
 Then confirm the CLI is available:
@@ -39,7 +39,7 @@ Bun can install Eden, but Eden still runs on Node. Do not use `bunx --bun`.
 - Wrangler authentication:
 
   ```sh
-  npx wrangler@4.120.0 login
+  npx wrangler@4.147.0 login
   ```
 
 - Docker or OrbStack with Linux/amd64 container support

@@ -85,7 +85,7 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
     expect(document).toContain(`bun add --global @moinulmoin/eden@${version}`);
     expect(document).toMatch(/Node `>=24\.17\.0`/u);
     expect(document).toContain("Docker or OrbStack");
-    expect(document).toContain("npx wrangler@4.120.0 login");
+    expect(document).toContain("npx wrangler@4.147.0 login");
     expect(document).toContain("eden deploy");
     expect(document).toContain("eden destroy");
     expect(document).toMatch(/pnpm (?:add --global|install)/);
@@ -143,7 +143,7 @@ test("exposes the Deploy-first root help and rejects unsupported commands", asyn
   expect(errors.join("\n")).toMatch(/unknown|preflight|deploy|destroy/i);
 });
 
-test("ships Apache licensing and Cloudflare bundling attribution", async () => {
+test("ships Apache licensing", async () => {
   await expect(access(join(repositoryRoot, "LICENSE"))).resolves.toBeUndefined();
   await expect(access(join(repositoryRoot, "NOTICE"))).resolves.toBeUndefined();
 
@@ -152,10 +152,6 @@ test("ships Apache licensing and Cloudflare bundling attribution", async () => {
   expect(license).toContain("Version 2.0, January 2004");
   expect(license).toContain("http://www.apache.org/licenses/");
   expect(license).toContain("END OF TERMS AND CONDITIONS");
-
-  const notice = await readRepositoryFile("NOTICE");
-  expect(notice).toMatch(/@cloudflare\/containers/i);
-  expect(notice).toMatch(/Apache-2\.0/i);
 });
 
 test("retains the exact release NOTICE", async () => {
@@ -163,15 +159,6 @@ test("retains the exact release NOTICE", async () => {
   const expectedNotice = [
     "Eden",
     "Copyright 2026 Eden contributors",
-    "",
-    "Cloudflare Containers",
-    "  @cloudflare/containers, version 0.3.7",
-    "  https://github.com/cloudflare/containers",
-    "",
-    "Eden's generated Worker host bundle includes software from",
-    "`@cloudflare/containers`, distributed under MIT OR Apache-2.0. Eden",
-    "redistributes that bundled software under the Apache-2.0 option included in",
-    "LICENSE.",
     "",
     "Workflow SDK",
     "  @workflow/world-postgres, version 5.0.0-beta.47",

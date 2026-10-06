@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0 — 2026-10-06
+
+### Changed
+
+- **Containers run on the Durable Object runtime.** The Eve host is now a
+  plain Durable Object driving Cloudflare's native `ctx.container`
+  (`scheduling_policy: "durable_object"`) instead of the
+  `@cloudflare/containers` Container class. The image is selected at
+  container start, so an `eden deploy` update no longer races the old image:
+  the running container is replaced when `inspect()` shows it still serves the
+  previous image, and deploy health promotion proves the served image.
+- **Agent files survive sleep.** When the container has been idle for the
+  sleep window (default 24 hours, `EDEN_EVE_CONTAINER_SLEEP_AFTER`), Eden
+  snapshots the container's writable filesystem and destroys the instance; the
+  next wake restores the snapshot in under a second, so `/workspace` —
+  including Eve's sandbox cache — survives sleep. Snapshots are bound to the
+  image they came from, expire after 30 idle days, and a redeploy that changes
+  the image starts fresh (workspace files do not carry across an update).
+- **Container size is `standard-1`** (1/2 vCPU, 4 GiB; previously `basic`,
+  1 GiB). Awake time is billed at the 4 GiB rate; a sleeping container costs
+  nothing.
+- **0.6.0 is a clean cutover.** Targets deployed with 0.5.0 should be
+  destroyed with 0.5.0 and redeployed.
+- **Registry cleanup now removes every tag** in a generation's repository —
+  including the `rootfs-snapshot-*`/`rootfs-set-*` tags container snapshots
+  create — on updates, destroy, and aborted pushes.
+- Wrangler requirement bumped to **4.147.0** (first release that deploys
+  `scheduling_policy: "durable_object"`); `@cloudflare/workers-types` to
+  `5.20261006.1`. `@cloudflare/containers` is no longer a dependency.
+- Durable Object ownership for preflight now reads the container
+  application's Durable Object namespace (`wrangler containers info`) and
+  matches it against the Worker's `EVE_CONTAINER` binding namespace;
+  unreadable provider state still fails closed.
+
 ## 0.5.0 — 2026-10-06
 
 ### Added

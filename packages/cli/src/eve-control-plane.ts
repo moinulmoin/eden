@@ -73,11 +73,15 @@ import {
   type EveRuntimeInjection,
   type EveRuntimeProtectedStore,
 } from "./eve-runtime-config.js";
-import type {
-  EveDurableBinding,
-  EveDurableMigration,
-  EveHostConfig,
-  EveScheduleCronEntry,
+import {
+  createEveHostConfig,
+  generateEveHostWorkerSource,
+  parseEveScheduleCron,
+  resolveStableWorkersDevOrigin,
+  type EveDurableBinding,
+  type EveDurableMigration,
+  type EveHostConfig,
+  type EveScheduleCronEntry,
 } from "@moinulmoin/eden-runtime-cloudflare";
 
 const execFileAsync = promisify(execFile);
@@ -208,15 +212,18 @@ export interface EveCloudflareReadResult {
     /**
      * Provider-backed facts about the live target, read through the
      * Cloudflare API (not self-asserted response headers, which any Worker
-     * can forge): the Container application's configured image and the
-     * `EDEN_EVE_DEPLOYMENT_ID` plain-text var Eden stamps into every Worker
-     * it publishes. `settingsReadable` tells the ownership resolver whether
-     * a missing var is evidence of a foreign Worker or just an unreadable
-     * settings call.
+     * can forge): the Container application's Durable Object namespace and
+     * the `EDEN_EVE_DEPLOYMENT_ID` plain-text var Eden stamps into every
+     * Worker it publishes. `settingsReadable` tells the ownership resolver
+     * whether a missing var is evidence of a foreign Worker or just an
+     * unreadable settings call.
      */
     readonly providerEvidence?: {
-      readonly containerImage?: string;
+      readonly containerApplicationId?: string;
+      readonly containerSchedulingPolicy?: string;
+      readonly containerNamespaceId?: string;
       readonly workerDeploymentId?: string;
+      readonly workerContainerNamespaceId?: string;
       readonly settingsReadable?: boolean;
     };
   };
@@ -418,7 +425,7 @@ export interface EvePreflightOptions {
   readonly destroyCloudflareRead?: EveDestroyCloudflareReadRunner;
   readonly deleteWorker?: EveWorkerDeleteRunner;
   readonly deleteContainer?: EveContainerDeleteRunner;
-  readonly deleteRegistryImage?: EveRegistryImageDeleteRunner;
+  readonly deleteRegistryRepository?: EveRegistryRepositoryDeleteRunner;
 }
 
 export interface EveDestroyTargetRead {
@@ -426,12 +433,13 @@ export interface EveDestroyTargetRead {
   readonly containerApplicationId?: string;
   readonly accountId?: string;
   /**
-   * Subset of the request's owned registry image tags (`repository:tag`)
-   * still present in the managed registry. `undefined` means the reader
-   * could not enumerate the registry; destroy then relies on the exact
-   * delete outcomes only.
+   * Every `repository:tag` ref still present in the managed registry whose
+   * repository is one of the request's owned repositories — including the
+   * `rootfs-snapshot-*`/`rootfs-set-*` tags container snapshots create.
+   * `undefined` means the reader could not enumerate the registry; destroy
+   * then relies on the exact delete outcomes only.
    */
-  readonly registryImagesPresent?: readonly string[];
+  readonly registryTagsPresent?: readonly string[];
 }
 
 export type EveDestroyCloudflareReadRunner = (
@@ -450,11 +458,12 @@ export type EveContainerDeleteRunner = (
   "deleted" | "absent" | "indeterminate"
 >;
 
-export type EveRegistryImageDeleteRunner = (
-  request: { readonly image: string },
+export type EveRegistryRepositoryDeleteRunner = (
+  request: { readonly repository: string },
 ) => "deleted" | "absent" | "indeterminate" | Promise<
   "deleted" | "absent" | "indeterminate"
 >;
+
 
 export type EveRuntimeConfigLoader = (
   path: string,
@@ -464,8 +473,8 @@ export type EveRuntimeConfigLoader = (
 export interface EveDestroyCloudflareReadRequest {
   readonly workerName: string;
   readonly containerApplicationName: string;
-  /** Exact `repository:tag` image refs recorded for this target. */
-  readonly registryImages?: readonly string[];
+  /** Registry repository names this target provably owns. */
+  readonly registryRepositories?: readonly string[];
 }
 
 interface EvePreflightCollection {
@@ -1071,11 +1080,10 @@ function exactContainerEntries(
 ): readonly {
   readonly id: string;
   readonly name: string;
-  readonly image?: string;
 }[] | undefined {
   const collection = jsonCollection(value);
   if (collection === undefined) return undefined;
-  const entries: { id: string; name: string; image?: string }[] = [];
+  const entries: { id: string; name: string }[] = [];
   for (const entry of collection) {
     if (
       typeof entry !== "object" ||
@@ -1085,25 +1093,11 @@ function exactContainerEntries(
     ) {
       return undefined;
     }
-    const id = (entry as { readonly id: string }).id;
     const entryName = (entry as { readonly name: string }).name;
     if (entryName === name) {
-      const configuration =
-        (entry as { readonly configuration?: unknown }).configuration;
-      const image =
-        typeof (entry as { readonly image?: unknown }).image === "string"
-          ? (entry as { readonly image: string }).image
-          : typeof configuration === "object" &&
-              configuration !== null &&
-              typeof (
-                configuration as { readonly image?: unknown }
-              ).image === "string"
-            ? (configuration as { readonly image: string }).image
-            : undefined;
       entries.push({
-        id,
+        id: (entry as { readonly id: string }).id,
         name: entryName,
-        ...(image === undefined ? {} : { image }),
       });
     }
   }
@@ -1206,7 +1200,7 @@ async function readWorkersDevSubdomain(
 export function exactTargetContainerEntries(
   value: unknown,
   name: string,
-): readonly { readonly id: string; readonly name: string; readonly image?: string }[] | undefined {
+): readonly { readonly id: string; readonly name: string }[] | undefined {
   return exactContainerEntries(value, boundedResourceName(name, "container"));
 }
 
@@ -1289,7 +1283,7 @@ async function defaultCloudflareRead(
     request.name,
     accountId,
     workerPresent,
-    containerPresent ? containerEntries?.[0]?.image : undefined,
+    containerPresent ? containerEntries?.[0] : undefined,
   );
   return {
     accountAccess,
@@ -1317,25 +1311,59 @@ async function defaultCloudflareRead(
 
 /**
  * Reads provider-backed facts about the live target: the Container
- * application's configured image (from `wrangler containers list`) and the
- * `EDEN_EVE_DEPLOYMENT_ID` plain-text var Eden stamps into every Worker it
- * publishes (from the script settings API). Both are provider state — a
- * foreign Worker can forge `x-eden-*` response headers but cannot set a var
- * Eden recorded at publish time.
+ * application's identity from `wrangler containers list` plus `containers
+ * info` (scheduling policy and Durable Object namespace), and the
+ * `EDEN_EVE_DEPLOYMENT_ID` plain-text var plus the `EVE_CONTAINER` Durable
+ * Object namespace Eden stamps into every Worker it publishes (from the
+ * script settings API). All are provider state — a foreign Worker can forge
+ * `x-eden-*` response headers but cannot set vars or namespaces Eden
+ * recorded at publish time. The ownership proof is the Container
+ * application's Durable Object namespace matching the Worker's binding
+ * namespace.
  */
 async function readProviderEvidence(
   workerName: string,
   accountId: string | undefined,
   workerPresent: boolean,
-  containerImage: string | undefined,
+  containerEntry:
+    | { readonly id: string; readonly name: string }
+    | undefined,
 ): Promise<NonNullable<EveCloudflareReadResult["target"]["providerEvidence"]> | undefined> {
   const evidence: {
-    containerImage?: string;
+    containerApplicationId?: string;
+    containerSchedulingPolicy?: string;
+    containerNamespaceId?: string;
     workerDeploymentId?: string;
+    workerContainerNamespaceId?: string;
     settingsReadable?: boolean;
   } = {
-    ...(containerImage === undefined ? {} : { containerImage }),
+    ...(containerEntry === undefined
+      ? {}
+      : { containerApplicationId: containerEntry.id }),
   };
+  if (containerEntry !== undefined) {
+    const info = await readWranglerJson([
+      "containers",
+      "info",
+      containerEntry.id,
+      "--json",
+    ]);
+    if (!info.failed && typeof info.value === "object" && info.value !== null) {
+      const infoRecord = info.value as {
+        readonly scheduling_policy?: unknown;
+        readonly durable_objects?: {
+          readonly namespace_id?: unknown;
+        };
+      };
+      if (typeof infoRecord.scheduling_policy === "string") {
+        evidence.containerSchedulingPolicy = infoRecord.scheduling_policy;
+      }
+      const namespaceId = infoRecord.durable_objects?.namespace_id;
+      if (typeof namespaceId === "string") {
+        evidence.containerNamespaceId = namespaceId;
+      }
+    }
+  }
   if (workerPresent && accountId !== undefined) {
     const token = process.env.CLOUDFLARE_API_TOKEN ??
       (await readWranglerOAuthToken());
@@ -1356,16 +1384,26 @@ async function readProviderEvidence(
                 readonly type?: string;
                 readonly name?: string;
                 readonly text?: string;
+                readonly namespace_id?: string;
               }[];
             };
           };
-          const binding = parsed.result?.bindings?.find(
+          const bindings = parsed.result?.bindings ?? [];
+          const deploymentBinding = bindings.find(
             (value) =>
               value.type === "plain_text" &&
               value.name === "EDEN_EVE_DEPLOYMENT_ID",
           );
-          if (typeof binding?.text === "string") {
-            evidence.workerDeploymentId = binding.text;
+          if (typeof deploymentBinding?.text === "string") {
+            evidence.workerDeploymentId = deploymentBinding.text;
+          }
+          const containerBinding = bindings.find(
+            (value) =>
+              value.type === "durable_object_namespace" &&
+              value.name === "EVE_CONTAINER",
+          );
+          if (typeof containerBinding?.namespace_id === "string") {
+            evidence.workerContainerNamespaceId = containerBinding.namespace_id;
           }
         } else if (response.status !== 404) {
           evidence.settingsReadable = false;
@@ -1418,10 +1456,9 @@ async function resolveEveTargetOwnership(
   }
   // Remote proof must come from provider state. A foreign Worker can echo
   // `x-eden-*` response headers, but it cannot plant the plain-text var Eden
-  // publishes into script settings, nor point the Container application at an
-  // image digest Eden recorded. The Worker is proven only by its own settings:
-  // a matching Container image proves the Container, never the Worker, so
-  // unreadable settings fail closed.
+  // publishes into script settings or claim the Durable Object namespace the
+  // Worker's EVE_CONTAINER binding resolves to. The Worker is proven only by
+  // its own settings: unreadable settings fail closed.
   const evidence = result.target.providerEvidence;
   const recordedDeploymentIds = new Set(record.deploymentIds);
   const workerProven = result.target.observed?.worker !== true ||
@@ -1430,10 +1467,15 @@ async function resolveEveTargetOwnership(
       evidence.workerDeploymentId !== undefined &&
       recordedDeploymentIds.has(evidence.workerDeploymentId)
     );
+  // The Container proof is the application running the durable_object
+  // scheduling policy with a namespace that matches the Worker binding's
+  // namespace; anything else fails closed.
   const containerProven = result.target.observed?.container !== true ||
     (
-      evidence?.containerImage !== undefined &&
-      record.images.includes(evidence.containerImage)
+      evidence?.containerSchedulingPolicy === "durable_object" &&
+      evidence.containerNamespaceId !== undefined &&
+      evidence.workerContainerNamespaceId !== undefined &&
+      evidence.containerNamespaceId === evidence.workerContainerNamespaceId
     );
   const remoteProven = evidence !== undefined && workerProven && containerProven;
   if (!remoteProven) {
@@ -1500,9 +1542,6 @@ async function resolvedCloudflareOrigin(
     return undefined;
   }
   try {
-    const { resolveStableWorkersDevOrigin } = await import(
-      "@moinulmoin/eden-runtime-cloudflare"
-    );
     const origin = resolveStableWorkersDevOrigin({
       workerName,
       workersDevSubdomain: result.workersDevSubdomain,
@@ -1985,8 +2024,6 @@ function defaultPublicationRunner(): EveDeploymentPublicationRunner {
         "--env",
         request.identity.environment,
         "--strict",
-        "--containers-rollout",
-        "immediate",
       ],
       dirname(request.wranglerConfigPath),
     );
@@ -2458,9 +2495,6 @@ async function runEveDeployment(
   }
   let stableWorkersDevOrigin: string;
   try {
-    const { resolveStableWorkersDevOrigin } = await import(
-      "@moinulmoin/eden-runtime-cloudflare"
-    );
     stableWorkersDevOrigin = resolveStableWorkersDevOrigin({
       workerName: request.name,
       workersDevSubdomain,
@@ -2622,40 +2656,39 @@ async function runEveDeployment(
       ? {}
       : { runtimeRevisionHandle: runtimeInjection.protectedHandle }),
   };
+  const baseConfigRequest = {
+    accountId,
+    workerName: identity.workerName,
+    containerApplicationName: identity.containerApplicationName,
+    containerClassName: "EveHostDurableContainer",
+    containerBindingName: "EVE_CONTAINER",
+    stableContainerInstanceName: identity.stableContainerInstanceName,
+    deploymentId: identity.deploymentId,
+    generationId: identity.generationId,
+    stableWorkersDevOrigin: identity.stableWorkersDevOrigin,
+    containerImage: identity.containerImage,
+    runtimeVariableNames: identity.runtimeVariableNames,
+    ...(identity.runtimeRevisionHandle === undefined
+      ? {}
+      : { runtimeRevisionHandle: identity.runtimeRevisionHandle }),
+    schedules: collected.schedules ?? [],
+    ...(collected.workflowWorld === undefined
+      ? {}
+      : { workflowWorld: collected.workflowWorld }),
+    // In-place updates carry the prior Durable Object bindings and
+    // migration history forward verbatim: classes are append-only and are
+    // never silently re-declared or removed.
+    ...(isUpdate && priorDurableObjects !== undefined
+      ? { durableObjects: priorDurableObjects }
+      : {}),
+    ...(process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER === undefined
+      ? {}
+      : { containerSleepAfter: process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER }),
+  };
   let hostConfig: EveHostConfig;
   try {
-    const {
-      createEveHostConfig,
-    } = await import("@moinulmoin/eden-runtime-cloudflare");
     hostConfig = createEveHostConfig({
-      accountId,
-      workerName: identity.workerName,
-      containerApplicationName: identity.containerApplicationName,
-      containerClassName: "EveHostContainer",
-      containerBindingName: "EVE_CONTAINER",
-      stableContainerInstanceName: identity.stableContainerInstanceName,
-      deploymentId: identity.deploymentId,
-      generationId: identity.generationId,
-      stableWorkersDevOrigin: identity.stableWorkersDevOrigin,
-      containerImage: identity.containerImage,
-      runtimeVariableNames: identity.runtimeVariableNames,
-      ...(identity.runtimeRevisionHandle === undefined
-        ? {}
-        : { runtimeRevisionHandle: identity.runtimeRevisionHandle }),
-      schedules: collected.schedules ?? [],
-      ...(collected.workflowWorld === undefined
-        ? {}
-        : { workflowWorld: collected.workflowWorld }),
-      // In-place updates carry the prior Durable Object bindings and
-      // migration history forward verbatim: classes are append-only, never
-      // re-declared, and never deleted (a deleted_classes migration destroys
-      // the data).
-      ...(isUpdate && priorDurableObjects !== undefined
-        ? { durableObjects: priorDurableObjects }
-        : {}),
-      ...(process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER === undefined
-        ? {}
-        : { containerSleepAfter: process.env.EDEN_EVE_CONTAINER_SLEEP_AFTER }),
+      ...baseConfigRequest,
     });
   } catch (error: unknown) {
     throw deploymentFailure(
@@ -2665,9 +2698,6 @@ async function runEveDeployment(
         : "The exact Eve Worker/Container host configuration was invalid.",
     );
   }
-  const { generateEveHostWorkerSource } = await import(
-    "@moinulmoin/eden-runtime-cloudflare"
-  );
   const workerSource = generateEveHostWorkerSource({ config: hostConfig });
   const paths = await writeEveDeploymentArtifacts(
     candidate,
@@ -2681,20 +2711,29 @@ async function runEveDeployment(
     ...paths,
     ...(runtimeInjection === undefined ? {} : { runtimeInjection }),
   };
+  /** Publishes one wrangler config; returns its terminal result. */
+  const publishOne = async (
+    request: EveDeploymentPublicationRequest,
+  ): Promise<EveDeploymentPublicationResult> =>
+    (options.publish ?? defaultPublicationRunner())(request);
   let publication: EveDeploymentPublicationResult;
+  const writeFailureRecord = async (
+    status: EveDeploymentStatus,
+    evidence: string,
+  ): Promise<void> => {
+    try {
+      await writeEveDeploymentRecord(candidate, identity, hostConfig, status, {
+        evidence,
+      });
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  };
   try {
     eveProgress(options, "publishing Worker and Container application");
-    publication = await (options.publish ?? defaultPublicationRunner())(
-      publicationRequest,
-    );
+    publication = await publishOne(publicationRequest);
   } catch {
-    await writeEveDeploymentRecord(
-      candidate,
-      identity,
-      hostConfig,
-      "indeterminate",
-      { evidence: "publication-threw-before-terminal-result" },
-    );
+    await writeFailureRecord("indeterminate", "publication-threw-before-terminal-result");
     const deployment = deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded);
     return {
       ...collected.result,
@@ -2703,13 +2742,7 @@ async function runEveDeployment(
     };
   }
   if (publication.status === "indeterminate") {
-    await writeEveDeploymentRecord(
-      candidate,
-      identity,
-      hostConfig,
-      "indeterminate",
-      { evidence: safeText(publication.reason) },
-    );
+    await writeFailureRecord("indeterminate", safeText(publication.reason));
     return {
       ...collected.result,
       ok: false,
@@ -3008,21 +3041,25 @@ async function runEveDeployment(
   if (isUpdate) {
     // The superseded generation's registry repository is generation-scoped
     // and no longer referenced once CURRENT promotes this generation; only
-    // then is it safe to delete.
-    const previousImage = priorIdentity === undefined
+    // then is it safe to delete. Every tag in the repository goes with it —
+    // including the snapshot tags Cloudflare created under it.
+    const previousRepository = priorIdentity === undefined
       ? undefined
-      : ownedRegistryImageRef(
+      : ownedRegistryRepository(
         priorIdentity,
         request.environment,
         request.name,
         accountId,
       );
-    if (previousImage !== undefined) {
-      eveProgress(options, `deleting superseded registry image ${previousImage}`);
+    if (previousRepository !== undefined) {
+      eveProgress(
+        options,
+        `deleting superseded registry repository ${previousRepository}`,
+      );
       let deleted: "deleted" | "absent" | "indeterminate" = "indeterminate";
       try {
-        deleted = await (options.deleteRegistryImage ??
-          defaultRegistryImageDelete)({ image: previousImage });
+        deleted = await (options.deleteRegistryRepository ??
+          defaultRegistryRepositoryDelete)({ repository: previousRepository });
       } catch {
         deleted = "indeterminate";
       }
@@ -3030,15 +3067,15 @@ async function runEveDeployment(
         ? check(
           "VAL-LIFE-007",
           "failed",
-          `The update is healthy and promoted, but the superseded registry image ${previousImage} could not be proven deleted.`,
-          `Remove only the recorded image ref ${previousImage}; do not retry or run broad registry cleanup.`,
+          `The update is healthy and promoted, but the superseded registry repository ${previousRepository} could not be proven deleted.`,
+          `Remove only the recorded repository's tags ${previousRepository}; do not retry or run broad registry cleanup.`,
         )
         : check(
           "VAL-LIFE-007",
           "passed",
           deleted === "deleted"
-            ? "The superseded generation's registry image was deleted after promotion."
-            : "The superseded generation's registry image was already absent.",
+            ? "The superseded generation's registry repository (all tags, including snapshots) was deleted after promotion."
+            : "The superseded generation's registry repository was already absent.",
         );
     }
   }
@@ -3324,11 +3361,6 @@ async function collectEvePreflight(
     ...(await collectEveWorldWarnings(candidate, undefined)),
   );
   const schedules = await readCompiledSchedules(candidate);
-  // The runtime package is imported lazily so `eden` commands that never
-  // reach deploy checks stay fast; the module specifier is fixed.
-  const { parseEveScheduleCron } = await import(
-    "@moinulmoin/eden-runtime-cloudflare"
-  );
   const expressible = schedules.filter(
     (schedule) => parseEveScheduleCron(schedule.cron) !== undefined,
   );
@@ -4021,8 +4053,6 @@ interface EveDeploymentRecord {
   readonly status: EveDeploymentStatus | undefined;
   /** Every deploymentId this target's records have ever published, used to prove a live remote Worker is one Eden deployed. */
   readonly deploymentIds: readonly string[];
-  /** Every Container image ref this target's records have published; the remote app's configured image must be one of them. */
-  readonly images: readonly string[];
   /** True when the recorded Worker carried `EDEN_EVE_WORLD_CLOUDFLARE`. */
   readonly worldCloudflare: boolean;
   /**
@@ -4073,13 +4103,12 @@ async function readEveDeploymentRecord(
   const scanned: {
     readonly record: Omit<
       EveDeploymentRecord,
-      "generationRoot" | "deploymentIds" | "images"
+      "generationRoot" | "deploymentIds"
     > & { readonly deploymentId?: string | undefined };
     readonly generationRoot: string;
     readonly modifiedAt: number;
   }[] = [];
   const deploymentIds = new Set<string>();
-  const images = new Set<string>();
   for (const entry of entries) {
     const generationRoot = join(generationsRoot, entry);
     const recordPath = join(generationRoot, "deployment.json");
@@ -4106,9 +4135,6 @@ async function readEveDeploymentRecord(
       });
       const deploymentId = parsed.deploymentId;
       if (deploymentId !== undefined) deploymentIds.add(deploymentId);
-      if (typeof parsed.identity.containerImage === "string") {
-        images.add(parsed.identity.containerImage);
-      }
     }
   }
   scanned.sort((left, right) => right.modifiedAt - left.modifiedAt);
@@ -4161,7 +4187,6 @@ async function readEveDeploymentRecord(
     identity: live.record.identity,
     status: live.record.status,
     deploymentIds: [...deploymentIds],
-    images: [...images],
     worldCloudflare: live.record.worldCloudflare,
     durableObjects: historySource?.record.durableObjects,
   };
@@ -4173,7 +4198,7 @@ async function parseEveDeploymentRecord(
   name: string,
 ): Promise<(Omit<
   EveDeploymentRecord,
-  "generationRoot" | "deploymentIds" | "images"
+  "generationRoot" | "deploymentIds"
 > & { readonly deploymentId?: string | undefined }) | undefined> {
   const base = await parseEveDestroyRecord(recordPath, environment, name);
   if (base === undefined) return undefined;
@@ -4219,6 +4244,14 @@ async function parseEveDeploymentRecord(
   const migrations: EveDurableMigration[] = [];
   const durableObjectsValid = Array.isArray(rawBindings) &&
     Array.isArray(rawMigrations);
+  const invalidHistory = () => ({
+    recordPath,
+    identity: base.identity,
+    status,
+    deploymentId,
+    worldCloudflare: rawVars?.EDEN_EVE_WORLD_CLOUDFLARE === true,
+    durableObjects: undefined,
+  });
   if (durableObjectsValid) {
     for (const binding of rawBindings as readonly unknown[]) {
       if (
@@ -4226,14 +4259,7 @@ async function parseEveDeploymentRecord(
         typeof (binding as EveDurableBinding).name !== "string" ||
         typeof (binding as EveDurableBinding).class_name !== "string"
       ) {
-        return {
-          recordPath,
-          identity: base.identity,
-          status,
-          deploymentId,
-          worldCloudflare: rawVars?.EDEN_EVE_WORLD_CLOUDFLARE === true,
-          durableObjects: undefined,
-        };
+        return invalidHistory();
       }
       bindings.push(binding as EveDurableBinding);
     }
@@ -4244,18 +4270,11 @@ async function parseEveDeploymentRecord(
         !Array.isArray(
           (migration as EveDurableMigration).new_sqlite_classes,
         ) ||
-        (migration as EveDurableMigration).new_sqlite_classes.some(
+        ((migration as EveDurableMigration).new_sqlite_classes ?? []).some(
           (className: unknown) => typeof className !== "string",
         )
       ) {
-        return {
-          recordPath,
-          identity: base.identity,
-          status,
-          deploymentId,
-          worldCloudflare: rawVars?.EDEN_EVE_WORLD_CLOUDFLARE === true,
-          durableObjects: undefined,
-        };
+        return invalidHistory();
       }
       migrations.push(migration as EveDurableMigration);
     }
@@ -4296,20 +4315,23 @@ async function defaultDestroyTargetRead(
     request.containerApplicationName,
   );
   const firstContainer = entries === undefined ? undefined : entries[0];
-  const ownedImages = request.registryImages;
-  let registryImagesPresent: readonly string[] | undefined;
-  if (ownedImages !== undefined && ownedImages.length > 0) {
+  const ownedRepositories = request.registryRepositories;
+  let registryTagsPresent: readonly string[] | undefined;
+  if (ownedRepositories !== undefined && ownedRepositories.length > 0) {
     const images = await readWranglerJson([
       "containers",
       "images",
       "list",
       "--json",
     ]);
-    const present = registryImageNames(images.value);
-    if (!images.failed && present !== undefined) {
-      registryImagesPresent = ownedImages.filter((image) =>
-        present.has(image)
-      );
+    const tagsByRepository = registryTagsByRepository(images.value);
+    if (!images.failed && tagsByRepository !== undefined) {
+      const present: string[] = [];
+      for (const [repository, tags] of tagsByRepository) {
+        if (!ownedRepositories.includes(repository)) continue;
+        for (const tag of tags) present.push(`${repository}:${tag}`);
+      }
+      registryTagsPresent = present;
     }
   }
   return {
@@ -4318,21 +4340,24 @@ async function defaultDestroyTargetRead(
       ? {}
       : { containerApplicationId: firstContainer.id }),
     ...(accountId === undefined ? {} : { accountId }),
-    ...(registryImagesPresent === undefined
+    ...(registryTagsPresent === undefined
       ? {}
-      : { registryImagesPresent }),
+      : { registryTagsPresent }),
   };
 }
 
 /**
  * `wrangler containers images list --json` reports `[{name, tags}]` entries
- * with the account prefix already stripped from the repository name. The set
- * carries `repository:tag` refs for the owned tags Eden publishes.
+ * with the account prefix already stripped from the repository name. The map
+ * carries every tag per repository so owned-repository cleanup can delete
+ * snapshot tags alongside the pushed `candidate` tag.
  */
-function registryImageNames(value: unknown): ReadonlySet<string> | undefined {
+function registryTagsByRepository(
+  value: unknown,
+): ReadonlyMap<string, readonly string[]> | undefined {
   const collection = jsonCollection(value);
   if (collection === undefined) return undefined;
-  const names = new Set<string>();
+  const tagsByRepository = new Map<string, readonly string[]>();
   for (const entry of collection) {
     if (typeof entry !== "object" || entry === null || !("name" in entry)) {
       return undefined;
@@ -4340,12 +4365,14 @@ function registryImageNames(value: unknown): ReadonlySet<string> | undefined {
     const name = entry.name;
     const tags = "tags" in entry ? entry.tags : undefined;
     if (typeof name !== "string" || !Array.isArray(tags)) return undefined;
+    const validTags: string[] = [];
     for (const tag of tags) {
       if (typeof tag !== "string") return undefined;
-      names.add(`${name}:${tag}`);
+      validTags.push(tag);
     }
+    tagsByRepository.set(name, validTags);
   }
-  return names;
+  return tagsByRepository;
 }
 
 async function defaultWorkerDelete(
@@ -4377,28 +4404,67 @@ async function defaultContainerDelete(
   return "indeterminate";
 }
 
-async function defaultRegistryImageDelete(
-  request: { readonly image: string },
+
+/**
+ * Deletes every tag in an owned registry repository — the `candidate` tag
+ * Eden pushed plus any `rootfs-snapshot-*`/`rootfs-set-*` tags container
+ * snapshots created under the source image repository. Deleting only
+ * `candidate` would leave snapshot storage behind, so each tag in the
+ * repository is deleted individually.
+ */
+async function defaultRegistryRepositoryDelete(
+  request: { readonly repository: string },
 ): Promise<"deleted" | "absent" | "indeterminate"> {
-  const result = await runWranglerWithInput(
-    ["containers", "images", "delete", request.image, "--skip-confirmation"],
-    process.cwd(),
+  const images = await readWranglerJson([
+    "containers",
+    "images",
+    "list",
+    "--json",
+  ]);
+  const collection = jsonCollection(images.value);
+  if (images.failed || collection === undefined) return "indeterminate";
+  const entry = collection.find(
+    (candidate) =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      (candidate as { readonly name?: unknown }).name === request.repository,
   );
-  if (result.exitCode === 0) return "deleted";
-  if (/(?:does not exist|not found|404)/iu.test(result.stderr)) {
-    return "absent";
+  if (entry === undefined) return "absent";
+  const tags = (entry as { readonly tags?: unknown }).tags;
+  if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== "string")) {
+    return "indeterminate";
   }
-  return "indeterminate";
+  let deletedAny = false;
+  for (const tag of tags) {
+    const result = await runWranglerWithInput(
+      [
+        "containers",
+        "images",
+        "delete",
+        `${request.repository}:${tag}`,
+        "--skip-confirmation",
+      ],
+      process.cwd(),
+    );
+    if (result.exitCode === 0) {
+      deletedAny = true;
+      continue;
+    }
+    if (!/(?:does not exist|not found|404)/iu.test(result.stderr)) {
+      return "indeterminate";
+    }
+  }
+  return deletedAny ? "deleted" : "absent";
 }
 
 /**
- * The exact `<repository>:${EVE_REGISTRY_IMAGE_TAG}` ref this generation's
- * deployment record proves Eden pushed, or undefined. Ownership holds only
- * when the recorded digest reference points at the repository derived from
- * the same identity that produced it; a digest-bearing reference to any other
- * repository was published outside Eden's push and is never owned here.
+ * The registry repository this generation's deployment record proves Eden
+ * pushed to, or undefined. Ownership holds only when the recorded digest
+ * reference points at the repository derived from the same identity that
+ * produced it; a digest-bearing reference to any other repository was
+ * published outside Eden's push and is never owned here.
  */
-function ownedRegistryImageRef(
+function ownedRegistryRepository(
   identity: VerifiedEveDestroyIdentity,
   environment: EveCliEnvironment,
   name: string,
@@ -4428,15 +4494,15 @@ function ownedRegistryImageRef(
   ) {
     return undefined;
   }
-  return `${repository}:${EVE_REGISTRY_IMAGE_TAG}`;
+  return repository;
 }
 
 /**
- * The exact image ref an indeterminate deploy attempt provably pushed. The
- * retained attempt evidence names the target's repository; the account and
- * target key must match the verified destroy record.
+ * The registry repository an indeterminate deploy attempt provably pushed.
+ * The retained attempt evidence names the target's repository; the account
+ * and target key must match the verified destroy record.
  */
-async function attemptRegistryImageRef(
+async function attemptRegistryRepository(
   attemptPath: string,
   accountId: string,
   targetKey: string,
@@ -4457,7 +4523,7 @@ async function attemptRegistryImageRef(
       (!("targetKey" in parsed) || parsed.targetKey === targetKey) &&
       "accountId" in parsed &&
       parsed.accountId === accountId) {
-    return `${parsed.imageRepository}:${EVE_REGISTRY_IMAGE_TAG}`;
+    return parsed.imageRepository;
   }
   if ("imageReference" in parsed &&
       typeof parsed.imageReference === "string" &&
@@ -4469,19 +4535,20 @@ async function attemptRegistryImageRef(
       repository.startsWith(expected) &&
       (!("targetKey" in parsed) || parsed.targetKey === targetKey)
     ) {
-      return `${repository.slice(`registry.cloudflare.com/${accountId}/`.length)}:${EVE_REGISTRY_IMAGE_TAG}`;
+      return repository.slice(`registry.cloudflare.com/${accountId}/`.length);
     }
   }
   return undefined;
 }
 
 /**
- * Every registry image tag this exact target provably owns: the recorded
+ * Every registry repository this exact target provably owns: the recorded
  * digest references in matching deployment records plus the repository
  * evidence retained by indeterminate pushes. Never derived by prefix-matching
- * the registry; each ref is computed from the immutable generation records.
+ * the registry; each repository is computed from the immutable generation
+ * records.
  */
-async function collectEveDestroyRegistryImages(
+async function collectEveDestroyRegistryRepositories(
   projectRoot: string,
   environment: EveCliEnvironment,
   name: string,
@@ -4494,7 +4561,7 @@ async function collectEveDestroyRegistryImages(
     "generations",
   );
   const entries = await readdir(generationsRoot).catch(() => []);
-  const images = new Set<string>();
+  const repositories = new Set<string>();
   const targetKey = record.projectId === undefined
     ? undefined
     : stableDeploymentKey(
@@ -4510,24 +4577,24 @@ async function collectEveDestroyRegistryImages(
       environment,
       name,
     );
-    const deployedImage = parsed === undefined
+    const deployedRepository = parsed === undefined
       ? undefined
-      : ownedRegistryImageRef(
+      : ownedRegistryRepository(
         parsed.identity,
         environment,
         name,
         record.accountId,
       );
-    if (deployedImage !== undefined) images.add(deployedImage);
+    if (deployedRepository !== undefined) repositories.add(deployedRepository);
     if (targetKey === undefined) continue;
-    const attemptImage = await attemptRegistryImageRef(
+    const attemptRepository = await attemptRegistryRepository(
       join(generationRoot, "deployment-attempt.json"),
       record.accountId,
       targetKey,
     );
-    if (attemptImage !== undefined) images.add(attemptImage);
+    if (attemptRepository !== undefined) repositories.add(attemptRepository);
   }
-  return [...images];
+  return [...repositories];
 }
 
 export async function runEveDestroy(
@@ -4617,7 +4684,7 @@ async function runEveDestroyLocked(
     );
 
     eveProgress(options, "verifying the immutable ownership record");
-    const ownedRegistryImages = await collectEveDestroyRegistryImages(
+    const ownedRegistryRepositories = await collectEveDestroyRegistryRepositories(
       request.projectRoot,
       request.environment,
       request.name,
@@ -4628,7 +4695,7 @@ async function runEveDestroyLocked(
       Promise.resolve(reader({
         workerName: expectedWorker,
         containerApplicationName: expectedContainer,
-        registryImages: ownedRegistryImages,
+        registryRepositories: ownedRegistryRepositories,
       }));
     const reader = options.destroyCloudflareRead ?? defaultDestroyTargetRead;
     eveProgress(options, "reading the exact remote inventory");
@@ -4644,9 +4711,9 @@ async function runEveDestroyLocked(
     if (
       !before.workerExists &&
       before.containerApplicationId === undefined &&
-      (ownedRegistryImages.length === 0 ||
-        (before.registryImagesPresent !== undefined &&
-          before.registryImagesPresent.length === 0))
+      (ownedRegistryRepositories.length === 0 ||
+        (before.registryTagsPresent !== undefined &&
+          before.registryTagsPresent.length === 0))
     ) {
       emit({
         ok: true,
@@ -4735,25 +4802,40 @@ async function runEveDestroyLocked(
         ),
       );
     }
-    const imageDeletes = new Map<string, "deleted" | "absent" | "indeterminate">();
-    if (ownedRegistryImages.length > 0) {
-      const deleteRegistryImage =
-        options.deleteRegistryImage ?? defaultRegistryImageDelete;
-      const deletable = before.registryImagesPresent === undefined
-        ? ownedRegistryImages
-        : ownedRegistryImages.filter((image) =>
-          before.registryImagesPresent?.includes(image) === true
+    const repositoryDeletes = new Map<
+      string,
+      "deleted" | "absent" | "indeterminate"
+    >();
+    if (ownedRegistryRepositories.length > 0) {
+      const deleteRegistryRepository =
+        options.deleteRegistryRepository ?? defaultRegistryRepositoryDelete;
+      // Every tag inside an owned repository is deleted (candidate plus
+      // snapshot tags). When the registry could not be enumerated, still
+      // attempt the exact owned repositories; absence verification below
+      // re-reads the registry when it becomes readable.
+      const presentRepositories = new Set(
+        (before.registryTagsPresent ?? []).map(
+          (ref) => ref.split(":")[0] ?? "",
+        ),
+      );
+      const deletable = before.registryTagsPresent === undefined
+        ? ownedRegistryRepositories
+        : ownedRegistryRepositories.filter(
+          (repository) => presentRepositories.has(repository),
         );
       if (deletable.length > 0) {
         eveProgress(
           options,
-          `deleting ${deletable.length} registry image${
-            deletable.length === 1 ? "" : "s"
+          `deleting ${deletable.length} registry repositor${
+            deletable.length === 1 ? "y" : "ies"
           }`,
         );
       }
-      for (const image of deletable) {
-        imageDeletes.set(image, await deleteRegistryImage({ image }));
+      for (const repository of deletable) {
+        repositoryDeletes.set(
+          repository,
+          await deleteRegistryRepository({ repository }),
+        );
       }
     }
 
@@ -4780,14 +4862,16 @@ async function runEveDestroyLocked(
         "The exact target could not be proven absent after deletion.",
       );
     }
-    const retainedImages = ownedRegistryImages.filter((image) =>
-      after.registryImagesPresent === undefined
-        ? imageDeletes.get(image) === "indeterminate"
-        : after.registryImagesPresent.includes(image)
+    const presentTagsAfter = after.registryTagsPresent ?? [];
+    const retainedRepositories = ownedRegistryRepositories.filter(
+      (repository) =>
+        presentTagsAfter.some((ref) => ref.startsWith(`${repository}:`)) ||
+        (after.registryTagsPresent === undefined &&
+          repositoryDeletes.get(repository) === "indeterminate"),
     );
-    if (ownedRegistryImages.length > 0) {
+    if (ownedRegistryRepositories.length > 0) {
       checks.push(
-        retainedImages.length === 0
+        retainedRepositories.length === 0
           ? check(
             "VAL-LIFE-006-REGISTRY",
             "passed",
@@ -4796,12 +4880,12 @@ async function runEveDestroyLocked(
           : check(
             "VAL-LIFE-006-REGISTRY",
             "failed",
-            `The exact target's registry image(s) remain after destroy: ${retainedImages.join(", ")}.`,
-            "Retry eden destroy with the same selectors, or remove only the listed image refs with wrangler containers images delete.",
+            `The exact target's registry image tag(s) remain after destroy: ${retainedRepositories.join(", ")}.`,
+            "Retry eden destroy with the same selectors, or remove only the listed repositories' tags with wrangler containers images delete.",
           ),
       );
     }
-    if (retainedImages.length > 0) {
+    if (retainedRepositories.length > 0) {
       emit({
         ok: false,
         status: "failed",
@@ -4811,7 +4895,7 @@ async function runEveDestroyLocked(
       });
       fail(
         "EVE_DESTROY_IMAGES_RETAINED",
-        `The exact Worker and Container are absent, but registry image(s) remain: ${retainedImages.join(", ")}.`,
+        `The exact Worker and Container are absent, but registry image tag(s) remain in: ${retainedRepositories.join(", ")}.`,
       );
     }
     checks.push(

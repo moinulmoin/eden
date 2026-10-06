@@ -26,11 +26,6 @@ export default defineConfig({
         test: {
           testTimeout: process.env.CI === "true" ? 30_000 : undefined,
           hookTimeout: process.env.CI === "true" ? 30_000 : undefined,
-          server: {
-            deps: {
-              inline: ["@cloudflare/containers"],
-            },
-          },
           name: "node",
           include: [
             "test/**/*.test.mjs",

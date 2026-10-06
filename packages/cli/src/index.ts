@@ -162,7 +162,7 @@ export type {
   EvePreflightWarning,
   EvePreflightRuntimeRunner,
   EvePreflightRuntimeRunnerRequest,
-  EveRegistryImageDeleteRunner,
+  EveRegistryRepositoryDeleteRunner,
   EveRuntimeConfigLoader,
   EveRuntimeImageDiscardRunner,
   EveWorkerDeleteRunner,

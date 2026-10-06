@@ -46,9 +46,9 @@ broaden to similarly named resources.
   not currently supported.
 - One logical Container instance per deployment; no horizontal scaling or
   custom domains.
-- Container-local memory and disk are disposable. Production durability
-  requires the tested Postgres World setup in
-  [deploy.md](deploy.md#durable-state-postgres-world).
+- Container-local disk survives sleep via filesystem snapshots but resets on
+  image updates. Production durability requires the tested Postgres World setup
+  in [deploy.md](deploy.md#durable-state-postgres-world).
 
 ## Cleanup
 

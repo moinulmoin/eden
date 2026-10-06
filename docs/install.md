@@ -33,19 +33,19 @@ Choose one installer.
 ### npm
 
 ```sh
-npm install --global @moinulmoin/eden@0.5.0
+npm install --global @moinulmoin/eden@0.6.0
 ```
 
 ### pnpm
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.5.0
+pnpm add --global @moinulmoin/eden@0.6.0
 ```
 
 ### Bun
 
 ```sh
-bun add --global @moinulmoin/eden@0.5.0
+bun add --global @moinulmoin/eden@0.6.0
 ```
 
 Bun is an installer only. Do not run Eden with `bunx --bun`.
@@ -59,18 +59,18 @@ eden --help
 The help output must list `preflight`, `deploy`, and `destroy`.
 
 ## Authenticate with Cloudflare
-Deploying to Cloudflare uses Wrangler `4.120.0`. The account must be on the
+Deploying to Cloudflare uses Wrangler `4.147.0`. The account must be on the
 Workers Paid plan, which Cloudflare Containers requires. Authenticate the
 Cloudflare account that owns the target Workers:
 
 ```sh
-npx wrangler@4.120.0 login
+npx wrangler@4.147.0 login
 ```
 
 Confirm the selected account:
 
 ```sh
-npx wrangler@4.120.0 whoami
+npx wrangler@4.147.0 whoami
 ```
 
 Review the returned account before deploying. Eden never selects a different

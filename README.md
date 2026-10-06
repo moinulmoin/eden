@@ -16,19 +16,19 @@ its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.5.0
+npm install --global @moinulmoin/eden@0.6.0
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.5.0
+pnpm add --global @moinulmoin/eden@0.6.0
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.5.0
+bun add --global @moinulmoin/eden@0.6.0
 ```
 
 Confirm the installation:
@@ -49,7 +49,7 @@ the Eden runtime, so do not force the CLI through `bunx --bun`.
 - Wrangler authentication:
 
   ```sh
-  npx wrangler@4.120.0 login
+  npx wrangler@4.147.0 login
   ```
 
 - Docker or OrbStack with Linux/amd64 container support
@@ -136,16 +136,16 @@ The Eve project remains responsible for its:
 
 ### Limits
 
-- Container disk and process memory are wiped when the Container sleeps;
-  Eve's default local Workflow World loses state, and Eden warns about it.
-  Durable state takes three steps with the Postgres World (any direct,
-  unpooled Postgres); see
+- Container disk survives sleep (Eden snapshots the filesystem and restores
+  it on wake) but not image updates; process-local World state is not durable
+  across an update, and Eden warns about it. Durable state takes three steps
+  with the Postgres World (any direct, unpooled Postgres); see
   [docs/deploy.md](docs/deploy.md#durable-state-postgres-world).
 - Schedules with standard 5-field cron fire while the Container sleeps (a
   Cloudflare Cron Trigger wakes it); others only run while it is awake. See
   [docs/deploy.md](docs/deploy.md#schedules).
-- One logical Container instance (`basic`, 1 GiB); no horizontal scaling or
-  custom domains in this release.
+- One logical Container instance (`standard-1`: 1/2 vCPU, 4 GiB); no
+  horizontal scaling or custom domains in this release.
 
 ## Commands
 

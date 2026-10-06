@@ -13,11 +13,5 @@ export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
     maxWorkers: 1,
-    fileParallelism: false,
-    server: {
-      deps: {
-        inline: ["@cloudflare/containers"],
-      },
-    },
   },
 });

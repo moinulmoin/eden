@@ -43,7 +43,7 @@ const origin: string = resolveStableWorkersDevOrigin({
 const config: EveHostConfig = createEveHostConfig({
   workerName: "eden-eve-preview",
   containerApplicationName: "eden-eve-preview-container",
-  containerClassName: "EveHostContainer",
+  containerClassName: "EveHostDurableContainer",
   containerBindingName: "EVE_CONTAINER",
   stableContainerInstanceName: "eden-eve-preview-instance",
   deploymentId: "dep-public",
@@ -100,19 +100,11 @@ test("public declarations do not re-export internal Worker implementation module
     await readFile(join(runtimeRoot, "package.json"), "utf8"),
   );
   const rootDeclaration = await readFile(join(runtimeDist, "index.d.ts"), "utf8");
-  const hostRuntimeDeclaration = await readFile(
-    join(runtimeDist, "eve-host-runtime.d.ts"),
-    "utf8",
-  );
 
   expect(Object.keys(packageJson.exports)).toEqual(["."]);
   expect(rootDeclaration).not.toMatch(
     /eve-host-runtime|@cloudflare\/containers|cloudflare:workers|DurableObject/,
   );
-  expect(hostRuntimeDeclaration).not.toMatch(
-    /from ["'](?:@cloudflare\/workers-types|cloudflare:workers)["']/u,
-  );
-  expect(hostRuntimeDeclaration).not.toMatch(/SqlStorage|\bDurableObject\b/u);
 
   const require = createRequire(import.meta.url);
   for (const subpath of ["eve-host-runtime", "eve-host"]) {

@@ -11,8 +11,9 @@ Start with [installation and account setup](./install.md).
 
 Eden runs the project's own `eve build`, starts the official project-local
 `eve start --host 0.0.0.0 --port 8080` supervisor inside one bounded Cloudflare
-Container (`instance_type: "basic"`, `max_instances: 1`), and routes the
-public surface through one generic Worker.
+Container (a `standard-1` instance: 1/2 vCPU, 4 GiB) attached to the Worker's
+Durable Object (`scheduling_policy: "durable_object"`), and routes the public
+surface through one generic Worker.
 
 Eden owns build orchestration, packaging, publication, deployment identity, and
 exact cleanup. Eve remains the application and workflow authority.
@@ -22,7 +23,7 @@ exact cleanup. Eve remains the application and workflow authority.
 Before deploying, confirm:
 
 - `eden --help` starts successfully.
-- `npx wrangler@4.120.0 whoami` shows the intended Cloudflare account on the
+- `npx wrangler@4.147.0 whoami` shows the intended Cloudflare account on the
   Workers Paid plan, which Containers requires.
 - Docker or OrbStack is running with Linux/amd64 support.
 - The selected Eve root contains `package.json` and `pnpm-lock.yaml`.
@@ -156,11 +157,13 @@ update instead of failing with `VAL-CLI-007-TARGET-CONFLICT`:
    application. Durable Object classes and their migration history are kept
    (new migration tags are only appended), so state stored in the Cloudflare
    World survives.
-3. The running Container restarts on the new image. Durable Object-managed
-   Containers don't take part in Cloudflare's application-wide rollouts, so
-   Eden's Worker detects the new deployment and restarts the instance itself.
+3. The running Container restarts on the new image. The image is selected at
+   container start, so Eden compares the running image against the new
+   deployment's and stops the instance itself when it still serves the
+   previous image; workspace files do not carry across an update.
 4. It health-checks the public URL, promotes the new generation, then deletes
-   the previous generation's registry image.
+   the previous generation's registry repository (every tag, including
+   snapshot tags).
 
 The summary prints `✓ updated <name>` (in `--json`, `deployment.operation` is
 `update`). A target that exists but isn't provably Eden's still fails with
@@ -200,7 +203,7 @@ every generation the ownership records prove this exact target pushed,
 including images retained by aborted pushes, then verifies each ref is gone.
 Any image left behind is reported in the destroy output with its exact
 `repository:tag` ref; remove only the listed refs with
-`npx wrangler@4.120.0 containers images delete <repository:tag>` and never
+`npx wrangler@4.147.0 containers images delete <repository:tag>` and never
 filter by prefix.
 
 After a healthy deployment is promoted, `deploy` also verifies and removes its
@@ -221,8 +224,8 @@ Also compare the Cloudflare Workers list and the Container inventory before and
 after the run:
 
 ```sh
-npx wrangler@4.120.0 containers list
-npx wrangler@4.120.0 containers images list
+npx wrangler@4.147.0 containers list
+npx wrangler@4.147.0 containers images list
 ```
 
 Require zero new Worker, Container, or managed-registry image residue
@@ -263,17 +266,21 @@ HTTPS self-origin delivery trusts Cloudflare's runtime-mounted Containers CA.
 callback URLs.
 
 A preview deployment that boots Eve's local Workflow World proves health,
-startup, and fresh request handling only. Container-local disk and process
-memory are wiped when the Container sleeps: a sleep or restart reinitializes
-local World state. Schedules still fire while the Container sleeps (see
-"Schedules" below).
+startup, and fresh request handling only. Container-local disk now survives
+sleep — when the Container has been idle for the sleep window, Eden snapshots
+the writable filesystem and stops the instance, and the next request restores
+that snapshot — but a restart after an image update starts fresh, so local
+World state still reinitializes across an update. Snapshots expire after 30
+idle days. Schedules still fire while the Container sleeps (see "Schedules"
+below). Durable Object memory always survives sleep and restarts.
 
 Production durability requires a project-configured, Cloudflare-reachable,
 durable Eve-compatible Workflow World such as Postgres (for example
 `@workflow/world-postgres`). See
 [Durable state (Postgres World)](#durable-state-postgres-world) for the exact
-tested setup. This release runs one logical Container instance
-and does not promise horizontal scaling or custom domains.
+tested setup. This release runs one `standard-1` Container instance
+(1/2 vCPU, 4 GiB; awake time is billed at 4 GiB, asleep costs nothing) and
+does not promise horizontal scaling or custom domains.
 
 ## Schedules
 
@@ -320,26 +327,26 @@ return 404.
 `eden destroy` permanently deletes this state along with the Worker. It is not
 a restart mechanism: preserve the Worker and Durable Object when restarting a
 Container. Cloudflare's [Worker deletion contract](https://developers.cloudflare.com/api/typescript/resources/workers/subresources/scripts/methods/delete/)
-deletes the Worker's Durable Object namespaces; no `deleted_classes` migration
-is needed when deleting the whole Worker.
+deletes the Worker's Durable Object namespaces when deleting the whole Worker.
 
 **Updates keep this state.** Running `eden deploy` again on a target Eden owns
 updates it in place (see [Updating an agent](#updating-an-agent)): the same
 Worker and Durable Object, so stored sessions and pending approvals survive.
 Only `eden destroy` deletes them.
 
-**Not yet verified: automatic sleep.** In the live test, a Container using
-this World was still running 45 seconds after its last client disconnected,
-with a 30-second sleep setting. Durability across a real Container restart is
-proven; whether and when the Container auto-sleeps with this World is not.
-Budget for an always-on Container (about $12/month at Cloudflare's published
-rates) until this is confirmed.
+**Sleep is snapshot-based.** With this World the container's idle sleep is
+driven by a Durable Object alarm: after the sleep window, Eden snapshots the
+container's filesystem, stops the instance, and restores the snapshot on the
+next request. Memory survives sleep and restarts; the 30-second-sleep live
+test left the container running 45 seconds after its last client, so budget
+for short awake tails after idle.
 
 ## Durable state (Postgres World)
 
-Container-local disk and process memory are wiped whenever the Container
-sleeps or is replaced, so Eve's default local Workflow World loses pending
-approvals and in-flight sessions. Eden has tested the Postgres World
+Container-local disk survives sleep via snapshots but not image updates
+(an update restarts the container fresh), so Eve's default local Workflow
+World still loses pending approvals and in-flight sessions across a
+redeploy. Eden has tested the Postgres World
 (`@workflow/world-postgres`) end to end: a pending tool approval survived a
 full `eden destroy` + `eden deploy` container replacement. This section is
 the tested recipe; other durable Worlds are project-owned and untested here.
@@ -430,7 +437,7 @@ hangs with headers only, the URL is pooled — fix step 3.
 | `eden` is not found | Follow the PATH section in [Install Eden](./install.md). |
 | Project or lockfile validation fails | Confirm the selected root, exact pnpm `packageManager`, root lockfile, frozen install, and project-local Eve executable. |
 | Docker build cannot start | Start Docker or OrbStack and verify Linux/amd64 support with `docker version`. |
-| Cloudflare account or origin resolution fails | Run `npx wrangler@4.120.0 whoami` and confirm the intended account and workers.dev subdomain. |
+| Cloudflare account or origin resolution fails | Run `npx wrangler@4.147.0 whoami` and confirm the intended account and workers.dev subdomain. |
 | Health never reaches ready | Inspect the Eve project's provider, Workflow World, and startup requirements; Eden does not replace them. |
 | Destroy refuses cleanup | Preserve the target records and inspect the reported ownership or identity mismatch. Never broaden deletion by prefix. |
 

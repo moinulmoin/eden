@@ -124,7 +124,7 @@ Eve works with any AI SDK provider, and so does Eden:
 1. **Node 24.17 or newer**, on macOS or Linux.
 2. **Docker or OrbStack** that can build `linux/amd64` images.
 3. **A Cloudflare account on the Workers Paid plan ($5/month).** Cloudflare Containers aren't available on the free plan.
-4. **Wrangler login:** `npx wrangler@4.120.0 login`.
+4. **Wrangler login:** `npx wrangler@4.147.0 login`.
 5. **An Eve project using pnpm**, with an exact `packageManager: "pnpm@..."` entry and its `pnpm-lock.yaml`.
 6. **`just-bash` as a dependency** (`pnpm add just-bash`). Eve's default sandbox needs it on Cloudflare, and `eve init` doesn't add it.
 
@@ -150,14 +150,15 @@ Run `eden deploy` again. Eden recognises a deployment it owns and updates it in 
 Eden is free and open source (Apache-2.0). You pay Cloudflare directly, on your own account:
 
 - **Workers Paid:** $5/month, which includes some Container usage.
-- **Container time:** billed only while the container runs. At Cloudflare's published rates (checked September 2026), a `basic` container running all month comes to about $12/month including the $5 plan, plus CPU used. Eden lets the container sleep after 24 hours without requests, and it wakes on the next request. Each scheduled run also wakes it, so an agent with daily or more frequent schedules is effectively always on.
+- **Container time:** billed only while the container runs, at the 4 GiB rate (a `standard-1` container: 1/2 vCPU, 4 GiB); a sleeping container costs nothing. At Cloudflare's published rates (checked September 2026), a container running all month comes to roughly $12–15/month including the $5 plan, plus CPU used. Eden lets the container sleep after 24 hours without requests, and it wakes on the next request. Each scheduled run also wakes it, so an agent with daily or more frequent schedules is effectively always on.
 - **Your model usage** goes to your model provider, with your key.
 
 ---
 
 ## Honest limits
 
-- **Container disk is wiped on sleep.** Memory survives only with the Postgres World (three steps, above). Without it, Eden warns you on every deploy.
+- **Container files survive sleep, not updates.** Eden snapshots the container's filesystem when it sleeps and restores it on wake, so your agent's files come back. A redeploy that changes the image starts the container fresh, so process-local Workflow World state still needs the Postgres World (three steps, above). Without it, Eden warns you on every deploy.
+- **Snapshots expire after 30 idle days.** An agent woken after a month asleep starts with the image's filesystem, not the snapshot.
 - **Schedules use standard 5-field cron.** Those fire on time even while the container sleeps. Schedules with a seconds field or shortcuts like `@daily` only run while it's awake, and Eden warns about them.
 - **The agent's bash is simulated.** Inside a Cloudflare Container, Eve's default sandbox uses `just-bash`, a simulated shell with a virtual filesystem, not a full Linux VM. Agents that need real tools such as `python` or `git` in their sandbox aren't a fit yet.
 - **One container instance per deployment.** No automatic scaling.

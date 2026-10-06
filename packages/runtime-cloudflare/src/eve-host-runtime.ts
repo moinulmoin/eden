@@ -1,4 +1,4 @@
-import { Container, ContainerProxy } from "@cloudflare/containers";
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { WorldCore } from "@moinulmoin/eden-world-cloudflare/core";
 
 import {
@@ -22,14 +22,92 @@ import {
   type EveReadinessGate,
 } from "./eve-host.js";
 
-export { ContainerProxy };
-
 const EVE_CLOUDFLARE_CONTAINERS_CA_PATH =
   "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
 
+/**
+ * The native `ctx.container` surface under `scheduling_policy:
+ * "durable_object"`. Declared structurally so the emitted declarations never
+ * depend on a specific `@cloudflare/workers-types` revision.
+ */
+interface EveContainerPort {
+  fetch(request: Request): Promise<Response>;
+}
+
+interface EveContainerRuntime {
+  readonly running: boolean;
+  readonly images: Record<string, string | undefined>;
+  start(options: {
+    readonly image?: string;
+    readonly containerSnapshot?: { readonly id: string };
+    readonly instance: string;
+    readonly enableInternet: boolean;
+    readonly env: Record<string, string>;
+  }): void;
+  monitor(): Promise<void>;
+  destroy(error?: unknown): Promise<void>;
+  inspect(): Promise<{ readonly image?: string } | null>;
+  snapshotContainer(options: {
+    readonly name: string;
+  }): Promise<{ readonly id: string }>;
+  setInactivityTimeout(ms: number): Promise<void> | void;
+  interceptOutboundHttps(hostname: string, entrypoint: unknown): Promise<void> | void;
+  getTcpPort(port: number): EveContainerPort;
+}
+
+interface EveContainerContext {
+  readonly container?: EveContainerRuntime | undefined;
+  readonly storage: {
+    get<T>(key: string): Promise<T | undefined> | T | undefined;
+    put(key: string, value: unknown): Promise<void> | void;
+    setAlarm(ms: number): Promise<void> | void;
+    sql?: { exec(query: string): unknown };
+    transactionSync?(callback: () => void): unknown;
+  };
+  readonly exports?: Record<string, unknown> | undefined;
+  blockConcurrencyWhile(callback: () => Promise<void>): void | Promise<void>;
+}
+
+/** Durable Object storage keys owned by `EveHostDurableContainer`. */
+const EVE_HOST_CONTAINER_ACTIVITY_KEY =
+  "eden.eve.host.last-activity-at";
+const EVE_HOST_CONTAINER_SNAPSHOT_KEY =
+  "eden.eve.host.workspace-snapshot";
+const EVE_HOST_CONTAINER_SNAPSHOT_ATTEMPTS_KEY =
+  "eden.eve.host.snapshot-attempts";
+
+/** Snapshot attempts the alarm retries before destroying anyway so a stuck
+ * snapshot path never keeps billing alive forever. */
+const EVE_HOST_SNAPSHOT_MAX_ATTEMPTS = 3;
+
+interface EveStoredContainerSnapshot {
+  readonly id: string;
+  readonly image: string;
+  readonly at: number;
+}
+
+/** Parses the `sleepAfter` duration spellings wrangler accepts ("300ms",
+ * "30s", "15m", "24h", "7d", or a bare number of seconds). */
+function sleepAfterDurationMs(value: string): number | undefined {
+  const match = /^([0-9]+)(ms|s|m|h|d)?$/u.exec(value.trim());
+  if (match === null) return undefined;
+  const amount = Number.parseInt(match[1] ?? "", 10);
+  const unit = match[2] ?? "s";
+  const factor = unit === "ms"
+    ? 1
+    : unit === "s"
+      ? 1_000
+      : unit === "m"
+        ? 60_000
+        : unit === "h"
+          ? 3_600_000
+          : 86_400_000;
+  return amount * factor;
+}
+
 interface EveContainerLoopbackNamespace {
   getByName(name: string): {
-    containerFetch(request: Request, port?: number): Promise<Response>;
+    loopbackFetch(request: Request): Promise<Response>;
   };
 }
 
@@ -57,7 +135,7 @@ export class EdenWorldDurableObject {
             throw new Error("The World queue Container identity is unavailable.");
           }
           const namespace = env[binding] as EveContainerLoopbackNamespace;
-          const response = await namespace.getByName(instance).containerFetch(
+          const response = await namespace.getByName(instance).loopbackFetch(
             new Request(new URL(`/.well-known/workflow/v1/${message.path}`, origin), {
               method: "POST",
               headers: {
@@ -69,7 +147,6 @@ export class EdenWorldDurableObject {
               },
               body: message.body as Uint8Array<ArrayBuffer>,
             }),
-            EVE_HOST_DEFAULTS.internalPort,
           );
           // Body transport errors must remain retryable; an HTTP status alone
           // is not an acknowledgement of a streamed Container response.
@@ -107,13 +184,16 @@ export class EdenWorldDurableObject {
 }
 
 /**
- * Delivers the container's own HTTPS requests to its public workers.dev origin
- * back into the container over the internal port instead of the public edge.
- * The Workflow local World posts queue deliveries to
- * `WORKFLOW_LOCAL_BASE_URL`, which must remain the public origin so Eve's
- * externally visible callback URLs stay correct; re-routing that traffic
- * inside the Worker lets the public Worker path refuse the unauthenticated
- * queue endpoints without breaking delivery.
+ * Delivers the container's own HTTPS requests to its public workers.dev
+ * origin back into the deployment without crossing the public edge. The
+ * Workflow local World posts queue deliveries to `WORKFLOW_LOCAL_BASE_URL`,
+ * which must remain the public origin so Eve's externally visible callback
+ * URLs stay correct; the DO registers an outbound-HTTPS intercept for that
+ * hostname aimed at `EveHostLoopback`, and this function routes the request:
+ * non-public hosts egress plainly, `/__eden/world/rpc` reaches the World
+ * Durable Object, and everything else re-enters the container over the
+ * internal port so the public Worker path can keep refusing the
+ * unauthenticated queue endpoints.
  */
 export async function routeEveOutboundRequest(
   request: Request,
@@ -156,9 +236,7 @@ export async function routeEveOutboundRequest(
       "The configured Container binding is unavailable to the outbound handler.",
     );
   }
-  return namespace
-    .getByName(instanceName)
-    .containerFetch(request, EVE_HOST_DEFAULTS.internalPort);
+  return namespace.getByName(instanceName).loopbackFetch(request);
 }
 
 /**
@@ -168,53 +246,45 @@ export async function routeEveOutboundRequest(
  * `cloudflare:workers`-dependent code.
  */
 
-type EveHostContainerContext = ConstructorParameters<typeof Container>[0];
-
 /**
- * Durable Object storage key recording which deployment last started the
- * Container. Cloudflare does not roll DO-managed Container instances onto a
- * new image when the Worker redeploys — the image is selected at
- * `ctx.container.start()` — so an in-place update must restart the running
- * instance itself before new code is served.
+ * The WorkerEntrypoint the container's intercepted outbound HTTPS traffic is
+ * delivered to (registered by `EveHostDurableContainer` right after every
+ * `ctx.container.start()`). Props carry the DO instance name because
+ * entrypoint props cannot hold a Fetcher.
  */
-const EVE_HOST_CONTAINER_DEPLOYMENT_KEY =
-  "eden.eve.host.started-deployment";
-
-/** Restart attempts are rate-limited under this key: during the
- * Worker-active-before-image-rollout window a restart still launches the old
- * image, so retries must wait for the rollout. */
-const EVE_HOST_CONTAINER_RESTART_ATTEMPT_KEY =
-  "eden.eve.host.restart-attempted-at";
-
-/** Compares image references by their generation-scoped repository name so
- * digest and tag spellings of the same pushed image match. */
-function containerRepositoryName(image: string): string {
-  return (image.split("@")[0] ?? "").split(":")[0] ?? "";
+export class EveHostLoopback extends WorkerEntrypoint<EveHostContainerEnvironment> {
+  override async fetch(request: Request): Promise<Response> {
+    return routeEveOutboundRequest(request, this.env);
+  }
 }
 
-
-export class EveHostContainer extends Container<EveHostContainerEnvironment> {
-  override defaultPort = EVE_HOST_DEFAULTS.internalPort;
-  override sleepAfter: string | number = EVE_HOST_DEFAULTS.sleepAfter;
-  override requiredPorts = [EVE_HOST_DEFAULTS.internalPort];
-  override interceptHttps = true;
-  override enableInternet = true;
-  override pingEndpoint = "localhost/eve/v1/health";
+/**
+ * The Eve host Durable Object. It drives `ctx.container` directly: the
+ * image is selected at `start()` from this Worker version's `images.eve`
+ * entry, the writable filesystem is preserved across sleep via a container
+ * snapshot, and an update restarts the instance when `inspect()` shows the
+ * running image predates the configured one.
+ */
+export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvironment> {
   readonly lifecycle = createEveHostLifecycleObserver();
   private readinessStarted = false;
-  /** Evidence is cached only under the deployment whose image was verified. */
-  private readinessEvidence:
-    | { readonly deploymentId: string | undefined; readonly evidence: EveHostReadinessEvidence }
-    | undefined;
+  /** Evidence is cached only while the container it was proven on keeps running. */
+  private readinessEvidence: EveHostReadinessEvidence | undefined;
+  /** True once the running container's image was proven to equal `images.eve`. */
+  private imageVerified = false;
   /**
    * Bumped whenever the Container stops or is reset. Readiness work captures
-   * the epoch it started under and may only record a marker or cache
-   * evidence if no stop happened in between.
+   * the epoch it started under and may only cache evidence if no stop
+   * happened in between.
    */
   private readinessEpoch = 0;
+  private monitorAttached = false;
+  private readonly envVars: Record<string, string>;
+  private readonly sleepAfterMs: number;
   private readonly readiness: EveReadinessGate;
+
   constructor(
-    ctx: EveHostContainerContext,
+    ctx: DurableObjectState,
     env: EveHostContainerEnvironment,
   ) {
     super(ctx, env);
@@ -258,160 +328,191 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
         : { EDEN_EVE_RUNTIME_REVISION: env.EDEN_EVE_RUNTIME_REVISION }),
     };
     const sleepAfterOverride = env.EDEN_EVE_CONTAINER_SLEEP_AFTER;
-    if (sleepAfterOverride !== undefined) {
-      // `env` is only readable after `super()`, so the override is applied in
-      // the constructor body; the base class reads `this.sleepAfter` again on
-      // every subsequent activity renewal.
-      this.sleepAfter = sleepAfterOverride;
-    }
+    this.sleepAfterMs =
+      sleepAfterOverride === undefined
+        ? sleepAfterDurationMs(EVE_HOST_DEFAULTS.sleepAfter) ?? 86_400_000
+        : sleepAfterDurationMs(sleepAfterOverride) ??
+          (() => {
+            throw new EveHostError(
+              "HOST_READINESS_UNPROVEN",
+              "The Container sleepAfter override is not a parseable duration.",
+            );
+          })();
     this.readiness = createEveReadinessGate({
-      startAndWaitForPorts: (options) =>
-        this.startAndWaitForPorts(options),
-      healthFetch: (request) =>
-        this.containerFetch(request, EVE_HOST_DEFAULTS.internalPort),
+      start: async () => {
+        await this.ensureContainerStarted();
+      },
+      healthFetch: (request) => {
+        const container = this.containerRuntime();
+        if (container === undefined) {
+          throw new EveHostError(
+            "HOST_READINESS_UNPROVEN",
+            "The Container runtime is unavailable.",
+          );
+        }
+        const url = new URL(request.url);
+        return container
+          .getTcpPort(EVE_HOST_DEFAULTS.internalPort)
+          .fetch(
+            new Request(`http://container${url.pathname}${url.search}`, request),
+          );
+      },
     });
+    const runtime = this.containerRuntime();
+    if (runtime?.running === true) {
+      // DO restarts lose the inactivity timeout; the monitor for this
+      // container generation is also gone, so both are re-attached here.
+      this.ctx.blockConcurrencyWhile(async () => {
+        await runtime.setInactivityTimeout(this.inactivityTimeoutMs);
+        this.attachMonitor(runtime);
+      });
+    }
   }
 
-  /**
-   * Compares the deployment the running Container was started under (stored
-   * in Durable Object storage, which survives Worker redeploys) against the
-   * deployment the *current* Worker stamps on the forwarded request. A
-   * stale Durable Object still detects the update because the header is
-   * stamped by new Worker code, not this code's environment.
-   *
-   * DO-managed Container instances are excluded from the application's fleet
-   * rollout — the image is only re-selected on the next
-   * `ctx.container.start()` — so an update must stop the instance itself.
-   * A missing marker means the running image cannot be trusted, so the
-   * container is restarted too (first update from runtimes that predate the
-   * marker). Restarts are rate-limited because Cloudflare activates a new
-   * Worker before the image rollout lands; starting in that window would
-   * re-launch the *old* image, so the deployment marker is only recorded
-   * after `inspect()` proves the running image is the expected one.
-   */
-  private async reconcileStartedDeployment(
-    requestDeploymentId: string | undefined,
-    requestImage: string | undefined,
-  ): Promise<void> {
-    // Requests without the Worker's deployment header (scheduled wakes on old
-    // Worker code, probes) cannot arbitrate drift; the Durable Object's own
-    // environment may itself be stale, so never fall back to it here.
-    if (requestDeploymentId === undefined) return;
-    const storage = this.ctx?.storage;
-    if (
-      storage === undefined ||
-      typeof storage.get !== "function" ||
-      typeof storage.put !== "function"
-    ) {
-      return;
-    }
-    const lastStarted = await storage.get<string>(
-      EVE_HOST_CONTAINER_DEPLOYMENT_KEY,
+  private containerRuntime(): EveContainerRuntime | undefined {
+    return (this.ctx as EveContainerContext).container;
+  }
+
+  /** Container lifetime the platform keeps after the DO goes inactive. */
+  private get inactivityTimeoutMs(): number {
+    return this.sleepAfterMs + 15 * 60_000;
+  }
+
+  private attachMonitor(runtime: EveContainerRuntime): void {
+    if (this.monitorAttached) return;
+    this.monitorAttached = true;
+    runtime.monitor().then(
+      () => {
+        this.monitorAttached = false;
+        this.recordContainerStopped("exit");
+      },
+      (error: unknown) => {
+        this.monitorAttached = false;
+        this.recordContainerStopped(
+          error instanceof Error ? error.name : "runtime_signal",
+        );
+      },
     );
-    if (lastStarted === requestDeploymentId) return;
-    const runtime = this.ctx?.container;
-    if (runtime?.running !== true) return;
-    if (
-      requestImage !== undefined &&
-      (await this.containerServesImage(runtime, requestImage)) === true
-    ) {
-      // The running instance already provably serves this deployment's image
-      // (e.g. the rollout replaced it); safe to mark it as started.
-      await storage.put(EVE_HOST_CONTAINER_DEPLOYMENT_KEY, requestDeploymentId);
-      return;
-    }
-    const attemptedAt = await storage.get<number>(
-      EVE_HOST_CONTAINER_RESTART_ATTEMPT_KEY,
-    );
-    const now = Date.now();
-    if (attemptedAt !== undefined && now - attemptedAt < 30_000) return;
-    await storage.put(EVE_HOST_CONTAINER_RESTART_ATTEMPT_KEY, now);
-    this.lifecycle.record("replaced");
+  }
+
+  private recordContainerStopped(reason: string): void {
     this.readinessEpoch += 1;
     this.readinessStarted = false;
     this.readinessEvidence = undefined;
+    this.imageVerified = false;
     this.readiness.reset();
-    await this.stop();
+    this.lifecycle.record("stopped", reason);
+  }
+
+  /** Routes the container's own requests to its public origin back inside. */
+  private async registerLoopbackIntercept(
+    runtime: EveContainerRuntime,
+  ): Promise<void> {
+    const exportsMap = (this.ctx as EveContainerContext).exports;
+    const entryFactory = exportsMap?.["EveHostLoopback"];
+    if (typeof entryFactory !== "function") return;
+    const entrypoint = (
+      entryFactory as (options: {
+        props: Record<string, string>;
+      }) => unknown
+    )({ props: {} });
+    await runtime.interceptOutboundHttps(
+      new URL(this.env.EVE_PUBLIC_ORIGIN ?? "").hostname,
+      entrypoint,
+    );
+  }
+
+  /**
+   * Records request activity and arms the sleep alarm at
+   * `lastActivityAt + sleepAfter`. The alarm — not the inactivity timeout —
+   * is what snapshots the writable filesystem before the container stops.
+   */
+  private async touchActivity(): Promise<void> {
+    const now = Date.now();
+    await this.ctx.storage.put(EVE_HOST_CONTAINER_ACTIVITY_KEY, now);
+    await this.ctx.storage.setAlarm(now + this.sleepAfterMs);
+  }
+
+  /**
+   * Starts the container when it is not running. A stored workspace snapshot
+   * is restored only when it was captured from the exact image this Worker
+   * version configures — restoring an older snapshot silently runs the
+   * previous image — so after an image update the container starts fresh and
+   * workspace files intentionally do not carry across.
+   */
+  private async ensureContainerStarted(): Promise<void> {
+    const runtime = this.containerRuntime();
+    if (runtime === undefined) {
+      throw new EveHostError(
+        "HOST_READINESS_UNPROVEN",
+        "The Container runtime is unavailable on this Durable Object.",
+      );
+    }
+    if (runtime.running) return;
+    const expectedImage = runtime.images["eve"];
+    if (expectedImage === undefined) {
+      throw new EveHostError(
+        "HOST_READINESS_UNPROVEN",
+        "The configured Container image is unavailable to this Worker version.",
+      );
+    }
+    const storedSnapshot = await this.ctx.storage.get<EveStoredContainerSnapshot>(
+      EVE_HOST_CONTAINER_SNAPSHOT_KEY,
+    );
+    if (this.lifecycle.events.some((event) => event.type === "started")) {
+      this.lifecycle.record("replaced");
+    }
+    runtime.start({
+      ...(storedSnapshot !== undefined && storedSnapshot.image === expectedImage
+        ? { containerSnapshot: { id: storedSnapshot.id } }
+        : { image: expectedImage }),
+      instance: EVE_HOST_DEFAULTS.instance,
+      enableInternet: true,
+      env: this.envVars,
+    });
+    // Intercepts do not survive a container start and late registration lags;
+    // register inside the same block before readiness polling.
+    await this.registerLoopbackIntercept(runtime);
+    this.attachMonitor(runtime);
+    await runtime.setInactivityTimeout(this.inactivityTimeoutMs);
+    this.lifecycle.record("started");
+  }
+
+  /**
+   * Replaces the running container when `inspect()` proves it still serves a
+   * pre-update image: this Worker version's `images.eve` is selected at
+   * `start()`, so an in-place update must stop the stale instance itself.
+   */
+  private async reconcileRunningImage(): Promise<void> {
+    if (this.imageVerified) return;
+    const runtime = this.containerRuntime();
+    if (runtime === undefined || !runtime.running) return;
+    const expectedImage = runtime.images["eve"];
+    let info: { readonly image?: string } | null;
+    try {
+      info = await runtime.inspect();
+    } catch {
+      info = null;
+    }
+    if (info?.image === expectedImage) {
+      this.imageVerified = true;
+      return;
+    }
+    this.lifecycle.record("image_mismatch");
+    this.recordContainerStopped("replaced");
+    await runtime.destroy();
     const stoppedAt = Date.now();
     while (runtime.running && Date.now() - stoppedAt < 10_000) {
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
   }
 
-  private async containerServesImage(
-    runtime: { readonly running: boolean },
-    expectedImage: string,
-  ): Promise<boolean | undefined> {
-    const inspect = (
-      runtime as {
-        inspect?: () => Promise<{ readonly image?: string } | null>;
-      }
-    ).inspect;
-    if (typeof inspect !== "function") return undefined;
-    let info: { readonly image?: string } | null;
-    try {
-      info = await inspect.call(runtime);
-    } catch {
-      return undefined;
-    }
-    if (info?.image === undefined) return undefined;
-    return containerRepositoryName(info.image) ===
-      containerRepositoryName(expectedImage);
-  }
-
-  /**
-   * Records the started deployment only when the running Container provably
-   * serves this deployment's image (`inspect()` matches the forwarded
-   * `x-eden-eve-image`). `false` or unknown (no `inspect`, a throwing call,
-   * or no image field) never records — a start inside the
-   * Worker-active-before-image-rollout window must not pin the old image.
-   * When the Worker stamps no image, the marker is recorded unverified,
-   * matching pre-drift behavior.
-   */
-  private async recordStartedDeployment(
-    requestDeploymentId: string | undefined,
-    requestImage: string | undefined,
-  ): Promise<boolean> {
-    if (requestDeploymentId === undefined) return true;
-    const storage = this.ctx?.storage;
-    if (
-      storage === undefined ||
-      typeof storage.get !== "function" ||
-      typeof storage.put !== "function"
-    ) {
-      return true;
-    }
-    const runtime = this.ctx?.container;
-    if (requestImage !== undefined) {
-      // A stopped (or stopping) instance can't prove which image it serves.
-      if (runtime?.running !== true) {
-        this.lifecycle.record("image_mismatch");
-        return false;
-      }
-      const verified = await this.containerServesImage(runtime, requestImage);
-      if (verified !== true) {
-        this.lifecycle.record("image_mismatch");
-        return false;
-      }
-    }
-    await storage.put(EVE_HOST_CONTAINER_DEPLOYMENT_KEY, requestDeploymentId);
-    return true;
-  }
-
-
   async ensureEveReady(
     signal: AbortSignal = new AbortController().signal,
-    requestDeploymentId?: string,
-    requestImage?: string,
   ): Promise<EveHostReadinessEvidence> {
-    await this.reconcileStartedDeployment(requestDeploymentId, requestImage);
-    // Cached evidence only serves the deployment it was verified under;
-    // a request for a different deployment re-runs readiness.
-    if (
-      this.readinessEvidence !== undefined &&
-      this.readinessEvidence.deploymentId === requestDeploymentId
-    ) {
-      return this.readinessEvidence.evidence;
+    await this.reconcileRunningImage();
+    if (this.readinessEvidence !== undefined) {
+      return this.readinessEvidence;
     }
     if (!this.readinessStarted) {
       this.readinessStarted = true;
@@ -419,15 +520,12 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
     }
     const epoch = this.readinessEpoch;
     const evidence = await this.readiness(signal);
-    if (
-      epoch === this.readinessEpoch &&
-      await this.recordStartedDeployment(requestDeploymentId, requestImage) &&
-      epoch === this.readinessEpoch
-    ) {
-      this.readinessEvidence = {
-        deploymentId: requestDeploymentId,
-        evidence,
-      };
+    if (epoch === this.readinessEpoch) {
+      this.readinessEvidence = evidence;
+      // Readiness under this Worker version proves the running container
+      // serves `images.eve`: it was either verified by inspect() or freshly
+      // started from the configured image above.
+      this.imageVerified = true;
     }
     this.lifecycle.record("health_ready", evidence.healthStatus);
     return evidence;
@@ -436,18 +534,31 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
   override async fetch(request: Request): Promise<Response> {
     const requestDeploymentId =
       request.headers.get("x-eden-eve-deployment-id") ?? undefined;
-    await this.ensureEveReady(
-      request.signal,
-      requestDeploymentId,
-      request.headers.get("x-eden-eve-image") ?? undefined,
-    );
-    const response = await super.fetch(request);
-    // Reporting the verified marker back lets deploy health-gate promotion on
-    // the served container actually running this generation's image.
+    await this.ensureEveReady(request.signal);
+    await this.touchActivity();
+    const runtime = this.containerRuntime();
+    if (runtime === undefined) {
+      throw new EveHostError(
+        "HOST_READINESS_UNPROVEN",
+        "The Container runtime is unavailable on this Durable Object.",
+      );
+    }
+    const url = new URL(request.url);
+    const response = await runtime
+      .getTcpPort(EVE_HOST_DEFAULTS.internalPort)
+      .fetch(
+        new Request(`http://container${url.pathname}${url.search}`, request),
+      );
+    // Reporting the verified start back lets deploy health-gate promotion on
+    // the served container actually running this generation's image: the
+    // header echoes only when the running container's image equals this
+    // Worker version's configured image and the request names this
+    // deployment.
     if (
+      requestDeploymentId !== undefined &&
+      requestDeploymentId === this.env.EDEN_EVE_DEPLOYMENT_ID &&
       this.readinessEvidence !== undefined &&
-      this.readinessEvidence.deploymentId === requestDeploymentId &&
-      requestDeploymentId !== undefined
+      this.imageVerified
     ) {
       const headers = new Headers(response.headers);
       headers.set("x-eden-eve-started-deployment", requestDeploymentId);
@@ -460,37 +571,100 @@ export class EveHostContainer extends Container<EveHostContainerEnvironment> {
     return response;
   }
 
-  override onStart(): void {
-    if (this.lifecycle.events.some((event) => event.type === "started")) {
-      this.lifecycle.record("replaced");
+  /**
+   * Queue deliveries and loopback traffic enter here: same readiness and
+   * forwarding as `fetch` without the deployment-header echo rules (the
+   * loopback path is not a deployment-health signal).
+   */
+  async loopbackFetch(request: Request): Promise<Response> {
+    await this.ensureEveReady(request.signal);
+    await this.touchActivity();
+    const runtime = this.containerRuntime();
+    if (runtime === undefined) {
+      throw new EveHostError(
+        "HOST_READINESS_UNPROVEN",
+        "The Container runtime is unavailable on this Durable Object.",
+      );
     }
-    this.lifecycle.record("started");
+    const url = new URL(request.url);
+    return runtime
+      .getTcpPort(EVE_HOST_DEFAULTS.internalPort)
+      .fetch(
+        new Request(`http://container${url.pathname}${url.search}`, request),
+      );
   }
 
-  override onStop(params: {
-    readonly exitCode: number;
-    readonly reason: "exit" | "runtime_signal";
-  }): void {
-    this.readinessEpoch += 1;
-    this.readinessStarted = false;
-    this.readinessEvidence = undefined;
-    this.readiness.reset();
-    this.lifecycle.record("stopped", `${params.reason}:${params.exitCode}`);
-  }
-
-  override onError(error: unknown): unknown {
-    this.readinessEpoch += 1;
-    this.readinessStarted = false;
-    this.readinessEvidence = undefined;
-    this.readiness.reset();
-    this.lifecycle.record(
-      "errored",
-      error instanceof Error ? error.name : "unknown",
-    );
-    throw new EveHostError(
-      "HOST_READINESS_UNPROVEN",
-      "The Eve Container supervisor reported an error.",
-    );
+  /**
+   * The idle-sleep path: once the container has been quiet for `sleepAfter`,
+   * snapshot the writable filesystem (so `/workspace` survives the sleep)
+   * and destroy the instance. A snapshot failure retries up to
+   * `EVE_HOST_SNAPSHOT_MAX_ATTEMPTS` times, then destroys anyway so billing
+   * for the running container stops.
+   */
+  override async alarm(): Promise<void> {
+    const runtime = this.containerRuntime();
+    const lastActivity =
+      (await this.ctx.storage.get<number>(EVE_HOST_CONTAINER_ACTIVITY_KEY)) ?? 0;
+    const now = Date.now();
+    if (now - lastActivity < this.sleepAfterMs) {
+      await this.ctx.storage.setAlarm(lastActivity + this.sleepAfterMs);
+      return;
+    }
+    if (runtime === undefined || !runtime.running) return;
+    const attempts =
+      (await this.ctx.storage.get<number>(
+        EVE_HOST_CONTAINER_SNAPSHOT_ATTEMPTS_KEY,
+      )) ?? 0;
+    try {
+      const snapshot = await runtime.snapshotContainer({
+        name: "eden-workspace",
+      });
+      const image = (await runtime.inspect().catch(() => null))?.image ??
+        runtime.images["eve"] ??
+        "";
+      const record: EveStoredContainerSnapshot = {
+        id: snapshot.id,
+        image,
+        at: now,
+      };
+      await this.ctx.storage.put(EVE_HOST_CONTAINER_SNAPSHOT_KEY, record);
+      await this.ctx.storage.put(EVE_HOST_CONTAINER_SNAPSHOT_ATTEMPTS_KEY, 0);
+      // The snapshot takes seconds and requests may interleave with it; a
+      // request that arrived meanwhile must not have its container destroyed
+      // underneath it. Keep running and re-arm sleep from that activity.
+      const activityAfterSnapshot =
+        (await this.ctx.storage.get<number>(EVE_HOST_CONTAINER_ACTIVITY_KEY)) ?? 0;
+      if (activityAfterSnapshot !== lastActivity) {
+        await this.ctx.storage.setAlarm(activityAfterSnapshot + this.sleepAfterMs);
+        return;
+      }
+      await runtime.destroy(new Error("idle-snapshot-done"));
+      this.recordContainerStopped("snapshot:idle");
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "unknown";
+      if (attempts + 1 >= EVE_HOST_SNAPSHOT_MAX_ATTEMPTS) {
+        console.error(
+          `The Eve workspace snapshot failed ${attempts + 1} times; destroying the container without it: ${message}`,
+        );
+        await this.ctx.storage.put(
+          EVE_HOST_CONTAINER_SNAPSHOT_ATTEMPTS_KEY,
+          0,
+        );
+        await runtime.destroy(
+          new Error("idle-snapshot-abandoned"),
+        );
+        this.recordContainerStopped("snapshot:abandoned");
+        return;
+      }
+      console.error(
+        `The Eve workspace snapshot failed (attempt ${attempts + 1}): ${message}`,
+      );
+      await this.ctx.storage.put(
+        EVE_HOST_CONTAINER_SNAPSHOT_ATTEMPTS_KEY,
+        attempts + 1,
+      );
+      await this.ctx.storage.setAlarm(now + 60_000);
+    }
   }
 }
 
@@ -564,9 +738,6 @@ export function createEveHostWorker(
         deploymentId: options.deploymentId,
         generationId: options.generationId,
         correlationId: globalThis.crypto.randomUUID(),
-        ...(options.containerImage === undefined
-          ? {}
-          : { containerImage: options.containerImage }),
         ...(options.runtimeRevisionHandle === undefined
           ? {}
           : { runtimeRevisionHandle: options.runtimeRevisionHandle }),
@@ -613,12 +784,8 @@ export function createEveHostWorker(
                   {
                     headers: {
                       // Stamp the Worker's own deployment so a stale Durable
-                      // Object never falls back to its own environment when
-                      // deciding whether to restart the running Container.
+                      // Object never falls back to its own environment.
                       "x-eden-eve-deployment-id": options.deploymentId,
-                      ...(options.containerImage === undefined
-                        ? {}
-                        : { "x-eden-eve-image": options.containerImage }),
                     },
                   },
                 ))

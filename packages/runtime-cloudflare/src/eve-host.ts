@@ -2,8 +2,7 @@ export const EVE_HOST_DEFAULTS = {
   compatibilityDate: "2026-04-01",
   healthPath: "/eve/v1/health",
   internalPort: 8080,
-  maxInstances: 1,
-  instanceType: "basic",
+  instance: "standard-1",
   sleepAfter: "24h",
 } as const;
 
@@ -228,7 +227,6 @@ export const EVE_HOST_OWNED_HEADERS = [
   "x-eden-eve-callback-base",
   "x-eden-eve-deployment-id",
   "x-eden-eve-generation-id",
-  "x-eden-eve-image",
   "x-eden-eve-started-deployment",
   "x-eden-eve-public-origin",
   "x-eden-eve-correlation-id",
@@ -320,8 +318,7 @@ export interface EveHostConfigRequest extends EveHostIdentity {
    * Durable Object state already published for this exact target. In-place
    * updates carry the recorded binding and migration history forward
    * verbatim: a class is only ever added once (`new_sqlite_classes` entries
-   * are append-only) and a class is never silently removed — a
-   * `deleted_classes` migration permanently destroys that class's data.
+   * are append-only) and a class is never removed.
    */
   readonly durableObjects?: {
     readonly bindings?: readonly EveDurableBinding[];
@@ -336,13 +333,13 @@ export interface EveDurableBinding {
 }
 
 /**
- * One `migrations` entry as it appears in wrangler config. Only the
- * `new_sqlite_classes` form Eden has ever emitted is modelled; entries are
- * compared by tag and carried forward verbatim across in-place updates.
+ * One `migrations` entry as it appears in wrangler config. Entries are
+ * compared by tag and carried forward verbatim across in-place updates;
+ * `new_sqlite_classes` declares a class.
  */
 export interface EveDurableMigration {
   readonly tag: string;
-  readonly new_sqlite_classes: readonly string[];
+  readonly new_sqlite_classes?: readonly string[];
 }
 
 export interface EveHostWranglerConfig {
@@ -350,6 +347,7 @@ export interface EveHostWranglerConfig {
   readonly name: string;
   readonly main: string;
   readonly compatibility_date: string;
+  readonly compatibility_flags: readonly ["enable_ctx_exports"];
   readonly workers_dev: true;
   readonly vars: {
     readonly EVE_PUBLIC_ORIGIN: string;
@@ -367,10 +365,10 @@ export interface EveHostWranglerConfig {
     {
       readonly name: string;
       readonly class_name: string;
-      readonly image: string;
-      readonly image_build_context?: string;
-      readonly max_instances: 1;
-      readonly instance_type: "basic";
+      readonly scheduling_policy: "durable_object";
+      readonly images: {
+        readonly eve: { readonly image: string };
+      };
     },
   ];
   readonly durable_objects: {
@@ -529,26 +527,26 @@ export function createEveHostConfig(
   const container = {
     name: request.containerApplicationName,
     class_name: request.containerClassName,
-    image: request.containerImage,
-    ...(request.containerImageBuildContext === undefined
-      ? {}
-      : { image_build_context: request.containerImageBuildContext }),
-    max_instances: EVE_HOST_DEFAULTS.maxInstances,
-    instance_type: EVE_HOST_DEFAULTS.instanceType,
+    scheduling_policy: "durable_object",
+    images: { eve: { image: request.containerImage } },
   } as const;
   const worldCloudflare =
     request.workflowWorld === "@moinulmoin/eden-world-cloudflare";
   const priorMigrations: EveDurableMigration[] = [];
   for (const migration of request.durableObjects?.migrations ?? []) {
+    const validClassList = (
+      value: unknown,
+    ): value is readonly string[] =>
+      Array.isArray(value) &&
+      value.every(
+        (className) =>
+          typeof className === "string" &&
+          IDENTIFIER_PATTERN.test(className),
+      );
     if (
       typeof migration.tag !== "string" ||
       migration.tag.length === 0 ||
-      !Array.isArray(migration.new_sqlite_classes) ||
-      migration.new_sqlite_classes.some(
-        (className) =>
-          typeof className !== "string" ||
-          !IDENTIFIER_PATTERN.test(className),
-      )
+      !validClassList(migration.new_sqlite_classes)
     ) {
       throw new EveHostError(
         "HOST_READINESS_UNPROVEN",
@@ -589,7 +587,9 @@ export function createEveHostConfig(
     }
   }
   const declaredClasses = new Set(
-    priorMigrations.flatMap((migration) => migration.new_sqlite_classes),
+    priorMigrations.flatMap(
+      (migration) => migration.new_sqlite_classes ?? [],
+    ),
   );
   const newClasses = [
     ...new Set(bindings.map((binding) => binding.class_name)),
@@ -619,6 +619,7 @@ export function createEveHostConfig(
       name: request.workerName,
       main: "worker.ts",
       compatibility_date: EVE_HOST_DEFAULTS.compatibilityDate,
+      compatibility_flags: ["enable_ctx_exports"],
       workers_dev: true,
       vars: {
         EVE_PUBLIC_ORIGIN: request.stableWorkersDevOrigin,
@@ -671,7 +672,6 @@ export function generateEveHostWorkerSource(
     containerBindingName: request.config.container.bindingName,
     deploymentId: request.config.container.deploymentId,
     generationId: request.config.container.generationId,
-    containerImage: request.config.worker.containers[0].image,
     stableContainerInstanceName: request.config.container.instanceName,
     ...(request.config.container.runtimeRevisionHandle === undefined
       ? {}
@@ -683,23 +683,26 @@ export function generateEveHostWorkerSource(
       ? {}
       : { schedules: request.config.container.schedules }),
   };
+  const exportContainerClass =
+    request.config.container.className === "EveHostDurableContainer"
+      ? "export { EveHostDurableContainer };"
+      : `export { EveHostDurableContainer as ${request.config.container.className} };`;
   return [
-    `import { ContainerProxy, EveHostContainer, createEveHostWorker, routeEveOutboundRequest } from ${JSON.stringify(moduleSpecifier)};`,
-    request.config.container.className === "EveHostContainer"
-      ? "export { ContainerProxy, EveHostContainer };"
-      : `export { ContainerProxy, EveHostContainer as ${request.config.container.className} };`,
+    `import { EdenWorldDurableObject, EveHostDurableContainer, EveHostLoopback, createEveHostWorker } from ${JSON.stringify(moduleSpecifier)};`,
+    `export { EveHostLoopback };`,
+    exportContainerClass,
     "",
     ...(request.config.worker.vars.EDEN_EVE_WORLD_CLOUDFLARE === true ||
       request.config.worker.durable_objects.bindings.some(
         (binding) => binding.class_name === "EdenWorldDurableObject",
       ) ||
       request.config.worker.migrations.some((migration) =>
-        migration.new_sqlite_classes.includes("EdenWorldDurableObject")
+        (migration.new_sqlite_classes ?? []).includes(
+          "EdenWorldDurableObject",
+        )
       )
-      ? [`export { EdenWorldDurableObject } from ${JSON.stringify(moduleSpecifier)};`]
+      ? ["export { EdenWorldDurableObject };"]
       : []),
-    `EveHostContainer.outboundByHost = { ${JSON.stringify(new URL(request.config.container.publicOrigin).hostname)}: routeEveOutboundRequest };`,
-    "",
     `export default createEveHostWorker(${JSON.stringify(workerOptions)});`,
     "",
   ].join("\n");
@@ -710,8 +713,6 @@ export interface EveHostForwardingMetadata {
   readonly deploymentId: string;
   readonly generationId: string;
   readonly correlationId: string;
-  /** The image this deployment's Worker config selects; the Durable Object verifies a running Container actually serves it before recording the deployment as started. */
-  readonly containerImage?: string;
   readonly runtimeRevisionHandle?: string;
 }
 
@@ -774,9 +775,6 @@ export function createTrustedEveRequest(
   headers.set("x-eden-eve-deployment-id", metadata.deploymentId);
   headers.set("x-eden-eve-generation-id", metadata.generationId);
   headers.set("x-eden-eve-correlation-id", metadata.correlationId);
-  if (metadata.containerImage !== undefined) {
-    headers.set("x-eden-eve-image", metadata.containerImage);
-  }
   if (metadata.runtimeRevisionHandle !== undefined) {
     headers.set(
       "x-eden-eve-runtime-revision",
@@ -892,24 +890,20 @@ export interface EveHostReadinessEvidence {
   readonly port: 8080;
   readonly checkedAt: string;
 }
-
 export interface EveHostReadinessOptions {
-  readonly startAndWaitForPorts: (
-    options: {
-      readonly ports: 8080;
-      readonly cancellationOptions: {
-        readonly abort: AbortSignal;
-        readonly instanceGetTimeoutMS: number;
-        readonly portReadyTimeoutMS: number;
-        readonly waitInterval: number;
-      };
-    },
-  ) => Promise<void>;
+  /**
+   * Ensures the Container is started (`ctx.container.start` when not
+   * running). Transient failures — scheduling-capacity errors surface only
+   * through `monitor()`/`start()` — are retried inside the gate's overall
+   * readiness deadline.
+   */
+  readonly start: (signal: AbortSignal) => Promise<void>;
   readonly healthFetch: (request: Request) => Promise<Response>;
   readonly healthPath?: "/eve/v1/health";
   readonly port?: 8080;
-  readonly instanceGetTimeoutMs?: number;
-  readonly portReadyTimeoutMs?: number;
+  /** Total deadline covering start retries and the health poll. */
+  readonly readinessTimeoutMs?: number;
+  /** Per-probe cap on a single health request. */
   readonly healthTimeoutMs?: number;
   readonly waitIntervalMs?: number;
 }
@@ -1009,8 +1003,7 @@ export function createEveReadinessGate(
 ): EveReadinessGate {
   const port = options.port ?? EVE_HOST_DEFAULTS.internalPort;
   const healthPath = options.healthPath ?? EVE_HOST_DEFAULTS.healthPath;
-  const instanceGetTimeoutMs = options.instanceGetTimeoutMs ?? 120_000;
-  const portReadyTimeoutMs = options.portReadyTimeoutMs ?? 30_000;
+  const readinessTimeoutMs = options.readinessTimeoutMs ?? 150_000;
   const healthTimeoutMs = options.healthTimeoutMs ?? 10_000;
   const waitIntervalMs = options.waitIntervalMs ?? 300;
   let evidence: EveHostReadinessEvidence | undefined;
@@ -1021,115 +1014,132 @@ export function createEveReadinessGate(
   let generation = 0;
 
   const run = async (signal: AbortSignal): Promise<EveHostReadinessEvidence> => {
-    try {
-      await options.startAndWaitForPorts({
-        ports: port,
-        cancellationOptions: {
-          abort: signal,
-          instanceGetTimeoutMS: instanceGetTimeoutMs,
-          portReadyTimeoutMS: portReadyTimeoutMs,
-          waitInterval: waitIntervalMs,
-        },
+    const deadline = Date.now() + readinessTimeoutMs;
+    let lastFailure: EveHostError | undefined;
+    const sleep = (): Promise<void> =>
+      new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, waitIntervalMs);
+        signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(
+            new EveHostError(
+              "HOST_REQUEST_ABORTED",
+              "The client request was cancelled before Eve became ready.",
+            ),
+          );
+        }, { once: true });
       });
-    } catch {
-      if (signal.aborted) {
-        throw new EveHostError(
-          "HOST_REQUEST_ABORTED",
-          "The client request was cancelled before Eve became ready.",
+    const probe = async (): Promise<EveHostReadinessEvidence | undefined> => {
+      const healthController = new AbortController();
+      let rejectHealthTimeout: ((reason?: unknown) => void) | undefined;
+      const abortHealth = (): void => {
+        healthController.abort();
+        rejectHealthTimeout?.(
+          new EveHostError(
+            "HOST_REQUEST_ABORTED",
+            "The client request was cancelled before Eve became ready.",
+          ),
         );
+      };
+      signal.addEventListener("abort", abortHealth, { once: true });
+      const healthTimeoutResult = new Promise<Response>((_resolve, reject) => {
+        rejectHealthTimeout = reject;
+      });
+      const healthTimeout = setTimeout(() => {
+        healthController.abort();
+        rejectHealthTimeout?.(
+          new EveHostError(
+            "HOST_READINESS_UNPROVEN",
+            "The bounded Eve health probe timed out.",
+          ),
+        );
+      }, healthTimeoutMs);
+      let response: Response;
+      try {
+        const healthRequest = new Request(`http://localhost${healthPath}`, {
+          method: "GET",
+          signal: healthController.signal,
+        });
+        const healthResult = options.healthFetch(healthRequest);
+        response = await Promise.race([healthResult, healthTimeoutResult]);
+      } catch {
+        // The port is not open yet (or the probe was aborted); poll again
+        // until the overall readiness deadline.
+        return undefined;
+      } finally {
+        clearTimeout(healthTimeout);
+        signal.removeEventListener("abort", abortHealth);
       }
-      throw new EveHostError(
-        "HOST_READINESS_UNPROVEN",
-        "The Eve Container did not reach its internal port readiness deadline.",
-      );
-    }
-    const healthController = new AbortController();
-    let rejectHealthTimeout: ((reason?: unknown) => void) | undefined;
-    const abortHealth = (): void => {
-      healthController.abort();
-      rejectHealthTimeout?.(
-        new EveHostError(
-          "HOST_REQUEST_ABORTED",
-          "The client request was cancelled before Eve became ready.",
-        ),
-      );
-    };
-    signal.addEventListener("abort", abortHealth, { once: true });
-    const healthTimeoutResult = new Promise<Response>((_resolve, reject) => {
-      rejectHealthTimeout = reject;
-    });
-    const healthTimeout = setTimeout(() => {
-      healthController.abort();
-      rejectHealthTimeout?.(
-        new EveHostError(
+      if (response.status !== 200) {
+        await response.arrayBuffer().catch(() => undefined);
+        lastFailure = new EveHostError(
           "HOST_READINESS_UNPROVEN",
-          "The bounded Eve health probe timed out.",
-        ),
-      );
-    }, healthTimeoutMs);
-    let response: Response;
-    try {
-      const healthRequest = new Request(`http://localhost${healthPath}`, {
-        method: "GET",
-        signal: healthController.signal,
-      });
-      const healthResult = options.healthFetch(healthRequest);
-      response = await Promise.race([healthResult, healthTimeoutResult]);
-    } catch {
-      if (signal.aborted) {
-        throw new EveHostError(
-          "HOST_REQUEST_ABORTED",
-          "The client request was cancelled before Eve became ready.",
+          "The Eve health route did not return the expected successful status.",
+        );
+        return undefined;
+      }
+      if (
+        !(response.headers.get("content-type") ?? "")
+          .toLowerCase()
+          .startsWith("application/json")
+      ) {
+        await response.arrayBuffer().catch(() => undefined);
+        lastFailure = new EveHostError(
+          "HOST_READINESS_UNPROVEN",
+          "The Eve health route did not return the expected JSON contract.",
+        );
+        return undefined;
+      }
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        lastFailure = new EveHostError(
+          "HOST_READINESS_UNPROVEN",
+          "The Eve health route did not return a valid ready response.",
+        );
+        return undefined;
+      }
+      if (!responseBodyIsReady(body)) {
+        lastFailure = new EveHostError(
+          "HOST_READINESS_UNPROVEN",
+          "The Eve health route is reachable but has not reported ready.",
+        );
+        return undefined;
+      }
+      return {
+        healthPath,
+        healthStatus: "ready",
+        healthVerified: true,
+        port,
+        checkedAt: new Date().toISOString(),
+      };
+    };
+    for (;;) {
+      throwIfAborted(signal);
+      try {
+        await options.start(signal);
+      } catch (error: unknown) {
+        throwIfAborted(signal);
+        // Transient scheduling/capacity failures surface through start() or
+        // monitor(); retry until the readiness deadline.
+        lastFailure = error instanceof EveHostError
+          ? error
+          : new EveHostError(
+            "HOST_READINESS_UNPROVEN",
+            "The Eve Container could not be scheduled for start.",
+          );
+      }
+      const result = await probe();
+      if (result !== undefined) return result;
+      if (Date.now() >= deadline) {
+        throw lastFailure ?? new EveHostError(
+          "HOST_READINESS_UNPROVEN",
+          "The Eve Container did not reach its readiness deadline.",
         );
       }
-      throw new EveHostError(
-        "HOST_READINESS_UNPROVEN",
-        "The bounded Eve health probe did not complete.",
-      );
-    } finally {
-      clearTimeout(healthTimeout);
-      signal.removeEventListener("abort", abortHealth);
+      await sleep();
     }
-    if (response.status !== 200) {
-      await response.arrayBuffer().catch(() => undefined);
-      throw new EveHostError(
-        "HOST_READINESS_UNPROVEN",
-        "The Eve health route did not return the expected successful status.",
-      );
-    }
-    if (
-      !(response.headers.get("content-type") ?? "")
-        .toLowerCase()
-        .startsWith("application/json")
-    ) {
-      await response.arrayBuffer().catch(() => undefined);
-      throw new EveHostError(
-        "HOST_READINESS_UNPROVEN",
-        "The Eve health route did not return the expected JSON contract.",
-      );
-    }
-    let body: unknown;
-    try {
-      body = await response.json();
-    } catch {
-      throw new EveHostError(
-        "HOST_READINESS_UNPROVEN",
-        "The Eve health route did not return a valid ready response.",
-      );
-    }
-    if (!responseBodyIsReady(body)) {
-      throw new EveHostError(
-        "HOST_READINESS_UNPROVEN",
-        "The Eve health route is reachable but has not reported ready.",
-      );
-    }
-    return {
-      healthPath,
-      healthStatus: "ready",
-      healthVerified: true,
-      port,
-      checkedAt: new Date().toISOString(),
-    };
   };
 
   const gate = ((signal: AbortSignal): Promise<EveHostReadinessEvidence> => {
