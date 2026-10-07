@@ -148,6 +148,14 @@ The Eve project remains responsible for its:
   [docs/deploy.md](docs/deploy.md#schedules).
 - One logical Container instance (`standard-1`: 1/2 vCPU, 4 GiB); no
   horizontal scaling or custom domains in this release.
+- The agent's sandbox is `just-bash`, a simulated shell — not a real Linux VM
+  like Vercel Sandbox. Files, `grep`/`sed`/`jq`/`sqlite3`, and `curl` work;
+  `python`, `git`, `npm`, and other real programs do not, and the sandbox has
+  unrestricted internet access.
+- A project that picks its own sandbox in `agent/sandbox.ts` (Docker,
+  microsandbox, or Vercel Sandbox) or adds `agent/sandbox/Dockerfile` is not
+  supported yet: the first three fail at build, and the Dockerfile silently
+  falls back to `just-bash`.
 
 ## Commands
 
