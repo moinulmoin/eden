@@ -12,15 +12,15 @@ If you already have an Eve project, start with `eden deploy`.
 Use any one of these package managers:
 
 ```sh
-npm install --global @moinulmoin/eden@0.6.0
+npm install --global @moinulmoin/eden@0.7.0
 ```
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.6.0
+pnpm add --global @moinulmoin/eden@0.7.0
 ```
 
 ```sh
-bun add --global @moinulmoin/eden@0.6.0
+bun add --global @moinulmoin/eden@0.7.0
 ```
 
 Then confirm the CLI is available:
@@ -126,12 +126,16 @@ Run `eden <command> --help` for command-specific options.
 
 - Deploy does not replace the Eve project's providers, databases, Workflow
   World, authentication, schedules, channels, or sandbox.
-- Container disk and memory are wiped when the Container sleeps. Durable
-  state needs a project-configured, Cloudflare-reachable Workflow World such
-  as Postgres (for example `@workflow/world-postgres`).
-- Schedules do not fire while the Container sleeps.
-- This release uses one logical Container instance (`basic`, 1 GiB) and does
-  not promise horizontal scaling or custom domains.
+- Container files survive sleep via snapshots, and image updates now carry
+  Eve's sandbox sessions — every conversation's files — across the image
+  change through the Durable Object's storage (capped at 1 GiB compressed).
+  The rest of `/workspace` still resets to the new image. Durable Workflow
+  state across updates needs a project-configured
+  World, such as Postgres or `@moinulmoin/eden-world-cloudflare`.
+- Standard 5-field cron schedules wake the Container; unsupported cron forms
+  only run while it is awake.
+- This release uses one logical Container instance (`standard-1`, 1/2 vCPU,
+  4 GiB) and does not promise horizontal scaling or custom domains.
 - Bun is an installer only; Node remains the runtime.
 
 ## Documentation

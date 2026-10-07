@@ -46,11 +46,6 @@ export interface EveCliExecutionRequest {
   readonly json?: boolean;
 }
 
-
-export type EveCliRunner = (
-  request: EveCliExecutionRequest,
-) => void | Promise<void>;
-
 export interface EveCliDiagnostic {
   readonly code: string;
   readonly message: string;
@@ -76,25 +71,7 @@ export class EveCliError extends Error {
   }
 }
 
-const EVE_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
-
-export const EVE_USAGE = `Usage: eden <preflight|deploy|destroy> [options]
-
-Eden Deploy commands:
-  preflight  Build and inspect a local Eve candidate without remote mutation
-  deploy     Deploy the selected Eve project to the exact named target
-  destroy    Remove the exact owned Eve target
-
-Without flags, preflight and deploy use the current directory, the preview
-environment, and a Worker name derived from the project's package.json name.
---env accepts only preview or production; production and destroy always
-require an explicit --name. --env-file is accepted only by preflight and deploy.
-All three commands print a human summary by default; --json prints the
-machine-readable result object for scripts and CI.
-
-Options:
-  --help  Show this help
-`;
+export const EVE_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 
 const EVE_COMMAND_USAGE: Readonly<Record<EveCliCommand, string>> = {
   preflight: `Usage: eden preflight [--project <path>] [--env <preview|production>] [--name <name>] [--env-file <path>] [--json]

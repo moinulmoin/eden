@@ -3,8 +3,51 @@ export const EVE_HOST_DEFAULTS = {
   healthPath: "/eve/v1/health",
   internalPort: 8080,
   instance: "standard-1",
-  sleepAfter: "24h",
+  sleepAfter: "1h",
 } as const;
+
+/**
+ * Cloudflare stops a container at most 6 hours after its Durable Object goes
+ * inactive (`setInactivityTimeout` rejects longer values). The idle-sleep
+ * alarm must fire before that so it can snapshot first, and the inactivity
+ * timeout is `sleepAfter` plus this margin.
+ */
+export const EVE_HOST_SLEEP_SNAPSHOT_MARGIN_MS = 15 * 60_000;
+export const EVE_HOST_MAX_SLEEP_AFTER_MS =
+  6 * 3_600_000 - EVE_HOST_SLEEP_SNAPSHOT_MARGIN_MS;
+
+/**
+ * Parses a `sleepAfter` duration ("300ms", "30s", "15m", "1h", or a bare
+ * number of seconds) and enforces Cloudflare's inactivity ceiling.
+ */
+export function parseEveSleepAfterMs(value: string): number {
+  const match = /^([0-9]+)(ms|s|m|h|d)?$/u.exec(value.trim());
+  if (match === null) {
+    throw new EveHostError(
+      "HOST_READINESS_UNPROVEN",
+      "The Container sleepAfter override is not a parseable duration.",
+    );
+  }
+  const amount = Number.parseInt(match[1] ?? "", 10);
+  const unit = match[2] ?? "s";
+  const factor = unit === "ms"
+    ? 1
+    : unit === "s"
+      ? 1_000
+      : unit === "m"
+        ? 60_000
+        : unit === "h"
+          ? 3_600_000
+          : 86_400_000;
+  const ms = amount * factor;
+  if (ms > EVE_HOST_MAX_SLEEP_AFTER_MS) {
+    throw new EveHostError(
+      "HOST_READINESS_UNPROVEN",
+      "The Container sleepAfter override exceeds 345m (5 h 45 min); Cloudflare stops a container within 6 hours of its Durable Object going idle, so Eden must snapshot before then.",
+    );
+  }
+  return ms;
+}
 
 export const EVE_SCHEDULE_WAKE_TRIGGER_CRON = "* * * * *";
 /**
@@ -206,15 +249,7 @@ export function isEveWorkflowInternalRoute(pathname: string): boolean {
 
 export const EVE_HOST_OWNED_HEADERS = [
   "forwarded",
-  "x-forwarded-for",
-  "x-forwarded-host",
-  "x-forwarded-port",
-  "x-forwarded-proto",
-  "x-forwarded-server",
-  "x-forwarded-scheme",
   "x-real-ip",
-  "cf-connecting-ip",
-  "cf-visitor",
   "true-client-ip",
   "x-original-host",
   "x-original-proto",
@@ -224,23 +259,11 @@ export const EVE_HOST_OWNED_HEADERS = [
   "x-host",
   "x-eve-public-origin",
   "x-workflow-local-base-url",
-  "x-eden-eve-callback-base",
-  "x-eden-eve-deployment-id",
-  "x-eden-eve-generation-id",
-  "x-eden-eve-started-deployment",
-  "x-eden-eve-public-origin",
-  "x-eden-eve-correlation-id",
-  "x-eden-eve-container-name",
-  "x-eden-eve-container-id",
-  "x-eden-eve-runtime-revision",
-  "x-eden-container-name",
-  "x-eden-container-id",
-  "cf-container-target-port",
 ] as const;
 
 const EVE_HOST_OWNED_HEADER_SET = new Set<string>(EVE_HOST_OWNED_HEADERS);
 export const WORKER_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
-const SUBDOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+const SUBDOMAIN_PATTERN = WORKER_NAME_PATTERN;
 export const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 const INSTANCE_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,125}[a-z0-9])?$/u;
 const SHA256_IMAGE_PATTERN =
@@ -249,9 +272,7 @@ const SHA256_IMAGE_PATTERN =
 export type EveHostErrorCode =
   | "HOST_ORIGIN_UNAVAILABLE"
   | "HOST_REQUEST_ABORTED"
-  | "HOST_READINESS_UNPROVEN"
-  | "HOST_TRANSPORT_UNTESTABLE"
-  | "HOST_WEBSOCKET_UNSUPPORTED";
+  | "HOST_READINESS_UNPROVEN";
 
 export class EveHostError extends Error {
   readonly code: EveHostErrorCode;
@@ -292,8 +313,6 @@ export function resolveStableWorkersDevOrigin(
 export interface EveHostIdentity {
   readonly workerName: string;
   readonly containerApplicationName: string;
-  readonly containerClassName: string;
-  readonly containerBindingName: string;
   readonly stableContainerInstanceName: string;
   readonly deploymentId: string;
   readonly generationId: string;
@@ -352,7 +371,6 @@ export interface EveHostWranglerConfig {
   readonly vars: {
     readonly EVE_PUBLIC_ORIGIN: string;
     readonly EVE_CONTAINER_INSTANCE_NAME: string;
-    readonly EVE_CONTAINER_BINDING_NAME: string;
     readonly EDEN_EVE_DEPLOYMENT_ID: string;
     readonly EDEN_EVE_GENERATION_ID: string;
     readonly EVE_RUNTIME_VARIABLE_NAMES: readonly string[];
@@ -473,19 +491,10 @@ export function createEveHostConfig(
       "The exact Worker name is not valid.",
     );
   }
-  if (
-    !WORKER_NAME_PATTERN.test(request.containerApplicationName) ||
-    !IDENTIFIER_PATTERN.test(request.containerClassName)
-  ) {
+  if (!WORKER_NAME_PATTERN.test(request.containerApplicationName)) {
     throw new EveHostError(
       "HOST_READINESS_UNPROVEN",
       "The Container application and class names must be stable safe identifiers.",
-    );
-  }
-  if (!IDENTIFIER_PATTERN.test(request.containerBindingName)) {
-    throw new EveHostError(
-      "HOST_READINESS_UNPROVEN",
-      "The Container binding name must be a valid Worker environment identifier.",
     );
   }
   if (!INSTANCE_NAME_PATTERN.test(request.stableContainerInstanceName)) {
@@ -517,16 +526,11 @@ export function createEveHostConfig(
     }
   }
   if (request.containerSleepAfter !== undefined) {
-    if (!/^[0-9]+(?:ms|s|m|h|d)?$/u.test(request.containerSleepAfter)) {
-      throw new EveHostError(
-        "HOST_READINESS_UNPROVEN",
-        "The Container sleepAfter override is not a parseable duration.",
-      );
-    }
+    parseEveSleepAfterMs(request.containerSleepAfter);
   }
   const container = {
     name: request.containerApplicationName,
-    class_name: request.containerClassName,
+    class_name: "EveHostDurableContainer",
     scheduling_policy: "durable_object",
     images: { eve: { image: request.containerImage } },
   } as const;
@@ -557,8 +561,8 @@ export function createEveHostConfig(
   }
   const bindings: EveDurableBinding[] = [
     {
-      name: request.containerBindingName,
-      class_name: request.containerClassName,
+      name: "EVE_CONTAINER",
+      class_name: "EveHostDurableContainer",
     },
     ...(worldCloudflare
       ? [{ name: "EDEN_WORLD", class_name: "EdenWorldDurableObject" }]
@@ -624,7 +628,6 @@ export function createEveHostConfig(
       vars: {
         EVE_PUBLIC_ORIGIN: request.stableWorkersDevOrigin,
         EVE_CONTAINER_INSTANCE_NAME: request.stableContainerInstanceName,
-        EVE_CONTAINER_BINDING_NAME: request.containerBindingName,
         EDEN_EVE_DEPLOYMENT_ID: request.deploymentId,
         EDEN_EVE_GENERATION_ID: request.generationId,
         EVE_RUNTIME_VARIABLE_NAMES: request.runtimeVariableNames ?? [],
@@ -647,9 +650,9 @@ export function createEveHostConfig(
     },
     container: {
       applicationName: request.containerApplicationName,
-      className: request.containerClassName,
+      className: "EveHostDurableContainer",
       instanceName: request.stableContainerInstanceName,
-      bindingName: request.containerBindingName,
+      bindingName: "EVE_CONTAINER",
       port: EVE_HOST_DEFAULTS.internalPort,
       publicOrigin: request.stableWorkersDevOrigin,
       deploymentId: request.deploymentId,
@@ -669,7 +672,6 @@ export function generateEveHostWorkerSource(
   const workerOptions = {
     publicOrigin: request.config.container.publicOrigin,
     workerName: request.config.worker.name,
-    containerBindingName: request.config.container.bindingName,
     deploymentId: request.config.container.deploymentId,
     generationId: request.config.container.generationId,
     stableContainerInstanceName: request.config.container.instanceName,
@@ -683,14 +685,10 @@ export function generateEveHostWorkerSource(
       ? {}
       : { schedules: request.config.container.schedules }),
   };
-  const exportContainerClass =
-    request.config.container.className === "EveHostDurableContainer"
-      ? "export { EveHostDurableContainer };"
-      : `export { EveHostDurableContainer as ${request.config.container.className} };`;
   return [
     `import { EdenWorldDurableObject, EveHostDurableContainer, EveHostLoopback, createEveHostWorker } from ${JSON.stringify(moduleSpecifier)};`,
     `export { EveHostLoopback };`,
-    exportContainerClass,
+    "export { EveHostDurableContainer };",
     "",
     ...(request.config.worker.vars.EDEN_EVE_WORLD_CLOUDFLARE === true ||
       request.config.worker.durable_objects.bindings.some(
@@ -794,20 +792,6 @@ export function createTrustedEveRequest(
   return new Request(targetUrl, init);
 }
 
-export interface EveContainerTransport {
-  readonly containerFetch: (request: Request) => Promise<Response>;
-  readonly fetch: (request: Request) => Promise<Response>;
-}
-
-export interface EveHostProxyOptions extends EveHostForwardingMetadata {
-  readonly transport: EveContainerTransport;
-  readonly ensureReady: (signal: AbortSignal) => Promise<void>;
-}
-
-function isWebSocketUpgrade(request: Request): boolean {
-  return request.headers.get("upgrade")?.toLowerCase() === "websocket";
-}
-
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) {
     throw new EveHostError(
@@ -817,65 +801,11 @@ function throwIfAborted(signal: AbortSignal): void {
   }
 }
 
-export function createEveHostProxy(
-  options: EveHostProxyOptions,
-): (request: Request) => Promise<Response> {
-  return async (request: Request): Promise<Response> => {
-    throwIfAborted(request.signal);
-    await options.ensureReady(request.signal);
-    throwIfAborted(request.signal);
-    const forwarded = createTrustedEveRequest(request, options);
-    return isWebSocketUpgrade(request)
-      ? options.transport.fetch(forwarded)
-      : options.transport.containerFetch(forwarded);
-  };
-}
-
-export interface EveHostLifecycleEvent {
-  readonly type:
-    | "start_requested"
-    | "started"
-    | "health_ready"
-    | "stopped"
-    | "errored"
-    | "image_mismatch"
-    | "replaced";
-  readonly at: number;
-  readonly safeStatus?: string;
-}
-
-export interface EveHostLifecycleObserver {
-  readonly events: readonly EveHostLifecycleEvent[];
-  record(
-    type: EveHostLifecycleEvent["type"],
-    safeStatus?: string,
-  ): EveHostLifecycleEvent;
-}
-
-export function createEveHostLifecycleObserver(
-  now: () => number = Date.now,
-): EveHostLifecycleObserver {
-  const events: EveHostLifecycleEvent[] = [];
-  return {
-    events,
-    record(type, safeStatus) {
-      const event = {
-        type,
-        at: now(),
-        ...(safeStatus === undefined ? {} : { safeStatus }),
-      };
-      events.push(event);
-      return event;
-    },
-  };
-}
-
 export interface EveHostContainerEnvironment {
   readonly [name: string]: unknown;
   readonly EVE_RUNTIME_VARIABLE_NAMES?: readonly string[];
   readonly EVE_PUBLIC_ORIGIN?: string;
   readonly EVE_CONTAINER_INSTANCE_NAME?: string;
-  readonly EVE_CONTAINER_BINDING_NAME?: string;
   readonly EDEN_EVE_DEPLOYMENT_ID?: string;
   readonly EDEN_EVE_GENERATION_ID?: string;
   readonly EDEN_EVE_RUNTIME_REVISION?: string;

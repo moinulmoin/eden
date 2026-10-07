@@ -12,13 +12,16 @@ import {
   readlink,
   readdir,
   realpath,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import {
   promisify,
 } from "node:util";
-import type {
-  EveRuntimeInputIdentity,
+import {
+  EVE_HOST_ENVIRONMENT as HOST_ENVIRONMENT,
+  EVE_START_COMMAND as START_COMMAND,
+  type EveRuntimeInputIdentity,
 } from "./eve-runtime-config.js";
 import {
   basename,
@@ -44,8 +47,7 @@ export type EvePackagingCode =
   | "UNSUPPORTED_HOST_REQUIREMENT"
   | "EVE_HEALTH_FAILED"
   | "WORLD_MIGRATION_FAILED"
-  | "CLEANUP_UNVERIFIED"
-  | "PACKAGE_VERIFICATION_FAILED";
+  | "CLEANUP_UNVERIFIED";
 
 export interface EveRuntimeConfigExclusion {
   /**
@@ -161,6 +163,25 @@ export interface EveProjectOutput {
   readonly fileCount: number;
 }
 
+/** Snapshot-relative root of Eve's prepared sandbox templates. */
+export const EVE_SANDBOX_CACHE_ROOT = ".eve/sandbox-cache" as const;
+
+/**
+ * Evidence for the sandbox templates `eve build` prepared inside the isolated
+ * builder. Runtime sandboxes resolve their template at
+ * `<appRoot>/.eve/sandbox-cache/<provider>/templates/<key>`, so this tree must
+ * ship inside the runtime image or every `bash`/`read_file`/`write_file` call
+ * fails with "Sandbox template ... is not provisioned". `null` when this Eve
+ * build prepared no sandbox template.
+ */
+export interface EveSandboxCacheOutput {
+  readonly present: true;
+  readonly root: typeof EVE_SANDBOX_CACHE_ROOT;
+  readonly outputDigest: string;
+  readonly fileCount: number;
+  readonly totalBytes: number;
+}
+
 export interface EveProjectBuildCandidate {
   readonly generationId: string;
   readonly generationRoot: string;
@@ -182,6 +203,7 @@ export interface EveProjectBuildCandidate {
   readonly sourceDigest: string;
   readonly snapshotDigest: string;
   readonly generatedOutput: EveProjectOutput;
+  readonly sandboxCache: EveSandboxCacheOutput | null;
   readonly runtimeConfigInputIdentity?: string;
   readonly runtimeVariableNames: readonly string[];
 }
@@ -238,16 +260,6 @@ export interface EveProjectImage {
   readonly generatedOutput: EveProjectOutput | null;
 }
 
-export interface EveProjectRuntime {
-  readonly listenHost: "0.0.0.0";
-  readonly listenPort: 8080;
-  readonly healthMethod: "GET";
-  readonly healthPath: "/eve/v1/health";
-  readonly healthStatus: "not-run";
-  readonly healthVerified: false;
-  readonly durableLocalFilesystemClaim: false;
-}
-
 export interface EveProjectSecretsEvidence {
   readonly runtimeVariableNames: readonly string[];
   readonly valuesRecorded: false;
@@ -294,9 +306,15 @@ export interface EveProjectPackagingResult {
   readonly snapshot: EveProjectSnapshot | null;
   readonly toolchain: EveProjectToolchain | null;
   readonly image: EveProjectImage | null;
-  readonly runtime: EveProjectRuntime | null;
   readonly secrets: EveProjectSecretsEvidence;
   readonly checks: readonly EvePackagingCheck[];
+  /**
+   * Outcome of the builder's temporary eve#4440 sandbox-resume patch:
+   * `applied` when the shipped just-bash binding carries it, `skipped` when
+   * the binding is a version Eden does not know, `absent` when this Eve
+   * build has no just-bash binding or packaging never reached the image.
+   */
+  readonly sandboxResumePatch: EveSandboxResumePatchStatus;
   readonly candidateImageId: string | null;
   readonly candidateImageRetainedLocally: boolean;
   readonly writtenPaths: readonly string[];
@@ -339,6 +357,136 @@ export class EvePackagingError extends Error {
 // CBOR_NATIVE_ACCELERATION_DISABLED.
 const IGNORED_BUILDS_GUARD =
   `node -e 'const m=JSON.parse(require("fs").readFileSync("node_modules/.modules.yaml","utf8"));const b=(m.ignoredBuilds||[]).filter((p)=>!p.startsWith("cbor-extract@"));if(b.length){console.error("ERR_PNPM_IGNORED_BUILDS Ignored build scripts: "+b.join(", "));process.exit(1)}'`;
+
+/**
+ * Eden's temporary fix for upstream https://github.com/vercel/eve/issues/4440
+ * (repro: https://github.com/moinulmoin/eve-justbash-resume-repro).
+ * Eve's just-bash provider permanently refuses to resume a conversation once
+ * the sandbox template changes (skills, `agent/sandbox/workspace/`, or the
+ * sandbox definition) and never falls back, so one `eden deploy` update would
+ * break every existing conversation's sandbox forever. The isolated builder
+ * rewrites one file in the installed Eve copy so an existing session reopens
+ * against the current template instead of throwing; user files under
+ * `/workspace` always win over the template. The patch applies only when the
+ * target file's sha256 equals `EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256`, and it
+ * is removed entirely once upstream ships the fix.
+ */
+export const EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256 =
+  "0ba0ac3a237c99af2f67a6028f1675bf7c04b22454b4ebfb4cd9d19e5bf5aaf8";
+/** Marker the patched binding always contains; proves the patch shipped. */
+export const EVE_SANDBOX_RESUME_PATCH_SIGNATURE = "edenRefreshJustBashSessionSkills";
+/** Path of the just-bash binding inside the resolved Eve package root. */
+const EVE_JUST_BASH_BINDING_PATH =
+  "dist/src/execution/sandbox/bindings/just-bash.js";
+
+/** The exact `resume()` implementation in eve 0.68.0, 0.71.2, and 0.72.1. */
+export const EVE_JUST_BASH_RESUME_ORIGINAL =
+  `async resume(e,n,r){let i=requirePreparedJustBashArtifact(n),a=requireJustBashSessionState(r),o=createSandboxProviderIdentity({artifact:i,version:1}),s=sessionRootPath(e,i);if(a.generation!==o||a.rootPath!==s)throw Error(\`just-bash session state is incompatible with this environment.\`);if(!await pathExists(a.rootPath))throw Error(\`just-bash session root "\${a.rootPath}" no longer exists.\`);return await openHandle(e,a.rootPath,t)}`;
+
+/**
+ * The replacement `resume()`: a session whose template generation moved is
+ * contained to the same sessions directory and reopened with its authored
+ * skills refreshed from the current template. A session folder that is gone
+ * (for example a deploy that could not carry it) is recreated from the
+ * current template instead of failing every later sandbox call.
+ */
+export const EVE_SANDBOX_RESUME_PATCHED =
+  `async resume(e,n,r){let i=requirePreparedJustBashArtifact(n),a=requireJustBashSessionState(r),o=createSandboxProviderIdentity({artifact:i,version:1}),s=sessionRootPath(e,i);if((a.generation!==o||a.rootPath!==s)&&dirname(a.rootPath)!==dirname(s))throw Error(\`just-bash session state is incompatible with this environment.\`);await ensureSessionRoot(i,a.rootPath);if(a.generation!==o)await edenRefreshJustBashSessionSkills(i.templateRootPath,a.rootPath);return await openHandle(e,a.rootPath,t)}`;
+
+/**
+ * Helpers appended to the patched binding. They use only identifiers the
+ * module already imports (`readdir`, `rm`, `join`, `pathExists`,
+ * `copyDirectoryAtomically`). Skills live at `$HOME/.agents/skills` inside a
+ * just-bash root, so the session keeps the same path relative to its `fs`
+ * directory as the template; the template's `fs` is scanned because `$HOME`
+ * is only known inside the sandbox.
+ */
+export const EVE_SANDBOX_RESUME_PATCH_HELPERS = `async function edenRefreshJustBashSessionSkills(e,t){let n=await edenFindTemplateSkillsRelativePath(join(e,"fs"));if(n===void 0)return;let r=join(t,"fs",n);await rm(r,{force:!0,recursive:!0}),await copyDirectoryAtomically(join(e,"fs",n),r)}
+async function edenFindTemplateSkillsRelativePath(e){let t=[["",0]];for(;t.length>0;){let n=t.shift(),r=n[0],i=n[1];if(i>3)continue;let a=[];try{a=await readdir(join(e,r),{withFileTypes:!0})}catch{a=[]}for(let o of a){if(!o.isDirectory())continue;let s=r===""?o.name:r+"/"+o.name;if(o.name===".agents")return await pathExists(join(e,s,"skills"))?s+"/skills":void 0;t.push([s,i+1])}}return void 0}
+`;
+
+/**
+ * The CommonJS patcher the isolated builder runs between the frozen install
+ * and `eve build` (and again for the production reinstall). It never touches
+ * project files, applies only against the known sha256, verifies the
+ * replacement matched exactly once, validates the result with `node --check`,
+ * and breaks hardlinks by writing a temp file and renaming it into place.
+ */
+export const EVE_SANDBOX_RESUME_PATCH_SCRIPT = `// Eden temporary fix for https://github.com/vercel/eve/issues/4440: Eve's
+// just-bash provider permanently refuses to resume a conversation after the
+// sandbox template changes (skills, agent/sandbox/workspace/, sandbox
+// definition) and never falls back. This rewrites one file in the installed
+// Eve copy so an existing session reopens against the current template. It
+// runs only against the sha256 Eden knows and is removed once upstream
+// ships the fix.
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
+const KNOWN_SHA256 = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256)};
+const SIGNATURE = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_SIGNATURE)};
+const BINDING_PATH = ${JSON.stringify(EVE_JUST_BASH_BINDING_PATH)};
+const ORIGINAL = ${JSON.stringify(EVE_JUST_BASH_RESUME_ORIGINAL)};
+const PATCHED_RESUME = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCHED)};
+const HELPERS = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_HELPERS)};
+function finish(outcome, detail) {
+  console.log("eden-eve-sandbox-resume-patch: " + outcome + " (" + detail + ")");
+}
+let packageJsonPath;
+try {
+  packageJsonPath = fs.realpathSync("node_modules/eve/package.json");
+} catch {
+  finish("absent", "no project-local eve package to patch");
+  process.exit(0);
+}
+const binding = path.join(path.dirname(packageJsonPath), BINDING_PATH);
+let source;
+try {
+  source = fs.readFileSync(binding, "utf8");
+} catch {
+  finish("absent", "this eve build has no just-bash binding");
+  process.exit(0);
+}
+if (source.includes(SIGNATURE)) {
+  finish("applied", "already patched");
+  process.exit(0);
+}
+const digest = crypto.createHash("sha256").update(source).digest("hex");
+if (digest !== KNOWN_SHA256) {
+  finish("skipped", "sha256 " + digest + " is not a version Eden knows (eve#4440)");
+  process.exit(0);
+}
+const first = source.indexOf(ORIGINAL);
+if (first === -1 || source.indexOf(ORIGINAL, first + 1) !== -1) {
+  console.error("eden-eve-sandbox-resume-patch: the known resume implementation did not match exactly once; refusing to patch");
+  process.exit(1);
+}
+const patched = source.slice(0, first) + PATCHED_RESUME +
+  source.slice(first + ORIGINAL.length) + "\\n" + HELPERS + "\\n";
+const temporary = binding + ".tmp.js";
+fs.rmSync(temporary, { force: true });
+fs.writeFileSync(temporary, patched);
+const parsed = spawnSync(process.execPath, ["--check", temporary], { encoding: "utf8" });
+if (parsed.status !== 0) {
+  fs.rmSync(temporary, { force: true });
+  console.error("eden-eve-sandbox-resume-patch: the patched file failed node --check; refusing to install it" + (typeof parsed.stderr === "string" ? "\\n" + parsed.stderr : ""));
+  process.exit(1);
+}
+// Rename (not write) so any hardlink to the original inode is broken.
+fs.renameSync(temporary, binding);
+finish("applied", "temporary eve#4440 fix written into the isolated builder image");
+`;
+
+/** The heredoc COPY + RUN inserted after each frozen install in the builder. */
+const EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP =
+  `COPY <<'EDEN_EVE_PATCH_EOF' /tmp/eden-eve-sandbox-resume-patch.cjs
+${EVE_SANDBOX_RESUME_PATCH_SCRIPT}EDEN_EVE_PATCH_EOF
+RUN node /tmp/eden-eve-sandbox-resume-patch.cjs
+`;
+
+/** Outcome of the builder's sandbox-resume patch for the packaged image. */
+export type EveSandboxResumePatchStatus = "applied" | "skipped" | "absent";
+
 const INSTALL_COMMAND = [
   "corepack",
   "pnpm",
@@ -346,14 +494,6 @@ const INSTALL_COMMAND = [
   "--frozen-lockfile",
 ] as const;
 const BUILD_COMMAND = ["./node_modules/.bin/eve", "build"] as const;
-const START_COMMAND = [
-  "./node_modules/.bin/eve",
-  "start",
-  "--host",
-  "0.0.0.0",
-  "--port",
-  "8080",
-] as const;
 const EVE_ENTRYPOINT = ".output/server/index.mjs" as const;
 const EVE_EXCLUDED_DIRECTORY_NAMES = new Set([
   ".eden",
@@ -390,13 +530,6 @@ const EVE_COMPETING_LOCKFILES = new Set([
   "package-lock.json",
   "yarn.lock",
 ]);
-const HOST_ENVIRONMENT = {
-  HOST: "0.0.0.0",
-  NITRO_HOST: "0.0.0.0",
-  PORT: "8080",
-  NITRO_PORT: "8080",
-  NODE_ENV: "production",
-} as const;
 
 interface CapturedFile extends EveProjectFile {
   readonly bytes: Buffer;
@@ -422,22 +555,54 @@ interface StableFile {
   readonly sha256: string;
 }
 
-function sha256(value: string | Buffer): string {
+export function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function jsonBytes(value: unknown): Buffer {
+export function jsonBytes(value: unknown): Buffer {
   return Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
 }
 
-function isWithin(root: string, candidate: string): boolean {
+export function isWithin(root: string, candidate: string): boolean {
   const normalizedRoot = root.endsWith("/") ? root.slice(0, -1) : root;
   return candidate === normalizedRoot ||
     candidate.startsWith(`${normalizedRoot}/`);
 }
 
-function safeRelativePath(root: string, candidate: string): string {
+export function safeRelativePath(root: string, candidate: string): string {
   return relative(root, candidate).split("\\").join("/");
+}
+
+export const IMAGE_ID_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+const NODE_IMAGE_PATTERN = /^node:24\.17\.0(?:-[a-z0-9][a-z0-9._-]*)?$/u;
+
+export function imageReference(
+  nodeImage: EveNodeImage,
+  reason: string,
+  remediation: string,
+): string {
+  if (!NODE_IMAGE_PATTERN.test(nodeImage.reference) ||
+      !IMAGE_ID_PATTERN.test(nodeImage.digest)) {
+    throw new EvePackagingError({
+      code: "DOCKER_PLATFORM_BLOCKED",
+      subject: "node-24-image",
+      reason,
+      remediation,
+    });
+  }
+  return `${nodeImage.reference}@${nodeImage.digest}`;
+}
+
+function safeDockerEnvironment(): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    TMPDIR: process.env.TMPDIR,
+    LANG: process.env.LANG,
+    LC_ALL: process.env.LC_ALL,
+    DOCKER_HOST: process.env.DOCKER_HOST,
+    DOCKER_CONTEXT: process.env.DOCKER_CONTEXT,
+  };
 }
 
 function isAllowedSystemAlias(path: string): boolean {
@@ -1193,6 +1358,12 @@ async function verifySnapshotInputs(
       if (firstSegment !== undefined && generatedRoots.has(firstSegment)) {
         continue;
       }
+      if (
+        relativePath === EVE_SANDBOX_CACHE_ROOT ||
+        relativePath.startsWith(`${EVE_SANDBOX_CACHE_ROOT}/`)
+      ) {
+        continue;
+      }
       const candidate = join(directory, entry.name);
       if (entry.isSymbolicLink() || !entry.isDirectory()) {
         if (!entry.isFile() || entry.isSymbolicLink()) {
@@ -1369,18 +1540,11 @@ async function writeDockerBuildFiles(options: {
   readonly packageManagerVersion: string;
   readonly lockfileSha256: string;
 }): Promise<void> {
-  if (
-    !/^sha256:[0-9a-f]{64}$/u.test(options.nodeImage.digest) ||
-    !/^node:24\.17\.0(?:-[a-z0-9][a-z0-9._-]*)?$/u.test(options.nodeImage.reference)
-  ) {
-    throw new EvePackagingError({
-      code: "DOCKER_PLATFORM_BLOCKED",
-      subject: "node-24-image",
-      reason: "The Linux/amd64 builder requires an immutable Node 24 image digest.",
-      remediation: "Supply a verified Node 24 image reference and sha256 digest.",
-    });
-  }
-  const image = `${options.nodeImage.reference}@${options.nodeImage.digest}`;
+  const image = imageReference(
+    options.nodeImage,
+    "The Linux/amd64 builder requires an immutable Node 24 image digest.",
+    "Supply a verified Node 24 image reference and sha256 digest.",
+  );
   const installSources = ["package.json", "pnpm-lock.yaml"];
   if (
     (await lstat(join(options.snapshotRoot, "pnpm-workspace.yaml"))
@@ -1403,16 +1567,18 @@ RUN corepack enable \\
   && test "$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)" = "${options.lockfileSha256}" \\
   && corepack pnpm install --frozen-lockfile --config.node-linker=hoisted --config.strict-dep-builds=false \\
   && ${IGNORED_BUILDS_GUARD}
-RUN test "$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)" = "${options.lockfileSha256}"
+${EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP}RUN test "$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)" = "${options.lockfileSha256}"
 COPY . ./
 RUN test -x ./node_modules/.bin/eve \\
-  && ./node_modules/.bin/eve build
+  && ./node_modules/.bin/eve build \\
+  && mkdir -p .eve/sandbox-cache
 
 FROM builder AS runtime-deps
 RUN rm -rf node_modules \\
   && corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted --config.strict-dep-builds=false \\
   && ${IGNORED_BUILDS_GUARD} \\
   && for l in node_modules/.bin/*; do t=$(readlink "$l") || continue; case "$t" in /*) ln -sfn "$(realpath --relative-to=node_modules/.bin "$t")" "$l" ;; esac; done
+${EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP}
 
 FROM --platform=linux/amd64 ${image} AS runtime
 WORKDIR /app
@@ -1422,6 +1588,12 @@ ENV HOST=0.0.0.0 \\
     NITRO_PORT=8080 \\
     NODE_ENV=production
 COPY --from=builder /workspace/.output /app/.output
+# Eve's prepared just-bash sandbox template: the builder stage's eve build
+# prewarm wrote it under /workspace/.eve/sandbox-cache, and the runtime sandbox
+# resolves it at /app/.eve/sandbox-cache (bash/read_file/write_file fail
+# without it). The mkdir in the build step guarantees the source exists even
+# when this Eve build prepared no template.
+COPY --from=builder /workspace/.eve/sandbox-cache /app/.eve/sandbox-cache
 ${runtimeSourceCopies}
 COPY --from=runtime-deps /workspace/node_modules /app/node_modules
 EXPOSE 8080
@@ -1700,12 +1872,131 @@ async function scanGeneratedOutput(
   };
 }
 
+/**
+ * A generous sanity bound for the prepared sandbox-template tree (templates
+ * carry the sandbox filesystem seeds and authored skills; the minimal Eve
+ * fixture produces ~1 KiB). Anything larger means the builder extracted more
+ * than Eve's build-time prewarm could have written.
+ */
+const EVE_SANDBOX_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Validates the prepared sandbox-template tree the builder extracted into
+ * `<snapshot>/.eve/sandbox-cache` with the same rigor as `.output`: regular
+ * files and directories only, no symbolic links, no special files, stable
+ * reads inside the immutable snapshot, and a total-size sanity bound.
+ * Returns `null` when this Eve build prepared no sandbox template.
+ */
+async function scanGeneratedSandboxCache(
+  snapshotRoot: string,
+): Promise<EveSandboxCacheOutput | null> {
+  const cacheRoot = join(snapshotRoot, EVE_SANDBOX_CACHE_ROOT);
+  const rootDetails = await lstat(cacheRoot).catch(() => undefined);
+  if (rootDetails === undefined) return null;
+  const rootCanonical = await realpath(cacheRoot).catch(() => undefined);
+  if (
+    !rootDetails.isDirectory() ||
+    rootDetails.isSymbolicLink() ||
+    rootCanonical === undefined ||
+    !isWithin(snapshotRoot, resolve(rootCanonical))
+  ) {
+    throw new EvePackagingError({
+      code: "UNSUPPORTED_EVE_OUTPUT",
+      subject: EVE_SANDBOX_CACHE_ROOT,
+      reason: "The prepared sandbox template root is missing, a symbolic link, or escapes the immutable snapshot.",
+      remediation: "Rebuild the candidate so the isolated builder extracts a regular .eve/sandbox-cache directory.",
+    });
+  }
+  const files: Array<{ readonly relativePath: string; readonly sha256: string; readonly byteLength: number }> = [];
+  let totalBytes = 0;
+  const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
+    const directoryDetails = await lstat(directory).catch(() => undefined);
+    const directoryCanonical = await realpath(directory).catch(() => undefined);
+    if (
+      directoryDetails === undefined ||
+      !directoryDetails.isDirectory() ||
+      directoryDetails.isSymbolicLink() ||
+      directoryCanonical === undefined ||
+      !isWithin(snapshotRoot, resolve(directoryCanonical))
+    ) {
+      throw new EvePackagingError({
+        code: "UNSUPPORTED_EVE_OUTPUT",
+        subject: relativeDirectory,
+        reason: "The prepared sandbox template tree escaped or changed during validation.",
+        remediation: "Rebuild the candidate so the isolated builder extracts regular template files.",
+      });
+    }
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const relativePath = relativeDirectory.length === 0
+        ? entry.name
+        : `${relativeDirectory}/${entry.name}`;
+      const candidate = join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        throw new EvePackagingError({
+          code: "UNSUPPORTED_EVE_OUTPUT",
+          subject: `${EVE_SANDBOX_CACHE_ROOT}/${relativePath}`,
+          reason: "The prepared sandbox template tree contains a symbolic link.",
+          remediation: "Rebuild the candidate so the isolated builder extracts regular template files only.",
+        });
+      }
+      if (entry.isDirectory()) {
+        await visit(candidate, relativePath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        throw new EvePackagingError({
+          code: "UNSUPPORTED_EVE_OUTPUT",
+          subject: `${EVE_SANDBOX_CACHE_ROOT}/${relativePath}`,
+          reason: "The prepared sandbox template tree contains a device, socket, FIFO, or other unsupported file.",
+          remediation: "Rebuild the candidate so the isolated builder extracts regular template files only.",
+        });
+      }
+      let stable: StableFile;
+      try {
+        stable = await readStableFile(candidate, snapshotRoot);
+      } catch {
+        throw new EvePackagingError({
+          code: "UNSUPPORTED_EVE_OUTPUT",
+          subject: `${EVE_SANDBOX_CACHE_ROOT}/${relativePath}`,
+          reason: "The prepared sandbox template file is unreadable or changed during validation.",
+          remediation: "Rebuild the candidate so the isolated builder extracts a stable template tree.",
+        });
+      }
+      totalBytes += stable.bytes.byteLength;
+      if (totalBytes > EVE_SANDBOX_CACHE_MAX_BYTES) {
+        throw new EvePackagingError({
+          code: "UNSUPPORTED_EVE_OUTPUT",
+          subject: EVE_SANDBOX_CACHE_ROOT,
+          reason: `The prepared sandbox template tree exceeds the ${EVE_SANDBOX_CACHE_MAX_BYTES}-byte sanity bound.`,
+          remediation: "Rebuild the candidate; the extracted template tree must contain only Eve's prepared templates.",
+        });
+      }
+      files.push({
+        relativePath: `${EVE_SANDBOX_CACHE_ROOT}/${relativePath}`,
+        sha256: stable.sha256,
+        byteLength: stable.bytes.byteLength,
+      });
+    }
+  };
+  await visit(cacheRoot, "");
+  return {
+    present: true,
+    root: EVE_SANDBOX_CACHE_ROOT,
+    outputDigest: sha256(jsonBytes(files)),
+    fileCount: files.length,
+    totalBytes,
+  };
+}
+
 async function assertGeneratedTreesExcludeSecrets(
   snapshotRoot: string,
 ): Promise<void> {
   const roots = [
     join(snapshotRoot, "node_modules"),
     join(snapshotRoot, ".output"),
+    join(snapshotRoot, EVE_SANDBOX_CACHE_ROOT),
   ];
   const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
     const directoryDetails = await lstat(directory).catch(() => undefined);
@@ -1791,7 +2082,7 @@ async function assertGeneratedTreesExcludeSecrets(
   }
 }
 
-function safeError(
+export function safeError(
   error: EvePackagingError,
 ): EveProjectPackagingResult["error"] {
   return {
@@ -1936,7 +2227,7 @@ function classifyDockerBuildFailure(error: unknown): EvePackagingError {
 
 function blockedResult(
   error: EvePackagingError,
-  extra: Partial<Pick<EveProjectPackagingResult, "project" | "writtenPaths" | "checks">> = {},
+  extra: Partial<Pick<EveProjectPackagingResult, "writtenPaths">> = {},
 ): EveProjectPackagingResult {
   return {
     schemaVersion: 1,
@@ -1945,12 +2236,11 @@ function blockedResult(
     status: "blocked",
     returnCode: error.code,
     deployable: false,
-    project: extra.project ?? null,
+    project: null,
     candidate: null,
     snapshot: null,
     toolchain: null,
     image: null,
-    runtime: null,
     secrets: {
       runtimeVariableNames: [],
       valuesRecorded: false,
@@ -1962,18 +2252,45 @@ function blockedResult(
       excludedFromManifestsAndLogs: true,
       redactionRegisteredBeforeChildren: false,
     },
-    checks: extra.checks ?? [{
+    checks: [{
       id: error.code,
       status: "blocked",
       subject: error.subject,
       reason: error.message,
       remediation: error.remediation,
     }],
+    sandboxResumePatch: "absent",
     candidateImageId: null,
     candidateImageRetainedLocally: false,
     writtenPaths: extra.writtenPaths ?? [],
     error: safeError(error),
   };
+}
+
+/**
+ * Decides the sandbox-resume patch outcome from the `node_modules` the
+ * builder copied out of the finished image: the shipped just-bash binding is
+ * the single source of truth and stays correct under Docker layer caching
+ * (a cached patch step still ships the patched file). Reading never throws —
+ * an unreadable tree counts as `absent`.
+ */
+async function detectEveSandboxResumePatch(
+  snapshotRoot: string,
+): Promise<EveSandboxResumePatchStatus> {
+  try {
+    const packageJsonPath = await realpath(
+      join(snapshotRoot, "node_modules/eve/package.json"),
+    );
+    const binding = await readFile(
+      join(dirname(packageJsonPath), EVE_JUST_BASH_BINDING_PATH),
+      "utf8",
+    );
+    return binding.includes(EVE_SANDBOX_RESUME_PATCH_SIGNATURE)
+      ? "applied"
+      : "skipped";
+  } catch {
+    return "absent";
+  }
 }
 
 async function currentInputIdentity(
@@ -2303,7 +2620,9 @@ export async function buildEveProjectSnapshot(
     }
 
     const eve = await resolveProjectLocalEve(snapshotRoot);
+    const sandboxResumePatch = await detectEveSandboxResumePatch(snapshotRoot);
     const output = await scanGeneratedOutput(snapshotRoot);
+    const sandboxCache = await scanGeneratedSandboxCache(snapshotRoot);
     await assertGeneratedTreesExcludeSecrets(snapshotRoot);
     const snapshotSourceDigest = await snapshotDigest(snapshotRoot);
     const runtimeManifestPath = join(generationRoot, "runtime-manifest.json");
@@ -2318,6 +2637,7 @@ export async function buildEveProjectSnapshot(
       sourceDigest: initialInputs.sourceDigest,
       snapshotDigest: snapshotSourceDigest,
       generatedOutput: output,
+      sandboxCache,
       artifactPath: EVE_ENTRYPOINT,
       platform: "linux/amd64",
       runtimeVariableNames,
@@ -2357,10 +2677,8 @@ export async function buildEveProjectSnapshot(
       sourceRaceChecked: true,
     };
     if (
-      (buildResult.imageId !== undefined &&
-        !/^sha256:[0-9a-f]{64}$/u.test(buildResult.imageId)) ||
-      (buildResult.imageId !== undefined &&
-        buildResult.imagePlatform !== "linux/amd64")
+      buildResult.imageId !== undefined &&
+      !IMAGE_ID_PATTERN.test(buildResult.imageId)
     ) {
       const imageError = new EvePackagingError({
         code: "DOCKER_PLATFORM_BLOCKED",
@@ -2402,6 +2720,7 @@ export async function buildEveProjectSnapshot(
       sourceDigest: initialInputs.sourceDigest,
       snapshotDigest: snapshotSourceDigest,
       generatedOutput: output,
+      sandboxCache,
       ...(initialRuntimeInputIdentity === undefined
         ? {}
         : { runtimeConfigInputIdentity: initialRuntimeInputIdentity }),
@@ -2442,7 +2761,6 @@ export async function buildEveProjectSnapshot(
       },
       image,
       candidate,
-      runtime: null,
       secrets: {
         runtimeVariableNames,
         valuesRecorded: false,
@@ -2491,7 +2809,17 @@ export async function buildEveProjectSnapshot(
           reason: "The resolved Eve executable is inside the isolated project dependency tree.",
           remediation: null,
         },
+        ...(sandboxResumePatch === "applied"
+          ? [{
+              id: "EVE_SANDBOX_RESUME_PATCH",
+              status: "pass",
+              subject: "eve-sandbox-resume",
+              reason: "applied temporary fix for eve#4440",
+              remediation: null,
+            } satisfies EvePackagingCheck]
+          : []),
       ],
+      sandboxResumePatch,
       candidateImageId: buildResult.imageId ?? null,
       candidateImageRetainedLocally: buildResult.imageId !== undefined,
       writtenPaths,
@@ -2666,15 +2994,7 @@ export function createDockerEveProjectBuilder(options: {
         });
       }
       const imageIdFile = join(request.generationRoot, "image-id");
-      const safeEnv: NodeJS.ProcessEnv = {
-        PATH: process.env.PATH,
-        HOME: process.env.HOME,
-        TMPDIR: process.env.TMPDIR,
-        LANG: process.env.LANG,
-        LC_ALL: process.env.LC_ALL,
-        DOCKER_HOST: process.env.DOCKER_HOST,
-        DOCKER_CONTEXT: process.env.DOCKER_CONTEXT,
-      };
+      const safeEnv = safeDockerEnvironment();
       let containerId: string | undefined;
       let imageBuilt = false;
       let retainImage = false;
@@ -2740,7 +3060,7 @@ export function createDockerEveProjectBuilder(options: {
         );
         imageBuilt = true;
         builtImageId = (await readFile(imageIdFile, "utf8")).trim();
-        if (!/^sha256:[0-9a-f]{64}$/u.test(builtImageId)) {
+        if (!IMAGE_ID_PATTERN.test(builtImageId)) {
           throw new EvePackagingError({
             code: "DOCKER_PLATFORM_BLOCKED",
             subject: "image identity",
@@ -2797,6 +3117,37 @@ export function createDockerEveProjectBuilder(options: {
           ["cp", `${containerId}:/app/node_modules`, join(request.snapshotRoot, "node_modules")],
           { env: safeEnv, cwd: request.generationRoot },
         );
+        // The builder stage's `eve build` prewarm writes the just-bash sandbox
+        // template under its workdir; the runtime stage copies it to
+        // /app/.eve/sandbox-cache (the mkdir in the Dockerfile guarantees the
+        // path exists). Extract exactly that subtree so runtime sandboxes can
+        // resolve their template; never the rest of `.eve` (sessions, locks,
+        // builds). Treated as absent when the container has no such path.
+        const sandboxCacheTarget = join(request.snapshotRoot, EVE_SANDBOX_CACHE_ROOT);
+        await ensureSnapshotDirectory(request.snapshotRoot, dirname(sandboxCacheTarget));
+        try {
+          await execFileAsync(
+            dockerCommand,
+            ["cp", `${containerId}:/app/${EVE_SANDBOX_CACHE_ROOT}`, sandboxCacheTarget],
+            { env: safeEnv, cwd: request.generationRoot },
+          );
+        } catch (error: unknown) {
+          const stderr = typeof error === "object" &&
+              error !== null &&
+              "stderr" in error &&
+              typeof error.stderr === "string"
+            ? error.stderr
+            : "";
+          if (
+            !/(?:could not find|no such|not found|does not exist)/iu.test(stderr)
+          ) {
+            throw error;
+          }
+          // Absent: remove the `.eve` parent this extraction created.
+          await rm(dirname(sandboxCacheTarget), { recursive: true, force: true }).catch(
+            () => undefined,
+          );
+        }
         const result: EveProjectBuilderResult = {
           imageId: builtImageId,
           imagePlatform: "linux/amd64",
@@ -2829,15 +3180,7 @@ export function createDockerEveProjectBuilder(options: {
     async discard(result) {
       const imageReference = result.imageReference;
       if (imageReference === undefined) return;
-      const safeEnv: NodeJS.ProcessEnv = {
-        PATH: process.env.PATH,
-        HOME: process.env.HOME,
-        TMPDIR: process.env.TMPDIR,
-        LANG: process.env.LANG,
-        LC_ALL: process.env.LC_ALL,
-        DOCKER_HOST: process.env.DOCKER_HOST,
-        DOCKER_CONTEXT: process.env.DOCKER_CONTEXT,
-      };
+      const safeEnv = safeDockerEnvironment();
       await execFileAsync(
         dockerCommand,
         ["image", "rm", "--force", imageReference],

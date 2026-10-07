@@ -1,8 +1,12 @@
 import {
   createHash,
 } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
+  access,
   chmod,
+  cp,
+  lstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -15,6 +19,7 @@ import {
   tmpdir,
 } from "node:os";
 import {
+  dirname,
   join,
 } from "node:path";
 
@@ -23,6 +28,13 @@ import { afterEach, describe, expect, test } from "vitest";
 import {
   buildEveProjectSnapshot,
   createDockerEveProjectBuilder,
+  EVE_JUST_BASH_RESUME_ORIGINAL,
+  EVE_SANDBOX_RESUME_PATCHED,
+  EVE_SANDBOX_RESUME_PATCH_HELPERS,
+  EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256,
+  EVE_SANDBOX_RESUME_PATCH_SCRIPT,
+  EVE_SANDBOX_RESUME_PATCH_SIGNATURE,
+  jsonBytes,
   type EveProjectBuilder,
   type EveProjectBuilderRequest,
 } from "../src/eve-packaging.js";
@@ -121,10 +133,12 @@ async function writeFakeDockerCommand(
   root: string,
   options: {
     readonly buildStderr?: string;
+    readonly sandboxCache?: "present" | "absent" | "escaping-symlink" | "special-file";
   } = {},
 ): Promise<{ readonly command: string; readonly log: string }> {
   const command = join(root, "fake-docker.cjs");
   const log = join(root, "docker-args.jsonl");
+  const sandboxCacheMode = options.sandboxCache ?? "present";
   await writeFile(
     command,
     `#!/usr/bin/env node
@@ -156,6 +170,7 @@ else if (args[0] === "build") {
 } else if (args[0] === "cp") {
   const source = args[1];
   const destination = args[2];
+  const sandboxCacheMode = ${JSON.stringify(sandboxCacheMode)};
   if (source.endsWith(":/app/.output")) {
     fs.mkdirSync(path.join(destination, "server"), { recursive: true });
     fs.writeFileSync(
@@ -173,6 +188,28 @@ else if (args[0] === "build") {
     fs.chmodSync(path.join(eve, "bin/eve.js"), 0o755);
     fs.mkdirSync(path.join(destination, ".bin"), { recursive: true });
     fs.symlinkSync("../eve/bin/eve.js", path.join(destination, ".bin/eve"));
+  } else if (source.endsWith(":/app/.eve/sandbox-cache")) {
+    if (sandboxCacheMode === "absent") {
+      process.stderr.write("Error response from daemon: Could not find the file /app/.eve/sandbox-cache in container abcdef123456: file does not exist\\n");
+      process.exitCode = 1;
+    } else {
+      const template = path.join(
+        destination,
+        "just-bash/templates/7bc778099a3b436ce4ad98ba",
+      );
+      fs.mkdirSync(path.join(template, "fs/workspace"), { recursive: true });
+      fs.writeFileSync(
+        path.join(template, "metadata.json"),
+        JSON.stringify({ templateKey: "7bc778099a3b436ce4ad98ba" }) + "\\n",
+      );
+      if (sandboxCacheMode === "escaping-symlink") {
+        fs.symlinkSync("/etc/hostname", path.join(template, "fs/escape"));
+      } else if (sandboxCacheMode === "special-file") {
+        require("node:child_process").execSync(
+          "mkfifo " + JSON.stringify(path.join(template, "fs/pipe")),
+        );
+      }
+    }
   }
 } else if (args[0] === "container" && args[1] === "inspect") {
   process.stderr.write("No such object: container\\n");
@@ -438,7 +475,6 @@ describe("Eve project snapshot/build boundary", () => {
         },
       },
       image: null,
-      runtime: null,
       candidateImageId: null,
       candidateImageRetainedLocally: false,
     });
@@ -1097,11 +1133,167 @@ describe("Eve project snapshot/build boundary", () => {
     }
     expect(dockerfile).not.toContain('"/app/.env"');
     expect(dockerfile).not.toContain('"/app/deploy.pem"');
+    // Authored `.eve` is never copied as source; only the builder-generated
+    // sandbox-template subtree ships, via the explicit builder-stage copy.
     expect(dockerfile).not.toContain('"/app/.eve"');
+    expect(dockerfile).toContain("mkdir -p .eve/sandbox-cache");
+    expect(dockerfile).toContain(
+      "COPY --from=builder /workspace/.eve/sandbox-cache /app/.eve/sandbox-cache",
+    );
     expect(dockerfile).not.toContain('"/app/node_modules"');
     const snapshotPath = result.snapshot?.path as string;
     await expect(readFile(join(snapshotPath, ".eve/state.json"), "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("extracts the prepared sandbox template into the generation snapshot", async () => {
+    const root = await createRoot("eden-eve-package-sandbox-extract-");
+    const artifacts = await createRoot("eden-eve-package-sandbox-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts);
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result.status).toBe("ready");
+    const snapshotPath = result.snapshot?.path as string;
+    const templateKey = "7bc778099a3b436ce4ad98ba";
+    const metadataRelativePath =
+      `.eve/sandbox-cache/just-bash/templates/${templateKey}/metadata.json`;
+    const metadataBytes = await readFile(join(snapshotPath, metadataRelativePath));
+    expect(await readdir(join(snapshotPath, ".eve"))).toEqual(["sandbox-cache"]);
+    const commands = (await readFile(fakeDocker.log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(commands).toContainEqual([
+      "cp",
+      `abcdef123456:/app/.eve/sandbox-cache`,
+      join(snapshotPath, ".eve/sandbox-cache"),
+    ]);
+    expect(result.candidate?.sandboxCache).toEqual({
+      present: true,
+      root: ".eve/sandbox-cache",
+      outputDigest: createHash("sha256").update(jsonBytes([
+        {
+          relativePath: metadataRelativePath,
+          sha256: createHash("sha256").update(metadataBytes).digest("hex"),
+          byteLength: metadataBytes.byteLength,
+        },
+      ])).digest("hex"),
+      fileCount: 1,
+      totalBytes: metadataBytes.byteLength,
+    });
+    const runtimeManifest = JSON.parse(
+      await readFile(
+        join(artifacts, "generation-one/runtime-manifest.json"),
+        "utf8",
+      ),
+    ) as { readonly sandboxCache?: unknown };
+    expect(runtimeManifest.sandboxCache).toEqual(result.candidate?.sandboxCache);
+  });
+
+  test("ships no sandbox cache when the builder prepared no template", async () => {
+    const root = await createRoot("eden-eve-package-sandbox-absent-");
+    const artifacts = await createRoot("eden-eve-package-sandbox-absent-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      sandboxCache: "absent",
+    });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result.status).toBe("ready");
+    expect(result.candidate?.sandboxCache).toBeNull();
+    const snapshotPath = result.snapshot?.path as string;
+    await expect(lstat(join(snapshotPath, ".eve"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  test("rejects a symbolic link inside the extracted sandbox template", async () => {
+    const root = await createRoot("eden-eve-package-sandbox-link-");
+    const artifacts = await createRoot("eden-eve-package-sandbox-link-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      sandboxCache: "escaping-symlink",
+    });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "UNSUPPORTED_EVE_OUTPUT",
+      deployable: false,
+      candidate: null,
+    });
+    expect(result.error?.subject).toBe(
+      ".eve/sandbox-cache/just-bash/templates/7bc778099a3b436ce4ad98ba/fs/escape",
+    );
+  });
+
+  test("rejects a special file inside the extracted sandbox template", async () => {
+    const root = await createRoot("eden-eve-package-sandbox-fifo-");
+    const artifacts = await createRoot("eden-eve-package-sandbox-fifo-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      sandboxCache: "special-file",
+    });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "UNSUPPORTED_EVE_OUTPUT",
+      deployable: false,
+      candidate: null,
+    });
+    expect(result.error?.subject).toContain(
+      ".eve/sandbox-cache/just-bash/templates/7bc778099a3b436ce4ad98ba/fs/pipe",
+    );
   });
 
   test("surfaces the pnpm release-age policy failure instead of lockfile ambiguity", async () => {
@@ -1277,5 +1469,472 @@ describe("Eve project snapshot/build boundary", () => {
     expect(result.error?.subject).toBe("ERR_PNPM_IGNORED_BUILDS");
     expect(result.error?.remediation).toContain("allowBuilds");
     expect(result.error?.remediation).toContain("pnpm-workspace.yaml");
+  });
+});
+
+describe("Eve sandbox-resume patch (eve#4440)", () => {
+  const bindingRelativePath =
+    "node_modules/eve/dist/src/execution/sandbox/bindings/just-bash.js";
+
+  /** A minimal but parseable module embedding the known resume text. */
+  function fixtureModule(resumeText: string): string {
+    return [
+      `import{dirname,join}from"node:path";`,
+      `const t={};`,
+      `function requirePreparedJustBashArtifact(){return{templateRootPath:"/tmp/template"}}`,
+      `const provider={${resumeText}};`,
+      `export{provider};`,
+    ].join("\n");
+  }
+
+  function patcherScriptWithHash(expectedSha256: string): string {
+    const knownLiteral = JSON.stringify(EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256);
+    expect(
+      EVE_SANDBOX_RESUME_PATCH_SCRIPT.split(knownLiteral).length - 1,
+    ).toBe(1);
+    return EVE_SANDBOX_RESUME_PATCH_SCRIPT.replace(
+      knownLiteral,
+      JSON.stringify(expectedSha256),
+    );
+  }
+
+  async function writeEveFixture(
+    root: string,
+    bindingSource: string,
+  ): Promise<string> {
+    const packageRoot = join(root, "project/node_modules/eve");
+    const bindingPath = join(
+      packageRoot,
+      "dist/src/execution/sandbox/bindings/just-bash.js",
+    );
+    await mkdir(dirname(bindingPath), { recursive: true });
+    await writeFile(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ name: "eve", version: "0.72.1", type: "module" }),
+      "utf8",
+    );
+    await writeFile(bindingPath, bindingSource, "utf8");
+    return bindingPath;
+  }
+
+  async function runPatcher(
+    projectRoot: string,
+    script: string,
+  ): Promise<{ readonly status: number | null; readonly output: string }> {
+    const scriptPath = join(projectRoot, "..", "patcher.cjs");
+    await writeFile(scriptPath, script, "utf8");
+    const run = spawnSync(process.execPath, [scriptPath], {
+      cwd: projectRoot,
+      encoding: "utf8",
+    });
+    return {
+      status: run.status,
+      output: `${run.stdout ?? ""}${run.stderr ?? ""}`,
+    };
+  }
+
+  test("applies once against a known binding and produces parseable JavaScript", async () => {
+    const root = await createRoot("eden-eve-patch-apply-");
+    const fixture = fixtureModule(EVE_JUST_BASH_RESUME_ORIGINAL);
+    const bindingPath = await writeEveFixture(root, fixture);
+    const script = patcherScriptWithHash(
+      createHash("sha256").update(fixture).digest("hex"),
+    );
+
+    const first = await runPatcher(join(root, "project"), script);
+    expect(first.status).toBe(0);
+    expect(first.output).toContain(
+      "eden-eve-sandbox-resume-patch: applied",
+    );
+
+    const patched = await readFile(bindingPath, "utf8");
+    expect(patched).not.toContain(EVE_JUST_BASH_RESUME_ORIGINAL);
+    expect(patched.split(EVE_SANDBOX_RESUME_PATCHED).length - 1).toBe(1);
+    expect(patched.split(EVE_SANDBOX_RESUME_PATCH_SIGNATURE).length - 1)
+      .toBeGreaterThan(0);
+    expect(spawnSync(process.execPath, ["--check", bindingPath], {
+      encoding: "utf8",
+    }).status).toBe(0);
+    const temporaryFiles = (await readdir(dirname(bindingPath)))
+      .filter((name) => name.includes(".tmp.js"));
+    expect(temporaryFiles).toEqual([]);
+
+    const second = await runPatcher(join(root, "project"), script);
+    expect(second.status).toBe(0);
+    expect(second.output).toContain("eden-eve-sandbox-resume-patch: applied");
+    expect(second.output).toContain("already patched");
+  });
+
+  test("skips an unknown binding and leaves every project file untouched", async () => {
+    const root = await createRoot("eden-eve-patch-skip-");
+    const mutatedResume = EVE_JUST_BASH_RESUME_ORIGINAL.replace(
+      "version:1",
+      "version:2",
+    );
+    expect(mutatedResume).not.toBe(EVE_JUST_BASH_RESUME_ORIGINAL);
+    const bindingPath = await writeEveFixture(root, fixtureModule(mutatedResume));
+    const otherSource = join(root, "project/src/index.ts");
+    await mkdir(dirname(otherSource), { recursive: true });
+    await writeFile(otherSource, "export const value = 1;\n", "utf8");
+
+    const run = await runPatcher(
+      join(root, "project"),
+      EVE_SANDBOX_RESUME_PATCH_SCRIPT,
+    );
+    expect(run.status).toBe(0);
+    expect(run.output).toContain("eden-eve-sandbox-resume-patch: skipped");
+    expect(await readFile(bindingPath, "utf8")).toBe(
+      fixtureModule(mutatedResume),
+    );
+    expect(await readFile(otherSource, "utf8")).toBe(
+      "export const value = 1;\n",
+    );
+  });
+
+  test("reports absent when the eve build has no just-bash binding", async () => {
+    const root = await createRoot("eden-eve-patch-absent-");
+    await writeEveFixture(root, "export const provider = {};\n");
+    await rm(join(root, "project", bindingRelativePath));
+
+    const run = await runPatcher(
+      join(root, "project"),
+      EVE_SANDBOX_RESUME_PATCH_SCRIPT,
+    );
+    expect(run.status).toBe(0);
+    expect(run.output).toContain("eden-eve-sandbox-resume-patch: absent");
+  });
+
+  test("runs the patch step in the builder and the production reinstall stages", async () => {
+    const root = await createRoot("eden-eve-patch-dockerfile-");
+    const artifacts = await createRoot("eden-eve-patch-dockerfile-artifacts-");
+    await writeProject(root);
+    const { builder, requests } = fakeBuilder(writeSuccessfulBuild);
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm",
+        digest: `sha256:${"a".repeat(64)}`,
+      },
+    });
+
+    expect(result.status).toBe("ready");
+    const dockerfilePath = requests[0]?.dockerfilePath;
+    expect(dockerfilePath).toBeDefined();
+    const dockerfile = await readFile(dockerfilePath ?? "", "utf8");
+    const step = "RUN node /tmp/eden-eve-sandbox-resume-patch.cjs";
+    expect(dockerfile.split(step).length - 1).toBe(2);
+    expect(dockerfile.split("COPY <<'EDEN_EVE_PATCH_EOF'").length - 1).toBe(2);
+    const installIndex = dockerfile.indexOf(
+      "corepack pnpm install --frozen-lockfile",
+    );
+    const prodInstallIndex = dockerfile.indexOf(
+      "corepack pnpm install --frozen-lockfile --prod",
+    );
+    const firstStep = dockerfile.indexOf(step);
+    const secondStep = dockerfile.indexOf(step, firstStep + 1);
+    expect(firstStep).toBeGreaterThan(installIndex);
+    expect(firstStep).toBeLessThan(prodInstallIndex);
+    expect(secondStep).toBeGreaterThan(prodInstallIndex);
+    expect(dockerfile.indexOf("./node_modules/.bin/eve build")).toBeGreaterThan(
+      firstStep,
+    );
+    // The heredoc delimiter is quoted, so the script never sees shell expansion.
+    expect(dockerfile).toContain("EDEN_EVE_PATCH_EOF");
+  });
+
+  test("reports the shipped binding as the patch outcome", async () => {
+    const root = await createRoot("eden-eve-patch-detect-");
+    const artifacts = await createRoot("eden-eve-patch-detect-artifacts-");
+    await writeProject(root);
+    const applied = fakeBuilder(async (request) => {
+      await writeSuccessfulBuild(request);
+      await mkdir(dirname(join(request.snapshotRoot, bindingRelativePath)), {
+        recursive: true,
+      });
+      await writeFile(
+        join(request.snapshotRoot, bindingRelativePath),
+        fixtureModule(EVE_SANDBOX_RESUME_PATCHED),
+        "utf8",
+      );
+    });
+    const appliedResult = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder: applied.builder,
+    });
+    expect(appliedResult.sandboxResumePatch).toBe("applied");
+    expect(appliedResult.checks).toContainEqual({
+      id: "EVE_SANDBOX_RESUME_PATCH",
+      status: "pass",
+      subject: "eve-sandbox-resume",
+      reason: "applied temporary fix for eve#4440",
+      remediation: null,
+    });
+
+    const skipped = fakeBuilder(async (request) => {
+      await writeSuccessfulBuild(request);
+      await mkdir(dirname(join(request.snapshotRoot, bindingRelativePath)), {
+        recursive: true,
+      });
+      await writeFile(
+        join(request.snapshotRoot, bindingRelativePath),
+        fixtureModule(EVE_JUST_BASH_RESUME_ORIGINAL),
+        "utf8",
+      );
+    });
+    const skippedResult = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-two"),
+      builder: skipped.builder,
+    });
+    expect(skippedResult.sandboxResumePatch).toBe("skipped");
+    expect(
+      skippedResult.checks.some((value) =>
+        value.id === "EVE_SANDBOX_RESUME_PATCH"
+      ),
+    ).toBe(false);
+  });
+
+  interface ResumeFixture {
+    readonly templateRoot: string;
+    readonly sessionsDir: string;
+    readonly sessionRoot: string;
+    resume(
+      context: { readonly sessionsDir: string },
+      artifact: { readonly templateRootPath: string; readonly generation: string },
+      state: { readonly generation: string; readonly rootPath: string },
+    ): Promise<unknown>;
+    readonly openCalls: string[];
+  }
+
+  async function createResumeFixture(
+    root: string,
+  ): Promise<ResumeFixture> {
+    const templateRoot = join(root, "template");
+    const sessionsDir = join(root, "sessions");
+    const sessionRoot = join(sessionsDir, "session-1");
+    const openCalls: string[] = [];
+    const harness = new Function(
+      "requirePreparedJustBashArtifact",
+      "requireJustBashSessionState",
+      "createSandboxProviderIdentity",
+      "sessionRootPath",
+      "pathExists",
+      "ensureSessionRoot",
+      "openHandle",
+      "dirname",
+      "join",
+      "rm",
+      "readdir",
+      "copyDirectoryAtomically",
+      "t",
+      `${EVE_SANDBOX_RESUME_PATCH_HELPERS}\nreturn { ${EVE_SANDBOX_RESUME_PATCHED} };`,
+    );
+    const scope = harness(
+      (artifact: { readonly templateRootPath: string }) => artifact,
+      (state: { readonly generation: string; readonly rootPath: string }) =>
+        state,
+      ({ artifact }: {
+        readonly artifact: { readonly generation: string };
+      }) => artifact.generation,
+      (
+        context: { readonly sessionsDir: string },
+        artifact: { readonly sessionId: string },
+      ) => join(context.sessionsDir, artifact.sessionId),
+      async (path: string) =>
+        await access(path).then(() => true, () => false),
+      async (
+        artifact: { readonly templateRootPath: string },
+        rootPath: string,
+      ) => {
+        if (
+          await access(rootPath).then(() => true, () => false)
+        ) return;
+        await mkdir(dirname(rootPath), { recursive: true });
+        await cp(artifact.templateRootPath, rootPath, { recursive: true });
+      },
+      async (
+        _context: unknown,
+        rootPath: string,
+        options: unknown,
+      ) => {
+        openCalls.push(rootPath);
+        return { opened: rootPath, options };
+      },
+      dirname,
+      join,
+      rm,
+      readdir,
+      async (from: string, to: string) => {
+        await mkdir(dirname(to), { recursive: true });
+        await cp(from, to, { recursive: true });
+      },
+      { autoInstall: false },
+    );
+    return {
+      templateRoot,
+      sessionsDir,
+      sessionRoot,
+      resume: scope.resume as ResumeFixture["resume"],
+      openCalls,
+    };
+  }
+
+  async function writeTemplateFixture(templateRoot: string): Promise<void> {
+    await mkdir(join(templateRoot, "fs/.agents/skills/greet"), {
+      recursive: true,
+    });
+    await mkdir(join(templateRoot, "fs/workspace"), { recursive: true });
+    await writeFile(
+      join(templateRoot, "fs/.agents/skills/greet/SKILL.md"),
+      "---\nname: greet\n---\n\nSay hello (v2).\n",
+      "utf8",
+    );
+    await writeFile(
+      join(templateRoot, "fs/workspace/seed.txt"),
+      "seed\n",
+      "utf8",
+    );
+  }
+
+  /** Seeds an existing session root with stale skills and user data. */
+  async function writeSessionFixture(sessionRoot: string): Promise<void> {
+    await mkdir(join(sessionRoot, "fs/.agents/skills/old"), {
+      recursive: true,
+    });
+    await mkdir(join(sessionRoot, "fs/workspace"), { recursive: true });
+    await writeFile(
+      join(sessionRoot, "fs/.agents/skills/old/SKILL.md"),
+      "stale\n",
+      "utf8",
+    );
+  }
+
+  test("reopens a session after the template changed and refreshes only its skills", async () => {
+    const root = await createRoot("eden-eve-patch-resume-");
+    const fixture = await createResumeFixture(root);
+    await writeTemplateFixture(fixture.templateRoot);
+    await writeSessionFixture(fixture.sessionRoot);
+    await writeFile(
+      join(fixture.sessionRoot, "fs/workspace/notes.txt"),
+      "user data\n",
+      "utf8",
+    );
+
+    await fixture.resume(
+      { sessionsDir: fixture.sessionsDir },
+      { templateRootPath: fixture.templateRoot, generation: "gen-2", sessionId: "session-1" },
+      { generation: "gen-1", rootPath: fixture.sessionRoot },
+    );
+
+    expect(fixture.openCalls).toEqual([fixture.sessionRoot]);
+    expect(
+      await readFile(
+        join(fixture.sessionRoot, "fs/.agents/skills/greet/SKILL.md"),
+        "utf8",
+      ),
+    ).toContain("Say hello (v2)");
+    await expect(
+      access(join(fixture.sessionRoot, "fs/.agents/skills/old")),
+    ).rejects.toThrow();
+    expect(
+      await readFile(
+        join(fixture.sessionRoot, "fs/workspace/notes.txt"),
+        "utf8",
+      ),
+    ).toBe("user data\n");
+    await expect(
+      access(join(fixture.sessionRoot, "fs/workspace/seed.txt")),
+    ).rejects.toThrow();
+  });
+
+  test("recreates a missing session from the current template", async () => {
+    const root = await createRoot("eden-eve-patch-resume-missing-");
+    const fixture = await createResumeFixture(root);
+    await writeTemplateFixture(fixture.templateRoot);
+
+    await fixture.resume(
+      { sessionsDir: fixture.sessionsDir },
+      { templateRootPath: fixture.templateRoot, generation: "gen-2", sessionId: "session-1" },
+      { generation: "gen-1", rootPath: fixture.sessionRoot },
+    );
+
+    expect(fixture.openCalls).toEqual([fixture.sessionRoot]);
+    expect(
+      await readFile(
+        join(fixture.sessionRoot, "fs/.agents/skills/greet/SKILL.md"),
+        "utf8",
+      ),
+    ).toContain("Say hello (v2)");
+  });
+
+  test("keeps throwing for a session root outside the sessions directory", async () => {
+    const root = await createRoot("eden-eve-patch-resume-escape-");
+    const fixture = await createResumeFixture(root);
+    await writeTemplateFixture(fixture.templateRoot);
+    const escapedRoot = join(root, "elsewhere", "session-1");
+
+    await expect(
+      fixture.resume(
+        { sessionsDir: fixture.sessionsDir },
+        { templateRootPath: fixture.templateRoot, generation: "gen-2", sessionId: "session-1" },
+        { generation: "gen-1", rootPath: escapedRoot },
+      ),
+    ).rejects.toThrow("incompatible with this environment");
+    expect(fixture.openCalls).toEqual([]);
+  });
+
+  test("reopens an unchanged session as-is and recreates a missing one", async () => {
+    const root = await createRoot("eden-eve-patch-resume-same-");
+    const fixture = await createResumeFixture(root);
+    await writeTemplateFixture(fixture.templateRoot);
+    await writeSessionFixture(fixture.sessionRoot);
+
+    await fixture.resume(
+      { sessionsDir: fixture.sessionsDir },
+      { templateRootPath: fixture.templateRoot, generation: "gen-1", sessionId: "session-1" },
+      { generation: "gen-1", rootPath: fixture.sessionRoot },
+    );
+    expect(fixture.openCalls).toEqual([fixture.sessionRoot]);
+    expect(
+      await readFile(
+        join(fixture.sessionRoot, "fs/.agents/skills/old/SKILL.md"),
+        "utf8",
+      ),
+    ).toBe("stale\n");
+
+    const gone = join(fixture.sessionsDir, "gone");
+    await fixture.resume(
+      { sessionsDir: fixture.sessionsDir },
+      { templateRootPath: fixture.templateRoot, generation: "gen-1", sessionId: "session-1" },
+      { generation: "gen-1", rootPath: gone },
+    );
+    expect(fixture.openCalls).toEqual([fixture.sessionRoot, gone]);
+    await expect(access(gone)).resolves.toBeUndefined();
+  });
+
+  test("leaves session skills untouched when the template has none", async () => {
+    const root = await createRoot("eden-eve-patch-resume-noskills-");
+    const fixture = await createResumeFixture(root);
+    await mkdir(join(fixture.templateRoot, "fs/workspace"), {
+      recursive: true,
+    });
+    await writeSessionFixture(fixture.sessionRoot);
+
+    await fixture.resume(
+      { sessionsDir: fixture.sessionsDir },
+      { templateRootPath: fixture.templateRoot, generation: "gen-2", sessionId: "session-1" },
+      { generation: "gen-1", rootPath: fixture.sessionRoot },
+    );
+    expect(fixture.openCalls).toEqual([fixture.sessionRoot]);
+    expect(
+      await readFile(
+        join(fixture.sessionRoot, "fs/.agents/skills/old/SKILL.md"),
+        "utf8",
+      ),
+    ).toBe("stale\n");
   });
 });

@@ -53,6 +53,14 @@ export const EVE_START_COMMAND = Object.freeze([
   "8080",
 ];
 
+export const EVE_HOST_ENVIRONMENT = Object.freeze({
+  HOST: "0.0.0.0",
+  NITRO_HOST: "0.0.0.0",
+  PORT: "8080",
+  NITRO_PORT: "8080",
+  NODE_ENV: "production",
+} as const);
+
 const EVE_ENVIRONMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 const EVE_RUNTIME_METADATA_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
@@ -547,9 +555,6 @@ export async function readEveRuntimeConfig(
   activeRedactionRegistries.add(redaction);
   return EveRuntimeConfig.from(observation, values, redaction);
 }
-
-export const parseEveRuntimeConfig = readEveRuntimeConfig;
-export const loadEveRuntimeConfig = readEveRuntimeConfig;
 
 function validateProtectedPutResult(
   result: unknown,

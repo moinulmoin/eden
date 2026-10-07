@@ -1,7 +1,4 @@
 import {
-  createHash,
-} from "node:crypto";
-import {
   execFile,
 } from "node:child_process";
 import {
@@ -28,31 +25,31 @@ import {
 
 import {
   EvePackagingError,
+  EVE_SANDBOX_CACHE_ROOT,
   eveSnapshotSourceEntries,
+  imageReference as packagingImageReference,
+  IMAGE_ID_PATTERN,
+  isWithin,
+  jsonBytes,
+  safeError as errorRecord,
+  safeRelativePath,
+  sha256,
   type EveNodeImage,
   type EvePackagingCheck,
   type EvePackagingCode,
   type EveProjectBuildCandidate,
   type EveProjectOutput,
 } from "./eve-packaging.js";
-import type {
-  EveRuntimeInjection,
+import {
+  EVE_HOST_ENVIRONMENT as HOST_ENVIRONMENT,
+  EVE_START_COMMAND as START_COMMAND,
+  type EveRuntimeInjection,
 } from "./eve-runtime-config.js";
 
 const execFileAsync = promisify(execFile);
 
-const START_COMMAND = [
-  "./node_modules/.bin/eve",
-  "start",
-  "--host",
-  "0.0.0.0",
-  "--port",
-  "8080",
-] as const;
 const HEALTH_PATH = "/eve/v1/health" as const;
 const INTERNAL_PORT = 8080 as const;
-const IMAGE_ID_PATTERN = /^sha256:[0-9a-f]{64}$/u;
-const NODE_IMAGE_PATTERN = /^node:24\.17\.0(?:-[a-z0-9][a-z0-9._-]*)?$/u;
 const FORBIDDEN_RUNTIME_NAMES = new Set([
   ".env",
   ".env.local",
@@ -65,14 +62,6 @@ const FORBIDDEN_RUNTIME_NAMES = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-
-const HOST_ENVIRONMENT = {
-  HOST: "0.0.0.0",
-  NITRO_HOST: "0.0.0.0",
-  PORT: "8080",
-  NITRO_PORT: "8080",
-  NODE_ENV: "production",
-} as const;
 
 export interface EveHostRequirements {
   readonly architecture: string;
@@ -107,6 +96,17 @@ export interface EveRuntimeClosure {
   readonly nativeModules: readonly EveRuntimeNativeModule[];
   readonly eveStartClosureRetained: true;
   readonly builderOnlyMaterialExcluded: true;
+  /**
+   * The prepared sandbox-template tree shipped at
+   * `/workspace/.eve/sandbox-cache`. Present only when this Eve build
+   * prepared a sandbox template; without it Eve's sandbox tools fail on the
+   * deployed agent.
+   */
+  readonly sandboxTemplate?: {
+    readonly root: "/workspace/.eve/sandbox-cache";
+    readonly digest: string;
+    readonly files: readonly EveRuntimeClosureFile[];
+  };
 }
 
 export interface EveRuntimeImage extends EveRuntimeImageMetadata {
@@ -213,6 +213,10 @@ interface RuntimeClosureCapture {
   readonly outputDigest: string;
   readonly dependencyDigest: string;
   readonly digest: string;
+  readonly sandbox?: {
+    readonly digest: string;
+    readonly files: readonly EveRuntimeClosureFile[];
+  };
 }
 
 interface DockerState {
@@ -225,23 +229,6 @@ interface DockerState {
   imageId: string | undefined;
   containerId: string | undefined;
   imageRetained: boolean;
-}
-
-function sha256(value: string | Buffer): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function jsonBytes(value: unknown): Buffer {
-  return Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
-}
-
-function isWithin(root: string, candidate: string): boolean {
-  const normalizedRoot = root.endsWith("/") ? root.slice(0, -1) : root;
-  return candidate === normalizedRoot || candidate.startsWith(`${normalizedRoot}/`);
-}
-
-function safeRelativePath(root: string, candidate: string): string {
-  return relative(root, candidate).split("\\").join("/");
 }
 
 async function assertFreshOwnedFilePath(
@@ -297,18 +284,11 @@ async function verifyOwnedFilePath(
 }
 
 function imageReference(nodeImage: EveNodeImage): string {
-  if (
-    !NODE_IMAGE_PATTERN.test(nodeImage.reference) ||
-    !IMAGE_ID_PATTERN.test(nodeImage.digest)
-  ) {
-    throw new EvePackagingError({
-      code: "DOCKER_PLATFORM_BLOCKED",
-      subject: "node-24-image",
-      reason: "The runtime image requires an immutable Linux/amd64 Node 24 image.",
-      remediation: "Supply the verified Node 24 image reference and sha256 digest.",
-    });
-  }
-  return `${nodeImage.reference}@${nodeImage.digest}`;
+  return packagingImageReference(
+    nodeImage,
+    "The runtime image requires an immutable Linux/amd64 Node 24 image.",
+    "Supply the verified Node 24 image reference and sha256 digest.",
+  );
 }
 
 function packagingError(
@@ -452,7 +432,7 @@ async function readRegularFile(
 async function captureRuntimeTree(
   root: string,
   snapshotRoot: string,
-  label: "output" | "dependencies",
+  label: "output" | "dependencies" | "sandbox-template",
 ): Promise<{
   readonly files: readonly EveRuntimeClosureFile[];
   readonly nativeModules: readonly EveRuntimeNativeModule[];
@@ -770,6 +750,56 @@ async function validateCandidateClosure(
     captureRuntimeTree(outputRoot, snapshotRoot, "output"),
     captureRuntimeTree(dependenciesRoot, snapshotRoot, "dependencies"),
   ]);
+  const sandboxCacheRoot = join(snapshotRoot, EVE_SANDBOX_CACHE_ROOT);
+  const sandboxCacheDetails = await lstat(sandboxCacheRoot).catch(() => undefined);
+  let sandbox: RuntimeClosureCapture["sandbox"];
+  if (candidate.sandboxCache?.present === true) {
+    if (
+      sandboxCacheDetails === undefined ||
+      !sandboxCacheDetails.isDirectory() ||
+      sandboxCacheDetails.isSymbolicLink()
+    ) {
+      throw packagingError(
+        "RUNTIME_CLOSURE_INCOMPLETE",
+        EVE_SANDBOX_CACHE_ROOT,
+        "The candidate records a prepared sandbox template but its tree is missing or not a regular directory.",
+        "Regenerate the candidate so the isolated builder extracts .eve/sandbox-cache into the immutable snapshot.",
+      );
+    }
+    const capturedSandbox = await captureRuntimeTree(
+      sandboxCacheRoot,
+      snapshotRoot,
+      "sandbox-template",
+    );
+    const sandboxEvidence = capturedSandbox.files.map((file) => ({
+      relativePath: file.path,
+      sha256: file.sha256,
+      byteLength: file.byteLength,
+    }));
+    const sandboxTotalBytes = capturedSandbox.files
+      .filter((file) => !file.symbolicLink)
+      .reduce((sum, file) => sum + file.byteLength, 0);
+    if (
+      capturedSandbox.files.length !== candidate.sandboxCache.fileCount ||
+      sandboxTotalBytes !== candidate.sandboxCache.totalBytes ||
+      sha256(jsonBytes(sandboxEvidence)) !== candidate.sandboxCache.outputDigest
+    ) {
+      throw packagingError(
+        "SOURCE_RACE",
+        EVE_SANDBOX_CACHE_ROOT,
+        "The prepared sandbox template no longer matches the immutable candidate evidence.",
+        "Discard the mixed-generation runtime candidate and rebuild from a quiescent snapshot.",
+      );
+    }
+    sandbox = { digest: capturedSandbox.digest, files: capturedSandbox.files };
+  } else if (sandboxCacheDetails !== undefined) {
+    throw packagingError(
+      "SOURCE_RACE",
+      EVE_SANDBOX_CACHE_ROOT,
+      "The candidate records no prepared sandbox template but the immutable snapshot contains one.",
+      "Discard the mixed-generation runtime candidate and rebuild from a quiescent snapshot.",
+    );
+  }
   const entrypointBytes = await readRegularFile(entrypoint, snapshotRoot);
   const candidateOutputDigest = sha256(jsonBytes(
     output.files.map((file) => ({
@@ -799,6 +829,7 @@ async function validateCandidateClosure(
       outputDigest: output.digest,
       dependencyDigest: dependencies.digest,
     })),
+    ...(sandbox === undefined ? {} : { sandbox }),
   };
 }
 
@@ -815,6 +846,15 @@ export async function revalidateEveRuntimeCandidate(
     nativeModules: closure.nativeModules,
     eveStartClosureRetained: true,
     builderOnlyMaterialExcluded: true,
+    ...(closure.sandbox === undefined
+      ? {}
+      : {
+        sandboxTemplate: {
+          root: "/workspace/.eve/sandbox-cache" as const,
+          digest: closure.sandbox.digest,
+          files: closure.sandbox.files,
+        },
+      }),
   };
 }
 
@@ -906,6 +946,12 @@ async function writeRuntimeContext(
       join(runtimeContextPath, "node_modules"),
       { recursive: true },
     );
+    const sandboxCacheSource = join(candidate.snapshotRoot, EVE_SANDBOX_CACHE_ROOT);
+    const sandboxCacheContext = join(runtimeContextPath, EVE_SANDBOX_CACHE_ROOT);
+    if (closure.sandbox !== undefined) {
+      await cp(sandboxCacheSource, sandboxCacheContext, { recursive: true });
+      await rewriteContextLinks(sandboxCacheSource, sandboxCacheContext);
+    }
     const sourceEntries = await eveSnapshotSourceEntries(candidate.snapshotRoot);
     for (const entry of sourceEntries) {
       await cp(
@@ -932,9 +978,17 @@ async function writeRuntimeContext(
       runtimeContextPath,
       "dependencies",
     );
+    const copiedSandbox = closure.sandbox === undefined
+      ? undefined
+      : await captureRuntimeTree(
+        sandboxCacheContext,
+        runtimeContextPath,
+        "sandbox-template",
+      );
     if (
       copiedOutput.digest !== closure.outputDigest ||
-      copiedDependencies.digest !== closure.dependencyDigest
+      copiedDependencies.digest !== closure.dependencyDigest ||
+      (closure.sandbox !== undefined && copiedSandbox?.digest !== closure.sandbox.digest)
     ) {
       throw packagingError(
         "SOURCE_RACE",
@@ -943,6 +997,12 @@ async function writeRuntimeContext(
         "Discard the mixed-generation runtime context and rebuild from a quiescent candidate.",
       );
     }
+    const sandboxContextCopy = closure.sandbox === undefined
+      ? ""
+      : `COPY ${JSON.stringify([EVE_SANDBOX_CACHE_ROOT, `/candidate/${EVE_SANDBOX_CACHE_ROOT}`])}\n`;
+    const sandboxImageCopy = closure.sandbox === undefined
+      ? ""
+      : `COPY --from=candidate ${JSON.stringify([`/candidate/${EVE_SANDBOX_CACHE_ROOT}`, `/workspace/${EVE_SANDBOX_CACHE_ROOT}`])}\n`;
     const sourceCopyLines = sourceEntries
       .map((entry) =>
         `COPY --from=candidate ${JSON.stringify([`/candidate/${entry}`, `/workspace/${entry}`])}`
@@ -953,7 +1013,7 @@ FROM --platform=linux/amd64 ${imageReference(nodeImage)} AS candidate
 WORKDIR /candidate
 COPY .output /candidate/.output
 COPY node_modules /candidate/node_modules
-${sourceEntries.map((entry) => `COPY ${JSON.stringify([entry, `/candidate/${entry}`])}`).join("\n")}
+${sandboxContextCopy}${sourceEntries.map((entry) => `COPY ${JSON.stringify([entry, `/candidate/${entry}`])}`).join("\n")}
 
 FROM --platform=linux/amd64 ${imageReference(nodeImage)} AS runtime
 WORKDIR /workspace
@@ -965,7 +1025,7 @@ ENV HOST=0.0.0.0 \\
     CBOR_NATIVE_ACCELERATION_DISABLED=true
 COPY --from=candidate /candidate/.output /workspace/.output
 COPY --from=candidate /candidate/node_modules /workspace/node_modules
-${sourceCopyLines}
+${sandboxImageCopy}${sourceCopyLines}
 EXPOSE 8080
 ENTRYPOINT ["./node_modules/.bin/eve", "start", "--host", "0.0.0.0", "--port", "8080"]
 `;
@@ -1132,6 +1192,67 @@ function runtimeContainerEnvironment(
         }
       : {}),
   };
+}
+
+/**
+ * Absolute `/workspace` sandbox-template paths recorded by `eve build` in the
+ * compiled `sandbox-prepared-artifacts.json` manifest. The boot probe asserts
+ * each recorded template exists inside the built image. Paths outside the
+ * sandbox cache, or containing anything unsafe to interpolate into a single
+ *-quoted shell word, are skipped (packaging validation already bounded the
+ * tree; this is an end-to-end existence proof).
+ */
+async function eveSandboxTemplateBootPaths(
+  candidate: EveProjectBuildCandidate,
+): Promise<readonly string[]> {
+  if (candidate.sandboxCache?.present !== true) return [];
+  const bootPrefix = `/workspace/${EVE_SANDBOX_CACHE_ROOT}/`;
+  const paths = new Set<string>();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(
+      await readFile(
+        join(
+          candidate.snapshotRoot,
+          ".output/.eve/compile/sandbox-prepared-artifacts.json",
+        ),
+        "utf8",
+      ),
+    );
+  } catch {
+    return [];
+  }
+  if (typeof parsed !== "object" || parsed === null || !("entries" in parsed)) {
+    return [];
+  }
+  const entries = parsed.entries;
+  if (!Array.isArray(entries)) return [];
+  for (const entry of entries) {
+    if (typeof entry !== "object" || entry === null || !("artifact" in entry)) {
+      continue;
+    }
+    const artifact = entry.artifact;
+    if (
+      typeof artifact !== "object" ||
+      artifact === null ||
+      !("templateRootPath" in artifact) ||
+      typeof artifact.templateRootPath !== "string"
+    ) {
+      continue;
+    }
+    const templateRootPath = artifact.templateRootPath;
+    if (
+      !templateRootPath.startsWith(bootPrefix) ||
+      templateRootPath.slice(bootPrefix.length).length === 0 ||
+      templateRootPath.slice(bootPrefix.length).split("/").includes("..") ||
+      templateRootPath.includes("'") ||
+      templateRootPath.includes("\\")
+    ) {
+      continue;
+    }
+    paths.add(templateRootPath);
+  }
+  return [...paths].sort();
 }
 
 function validateHealthPort(port: number): void {
@@ -1452,15 +1573,6 @@ async function pollEveHealth(
   );
 }
 
-function errorRecord(error: EvePackagingError): EveRuntimeImageResult["error"] {
-  return {
-    code: error.code,
-    subject: error.subject,
-    reason: error.message,
-    remediation: error.remediation,
-  };
-}
-
 function blockedResult(
   candidate: EveProjectBuildCandidate,
   error: EvePackagingError,
@@ -1561,9 +1673,17 @@ export async function buildEveRuntimeImage(
       context.runtimeContextPath,
       "dependencies",
     );
+    const postBuildSandbox = closure.sandbox === undefined
+      ? undefined
+      : await captureRuntimeTree(
+        join(context.runtimeContextPath, EVE_SANDBOX_CACHE_ROOT),
+        context.runtimeContextPath,
+        "sandbox-template",
+      );
     if (
       postBuildOutput.digest !== closure.outputDigest ||
-      postBuildDependencies.digest !== closure.dependencyDigest
+      postBuildDependencies.digest !== closure.dependencyDigest ||
+      (closure.sandbox !== undefined && postBuildSandbox?.digest !== closure.sandbox.digest)
     ) {
       throw packagingError(
         "SOURCE_RACE",
@@ -1661,6 +1781,16 @@ export async function buildEveRuntimeImage(
       "-ceu",
       "test -f /workspace/.output/server/index.mjs && test -x /workspace/node_modules/.bin/eve",
     ]);
+    const sandboxTemplatePaths = await eveSandboxTemplateBootPaths(request.candidate);
+    if (sandboxTemplatePaths.length > 0) {
+      await docker(state, [
+        "exec",
+        state.containerId,
+        "sh",
+        "-ceu",
+        sandboxTemplatePaths.map((path) => `test -d '${path}'`).join(" && "),
+      ]);
+    }
     await docker(state, [
       "exec",
       state.containerId,
@@ -1712,15 +1842,15 @@ export async function buildEveRuntimeImage(
       "-ceu",
       "awk '$2 ~ /^00000000:1F90/ { found=1 } END { exit found ? 0 : 1 }' /proc/net/tcp /proc/net/tcp6",
     ]);
-    await docker(state, [
-      "exec",
-      state.containerId,
-      "sh",
-      "-ceu",
-      "test -z \"$(find /app -type f \\( -name '.env*' -o -name '.npmrc' -o -name '.pnpmrc' -o -name '*.pem' -o -name '*.key' -o -name 'credentials.json' -o -name 'service-account.json' \\) -print -quit)\"",
-    ]);
     imageRetained = retainImage;
     state.imageRetained = retainImage;
+    const sandboxTemplate = closure.sandbox === undefined
+      ? undefined
+      : {
+        root: "/workspace/.eve/sandbox-cache" as const,
+        digest: closure.sandbox.digest,
+        files: closure.sandbox.files,
+      };
     containerRemoved = await removeOwnedContainer(state);
     state.containerId = undefined;
     cleanupVerified = containerRemoved;
@@ -1768,7 +1898,14 @@ export async function buildEveRuntimeImage(
         ? {}
         : { publicOrigin: request.publicOrigin }),
       applicationArtifact: request.candidate.generatedOutput.entrypointPath,
-      runtimeClosure: closure,
+      runtimeClosure: {
+        files: closure.files,
+        nativeModules: closure.nativeModules,
+        outputDigest: closure.outputDigest,
+        dependencyDigest: closure.dependencyDigest,
+        digest: closure.digest,
+        ...(sandboxTemplate === undefined ? {} : { sandboxTemplate }),
+      },
       health: {
         method: "GET",
         path: HEALTH_PATH,
@@ -1803,6 +1940,7 @@ export async function buildEveRuntimeImage(
         nativeModules: closure.nativeModules,
         eveStartClosureRetained: true,
         builderOnlyMaterialExcluded: true,
+        ...(sandboxTemplate === undefined ? {} : { sandboxTemplate }),
       },
     };
     return {

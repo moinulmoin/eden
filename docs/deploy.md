@@ -160,10 +160,25 @@ update instead of failing with `VAL-CLI-007-TARGET-CONFLICT`:
 3. The running Container restarts on the new image. The image is selected at
    container start, so Eden compares the running image against the new
    deployment's and stops the instance itself when it still serves the
-   previous image; workspace files do not carry across an update.
+   previous image. Before stopping it, Eden copies Eve's sandbox sessions —
+   every conversation's files under
+   `/workspace/.eve/sandbox-cache/just-bash/sessions` — into the Durable
+   Object's storage (capped at 1 GiB compressed) and restores them into the
+   fresh container before it serves any request. The rest of `/workspace`
+   (including Eve's sandbox templates) resets to the new image, like on
+   Vercel.
 4. It health-checks the public URL, promotes the new generation, then deletes
    the previous generation's registry repository (every tag, including
    snapshot tags).
+
+Because conversations survive the image change, a skill change no longer
+breaks existing sessions: Eden's builder also applies a temporary fix for
+Eve's [just-bash resume bug](https://github.com/vercel/eve/issues/4440)
+(Eve would otherwise permanently refuse to resume a conversation after its
+sandbox template changes). The fix is applied inside Eden's throwaway build
+image only, and only for Eve versions whose file matches a known checksum;
+on an unknown Eve version the deploy still succeeds and prints an
+`EVE_SANDBOX_RESUME_PATCH` warning instead.
 
 The summary prints `✓ updated <name>` (in `--json`, `deployment.operation` is
 `update`). A target that exists but isn't provably Eden's still fails with
@@ -266,13 +281,15 @@ HTTPS self-origin delivery trusts Cloudflare's runtime-mounted Containers CA.
 callback URLs.
 
 A preview deployment that boots Eve's local Workflow World proves health,
-startup, and fresh request handling only. Container-local disk now survives
-sleep — when the Container has been idle for the sleep window, Eden snapshots
-the writable filesystem and stops the instance, and the next request restores
-that snapshot — but a restart after an image update starts fresh, so local
-World state still reinitializes across an update. Snapshots expire after 30
-idle days. Schedules still fire while the Container sleeps (see "Schedules"
-below). Durable Object memory always survives sleep and restarts.
+startup, and fresh request handling only. Container-local disk survives sleep
+— when the Container has been idle for the sleep window, Eden snapshots the
+writable filesystem and stops the instance, and the next request restores
+that snapshot — and an update carries Eve's sandbox sessions (conversation
+files) across the image change through the Durable Object's storage, so
+sessions now survive updates too. Local World *state* still reinitializes
+across an update, and snapshots expire after 30 idle days. Schedules still
+fire while the Container sleeps (see "Schedules" below). Durable Object
+memory always survives sleep and restarts.
 
 Production durability requires a project-configured, Cloudflare-reachable,
 durable Eve-compatible Workflow World such as Postgres (for example
@@ -302,8 +319,11 @@ Because the every-minute trigger exists to wake the Container, a project
 with schedules pays one scheduled invocation per minute (~43k/month), which
 is well inside the Workers Paid allocation.
 
-For testing sleep behavior, `EDEN_EVE_CONTAINER_SLEEP_AFTER=<duration>`
-(for example `90s`) overrides the Container's `sleepAfter` at deploy time.
+The Container sleeps after 1 hour without requests: Eden snapshots its
+filesystem, then stops it. `EDEN_EVE_CONTAINER_SLEEP_AFTER=<duration>` (for
+example `90s` or `3h`) overrides this at deploy time, up to `345m` (5 h 45
+min) — Cloudflare stops a container within 6 hours of its Durable Object going
+idle, and Eden must snapshot before that.
 
 ## Durable state on Cloudflare (no database)
 
@@ -337,16 +357,17 @@ Only `eden destroy` deletes them.
 **Sleep is snapshot-based.** With this World the container's idle sleep is
 driven by a Durable Object alarm: after the sleep window, Eden snapshots the
 container's filesystem, stops the instance, and restores the snapshot on the
-next request. Memory survives sleep and restarts; the 30-second-sleep live
-test left the container running 45 seconds after its last client, so budget
-for short awake tails after idle.
+next request. Workflow memory lives in the Durable Object and survives container
+restarts and updates. Automatic container sleep with this World remains
+unverified.
 
 ## Durable state (Postgres World)
 
-Container-local disk survives sleep via snapshots but not image updates
-(an update restarts the container fresh), so Eve's default local Workflow
-World still loses pending approvals and in-flight sessions across a
-redeploy. Eden has tested the Postgres World
+Container-local disk survives sleep via snapshots, and updates now carry
+Eve's sandbox sessions (conversation files) across the image change through
+the Durable Object's storage — but local World *state* (pending approvals and
+in-flight sessions) still reinitializes across an update. Eden has tested
+the Postgres World
 (`@workflow/world-postgres`) end to end: a pending tool approval survived a
 full `eden destroy` + `eden deploy` container replacement. This section is
 the tested recipe; other durable Worlds are project-owned and untested here.

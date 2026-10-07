@@ -12,15 +12,14 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 
 import { afterEach, describe, expect, test } from "vitest";
 
 import {
-  EDEN_CLI_COMMANDS,
+  EVE_CLI_COMMANDS,
   EveCliError,
   deriveEveTargetName,
-  isEdenCliCommand,
   parseEveArguments,
   runEdenCli,
   type EveCliHelp,
@@ -32,6 +31,7 @@ import type {
 } from "../src/index.js";
 import type { EveProjectBuilderRequest } from "../src/eve-packaging.js";
 import type { EveProjectBuilder } from "../src/eve-packaging.js";
+import { EVE_SANDBOX_RESUME_PATCH_SIGNATURE } from "../src/eve-packaging.js";
 import { exactTargetContainerEntries } from "../src/eve-control-plane.js";
 
 const roots: string[] = [];
@@ -113,13 +113,11 @@ describe("top-level Eden Deploy commands", () => {
 
     expect(output.join("\n")).toMatch(/preflight|deploy|destroy/u);
     expect(output.join("\n")).not.toMatch(/eden eve/u);
-    expect(EDEN_CLI_COMMANDS).toEqual([
+    expect(EVE_CLI_COMMANDS).toEqual([
       "preflight",
       "deploy",
       "destroy",
     ]);
-    expect(isEdenCliCommand("agent")).toBe(false);
-    expect(isEdenCliCommand("eve")).toBe(false);
   });
 
   test.each([
@@ -1927,6 +1925,90 @@ describe("Workflow World warnings", () => {
     expect(text).toContain("! EVE_WORLD_LOCAL");
     expect(text).toContain("durable-state-postgres-world");
     expect(text).toContain("preflight passed");
+  });
+
+  test("warns when the builder's Eve is not a known just-bash version", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-patch-unknown", "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(
+            root,
+            fakeBuilder(async (request) => {
+              const binding = join(
+                request.snapshotRoot,
+                "node_modules/eve/dist/src/execution/sandbox/bindings/just-bash.js",
+              );
+              await mkdir(dirname(binding), { recursive: true });
+              await writeFile(binding, "export const provider = {};\n", "utf8");
+            }),
+          ),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly warnings: readonly { readonly id: string }[];
+    };
+    expect(result.warnings.map((value) => value.id)).toContain(
+      "EVE_SANDBOX_RESUME_PATCH",
+    );
+  });
+
+  test("does not warn when the builder applied the sandbox-resume patch", async () => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-patch-applied", "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(
+            root,
+            fakeBuilder(async (request) => {
+              const binding = join(
+                request.snapshotRoot,
+                "node_modules/eve/dist/src/execution/sandbox/bindings/just-bash.js",
+              );
+              await mkdir(dirname(binding), { recursive: true });
+              await writeFile(
+                binding,
+                `// patched\nconst ${EVE_SANDBOX_RESUME_PATCH_SIGNATURE} = async () => undefined;\n`,
+                "utf8",
+              );
+            }),
+          ),
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly warnings: readonly { readonly id: string }[];
+      readonly checks: readonly {
+        readonly id: string;
+        readonly status: string;
+        readonly message: string;
+      }[];
+    };
+    expect(result.warnings.map((value) => value.id)).not.toContain(
+      "EVE_SANDBOX_RESUME_PATCH",
+    );
+    expect(result.checks).toContainEqual({
+      id: "EVE_SANDBOX_RESUME_PATCH",
+      status: "passed",
+      message: "applied temporary fix for eve#4440",
+    });
   });
 
   test("does not warn when the compiled agent selects a durable World", async () => {

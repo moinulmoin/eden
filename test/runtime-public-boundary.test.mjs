@@ -32,7 +32,7 @@ async function createConsumerProject() {
   generateEveHostWorkerSource,
   resolveStableWorkersDevOrigin,
   type EveHostConfig,
-  type EveReadinessGate,
+  type EveScheduleCronEntry,
 } from "@moinulmoin/eden-runtime-cloudflare";
 
 const origin: string = resolveStableWorkersDevOrigin({
@@ -43,8 +43,6 @@ const origin: string = resolveStableWorkersDevOrigin({
 const config: EveHostConfig = createEveHostConfig({
   workerName: "eden-eve-preview",
   containerApplicationName: "eden-eve-preview-container",
-  containerClassName: "EveHostDurableContainer",
-  containerBindingName: "EVE_CONTAINER",
   stableContainerInstanceName: "eden-eve-preview-instance",
   deploymentId: "dep-public",
   generationId: "gen-public",
@@ -54,10 +52,10 @@ const config: EveHostConfig = createEveHostConfig({
 });
 
 const source: string = generateEveHostWorkerSource({ config });
-const gate: EveReadinessGate | undefined = undefined;
+const schedule: EveScheduleCronEntry | undefined = undefined;
 
 void source;
-void gate;
+void schedule;
 `,
     "utf8",
   );

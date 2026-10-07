@@ -42,7 +42,6 @@ import {
 
 export {
   EVE_CLI_COMMANDS,
-  EVE_USAGE,
   EveCliError,
   deriveEveTargetName,
   eveHelpText,
@@ -59,8 +58,6 @@ export {
   EVE_START_COMMAND,
   EveRuntimeConfig,
   EveRuntimeConfigError,
-  loadEveRuntimeConfig,
-  parseEveRuntimeConfig,
   prepareEveRuntimeInjection,
   readEveRuntimeConfig,
   redactEveRuntimeOutput,
@@ -90,7 +87,6 @@ export type {
   EveCliExecutionRequest,
   EveCliHelp,
   EveCliInvocation,
-  EveCliRunner,
   ParsedEveInvocation,
 } from "./eve.js";
 export type {
@@ -106,11 +102,11 @@ export type {
   EveProjectInputManifest,
   EveProjectOutput,
   EveProjectPackagingResult,
-  EveProjectRuntime,
   EveProjectSnapshot,
   EveProjectSnapshotOptions,
   EveProjectToolchain,
   EveRuntimeConfigExclusion,
+  EveSandboxResumePatchStatus,
 } from "./eve-packaging.js";
 export type {
   EveHostRequirements,
@@ -167,14 +163,6 @@ export type {
   EveRuntimeImageDiscardRunner,
   EveWorkerDeleteRunner,
 } from "./eve-control-plane.js";
-
-export const EDEN_CLI_COMMANDS = [
-  "preflight",
-  "deploy",
-  "destroy",
-] as const;
-
-export type EdenCliCommand = (typeof EDEN_CLI_COMMANDS)[number];
 
 export interface EdenCliRunOptions {
   readonly cwd?: string;
@@ -405,10 +393,6 @@ export async function main(
   args: readonly string[] = process.argv.slice(2),
 ): Promise<number> {
   return runEdenCli(args);
-}
-
-export function isEdenCliCommand(value: string): value is EdenCliCommand {
-  return (EDEN_CLI_COMMANDS as readonly string[]).includes(value);
 }
 
 if (

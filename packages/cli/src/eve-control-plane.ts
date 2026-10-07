@@ -40,6 +40,7 @@ import {
 
 import {
   EveCliError,
+  EVE_NAME_PATTERN,
   type EveCliEnvironment,
   type EveCliExecutionRequest,
 } from "./eve.js";
@@ -48,6 +49,7 @@ import {
   createDockerEveProjectBuilder,
   revalidateEveProjectCandidateInputs,
   EvePackagingError,
+  IMAGE_ID_PATTERN,
   type EveNodeImage,
   type EvePackagingCheck,
   type EveProjectBuildCandidate,
@@ -528,6 +530,8 @@ function mapPackagingCheck(value: EvePackagingCheck): EvePreflightCheck {
         return "VAL-SEC-003";
       case "DOCKER_PLATFORM_BLOCKED":
         return "VAL-BUILD-005";
+      case "EVE_SANDBOX_RESUME_PATCH":
+        return value.id;
       default:
         return `EVE-${value.id}`;
     }
@@ -1184,7 +1188,7 @@ async function readWorkersDevSubdomain(
       ? (result as { readonly subdomain?: unknown }).subdomain
       : undefined;
     return typeof subdomain === "string" &&
-        /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(subdomain)
+        EVE_NAME_PATTERN.test(subdomain)
       ? subdomain
       : undefined;
   } catch {
@@ -1204,39 +1208,38 @@ export function exactTargetContainerEntries(
   return exactContainerEntries(value, boundedResourceName(name, "container"));
 }
 
+async function readExactTargetInventory(workerName: string, containerApp: string) {
+  const containers = await readWranglerJson([
+    "containers", "list", "--json", "--per-page", "100",
+  ]);
+  const deployments = await readWranglerJson([
+    "deployments", "list", "--name", workerName, "--json",
+  ]);
+  return {
+    containers,
+    deployments,
+    containerEntries: exactContainerEntries(containers.value, containerApp),
+    deploymentEntries: exactDeploymentEntries(deployments.value),
+  };
+}
+
 async function defaultCloudflareRead(
   request: EveCloudflareReadRequest,
 ): Promise<EveCloudflareReadResult> {
   const account = await readWranglerJson(["whoami", "--json"]);
-  const containers = await readWranglerJson([
-    "containers",
-    "list",
-    "--json",
-    "--per-page",
-    "100",
-  ]);
-  const deployments = await readWranglerJson([
-    "deployments",
-    "list",
-    "--name",
-    request.name,
-    "--json",
-  ]);
+  const { containers, deployments, containerEntries, deploymentEntries: listedDeployments } =
+    await readExactTargetInventory(request.name, boundedResourceName(request.name, "container"));
   const accountId = authenticatedAccountId(account.value);
   const accountAccess = account.failed || accountId === undefined
     ? "unavailable"
     : "available";
-  const containerEntries = exactTargetContainerEntries(
-    containers.value,
-    request.name,
-  );
   const containerAccess = containers.failed || containerEntries === undefined
     ? "unavailable"
     : "available";
   const deploymentEntries = deployments.failed &&
       /(?:does not exist|not found)/iu.test(deployments.stderr ?? "")
     ? []
-    : exactDeploymentEntries(deployments.value);
+    : listedDeployments;
   const workersDevSubdomain = await readWorkersDevSubdomain(accountId);
   if (
     accountAccess === "unavailable" ||
@@ -2035,25 +2038,11 @@ function defaultPublicationRunner(): EveDeploymentPublicationRunner {
         ownershipEvidenceRetained: true,
       };
     }
-    const containers = await readWranglerJson([
-      "containers",
-      "list",
-      "--json",
-      "--per-page",
-      "100",
-    ]);
-    const containerEntries = exactContainerEntries(
-      containers.value,
-      request.hostConfig.container.applicationName,
-    );
-    const deployments = await readWranglerJson([
-      "deployments",
-      "list",
-      "--name",
-      request.identity.workerName,
-      "--json",
-    ]);
-    const deploymentEntries = exactDeploymentEntries(deployments.value);
+    const { containers, deployments, containerEntries, deploymentEntries } =
+      await readExactTargetInventory(
+        request.identity.workerName,
+        request.hostConfig.container.applicationName,
+      );
     if (
       containers.failed ||
       containerEntries === undefined ||
@@ -2518,7 +2507,7 @@ async function runEveDeployment(
   }
 
   const imageDigest = runtimeEvidence.imageDigest;
-  if (imageDigest === undefined || !/^sha256:[0-9a-f]{64}$/u.test(imageDigest)) {
+  if (imageDigest === undefined || !IMAGE_ID_PATTERN.test(imageDigest)) {
     throw deploymentFailure(
       "EVE_IMAGE_IDENTITY_UNAVAILABLE",
       "The deploy candidate did not provide an immutable runtime image digest.",
@@ -2660,8 +2649,6 @@ async function runEveDeployment(
     accountId,
     workerName: identity.workerName,
     containerApplicationName: identity.containerApplicationName,
-    containerClassName: "EveHostDurableContainer",
-    containerBindingName: "EVE_CONTAINER",
     stableContainerInstanceName: identity.stableContainerInstanceName,
     deploymentId: identity.deploymentId,
     generationId: identity.generationId,
@@ -3271,7 +3258,6 @@ async function collectEvePreflight(
       snapshot: null,
       toolchain: null,
       image: null,
-      runtime: null,
       secrets: {
         runtimeVariableNames: [],
         valuesRecorded: false,
@@ -3284,6 +3270,7 @@ async function collectEvePreflight(
         redactionRegisteredBeforeChildren: false,
       },
       checks: [],
+      sandboxResumePatch: "absent",
       candidateImageId: null,
       candidateImageRetainedLocally: false,
       writtenPaths: [],
@@ -3291,6 +3278,15 @@ async function collectEvePreflight(
     };
   }
   checks.push(...packaging.checks.map(mapPackagingCheck));
+  if (packaging.sandboxResumePatch === "skipped") {
+    warnings.push({
+      id: "EVE_SANDBOX_RESUME_PATCH",
+      message:
+        "Eve's just-bash file is not a version Eden knows; conversations may lose their sandbox after a skill change (eve#4440)",
+      remediation:
+        "Pin Eve to a version Eden knows, or update Eden so its known Eve versions include yours.",
+    });
+  }
   const discardPackagingImage = async (): Promise<void> => {
     if (
       packaging.candidateImageId === null ||
@@ -3579,7 +3575,7 @@ async function collectEvePreflight(
         )
       );
       const runtimeImageIdentityValid =
-        /^sha256:[0-9a-f]{64}$/u.test(runtimeEvidence.imageDigest ?? "");
+        IMAGE_ID_PATTERN.test(runtimeEvidence.imageDigest ?? "");
       if (!runtimeProofComplete) {
         checks.push(
           check(
@@ -4293,27 +4289,11 @@ async function defaultDestroyTargetRead(
   request: EveDestroyCloudflareReadRequest,
 ): Promise<EveDestroyTargetRead> {
   const account = await readWranglerJson(["whoami", "--json"]);
-  const deployments = await readWranglerJson([
-    "deployments",
-    "list",
-    "--name",
-    request.workerName,
-    "--json",
-  ]);
-  const containers = await readWranglerJson([
-    "containers",
-    "list",
-    "--json",
-    "--per-page",
-    "100",
-  ]);
+  const { deployments, containerEntries: entries, deploymentEntries } =
+    await readExactTargetInventory(request.workerName, request.containerApplicationName);
   const accountId = authenticatedAccountId(account.value);
   const workerExists = !deployments.failed &&
-    (exactDeploymentEntries(deployments.value)?.length ?? 0) > 0;
-  const entries = exactContainerEntries(
-    containers.value,
-    request.containerApplicationName,
-  );
+    (deploymentEntries?.length ?? 0) > 0;
   const firstContainer = entries === undefined ? undefined : entries[0];
   const ownedRepositories = request.registryRepositories;
   let registryTagsPresent: readonly string[] | undefined;

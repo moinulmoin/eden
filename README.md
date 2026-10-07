@@ -16,19 +16,19 @@ its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.6.0
+npm install --global @moinulmoin/eden@0.7.0
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.6.0
+pnpm add --global @moinulmoin/eden@0.7.0
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.6.0
+bun add --global @moinulmoin/eden@0.7.0
 ```
 
 Confirm the installation:
@@ -137,9 +137,11 @@ The Eve project remains responsible for its:
 ### Limits
 
 - Container disk survives sleep (Eden snapshots the filesystem and restores
-  it on wake) but not image updates; process-local World state is not durable
-  across an update, and Eden warns about it. Durable state takes three steps
-  with the Postgres World (any direct, unpooled Postgres); see
+  it on wake), and updates carry Eve's sandbox sessions — every
+  conversation's files — across the image change through the Durable Object's
+  storage (capped at 1 GiB compressed). Local Workflow World state is not
+  durable across an update, and Eden warns about it. Durable state takes
+  three steps with the Postgres World (any direct, unpooled Postgres); see
   [docs/deploy.md](docs/deploy.md#durable-state-postgres-world).
 - Schedules with standard 5-field cron fire while the Container sleeps (a
   Cloudflare Cron Trigger wakes it); others only run while it is awake. See

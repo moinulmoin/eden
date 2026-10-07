@@ -8,6 +8,7 @@ import {
   readFile,
   readdir,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import {
@@ -37,9 +38,12 @@ async function createRoot(prefix: string): Promise<string> {
   return root;
 }
 
+const SANDBOX_TEMPLATE_KEY = "7bc778099a3b436ce4ad98ba";
+
 async function writeCandidate(
   root: string,
   extraOutputFiles: Record<string, string> = {},
+  options: { readonly sandboxCache?: boolean } = {},
 ): Promise<EveRuntimeImageRequest["candidate"]> {
   const generationRoot = join(root, "generation");
   const snapshotRoot = join(generationRoot, "container", "snapshot");
@@ -82,6 +86,83 @@ async function writeCandidate(
     const outputPath = join(snapshotRoot, ".output", relativePath);
     await mkdir(dirname(outputPath), { recursive: true });
     await writeFile(outputPath, contents, "utf8");
+  }
+
+  let sandboxCache: EveRuntimeImageRequest["candidate"]["sandboxCache"] = null;
+  if (options.sandboxCache === true) {
+    const templateRoot = join(
+      snapshotRoot,
+      ".eve/sandbox-cache/just-bash/templates",
+      SANDBOX_TEMPLATE_KEY,
+    );
+    await mkdir(join(templateRoot, "fs/workspace"), { recursive: true });
+    const metadata =
+      `${JSON.stringify({ templateKey: SANDBOX_TEMPLATE_KEY })}\n`;
+    await writeFile(join(templateRoot, "metadata.json"), metadata, "utf8");
+    await mkdir(dirname(join(snapshotRoot, ".output/.eve/compile/x")), {
+      recursive: true,
+    });
+    await writeFile(
+      join(
+        snapshotRoot,
+        ".output/.eve/compile/sandbox-prepared-artifacts.json",
+      ),
+      `${JSON.stringify({
+        entries: [
+          {
+            artifact: {
+              templateRootPath: `/workspace/.eve/sandbox-cache/just-bash/templates/${SANDBOX_TEMPLATE_KEY}`,
+            },
+            nodeId: "__root__",
+            providerName: "just-bash",
+          },
+        ],
+        kind: "eve-sandbox-prepared-artifacts",
+        version: 2,
+      })}\n`,
+      "utf8",
+    );
+    const sandboxFiles: Array<{
+      readonly relativePath: string;
+      readonly sha256: string;
+      readonly byteLength: number;
+    }> = [];
+    let sandboxTotalBytes = 0;
+    const collectSandbox = async (
+      directory: string,
+      relativeDirectory: string,
+    ): Promise<void> => {
+      const entries = await readdir(directory, { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        const entryPath = join(directory, entry.name);
+        const relativePath = relativeDirectory.length === 0
+          ? entry.name
+          : `${relativeDirectory}/${entry.name}`;
+        if (entry.isDirectory()) {
+          await collectSandbox(entryPath, relativePath);
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        const bytes = await readFile(entryPath);
+        sandboxTotalBytes += bytes.byteLength;
+        sandboxFiles.push({
+          relativePath: `.eve/sandbox-cache/${relativePath}`,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          byteLength: bytes.byteLength,
+        });
+      }
+    };
+    await collectSandbox(join(snapshotRoot, ".eve/sandbox-cache"), "");
+    sandboxCache = {
+      present: true,
+      root: ".eve/sandbox-cache",
+      outputDigest: createHash("sha256")
+        .update(JSON.stringify(sandboxFiles) + "\n")
+        .digest("hex"),
+      fileCount: sandboxFiles.length,
+      totalBytes: sandboxTotalBytes,
+    };
   }
 
 
@@ -142,6 +223,7 @@ async function writeCandidate(
       outputDigest,
       fileCount: outputFiles.length,
     },
+    sandboxCache,
     runtimeVariableNames: [],
   };
 }
@@ -670,6 +752,215 @@ describe("Eve runtime image boundary", () => {
     expect(dockerfile).not.toContain(".env");
     expect(dockerfile).not.toContain("RUNTIME_SECRET");
     expect(dockerfile).not.toContain("do-not-copy");
+    expect(dockerfile).not.toContain(".eve/sandbox-cache");
+  });
+
+  test("ships the prepared sandbox template at /workspace/.eve/sandbox-cache", async () => {
+    const root = await createRoot("eden-eve-runtime-image-sandbox-");
+    const candidate = await writeCandidate(root, {}, { sandboxCache: true });
+    const fakeDocker = await writeFakeDocker(root);
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+      healthPort: 4317,
+      retainImage: false,
+      fetchHealth: async () => new Response(
+        JSON.stringify({ status: "ready" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result.status).toBe("ready");
+    const dockerfile = await readFile(
+      join(candidate.generationRoot, "container/runtime.Dockerfile"),
+      "utf8",
+    );
+    expect(dockerfile).toContain(
+      'COPY [".eve/sandbox-cache","/candidate/.eve/sandbox-cache"]',
+    );
+    expect(dockerfile).toContain(
+      'COPY --from=candidate ["/candidate/.eve/sandbox-cache","/workspace/.eve/sandbox-cache"]',
+    );
+    expect(result.image?.runtimeClosure.sandboxTemplate).toMatchObject({
+      root: "/workspace/.eve/sandbox-cache",
+    });
+    expect(result.image?.runtimeClosure.sandboxTemplate?.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: ".eve/sandbox-cache/just-bash/templates/7bc778099a3b436ce4ad98ba/metadata.json",
+          symbolicLink: false,
+        }),
+      ]),
+    );
+    // The sandbox-template files stay out of the output/dependency closure.
+    expect(
+      result.image?.runtimeClosure.files.some((file) =>
+        file.path.startsWith(".eve/")
+      ),
+    ).toBe(false);
+    const runtimeManifest = JSON.parse(
+      await readFile(
+        join(candidate.generationRoot, "runtime-image-manifest.json"),
+        "utf8",
+      ),
+    ) as {
+      readonly runtimeClosure?: {
+        readonly sandboxTemplate?: { readonly root?: unknown };
+      };
+    };
+    expect(runtimeManifest.runtimeClosure?.sandboxTemplate?.root).toBe(
+      "/workspace/.eve/sandbox-cache",
+    );
+    const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const templateProbe = dockerArgs.find((args) =>
+      args[0] === "exec" &&
+      args.some((arg) =>
+        arg.includes(
+          `test -d '/workspace/.eve/sandbox-cache/just-bash/templates/${SANDBOX_TEMPLATE_KEY}'`,
+        )
+      )
+    );
+    expect(templateProbe).toBeDefined();
+  });
+
+  test("rejects an extracted sandbox template that escapes its runtime root", async () => {
+    const root = await createRoot("eden-eve-runtime-image-sandbox-link-");
+    const candidate = await writeCandidate(root, {}, { sandboxCache: true });
+    await symlink(
+      "/etc/hostname",
+      join(
+        candidate.snapshotRoot,
+        ".eve/sandbox-cache/just-bash/templates/7bc778099a3b436ce4ad98ba/fs/escape",
+      ),
+    );
+    const fakeDocker = await writeFakeDocker(root);
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+      healthPort: 4318,
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "RUNTIME_CLOSURE_INCOMPLETE",
+      deployable: false,
+      image: null,
+    });
+    expect(result.error?.subject).toContain(".eve/sandbox-cache");
+  });
+
+  test("rejects a sandbox template that no longer matches the candidate evidence", async () => {
+    const root = await createRoot("eden-eve-runtime-image-sandbox-drift-");
+    const candidate = await writeCandidate(root, {}, { sandboxCache: true });
+    await writeFile(
+      join(
+        candidate.snapshotRoot,
+        ".eve/sandbox-cache/just-bash/templates/7bc778099a3b436ce4ad98ba/metadata.json",
+      ),
+      '{"templateKey":"tampered"}\n',
+      "utf8",
+    );
+    const fakeDocker = await writeFakeDocker(root);
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+      healthPort: 4319,
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "SOURCE_RACE",
+      deployable: false,
+      image: null,
+    });
+  });
+
+  test("rejects a sandbox template present without candidate evidence", async () => {
+    const root = await createRoot("eden-eve-runtime-image-sandbox-unevidenced-");
+    const candidate = await writeCandidate(root);
+    await mkdir(
+      join(
+        candidate.snapshotRoot,
+        ".eve/sandbox-cache/just-bash/templates/7bc778099a3b436ce4ad98ba",
+      ),
+      { recursive: true },
+    );
+    const fakeDocker = await writeFakeDocker(root);
+
+    const result = await buildEveRuntimeImage({
+      candidate,
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+      healthPort: 4320,
+      hostRequirements: {
+        architecture: "linux/amd64",
+        world: "supported",
+        sandbox: "supported",
+        privileged: false,
+        devices: "none",
+        kernel: "supported",
+        network: "supported",
+        durableLocalFilesystem: false,
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "SOURCE_RACE",
+      deployable: false,
+      image: null,
+    });
   });
 
   test("disables the cbor native addon and exempts its musl binary from the ldd check", async () => {

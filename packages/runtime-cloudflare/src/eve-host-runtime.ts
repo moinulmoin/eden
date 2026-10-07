@@ -3,15 +3,15 @@ import { WorldCore } from "@moinulmoin/eden-world-cloudflare/core";
 
 import {
   EVE_HOST_DEFAULTS,
+  EVE_HOST_SLEEP_SNAPSHOT_MARGIN_MS,
   EVE_SCHEDULE_WAKE_LEAD_MS,
+  parseEveSleepAfterMs,
   EveHostError,
   assertNonEmpty,
   assertStableOrigin,
-  createEveHostLifecycleObserver,
   createEveReadinessGate,
   createTrustedEveRequest,
   eveScheduleCronFiresWithin,
-  IDENTIFIER_PATTERN,
   readProtectedRuntimeVariables,
   WORKER_NAME_PATTERN,
   type EveHostContainerEnvironment,
@@ -26,12 +26,33 @@ const EVE_CLOUDFLARE_CONTAINERS_CA_PATH =
   "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
 
 /**
+ * Cloudflare's durable_object containers expose `/dev/kvm`, which makes Eve's
+ * `DefaultSandbox` pick microsandbox at runtime, while Eden's isolated builder
+ * (no KVM, no Docker daemon) prepared the just-bash template — every sandbox
+ * tool then fails with a provider mismatch. Hiding the device before Eve
+ * starts keeps runtime selection equal to the build's. Same Eve start
+ * command as the image entrypoint.
+ */
+const EVE_HOST_ENTRYPOINT = Object.freeze([
+  "/bin/sh",
+  "-c",
+  "rm -f /dev/kvm; cd /workspace && exec ./node_modules/.bin/eve start --host 0.0.0.0 --port 8080",
+]);
+
+/**
  * The native `ctx.container` surface under `scheduling_policy:
  * "durable_object"`. Declared structurally so the emitted declarations never
  * depend on a specific `@cloudflare/workers-types` revision.
  */
 interface EveContainerPort {
   fetch(request: Request): Promise<Response>;
+}
+
+/** Structural slice of `ExecProcess` from `@cloudflare/workers-types`. */
+interface EveContainerExecProcess {
+  readonly exitCode: Promise<number>;
+  readonly stdout: ReadableStream | null;
+  readonly stderr: ReadableStream | null;
 }
 
 interface EveContainerRuntime {
@@ -43,6 +64,7 @@ interface EveContainerRuntime {
     readonly instance: string;
     readonly enableInternet: boolean;
     readonly env: Record<string, string>;
+    readonly entrypoint: readonly string[];
   }): void;
   monitor(): Promise<void>;
   destroy(error?: unknown): Promise<void>;
@@ -53,6 +75,14 @@ interface EveContainerRuntime {
   setInactivityTimeout(ms: number): Promise<void> | void;
   interceptOutboundHttps(hostname: string, entrypoint: unknown): Promise<void> | void;
   getTcpPort(port: number): EveContainerPort;
+  exec(
+    command: readonly string[],
+    options?: {
+      readonly stdin?: ReadableStream;
+      readonly stdout?: "pipe" | "ignore";
+      readonly stderr?: "pipe" | "ignore" | "combined";
+    },
+  ): Promise<EveContainerExecProcess>;
 }
 
 interface EveContainerContext {
@@ -60,6 +90,7 @@ interface EveContainerContext {
   readonly storage: {
     get<T>(key: string): Promise<T | undefined> | T | undefined;
     put(key: string, value: unknown): Promise<void> | void;
+    delete(key: string): Promise<boolean> | boolean;
     setAlarm(ms: number): Promise<void> | void;
     sql?: { exec(query: string): unknown };
     transactionSync?(callback: () => void): unknown;
@@ -75,6 +106,40 @@ const EVE_HOST_CONTAINER_SNAPSHOT_KEY =
   "eden.eve.host.workspace-snapshot";
 const EVE_HOST_CONTAINER_SNAPSHOT_ATTEMPTS_KEY =
   "eden.eve.host.snapshot-attempts";
+/**
+ * The image the current container was started with. `inspect()` reports an
+ * empty image for a container restored from a snapshot (and while one is
+ * starting), so update detection falls back to this record.
+ */
+const EVE_HOST_CONTAINER_STARTED_IMAGE_KEY =
+  "eden.eve.host.started-image";
+
+/**
+ * Sandbox-session carry keys. The meta record names the active carry; its
+ * archive streams into `<chunkPrefix>.<carryId>.<index>` values so no single
+ * key+value pair approaches the SQLite-backed 2 MiB storage limit and the
+ * whole archive never sits in isolate memory (128 MB limit).
+ */
+const EVE_HOST_SANDBOX_CARRY_KEY = "eden.eve.host.sandbox-carry";
+const EVE_HOST_SANDBOX_CARRY_CHUNK_PREFIX = "eden.eve.host.sandbox-carry";
+/** The only `/workspace` subtree carried across an image update. */
+const EVE_HOST_SANDBOX_CARRY_SOURCE = "/workspace/.eve/sandbox-cache/just-bash";
+/**
+ * Carry archive limits. `chunkBytes` stays safely under the per-key limit;
+ * `maxBytes` caps the compressed archive (tests shrink both).
+ */
+export const EVE_HOST_CARRY_LIMITS = {
+  chunkBytes: 1024 * 1024,
+  maxBytes: 1024 * 1024 * 1024,
+};
+
+/** Meta record for the active carried sandbox-session archive. */
+interface EveStoredSandboxCarry {
+  readonly id: string;
+  readonly chunks: number;
+  readonly bytes: number;
+  readonly at: number;
+}
 
 /** Snapshot attempts the alarm retries before destroying anyway so a stuck
  * snapshot path never keeps billing alive forever. */
@@ -84,25 +149,6 @@ interface EveStoredContainerSnapshot {
   readonly id: string;
   readonly image: string;
   readonly at: number;
-}
-
-/** Parses the `sleepAfter` duration spellings wrangler accepts ("300ms",
- * "30s", "15m", "24h", "7d", or a bare number of seconds). */
-function sleepAfterDurationMs(value: string): number | undefined {
-  const match = /^([0-9]+)(ms|s|m|h|d)?$/u.exec(value.trim());
-  if (match === null) return undefined;
-  const amount = Number.parseInt(match[1] ?? "", 10);
-  const unit = match[2] ?? "s";
-  const factor = unit === "ms"
-    ? 1
-    : unit === "s"
-      ? 1_000
-      : unit === "m"
-        ? 60_000
-        : unit === "h"
-          ? 3_600_000
-          : 86_400_000;
-  return amount * factor;
 }
 
 interface EveContainerLoopbackNamespace {
@@ -128,13 +174,11 @@ export class EdenWorldDurableObject {
       delivery: {
         deliver: async (message) => {
           const origin = env.EVE_PUBLIC_ORIGIN;
-          const binding = env.EVE_CONTAINER_BINDING_NAME;
           const instance = env.EVE_CONTAINER_INSTANCE_NAME;
-          if (typeof origin !== "string" || typeof binding !== "string" ||
-              typeof instance !== "string") {
+          if (typeof origin !== "string" || typeof instance !== "string") {
             throw new Error("The World queue Container identity is unavailable.");
           }
-          const namespace = env[binding] as EveContainerLoopbackNamespace;
+          const namespace = env.EVE_CONTAINER as EveContainerLoopbackNamespace;
           const response = await namespace.getByName(instance).loopbackFetch(
             new Request(new URL(`/.well-known/workflow/v1/${message.path}`, origin), {
               method: "POST",
@@ -200,11 +244,9 @@ export async function routeEveOutboundRequest(
   env: EveHostContainerEnvironment,
 ): Promise<Response> {
   const publicOrigin = env.EVE_PUBLIC_ORIGIN;
-  const bindingName = env.EVE_CONTAINER_BINDING_NAME;
   const instanceName = env.EVE_CONTAINER_INSTANCE_NAME;
   if (
     typeof publicOrigin !== "string" ||
-    typeof bindingName !== "string" ||
     typeof instanceName !== "string"
   ) {
     throw new EveHostError(
@@ -213,7 +255,6 @@ export async function routeEveOutboundRequest(
     );
   }
   assertStableOrigin(publicOrigin);
-  assertNonEmpty(bindingName, "Container binding name");
   assertNonEmpty(instanceName, "Container instance name");
   const hostname = new URL(request.url).hostname;
   if (hostname !== new URL(publicOrigin).hostname) {
@@ -227,7 +268,7 @@ export async function routeEveOutboundRequest(
     if (world === undefined) return new Response(null, { status: 404 });
     return world.get(world.idFromName("world")).fetch(request);
   }
-  const namespace = (env as Record<string, unknown>)[bindingName] as
+  const namespace = env.EVE_CONTAINER as
     | EveContainerLoopbackNamespace
     | undefined;
   if (namespace === undefined) {
@@ -266,8 +307,6 @@ export class EveHostLoopback extends WorkerEntrypoint<EveHostContainerEnvironmen
  * running image predates the configured one.
  */
 export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvironment> {
-  readonly lifecycle = createEveHostLifecycleObserver();
-  private readinessStarted = false;
   /** Evidence is cached only while the container it was proven on keeps running. */
   private readinessEvidence: EveHostReadinessEvidence | undefined;
   /** True once the running container's image was proven to equal `images.eve`. */
@@ -279,6 +318,12 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
    */
   private readinessEpoch = 0;
   private monitorAttached = false;
+  /** Serializes sandbox-session carry-outs on this Durable Object instance. */
+  private carryOutQueue: Promise<void> = Promise.resolve();
+  /** True only while the last start was fresh from `images.eve`, not a snapshot. */
+  private pendingCarryRestore = false;
+  /** Shared single-flight carry restore for the current container generation. */
+  private carryRestorePromise: Promise<void> | undefined;
   private readonly envVars: Record<string, string>;
   private readonly sleepAfterMs: number;
   private readonly readiness: EveReadinessGate;
@@ -327,17 +372,9 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
         ? {}
         : { EDEN_EVE_RUNTIME_REVISION: env.EDEN_EVE_RUNTIME_REVISION }),
     };
-    const sleepAfterOverride = env.EDEN_EVE_CONTAINER_SLEEP_AFTER;
-    this.sleepAfterMs =
-      sleepAfterOverride === undefined
-        ? sleepAfterDurationMs(EVE_HOST_DEFAULTS.sleepAfter) ?? 86_400_000
-        : sleepAfterDurationMs(sleepAfterOverride) ??
-          (() => {
-            throw new EveHostError(
-              "HOST_READINESS_UNPROVEN",
-              "The Container sleepAfter override is not a parseable duration.",
-            );
-          })();
+    this.sleepAfterMs = parseEveSleepAfterMs(
+      env.EDEN_EVE_CONTAINER_SLEEP_AFTER ?? EVE_HOST_DEFAULTS.sleepAfter,
+    );
     this.readiness = createEveReadinessGate({
       start: async () => {
         await this.ensureContainerStarted();
@@ -373,9 +410,10 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     return (this.ctx as EveContainerContext).container;
   }
 
-  /** Container lifetime the platform keeps after the DO goes inactive. */
+  /** Container lifetime the platform keeps after the DO goes inactive: long
+   * enough for the idle alarm to snapshot first, within Cloudflare's 6 h cap. */
   private get inactivityTimeoutMs(): number {
-    return this.sleepAfterMs + 15 * 60_000;
+    return this.sleepAfterMs + EVE_HOST_SLEEP_SNAPSHOT_MARGIN_MS;
   }
 
   private attachMonitor(runtime: EveContainerRuntime): void {
@@ -384,24 +422,22 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     runtime.monitor().then(
       () => {
         this.monitorAttached = false;
-        this.recordContainerStopped("exit");
+        this.recordContainerStopped();
       },
-      (error: unknown) => {
+      () => {
         this.monitorAttached = false;
-        this.recordContainerStopped(
-          error instanceof Error ? error.name : "runtime_signal",
-        );
+        this.recordContainerStopped();
       },
     );
   }
 
-  private recordContainerStopped(reason: string): void {
+  private recordContainerStopped(): void {
     this.readinessEpoch += 1;
-    this.readinessStarted = false;
     this.readinessEvidence = undefined;
     this.imageVerified = false;
+    this.pendingCarryRestore = false;
+    this.carryRestorePromise = undefined;
     this.readiness.reset();
-    this.lifecycle.record("stopped", reason);
   }
 
   /** Routes the container's own requests to its public origin back inside. */
@@ -438,7 +474,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
    * is restored only when it was captured from the exact image this Worker
    * version configures — restoring an older snapshot silently runs the
    * previous image — so after an image update the container starts fresh and
-   * workspace files intentionally do not carry across.
+   * the readiness path restores the carried sandbox sessions instead.
    */
   private async ensureContainerStarted(): Promise<void> {
     const runtime = this.containerRuntime();
@@ -459,29 +495,40 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     const storedSnapshot = await this.ctx.storage.get<EveStoredContainerSnapshot>(
       EVE_HOST_CONTAINER_SNAPSHOT_KEY,
     );
-    if (this.lifecycle.events.some((event) => event.type === "started")) {
-      this.lifecycle.record("replaced");
-    }
+    const snapshotId = storedSnapshot !== undefined &&
+        storedSnapshot.image === expectedImage
+      ? storedSnapshot.id
+      : undefined;
     runtime.start({
-      ...(storedSnapshot !== undefined && storedSnapshot.image === expectedImage
-        ? { containerSnapshot: { id: storedSnapshot.id } }
-        : { image: expectedImage }),
+      ...(snapshotId === undefined
+        ? { image: expectedImage }
+        : { containerSnapshot: { id: snapshotId } }),
       instance: EVE_HOST_DEFAULTS.instance,
       enableInternet: true,
       env: this.envVars,
+      entrypoint: EVE_HOST_ENTRYPOINT,
     });
+    // Set before any await: a failure below makes the readiness retry see a
+    // running container and skip this method, so the restore must already be
+    // pending. A start from the configured image (an update) has no sandbox
+    // sessions yet; a same-image snapshot wake already contains them.
+    this.pendingCarryRestore = snapshotId === undefined;
+    // Both start sources run `expectedImage` (a snapshot is only restored
+    // from that image).
+    await this.ctx.storage.put(EVE_HOST_CONTAINER_STARTED_IMAGE_KEY, expectedImage);
     // Intercepts do not survive a container start and late registration lags;
     // register inside the same block before readiness polling.
     await this.registerLoopbackIntercept(runtime);
     this.attachMonitor(runtime);
     await runtime.setInactivityTimeout(this.inactivityTimeoutMs);
-    this.lifecycle.record("started");
   }
 
   /**
-   * Replaces the running container when `inspect()` proves it still serves a
-   * pre-update image: this Worker version's `images.eve` is selected at
-   * `start()`, so an in-place update must stop the stale instance itself.
+   * Replaces the running container when it still serves a pre-update image:
+   * this Worker version's `images.eve` is selected at `start()`, so an
+   * in-place update must stop the stale instance itself. `inspect()` reports
+   * an empty image for a snapshot-restored container, so the image recorded
+   * at start stands in for it.
    */
   private async reconcileRunningImage(): Promise<void> {
     if (this.imageVerified) return;
@@ -494,16 +541,243 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     } catch {
       info = null;
     }
-    if (info?.image === expectedImage) {
+    const runningImage = info?.image !== undefined && info.image !== ""
+      ? info.image
+      : await this.ctx.storage.get<string>(EVE_HOST_CONTAINER_STARTED_IMAGE_KEY);
+    if (runningImage === expectedImage) {
       this.imageVerified = true;
       return;
     }
-    this.lifecycle.record("image_mismatch");
-    this.recordContainerStopped("replaced");
+    this.recordContainerStopped();
+    // The stale container's conversation sandboxes must survive the update:
+    // stream them into Durable Object storage before the destroy makes the
+    // container unreachable. A failed carry still lets the update proceed.
+    try {
+      await this.carrySandboxSessionsOut(runtime);
+    } catch (error: unknown) {
+      console.error(
+        "The Eve sandbox session carry failed before the image update:",
+        error instanceof Error ? error.message : "unknown",
+      );
+    }
     await runtime.destroy();
     const stoppedAt = Date.now();
     while (runtime.running && Date.now() - stoppedAt < 10_000) {
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  /**
+   * Streams `/workspace/.eve/sandbox-cache/just-bash/sessions` — every
+   * conversation's sandbox files and metadata — into Durable Object storage,
+   * so a fresh container started by an image update can restore them. Not
+   * carried: templates and the rest of `/workspace`, which come from the new
+   * image. One carry runs at a time on this Durable Object; a failure never
+   * blocks the destroy that follows and leaves the previous carry intact.
+   */
+  private carrySandboxSessionsOut(
+    runtime: EveContainerRuntime,
+  ): Promise<void> {
+    const run = this.carryOutQueue.then(() =>
+      this.carrySandboxSessionsOutNow(runtime)
+    );
+    this.carryOutQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async carrySandboxSessionsOutNow(
+    runtime: EveContainerRuntime,
+  ): Promise<void> {
+    const previous = await this.ctx.storage.get<EveStoredSandboxCarry>(
+      EVE_HOST_SANDBOX_CARRY_KEY,
+    );
+    const carryId = globalThis.crypto.randomUUID();
+    const chunkPrefix = `${EVE_HOST_SANDBOX_CARRY_CHUNK_PREFIX}.${carryId}.`;
+    const writtenChunkKeys: string[] = [];
+    const discardWrittenChunks = async (): Promise<void> => {
+      for (const key of writtenChunkKeys) await this.ctx.storage.delete(key);
+    };
+    const exec = await runtime.exec(
+      [
+        "sh",
+        "-c",
+        `cd ${EVE_HOST_SANDBOX_CARRY_SOURCE} && [ -d sessions ] && tar -czf - sessions || true`,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const buffered: Uint8Array[] = [];
+    let bufferedBytes = 0;
+    let chunks = 0;
+    let bytes = 0;
+    const flushOnce = async (): Promise<void> => {
+      if (bufferedBytes === 0) return;
+      const size = Math.min(bufferedBytes, EVE_HOST_CARRY_LIMITS.chunkBytes);
+      const value = new Uint8Array(size);
+      let offset = 0;
+      while (offset < size) {
+        const part = buffered[0];
+        if (part === undefined) break;
+        const take = Math.min(part.byteLength, size - offset);
+        value.set(
+          take === part.byteLength ? part : part.subarray(0, take),
+          offset,
+        );
+        offset += take;
+        if (take === part.byteLength) buffered.shift();
+        else buffered[0] = part.subarray(take);
+      }
+      bufferedBytes -= size;
+      const key = `${chunkPrefix}${chunks}`;
+      writtenChunkKeys.push(key);
+      await this.ctx.storage.put(key, value);
+      chunks += 1;
+      bytes += value.byteLength;
+    };
+    const flushBufferedChunks = async (): Promise<void> => {
+      while (bufferedBytes >= EVE_HOST_CARRY_LIMITS.chunkBytes) {
+        await flushOnce();
+      }
+    };
+    try {
+      const stdout = exec.stdout;
+      if (stdout === null) throw new Error("the exec stdout was not piped");
+      const reader = stdout.getReader();
+      let overflowed = false;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value === undefined) continue;
+        buffered.push(value);
+        bufferedBytes += value.byteLength;
+        if (bytes + bufferedBytes > EVE_HOST_CARRY_LIMITS.maxBytes) {
+          overflowed = true;
+          break;
+        }
+        await flushBufferedChunks();
+      }
+      await reader.cancel().catch(() => undefined);
+      if (overflowed) {
+        await discardWrittenChunks();
+        console.error(
+          `The Eve sandbox session carry exceeded ${EVE_HOST_CARRY_LIMITS.maxBytes} compressed bytes; keeping the previous carry.`,
+        );
+        return;
+      }
+      await flushOnce();
+    } catch (error: unknown) {
+      await discardWrittenChunks();
+      throw error;
+    }
+    let exitCode = -1;
+    try {
+      exitCode = await exec.exitCode;
+    } catch {
+      exitCode = -1;
+    }
+    if (exitCode !== 0) {
+      await discardWrittenChunks();
+      console.error(
+        `The Eve sandbox session carry failed with exit code ${exitCode}; keeping the previous carry.`,
+      );
+      return;
+    }
+    if (bytes === 0) {
+      // No sessions directory in this container (nothing to carry); keep any
+      // previous carry as the restore source.
+      return;
+    }
+    await this.ctx.storage.put(EVE_HOST_SANDBOX_CARRY_KEY, {
+      id: carryId,
+      chunks,
+      bytes,
+      at: Date.now(),
+    } satisfies EveStoredSandboxCarry);
+    if (previous !== undefined) {
+      for (let index = 0; index < previous.chunks; index += 1) {
+        await this.ctx.storage.delete(
+          `${EVE_HOST_SANDBOX_CARRY_CHUNK_PREFIX}.${previous.id}.${index}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Single restore per fresh container generation, shared by every
+   * concurrent readiness caller: the first caller starts it, everyone awaits
+   * the same promise, and no request is forwarded before it settles.
+   */
+  private async restoreCarriedSandboxSessions(): Promise<void> {
+    if (!this.pendingCarryRestore) return;
+    this.carryRestorePromise ??= this.carrySandboxSessionsIn();
+    await this.carryRestorePromise;
+    this.pendingCarryRestore = false;
+  }
+
+  /**
+   * Extracts the carried sandbox sessions into a container that started
+   * fresh from `images.eve`. The archive streams chunk by chunk from Durable
+   * Object storage through exec stdin, so it never sits in isolate memory. A
+   * failure is logged and swallowed: the agent still serves, only the
+   * carried files are missing.
+   */
+  private async carrySandboxSessionsIn(): Promise<void> {
+    try {
+      const carry = await this.ctx.storage.get<EveStoredSandboxCarry>(
+        EVE_HOST_SANDBOX_CARRY_KEY,
+      );
+      if (carry === undefined) return;
+      let nextChunk = 0;
+      const archive = new ReadableStream<Uint8Array>({
+        pull: async (controller) => {
+          if (nextChunk >= carry.chunks) {
+            controller.close();
+            return;
+          }
+          const chunk = await this.ctx.storage.get<Uint8Array>(
+            `${EVE_HOST_SANDBOX_CARRY_CHUNK_PREFIX}.${carry.id}.${nextChunk}`,
+          );
+          const index = nextChunk;
+          nextChunk += 1;
+          if (chunk === undefined) {
+            controller.error(
+              new Error(`The sandbox carry chunk ${index} is missing.`),
+            );
+            return;
+          }
+          controller.enqueue(chunk);
+        },
+      });
+      const runtime = this.containerRuntime();
+      if (runtime === undefined) {
+        throw new Error("the Container runtime is unavailable");
+      }
+      const exec = await runtime.exec(
+        [
+          "sh",
+          "-c",
+          `mkdir -p ${EVE_HOST_SANDBOX_CARRY_SOURCE} && tar -xzf - -C ${EVE_HOST_SANDBOX_CARRY_SOURCE}`,
+        ],
+        { stdin: archive, stderr: "pipe" },
+      );
+      let exitCode = -1;
+      try {
+        exitCode = await exec.exitCode;
+      } catch {
+        exitCode = -1;
+      }
+      if (exitCode !== 0) {
+        console.error(
+          `The Eve sandbox session restore failed with exit code ${exitCode}; the agent serves without the carried files.`,
+        );
+      }
+    } catch (error: unknown) {
+      console.error(
+        "The Eve sandbox session restore failed; the agent serves without the carried files:",
+        error instanceof Error ? error.message : "unknown",
+      );
     }
   }
 
@@ -514,41 +788,26 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     if (this.readinessEvidence !== undefined) {
       return this.readinessEvidence;
     }
-    if (!this.readinessStarted) {
-      this.readinessStarted = true;
-      this.lifecycle.record("start_requested");
-    }
     const epoch = this.readinessEpoch;
     const evidence = await this.readiness(signal);
     if (epoch === this.readinessEpoch) {
+      // Restore carried sandbox sessions while still inside the single-flight
+      // readiness path, before evidence is cached: every fetch and loopback
+      // request waits on this evidence, so nothing reaches Eve first.
+      await this.restoreCarriedSandboxSessions();
       this.readinessEvidence = evidence;
       // Readiness under this Worker version proves the running container
       // serves `images.eve`: it was either verified by inspect() or freshly
       // started from the configured image above.
       this.imageVerified = true;
     }
-    this.lifecycle.record("health_ready", evidence.healthStatus);
     return evidence;
   }
 
   override async fetch(request: Request): Promise<Response> {
     const requestDeploymentId =
       request.headers.get("x-eden-eve-deployment-id") ?? undefined;
-    await this.ensureEveReady(request.signal);
-    await this.touchActivity();
-    const runtime = this.containerRuntime();
-    if (runtime === undefined) {
-      throw new EveHostError(
-        "HOST_READINESS_UNPROVEN",
-        "The Container runtime is unavailable on this Durable Object.",
-      );
-    }
-    const url = new URL(request.url);
-    const response = await runtime
-      .getTcpPort(EVE_HOST_DEFAULTS.internalPort)
-      .fetch(
-        new Request(`http://container${url.pathname}${url.search}`, request),
-      );
+    const response = await this.forwardToEve(request);
     // Reporting the verified start back lets deploy health-gate promotion on
     // the served container actually running this generation's image: the
     // header echoes only when the running container's image equals this
@@ -577,6 +836,10 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
    * loopback path is not a deployment-health signal).
    */
   async loopbackFetch(request: Request): Promise<Response> {
+    return this.forwardToEve(request);
+  }
+
+  private async forwardToEve(request: Request): Promise<Response> {
     await this.ensureEveReady(request.signal);
     await this.touchActivity();
     const runtime = this.containerRuntime();
@@ -611,6 +874,17 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       return;
     }
     if (runtime === undefined || !runtime.running) return;
+    // The snapshot restores same-image wakes; the carry additionally lets an
+    // update that lands while asleep restore the conversation sandboxes. A
+    // failed carry must not degrade the snapshot path, so it is only logged.
+    try {
+      await this.carrySandboxSessionsOut(runtime);
+    } catch (error: unknown) {
+      console.error(
+        "The Eve sandbox session carry failed during idle sleep:",
+        error instanceof Error ? error.message : "unknown",
+      );
+    }
     const attempts =
       (await this.ctx.storage.get<number>(
         EVE_HOST_CONTAINER_SNAPSHOT_ATTEMPTS_KEY,
@@ -639,7 +913,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
         return;
       }
       await runtime.destroy(new Error("idle-snapshot-done"));
-      this.recordContainerStopped("snapshot:idle");
+      this.recordContainerStopped();
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "unknown";
       if (attempts + 1 >= EVE_HOST_SNAPSHOT_MAX_ATTEMPTS) {
@@ -653,7 +927,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
         await runtime.destroy(
           new Error("idle-snapshot-abandoned"),
         );
-        this.recordContainerStopped("snapshot:abandoned");
+        this.recordContainerStopped();
         return;
       }
       console.error(
@@ -668,11 +942,8 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   }
 }
 
-export type EveHostWorkerEnvironment = EveHostContainerEnvironment;
-
 export interface EveHostWorkerOptions extends EveHostForwardingMetadata {
   readonly workerName: string;
-  readonly containerBindingName: string;
   readonly stableContainerInstanceName: string;
   readonly schedules?: readonly EveScheduleCronEntry[];
 }
@@ -682,10 +953,10 @@ export interface EveHostWorkerOptions extends EveHostForwardingMetadata {
  * declarations never reference provider ambient types.
  */
 export interface EveHostWorkerHandler {
-  fetch(request: Request, env: EveHostWorkerEnvironment): Promise<Response>;
+  fetch(request: Request, env: EveHostContainerEnvironment): Promise<Response>;
   scheduled?(
     event: { readonly cron: string; readonly scheduledTime: number },
-    env: EveHostWorkerEnvironment,
+    env: EveHostContainerEnvironment,
     ctx: { waitUntil(task: Promise<unknown>): void },
   ): void;
 }
@@ -705,17 +976,9 @@ export function createEveHostWorker(
   }
   assertStableOrigin(options.publicOrigin, options.workerName);
   assertNonEmpty(options.stableContainerInstanceName, "Container instance name");
-  if (!IDENTIFIER_PATTERN.test(options.containerBindingName)) {
-    throw new EveHostError(
-      "HOST_READINESS_UNPROVEN",
-      "The Container binding name is not valid.",
-    );
-  }
   const schedules = options.schedules ?? [];
-  const resolveContainer = (env: EveHostWorkerEnvironment) => {
-    const namespace = (
-      env as unknown as Record<string, EveContainerNamespace | undefined>
-    )[options.containerBindingName];
+  const resolveContainer = (env: EveHostContainerEnvironment) => {
+    const namespace = env.EVE_CONTAINER as EveContainerNamespace | undefined;
     if (namespace === undefined) {
       throw new EveHostError(
         "HOST_READINESS_UNPROVEN",
@@ -781,13 +1044,6 @@ export function createEveHostWorker(
               resolveContainer(env)
                 .fetch(new Request(
                   new URL(EVE_HOST_DEFAULTS.healthPath, options.publicOrigin),
-                  {
-                    headers: {
-                      // Stamp the Worker's own deployment so a stale Durable
-                      // Object never falls back to its own environment.
-                      "x-eden-eve-deployment-id": options.deploymentId,
-                    },
-                  },
                 ))
                 .catch((error: unknown) => {
                   console.error(

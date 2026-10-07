@@ -1,11 +1,10 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { createRequire } from "node:module";
 import { NodeSqliteAdapter } from "../../world-cloudflare/src/core/node-sqlite.js";
 
 import {
   EVE_HOST_DEFAULTS,
   createEveHostConfig,
-  createEveHostProxy,
   createEveReadinessGate,
   createTrustedEveRequest,
   eveScheduleCronFiresWithin,
@@ -13,9 +12,9 @@ import {
   generateEveHostWorkerSource,
   parseEveScheduleCron,
   resolveStableWorkersDevOrigin,
-  type EveContainerTransport,
 } from "../src/eve-host.js";
 import {
+  EVE_HOST_CARRY_LIMITS,
   createEveHostWorker,
   EveHostDurableContainer,
   EdenWorldDurableObject,
@@ -25,8 +24,6 @@ import {
 const IDENTITY = {
   workerName: "eden-eve-preview",
   containerApplicationName: "eden-eve-preview-container",
-  containerClassName: "EveHostDurableContainer",
-  containerBindingName: "EVE_CONTAINER",
   stableContainerInstanceName: "eden-eve-preview-instance",
   deploymentId: "dep-test",
   generationId: "gen-test",
@@ -41,6 +38,48 @@ interface FakeRuntimeOptions {
   readonly running?: boolean;
   readonly inspectImage?: string;
   readonly snapshotFails?: number;
+  /** Bytes the fake `tar -czf - sessions` streams on carry-out. */
+  readonly carryArchive?: string;
+  readonly carryOutExitCode?: number;
+  readonly carryInExitCode?: number;
+  /** Makes every exec call throw, simulating a dead runtime. */
+  readonly execFails?: boolean;
+}
+
+const CARRY_OUT_SCRIPT = "tar -czf - sessions";
+const CARRY_IN_SCRIPT = "tar -xzf -";
+
+async function drainStream(
+  stream: ReadableStream | undefined | null,
+): Promise<Uint8Array> {
+  if (stream === undefined || stream === null) return new Uint8Array();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  const reader = stream.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value === undefined) continue;
+    parts.push(value);
+    total += value.byteLength;
+  }
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    joined.set(part, offset);
+    offset += part.byteLength;
+  }
+  return joined;
+}
+
+function streamOf(text: string): ReadableStream {
+  const bytes = new TextEncoder().encode(text);
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
 }
 
 function fakeContainerRuntime(options: FakeRuntimeOptions = {}) {
@@ -49,6 +88,12 @@ function fakeContainerRuntime(options: FakeRuntimeOptions = {}) {
     image: options.inspectImage ?? CURRENT_IMAGE,
     snapshotCalls: 0,
     destroyCalls: 0,
+    carryOutCalls: 0,
+    carryInCalls: 0,
+    /** Payloads the fake container received on carry-in stdin. */
+    carryInPayloads: [] as string[],
+    /** Order of container events, e.g. ["carry-out","destroy","start"]. */
+    timeline: [] as string[],
   };
   const runtime: FakeContainerRuntime & {
     lastStart?: {
@@ -63,7 +108,11 @@ function fakeContainerRuntime(options: FakeRuntimeOptions = {}) {
     images: { eve: CURRENT_IMAGE },
     start(startOptions) {
       state.running = true;
-      state.image = startOptions.image ?? state.image;
+      // Cloudflare's inspect() reports an empty image for a snapshot restore.
+      state.image = startOptions.containerSnapshot === undefined
+        ? startOptions.image ?? state.image
+        : "";
+      state.timeline.push("start");
       runtime.lastStart = {
         ...(startOptions.image === undefined ? {} : { image: startOptions.image }),
         ...(startOptions.containerSnapshot === undefined
@@ -77,6 +126,7 @@ function fakeContainerRuntime(options: FakeRuntimeOptions = {}) {
     async destroy() {
       state.destroyCalls += 1;
       state.running = false;
+      state.timeline.push("destroy");
     },
     async inspect() {
       return state.running ? { image: state.image } : null;
@@ -88,12 +138,54 @@ function fakeContainerRuntime(options: FakeRuntimeOptions = {}) {
       }
       return { id: "snapshot-1" };
     },
-    async setInactivityTimeout() {},
+    async setInactivityTimeout(ms: number) {
+      if (ms > 6 * 3_600_000) {
+        throw new Error(
+          "The maximum amount of time that a container can stay disconnected from a Durable Object is 6 hours",
+        );
+      }
+    },
     async interceptOutboundHttps() {},
     getTcpPort() {
       return {
-        fetch: async () => Response.json({ status: "ready" }),
+        fetch: async (request: Request) => {
+          state.timeline.push(
+            new URL(request.url).pathname === EVE_HOST_DEFAULTS.healthPath
+              ? "health"
+              : "forward",
+          );
+          return Response.json({ status: "ready" });
+        },
       };
+    },
+    async exec(command, execOptions) {
+      if (options.execFails === true) throw new Error("exec unavailable");
+      const script = command[0] === "sh" && typeof command[1] === "string" &&
+          command[1] === "-c" && typeof command[2] === "string"
+        ? command[2]
+        : "";
+      if (script.includes(CARRY_OUT_SCRIPT)) {
+        state.carryOutCalls += 1;
+        state.timeline.push("carry-out");
+        return {
+          exitCode: Promise.resolve(options.carryOutExitCode ?? 0),
+          stdout: streamOf(options.carryArchive ?? ""),
+          stderr: null,
+        };
+      }
+      if (script.includes(CARRY_IN_SCRIPT)) {
+        state.carryInCalls += 1;
+        state.timeline.push("carry-in");
+        state.carryInPayloads.push(
+          new TextDecoder().decode(await drainStream(execOptions?.stdin)),
+        );
+        return {
+          exitCode: Promise.resolve(options.carryInExitCode ?? 0),
+          stdout: null,
+          stderr: null,
+        };
+      }
+      return { exitCode: Promise.resolve(0), stdout: null, stderr: null };
     },
   };
   return runtime;
@@ -105,6 +197,10 @@ interface FakeContainerRuntime {
     image: string;
     snapshotCalls: number;
     destroyCalls: number;
+    carryOutCalls: number;
+    carryInCalls: number;
+    carryInPayloads: string[];
+    timeline: string[];
   };
   readonly running: boolean;
   images: { eve: string };
@@ -119,9 +215,21 @@ interface FakeContainerRuntime {
   destroy(): Promise<void>;
   inspect(): Promise<{ image: string } | null>;
   snapshotContainer(): Promise<{ id: string }>;
-  setInactivityTimeout(): Promise<void>;
+  setInactivityTimeout(ms: number): Promise<void>;
   interceptOutboundHttps(): Promise<void>;
   getTcpPort(): { fetch(request: Request): Promise<Response> };
+  exec(
+    command: readonly string[],
+    options?: {
+      readonly stdin?: ReadableStream;
+      readonly stdout?: "pipe" | "ignore";
+      readonly stderr?: "pipe" | "ignore" | "combined";
+    },
+  ): Promise<{
+    readonly exitCode: Promise<number>;
+    readonly stdout: ReadableStream | null;
+    readonly stderr: ReadableStream | null;
+  }>;
 }
 
 function hostContainer(
@@ -138,6 +246,9 @@ function hostContainer(
         put: async (key: string, value: unknown) => {
           stored.set(key, value);
         },
+        delete: async (key: string) => {
+          stored.delete(key);
+        },
         setAlarm: async (at: number) => {
           alarms?.push(at);
         },
@@ -149,12 +260,25 @@ function hostContainer(
     {
       EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
       EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
-      EVE_CONTAINER_BINDING_NAME: "EVE_CONTAINER",
       EDEN_EVE_DEPLOYMENT_ID: IDENTITY.deploymentId,
       EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
     },
   );
   return container;
+}
+
+/** Temporarily shrinks the sandbox carry limits for chunking/cap tests. */
+async function withCarryLimits<T>(
+  limits: { readonly chunkBytes: number; readonly maxBytes: number },
+  run: () => Promise<T>,
+): Promise<T> {
+  const previous = { ...EVE_HOST_CARRY_LIMITS };
+  Object.assign(EVE_HOST_CARRY_LIMITS, limits);
+  try {
+    return await run();
+  } finally {
+    Object.assign(EVE_HOST_CARRY_LIMITS, previous);
+  }
 }
 
 describe("durable World queue acknowledgements", () => {
@@ -176,7 +300,6 @@ describe("durable World queue acknowledgements", () => {
         blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(),
       } as never, {
         EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
-        EVE_CONTAINER_BINDING_NAME: "EVE_CONTAINER",
         EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
         EVE_CONTAINER: {
           getByName: () => ({
@@ -225,7 +348,7 @@ describe("generic Eve Cloudflare host", () => {
     expect(config.worker.containers).toEqual([
       {
         name: IDENTITY.containerApplicationName,
-        class_name: IDENTITY.containerClassName,
+        class_name: "EveHostDurableContainer",
         scheduling_policy: "durable_object",
         images: {
           eve: { image: config.worker.containers?.[0]?.images.eve.image },
@@ -234,14 +357,14 @@ describe("generic Eve Cloudflare host", () => {
     ]);
     expect(config.worker.durable_objects?.bindings).toEqual([
       {
-        name: IDENTITY.containerBindingName,
-        class_name: IDENTITY.containerClassName,
+        name: "EVE_CONTAINER",
+        class_name: "EveHostDurableContainer",
       },
     ]);
     expect(config.worker.migrations).toEqual([
       {
         tag: "v1",
-        new_sqlite_classes: [IDENTITY.containerClassName],
+        new_sqlite_classes: ["EveHostDurableContainer"],
       },
     ]);
     expect(config.container.instanceName).toBe(
@@ -254,7 +377,6 @@ describe("generic Eve Cloudflare host", () => {
     expect(config.worker.vars).toEqual({
       EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
       EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
-      EVE_CONTAINER_BINDING_NAME: IDENTITY.containerBindingName,
       EDEN_EVE_DEPLOYMENT_ID: IDENTITY.deploymentId,
       EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
       EVE_RUNTIME_VARIABLE_NAMES: ["EVE_AUTH_SECRET", "WORKFLOW_API_URL"],
@@ -267,19 +389,6 @@ describe("generic Eve Cloudflare host", () => {
     expect(source).not.toMatch(/EdenSession|handleEdenRequest|\/eden\/v1/u);
     expect(source).not.toContain("secret-value");
 
-    const customConfig = createEveHostConfig({
-      ...IDENTITY,
-      containerClassName: "CustomEveContainer",
-      containerBindingName: "CUSTOM_CONTAINER",
-      stableWorkersDevOrigin: "https://eden-eve-preview.account.workers.dev",
-      containerImage:
-        "registry.example/eve@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    });
-    const customSource = generateEveHostWorkerSource({ config: customConfig });
-    expect(customSource).toContain(
-      "export { EveHostDurableContainer as CustomEveContainer };",
-    );
-    expect(customSource).toContain('"containerBindingName":"CUSTOM_CONTAINER"');
     expect(source).toContain("export { EveHostDurableContainer };");
     expect(config.worker.compatibility_flags).toEqual(["enable_ctx_exports"]);
     expect(source).not.toMatch(/@moinulmoin\/eden-runtime-cloudflare|node:/u);
@@ -317,31 +426,6 @@ describe("generic Eve Cloudflare host", () => {
   });
 
   test("strips spoofed host metadata while preserving application headers and bytes", async () => {
-    const forwarded: Request[] = [];
-    const transport: EveContainerTransport = {
-      containerFetch: async (request) => {
-        forwarded.push(request);
-        return new Response(
-          new ReadableStream({
-            start(controller) {
-              controller.enqueue(new TextEncoder().encode("first"));
-              queueMicrotask(() => {
-                controller.enqueue(new TextEncoder().encode("-last"));
-                controller.close();
-              });
-            },
-          }),
-          {
-            status: 207,
-            headers: {
-              "content-type": "application/octet-stream",
-              "x-eve-response": "preserved",
-            },
-          },
-        );
-      },
-      fetch: async () => new Response("websocket path"),
-    };
     const requestBody = new Uint8Array([0, 255, 1, 2, 3]);
     const request = new Request(
       "https://client.invalid/eve/%2Fencoded?tag=one&tag=two",
@@ -364,23 +448,12 @@ describe("generic Eve Cloudflare host", () => {
         },
       },
     );
-    const proxy = createEveHostProxy({
-      transport,
+    const upstream = createTrustedEveRequest(request, {
       publicOrigin: "https://eden-eve-preview.account.workers.dev",
       deploymentId: IDENTITY.deploymentId,
       generationId: IDENTITY.generationId,
       correlationId: "corr-test",
-      ensureReady: async () => undefined,
     });
-
-    const response = await proxy(request);
-    expect(response.status).toBe(207);
-    expect(response.headers.get("x-eve-response")).toBe("preserved");
-    expect(new Uint8Array(await response.arrayBuffer())).toEqual(
-      new Uint8Array([...new TextEncoder().encode("first-last")]),
-    );
-    expect(forwarded).toHaveLength(1);
-    const upstream = forwarded[0] as Request;
     expect(upstream.method).toBe("PATCH");
     expect(new URL(upstream.url).origin).toBe(
       "https://eden-eve-preview.account.workers.dev",
@@ -408,112 +481,6 @@ describe("generic Eve Cloudflare host", () => {
     expect(upstream.headers.get("forwarded")).toBe(
       "proto=https;host=eden-eve-preview.account.workers.dev",
     );
-  });
-
-  test("uses one readiness gate and never replays an application request", async () => {
-    let readinessCalls = 0;
-    let forwardedCalls = 0;
-    let releaseReadiness: (() => void) | undefined;
-    const readiness = new Promise<void>((resolve) => {
-      releaseReadiness = resolve;
-    });
-    const proxy = createEveHostProxy({
-      transport: {
-        containerFetch: async () => {
-          forwardedCalls += 1;
-          return new Response("application", { status: 201 });
-        },
-        fetch: async () => new Response("websocket"),
-      },
-      publicOrigin: "https://eden-eve-preview.account.workers.dev",
-      deploymentId: IDENTITY.deploymentId,
-      generationId: IDENTITY.generationId,
-      correlationId: "corr-readiness",
-      ensureReady: async () => {
-        readinessCalls += 1;
-        await readiness;
-      },
-    });
-
-    const request = new Request("https://client.invalid/callback", {
-      method: "POST",
-      body: "one-request",
-    });
-    const pending = proxy(request);
-    releaseReadiness?.();
-    const response = await pending;
-
-    expect(response.status).toBe(201);
-    expect(readinessCalls).toBe(1);
-    expect(forwardedCalls).toBe(1);
-  });
-
-  test("dispatches WebSocket upgrades through fetch without downgrading them", async () => {
-    const calls: string[] = [];
-    const proxy = createEveHostProxy({
-      transport: {
-        containerFetch: async () => {
-          calls.push("containerFetch");
-          return new Response("http");
-        },
-        fetch: async (request) => {
-          calls.push("fetch");
-          expect(request.headers.get("upgrade")).toBe("websocket");
-          return new Response("upgrade");
-        },
-      },
-      publicOrigin: "https://eden-eve-preview.account.workers.dev",
-      deploymentId: IDENTITY.deploymentId,
-      generationId: IDENTITY.generationId,
-      correlationId: "corr-websocket",
-      ensureReady: async () => undefined,
-    });
-
-    const response = await proxy(
-      new Request("https://client.invalid/live", {
-        headers: { upgrade: "websocket", connection: "Upgrade" },
-      }),
-    );
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe("upgrade");
-    expect(calls).toEqual(["fetch"]);
-  });
-
-  test("does not consume an aborted request while waiting for readiness", async () => {
-    const controller = new AbortController();
-    let forwarded = false;
-    const proxy = createEveHostProxy({
-      transport: {
-        containerFetch: async () => {
-          forwarded = true;
-          return new Response("unexpected");
-        },
-        fetch: async () => new Response("unexpected"),
-      },
-      publicOrigin: "https://eden-eve-preview.account.workers.dev",
-      deploymentId: IDENTITY.deploymentId,
-      generationId: IDENTITY.generationId,
-      correlationId: "corr-abort",
-      ensureReady: async (signal) => {
-        await new Promise<void>((resolve) => {
-          signal.addEventListener("abort", () => resolve(), { once: true });
-        });
-      },
-    });
-
-    const pending = proxy(
-      new Request("https://client.invalid/abort", {
-        method: "POST",
-        body: "must-not-replay",
-        signal: controller.signal,
-      }),
-    );
-    controller.abort();
-
-    await expect(pending).rejects.toMatchObject({
-      code: "HOST_REQUEST_ABORTED",
-    });
-    expect(forwarded).toBe(false);
   });
 
   test("constructs a forwarding request without reading the application body", async () => {
@@ -647,32 +614,11 @@ describe("generic Eve Cloudflare host", () => {
     });
   });
 
-  test("records outer lifecycle transitions without starting a second Eve supervisor", async () => {
-    const lifecycle = (
-      await import("../src/eve-host.js")
-    ).createEveHostLifecycleObserver(() => 42);
-    lifecycle.record("start_requested");
-    lifecycle.record("started");
-    lifecycle.record("health_ready", "ready");
-    lifecycle.record("replaced");
-    lifecycle.record("stopped", "runtime_signal:0");
-
-    expect(lifecycle.events).toEqual([
-      { type: "start_requested", at: 42 },
-      { type: "started", at: 42 },
-      { type: "health_ready", at: 42, safeStatus: "ready" },
-      { type: "replaced", at: 42 },
-      { type: "stopped", at: 42, safeStatus: "runtime_signal:0" },
-    ]);
-    expect(EveHostDurableContainer.prototype.fetch).toBeDefined();
-  });
-
   test("refuses the Workflow queue-delivery subtree on the public Worker path", async () => {
     const forwardedUrls: string[] = [];
     const worker = createEveHostWorker({
       publicOrigin: "https://eden-eve-preview.account.workers.dev",
       workerName: IDENTITY.workerName,
-      containerBindingName: IDENTITY.containerBindingName,
       stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
       deploymentId: IDENTITY.deploymentId,
       generationId: IDENTITY.generationId,
@@ -751,7 +697,6 @@ describe("generic Eve Cloudflare host", () => {
     const env = {
       EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
       EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
-      EVE_CONTAINER_BINDING_NAME: IDENTITY.containerBindingName,
       EDEN_EVE_DEPLOYMENT_ID: IDENTITY.deploymentId,
       EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
       EVE_CONTAINER: {
@@ -794,15 +739,6 @@ describe("generic Eve Cloudflare host", () => {
 });
 
 describe("Eve schedule wake triggers", () => {
-  const SCHEDULED_ENV = {
-    EVE_CONTAINER: {
-      getByName: () => ({
-        fetch: async (request: Request) =>
-          new Response(`wake:${request.url}`),
-      }),
-    },
-  };
-
   test("emits one every-minute cron trigger only when schedules exist", () => {
     const withSchedules = createEveHostConfig({
       ...IDENTITY,
@@ -896,7 +832,6 @@ describe("Eve schedule wake triggers", () => {
     const worker = createEveHostWorker({
       publicOrigin: "https://eden-eve-preview.account.workers.dev",
       workerName: IDENTITY.workerName,
-      containerBindingName: IDENTITY.containerBindingName,
       stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
       deploymentId: IDENTITY.deploymentId,
       generationId: IDENTITY.generationId,
@@ -934,20 +869,17 @@ describe("Eve schedule wake triggers", () => {
     const worker = createEveHostWorker({
       publicOrigin: "https://eden-eve-preview.account.workers.dev",
       workerName: IDENTITY.workerName,
-      containerBindingName: IDENTITY.containerBindingName,
       stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
       deploymentId: IDENTITY.deploymentId,
       generationId: IDENTITY.generationId,
     });
     expect(worker.scheduled).toBeUndefined();
-    expect(SCHEDULED_ENV.EVE_CONTAINER.getByName).toBeTypeOf("function");
   });
 
   test("schedules do not loosen the internal-route refusal", async () => {
     const worker = createEveHostWorker({
       publicOrigin: "https://eden-eve-preview.account.workers.dev",
       workerName: IDENTITY.workerName,
-      containerBindingName: IDENTITY.containerBindingName,
       stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
       deploymentId: IDENTITY.deploymentId,
       generationId: IDENTITY.generationId,
@@ -1060,38 +992,6 @@ describe("in-place update Durable Object history", () => {
     ).toThrow(/migration history/u);
   });
 
-  test("scheduled wake requests carry the Worker's deployment identity", async () => {
-    let wakeHeaders: Headers | undefined;
-    const env = {
-      EVE_CONTAINER: {
-        getByName: () => ({
-          fetch: async (request: Request) => {
-            wakeHeaders = request.headers;
-            return new Response("ok");
-          },
-        }),
-      },
-    };
-    const worker = createEveHostWorker({
-      publicOrigin: "https://eden-eve-preview.account.workers.dev",
-      workerName: IDENTITY.workerName,
-      containerBindingName: IDENTITY.containerBindingName,
-      stableContainerInstanceName: IDENTITY.stableContainerInstanceName,
-      deploymentId: IDENTITY.deploymentId,
-      generationId: IDENTITY.generationId,
-      schedules: [{ name: "digest", cron: "0 9 * * 1-5" }],
-    });
-    const waited: Promise<unknown>[] = [];
-    worker.scheduled?.(
-      { cron: "* * * * *", scheduledTime: Date.parse("2026-10-02T08:57:00Z") },
-      env,
-      { waitUntil: (task: Promise<unknown>) => waited.push(task) },
-    );
-    await Promise.all(waited);
-    expect(wakeHeaders?.get("x-eden-eve-deployment-id")).toBe(
-      IDENTITY.deploymentId,
-    );
-  });
 });
 
 describe("EveHostDurableContainer lifecycle", () => {
@@ -1133,9 +1033,50 @@ describe("EveHostDurableContainer lifecycle", () => {
     await container.ensureEveReady(new AbortController().signal);
     expect(runtime.state.destroyCalls).toBe(1);
     expect(runtime.lastStart?.image).toBe(CURRENT_IMAGE);
-    expect(
-      container.lifecycle.events.map((event) => event.type),
-    ).toContain("image_mismatch");
+  });
+
+  test("keeps a snapshot-restored container whose inspect() image is empty", async () => {
+    const stored = new Map<string, unknown>([
+      ["eden.eve.host.workspace-snapshot", { id: "snap-ok", image: CURRENT_IMAGE, at: 0 }],
+    ]);
+    const runtime = fakeContainerRuntime();
+    await hostContainer(stored, runtime).ensureEveReady(new AbortController().signal);
+    expect(runtime.lastStart?.containerSnapshot).toEqual({ id: "snap-ok" });
+    // A fresh Durable Object (e.g. after eviction) must not replace it.
+    await hostContainer(stored, runtime).ensureEveReady(new AbortController().signal);
+    expect(runtime.state.destroyCalls).toBe(0);
+  });
+
+  test("replaces a running container recorded as started from an older image", async () => {
+    const stored = new Map<string, unknown>([
+      ["eden.eve.host.started-image", OLD_IMAGE],
+    ]);
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: "" });
+    await hostContainer(stored, runtime).ensureEveReady(new AbortController().signal);
+    expect(runtime.state.destroyCalls).toBe(1);
+    expect(runtime.lastStart?.image).toBe(CURRENT_IMAGE);
+  });
+
+  test("the default sleep window fits Cloudflare's 6-hour inactivity limit", async () => {
+    const runtime = fakeContainerRuntime();
+    await expect(
+      hostContainer(new Map(), runtime).ensureEveReady(new AbortController().signal),
+    ).resolves.toMatchObject({ healthPath: EVE_HOST_DEFAULTS.healthPath });
+  });
+
+  test("rejects a sleep override Cloudflare cannot honor before it snapshots", () => {
+    const request = {
+      ...IDENTITY,
+      stableWorkersDevOrigin: "https://eden-eve-preview.account.workers.dev",
+      containerImage:
+        "registry.example/eve@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    expect(() =>
+      createEveHostConfig({ ...request, containerSleepAfter: "6h" }),
+    ).toThrow(/exceeds 345m/u);
+    expect(() =>
+      createEveHostConfig({ ...request, containerSleepAfter: "345m" }),
+    ).not.toThrow();
   });
 
   test("echoes the started deployment only when the served image and deployment id match", async () => {
@@ -1206,5 +1147,179 @@ describe("EveHostDurableContainer lifecycle", () => {
     expect(runtime.state.snapshotCalls).toBe(3);
     expect(runtime.state.destroyCalls).toBe(1);
     expect(stored.get("eden.eve.host.workspace-snapshot")).toBeUndefined();
+  });
+});
+
+describe("sandbox session carry across image updates", () => {
+  const CARRY_META_KEY = "eden.eve.host.sandbox-carry";
+
+  test("saves a chunked carry before destroying a stale image and restores it before the first forwarded request", async () => {
+    await withCarryLimits({ chunkBytes: 4, maxBytes: 1024 }, async () => {
+      const stored = new Map<string, unknown>();
+      const runtime = fakeContainerRuntime({
+        running: true,
+        inspectImage: OLD_IMAGE,
+        carryArchive: "sessions-archive-v1",
+      });
+      const container = hostContainer(stored, runtime);
+      const response = await container.fetch(
+        new Request("https://eden-eve-preview.account.workers.dev/eve/v1/info"),
+      );
+      expect(response.status).toBe(200);
+      expect(runtime.state.timeline).toEqual([
+        "carry-out",
+        "destroy",
+        "start",
+        "health",
+        "carry-in",
+        "forward",
+      ]);
+      expect(runtime.lastStart?.image).toBe(CURRENT_IMAGE);
+      const carry = stored.get(CARRY_META_KEY) as {
+        id: string;
+        chunks: number;
+        bytes: number;
+        at: number;
+      };
+      expect(carry.chunks).toBe(5);
+      expect(carry.bytes).toBe(19);
+      const decoder = new TextDecoder();
+      const joined = Array.from({ length: carry.chunks }, (_, index) =>
+        decoder.decode(
+          stored.get(`${CARRY_META_KEY}.${carry.id}.${index}`) as Uint8Array,
+        ),
+      ).join("");
+      expect(joined).toBe("sessions-archive-v1");
+      expect(runtime.state.carryInPayloads).toEqual(["sessions-archive-v1"]);
+    });
+  });
+
+  test("does not restore a carry after a same-image snapshot wake", async () => {
+    const carryId = "carry-alarm";
+    const stored = new Map<string, unknown>([
+      ["eden.eve.host.workspace-snapshot", {
+        id: "snap-ok",
+        image: CURRENT_IMAGE,
+        at: 0,
+      }],
+      [CARRY_META_KEY, { id: carryId, chunks: 1, bytes: 3, at: 0 }],
+      [`${CARRY_META_KEY}.${carryId}.0`, new TextEncoder().encode("abc")],
+    ]);
+    const runtime = fakeContainerRuntime();
+    const container = hostContainer(stored, runtime);
+    await container.ensureEveReady(new AbortController().signal);
+    expect(runtime.lastStart?.containerSnapshot).toEqual({ id: "snap-ok" });
+    expect(runtime.state.carryInCalls).toBe(0);
+    expect(runtime.state.timeline).toEqual(["start", "health"]);
+  });
+
+  test("alarm carries sessions out together with the snapshot", async () => {
+    const stored = new Map<string, unknown>([
+      ["eden.eve.host.last-activity-at", 0],
+    ]);
+    const alarms: number[] = [];
+    const runtime = fakeContainerRuntime({
+      running: true,
+      carryArchive: "alarm-archive",
+    });
+    const container = hostContainer(stored, runtime, alarms);
+    await container.alarm();
+    expect(runtime.state.timeline).toEqual(["carry-out", "destroy"]);
+    expect(runtime.state.snapshotCalls).toBe(1);
+    const carry = stored.get(CARRY_META_KEY) as {
+      id: string;
+      chunks: number;
+      bytes: number;
+    };
+    expect(carry.chunks).toBe(1);
+    expect(carry.bytes).toBe(13);
+    expect(stored.get(`${CARRY_META_KEY}.${carry.id}.0`)).toEqual(
+      new TextEncoder().encode("alarm-archive"),
+    );
+    expect(stored.get("eden.eve.host.workspace-snapshot")).toEqual({
+      id: "snapshot-1",
+      image: CURRENT_IMAGE,
+      at: expect.any(Number),
+    });
+  });
+
+  test("keeps the previous carry when the new carry exceeds the cap", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    await withCarryLimits({ chunkBytes: 4, maxBytes: 8 }, async () => {
+      const stored = new Map<string, unknown>([
+        [CARRY_META_KEY, { id: "carry-prev", chunks: 2, bytes: 8, at: 0 }],
+        [`${CARRY_META_KEY}.carry-prev.0`, new TextEncoder().encode("0123")],
+        [`${CARRY_META_KEY}.carry-prev.1`, new TextEncoder().encode("4567")],
+      ]);
+      const runtime = fakeContainerRuntime({
+        running: true,
+        inspectImage: OLD_IMAGE,
+        carryArchive: "0123456789ABCDEF",
+      });
+      const container = hostContainer(stored, runtime);
+      await container.fetch(
+        new Request("https://eden-eve-preview.account.workers.dev/eve/v1/info"),
+      );
+      expect(runtime.state.destroyCalls).toBe(1);
+      expect(stored.get(CARRY_META_KEY)).toEqual({
+        id: "carry-prev",
+        chunks: 2,
+        bytes: 8,
+        at: 0,
+      });
+      expect(stored.has(`${CARRY_META_KEY}.carry-prev.0`)).toBe(true);
+      expect(stored.has(`${CARRY_META_KEY}.carry-prev.1`)).toBe(true);
+      const extraKeys = [...stored.keys()].filter(
+        (key) => key.startsWith(`${CARRY_META_KEY}.`) &&
+          !key.endsWith("carry-prev.0") &&
+          !key.endsWith("carry-prev.1") &&
+          key !== CARRY_META_KEY,
+      );
+      expect(extraKeys).toEqual([]);
+      expect(errorSpy).toHaveBeenCalled();
+    });
+    errorSpy.mockRestore();
+  });
+
+  test("a failed restore does not block serving", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const carryId = "carry-broken";
+    const stored = new Map<string, unknown>([
+      [CARRY_META_KEY, { id: carryId, chunks: 1, bytes: 3, at: 0 }],
+      [`${CARRY_META_KEY}.${carryId}.0`, new TextEncoder().encode("abc")],
+    ]);
+    const runtime = fakeContainerRuntime({ carryInExitCode: 7 });
+    const container = hostContainer(stored, runtime);
+    const response = await container.fetch(
+      new Request("https://eden-eve-preview.account.workers.dev/eve/v1/info"),
+    );
+    expect(response.status).toBe(200);
+    expect(runtime.state.timeline).toEqual([
+      "start",
+      "health",
+      "carry-in",
+      "forward",
+    ]);
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  test("a failing carry still lets the update destroy and restart", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stored = new Map<string, unknown>();
+    const runtime = fakeContainerRuntime({
+      running: true,
+      inspectImage: OLD_IMAGE,
+      execFails: true,
+    });
+    const container = hostContainer(stored, runtime);
+    const response = await container.fetch(
+      new Request("https://eden-eve-preview.account.workers.dev/eve/v1/info"),
+    );
+    expect(response.status).toBe(200);
+    expect(runtime.state.destroyCalls).toBe(1);
+    expect(runtime.state.carryInCalls).toBe(0);
+    expect(stored.has(CARRY_META_KEY)).toBe(false);
+    errorSpy.mockRestore();
   });
 });

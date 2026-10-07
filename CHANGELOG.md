@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.7.0 — 2026-10-07
+
+### Added
+
+- **Agent files and conversations survive updates too (including skill
+  changes).** An `eden deploy` update replaces the running Container's image;
+  Eden now carries Eve's sandbox sessions — every conversation's files and
+  metadata under `/workspace/.eve/sandbox-cache/just-bash/sessions` — out of
+  the old container into the agent's Durable Object storage in ~1 MiB chunks
+  (capped at 1 GiB compressed; the previous carry is kept when the cap or an
+  exec failure aborts a carry) and restores them into the fresh container
+  before it serves any request. Same-image snapshot wakes keep using the
+  fast snapshot path. `/workspace` outside Eve's sandbox sessions still
+  resets to the new image.
+- **Temporary Eve fix for the just-bash resume bug
+  ([eve#4440](https://github.com/vercel/eve/issues/4440)).** Upstream Eve's
+  just-bash provider permanently refuses to resume a conversation after the
+  sandbox template changes (skills, `agent/sandbox/workspace/`, sandbox
+  definition) and never falls back. Eden's isolated builder now patches one
+  file in the installed Eve copy — only when its sha256 matches a version
+  Eden knows (verified for 0.68.0, 0.71.2, and 0.72.1) — so a session
+  reopens against the current template, refreshes the authored skills, and
+  never touches `/workspace` user data. The patch exists only inside the
+  build image and is removed when upstream ships the fix; an unknown Eve
+  version still deploys and prints an `EVE_SANDBOX_RESUME_PATCH` warning
+  (applied prints `✓ EVE_SANDBOX_RESUME_PATCH`).
+
+### Changed
+
+- Removed undocumented package exports.
+- Docs corrected for 0.6.0 sleep/instance behavior.
+
+### Fixed
+
+- Eve sandbox tools (`bash`, `read_file`, `write_file`) now work on deployed
+  agents: the prepared sandbox template ships in the image, and runtime
+  sandbox selection matches the build.
+- **Sleep now snapshots with the default settings.** The 0.6.0 default
+  sleep window (24 hours) exceeded Cloudflare's 6-hour limit on how long a
+  container may outlive its idle Durable Object, so the inactivity timeout
+  was rejected and Cloudflare stopped idle containers without a snapshot —
+  files were lost and updates had nothing to carry. The default is now 1
+  hour, and `EDEN_EVE_CONTAINER_SLEEP_AFTER` is capped at `345m` (5 h 45 min).
+- A container restored from a snapshot is no longer mistaken for a stale
+  image (`inspect()` reports an empty image for it); Eden compares the image
+  it recorded at start instead.
+
 ## 0.6.0 — 2026-10-06
 
 ### Changed

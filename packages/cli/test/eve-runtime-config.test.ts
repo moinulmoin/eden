@@ -24,8 +24,6 @@ import {
   EVE_RESERVED_HOST_VARIABLES,
   EVE_START_COMMAND,
   EveRuntimeConfigError,
-  loadEveRuntimeConfig,
-  parseEveRuntimeConfig,
   prepareEveRuntimeInjection,
   redactEveRuntimeOutput,
   readEveRuntimeConfig,
@@ -175,7 +173,7 @@ describe("Eve runtime configuration", () => {
     const previous = process.env.EDEN_CONTROL_PLANE_TOKEN;
     process.env.EDEN_CONTROL_PLANE_TOKEN = "ambient-control-plane-marker";
     try {
-      const config = await parseEveRuntimeConfig(envPath);
+      const config = await readEveRuntimeConfig(envPath);
       const injection = await prepareEveRuntimeInjection(config, {
         mode: "preflight",
       });
@@ -531,12 +529,6 @@ describe("Eve runtime configuration", () => {
     expect(requests).toEqual([envPath, join(root, "missing.env")]);
   });
 
-  test("reports an Eden-owned error when a missing path is parsed", async () => {
-    await expect(loadEveRuntimeConfig("/tmp/eden-env-file-that-is-not-present")).rejects.toMatchObject({
-      code: "EVE_ENV_FILE_NOT_FOUND",
-    });
-  });
-
   test("renders parser failures with their Eden error code", async () => {
     const root = await createRoot();
     const missingPath = join(root, "missing.env");
@@ -556,7 +548,7 @@ describe("Eve runtime configuration", () => {
           cwd: root,
           stderr: (line) => errors.push(line),
           eveRunner: async (request) => {
-            await loadEveRuntimeConfig(request.envFile ?? "");
+            await readEveRuntimeConfig(request.envFile ?? "");
           },
         },
       ),

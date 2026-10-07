@@ -136,7 +136,7 @@ Plus whatever your agent itself needs: model keys, databases, external services.
 
 **1. Real sign-in.** A fresh `eve init` project only accepts Vercel-issued tokens in production. Off Vercel, that means every request except the health check gets a 401. Pick one of Eve's authenticators in `agent/channels/eve.ts`, for example `jwtHmac()`, `httpBasic()` or `oidc()`, or `none()` for a public demo. Eve's own self-hosting guide says the same.
 
-**2. Durable memory for real agents.** The container's disk is wiped whenever it sleeps, so by default Eve forgets pending approvals and sessions. Three steps fix it: add the Postgres World package, select it in `agent.ts`, and put a direct Postgres URL in your env file. Any Postgres works (Neon, Supabase, Railway, your own server); use the direct address, not a pooled one. Eden runs the database setup for you during deploy. See [Durable state (Postgres World)](docs/deploy.md#durable-state-postgres-world).
+**2. Durable memory for real agents.** Container files survive sleep via snapshots, and updates now carry Eve's sandbox sessions (conversation files) across the image change — including skill changes, which Eden makes safe with a temporary fix for Eve's just-bash resume bug. Local Workflow World *state* (pending approvals, in-flight runs) still needs a durable World: add the Postgres World package, select it in `agent.ts`, and put a direct Postgres URL in your env file. Any Postgres works (Neon, Supabase, Railway, your own server); use the direct address, not a pooled one. Eden runs the database setup for you during deploy. See [Durable state (Postgres World)](docs/deploy.md#durable-state-postgres-world).
 
 **Experimental, no database at all:** add `@moinulmoin/eden-world-cloudflare` and select it in `agent.ts`. Memory lives in a Durable Object on your own Cloudflare account, and Eden sets it up. It passes Workflow's official World test suite, and on Cloudflare a pending approval survived both a container restart and an agent update. One caveat for now: automatic container sleep with it isn't verified yet. See [Durable state on Cloudflare](docs/deploy.md#durable-state-on-cloudflare-no-database).
 
@@ -150,14 +150,14 @@ Run `eden deploy` again. Eden recognises a deployment it owns and updates it in 
 Eden is free and open source (Apache-2.0). You pay Cloudflare directly, on your own account:
 
 - **Workers Paid:** $5/month, which includes some Container usage.
-- **Container time:** billed only while the container runs, at the 4 GiB rate (a `standard-1` container: 1/2 vCPU, 4 GiB); a sleeping container costs nothing. At Cloudflare's published rates (checked September 2026), a container running all month comes to roughly $12–15/month including the $5 plan, plus CPU used. Eden lets the container sleep after 24 hours without requests, and it wakes on the next request. Each scheduled run also wakes it, so an agent with daily or more frequent schedules is effectively always on.
+- **Container time:** billed only while the container runs, at the 4 GiB rate (a `standard-1` container: 1/2 vCPU, 4 GiB); a sleeping container costs nothing. At Cloudflare's published rates (checked September 2026), a container running all month comes to roughly $12–15/month including the $5 plan, plus CPU used. Eden lets the container sleep after 1 hour without requests, and it wakes on the next request. Each scheduled run also wakes it, so an agent with hourly or more frequent schedules is effectively always on.
 - **Your model usage** goes to your model provider, with your key.
 
 ---
 
 ## Honest limits
 
-- **Container files survive sleep, not updates.** Eden snapshots the container's filesystem when it sleeps and restores it on wake, so your agent's files come back. A redeploy that changes the image starts the container fresh, so process-local Workflow World state still needs the Postgres World (three steps, above). Without it, Eden warns you on every deploy.
+- **Conversation files survive sleep and updates; World state needs a database.** Eden snapshots the container's filesystem when it sleeps and restores it on wake, and an update carries Eve's sandbox sessions across the image change (capped at 1 GiB compressed; `/workspace` outside those sessions resets to the new image). Process-local Workflow World state still needs the Postgres World (three steps, above). Without it, Eden warns you on every deploy.
 - **Snapshots expire after 30 idle days.** An agent woken after a month asleep starts with the image's filesystem, not the snapshot.
 - **Schedules use standard 5-field cron.** Those fire on time even while the container sleeps. Schedules with a seconds field or shortcuts like `@daily` only run while it's awake, and Eden warns about them.
 - **The agent's bash is simulated.** Inside a Cloudflare Container, Eve's default sandbox uses `just-bash`, a simulated shell with a virtual filesystem, not a full Linux VM. Agents that need real tools such as `python` or `git` in their sandbox aren't a fit yet.
@@ -195,6 +195,8 @@ Pick Vercel when you want Eve's full managed platform. Pick Eden when you want y
 - **Memory across a container replacement:** with the Postgres World, an approval requested before the container was destroyed and replaced was approved afterwards and the run finished. Without it, the approval was lost.
 - **Memory across an update:** with the Cloudflare World, an approval requested before `eden deploy` updated the agent with new instructions was approved afterwards on the new code, and the run finished.
 - **Schedules while asleep:** a schedule every 3 minutes fired exactly once per tick while the container slept between ticks.
+- **Files and conversations across an update that changes a skill:** a conversation wrote a file with Eve's `bash` tool; `eden deploy` then shipped a changed skill. In the same conversation afterwards, the file was still there and the sandbox showed the new skill text.
+- **Files across sleep, and across an update that lands while asleep:** a file written before the container slept was read back after a same-image wake, and after an update deployed while the container was asleep.
 - Eden's own release gates run build, typecheck, lint, tests and the Eve compatibility check on every change.
 
 ---
