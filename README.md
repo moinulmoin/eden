@@ -157,6 +157,30 @@ The Eve project remains responsible for its:
   supported yet: the first three fail at build, and the Dockerfile silently
   falls back to `just-bash`.
 
+### What we found running Eve on Cloudflare
+
+Things that differ from Vercel, and what Eden does about each:
+
+- **Container disk is wiped when a container stops.** Eden snapshots the disk
+  before the container sleeps and restores it on wake. Cloudflare deletes a
+  snapshot after 30 days without a wake.
+- **Cloudflare stops an idle container within 6 hours.** Eden puts it to sleep
+  after 1 hour without requests (`EDEN_EVE_CONTAINER_SLEEP_AFTER`, up to
+  `345m`) so the snapshot always happens first.
+- **An update starts a new container from a new image.** Eden copies every
+  conversation's sandbox files into it before it serves requests.
+- **Eve's `just-bash` sandbox refuses to resume a conversation after a skill
+  change** ([eve#4440](https://github.com/vercel/eve/issues/4440)). Eden applies
+  a small temporary fix at build time, only for Eve versions it recognizes,
+  until Eve ships its own.
+- **Eve prepares its sandbox at build time, on the machine that builds.** A
+  real Linux sandbox (microsandbox or Docker) needs KVM or a Docker daemon
+  there; Eden's builder has neither, so agents get `just-bash`. microsandbox
+  does run inside Cloudflare's container, but preparing it there adds about 7
+  minutes to every deploy and update, so Eden does not use it yet.
+- **Waking a sleeping agent takes about 10–15 seconds**, mostly Eve's server
+  starting up. The container itself starts in about a second.
+
 ## Commands
 
 | Command | Purpose |
