@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.1 — 2026-10-15
+
+### Fixed
+
+- Extend the temporary Eve just-bash resume fix (eve#4440) to Eve `0.79.1`.
+  The newer prepared artifact carries a `templateKey`, not a
+  `templateRootPath`; Eden now resolves the current template before reopening
+  or recreating a session and refreshing its skills. Existing recognized
+  `0.68.0`–`0.72.1` bindings retain their original replacement; unknown hashes
+  are still skipped with a warning.
+- Document the complete fresh Eve initializer setup for Eden: converting
+  npm output to pinned pnpm, excluding optional native archive dependencies,
+  adding `just-bash`, and replacing production placeholder authentication.
+- Reload a stale container Durable Object before forwarding requests from a
+  newer Worker deployment, so updates roll to the new image before the
+  deployment health gate can promote them. Scheduled wakes carry the same
+  deployment identity and use the same bounded retry.
+- Agents deployed with `0.7.0` or earlier must be recreated with
+  `eden destroy` followed by `eden deploy` (or deployed to a fresh target)
+  to pick up the reliable-update runtime.
+- Allow up to ten minutes for Wrangler's Worker publication step, since
+  Cloudflare image preparation can consume the previous two-minute deadline
+  before the Worker and Container application are published. Other Wrangler
+  operations retain their existing deadlines.
+
 ## 0.7.0 — 2026-10-07
 
 ### Added

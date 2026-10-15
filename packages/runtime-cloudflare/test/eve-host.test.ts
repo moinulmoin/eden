@@ -236,10 +236,17 @@ function hostContainer(
   stored: Map<string, unknown>,
   runtime: FakeContainerRuntime,
   alarms?: number[],
+  options: {
+    readonly deploymentId?: string;
+    readonly abort?: (reason?: string) => void;
+  } = {},
 ) {
   const container = new EveHostDurableContainer(
     {
       container: runtime,
+      abort: options.abort ?? ((reason?: string) => {
+        throw new Error(reason);
+      }),
       storage: {
         sql: { exec: () => [] },
         get: async (key: string) => stored.get(key),
@@ -260,7 +267,7 @@ function hostContainer(
     {
       EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
       EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
-      EDEN_EVE_DEPLOYMENT_ID: IDENTITY.deploymentId,
+      EDEN_EVE_DEPLOYMENT_ID: options.deploymentId ?? IDENTITY.deploymentId,
       EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
     },
   );
@@ -674,6 +681,7 @@ describe("generic Eve Cloudflare host", () => {
     );
     expect(webhook.status).toBe(200);
     expect(forwardedUrls).toEqual([
+      "https://eden-eve-preview.account.workers.dev/eve/v1/health",
       "https://eden-eve-preview.account.workers.dev/.well-known/workflow/v1/webhook/token-123",
     ]);
     const manifest = await worker.fetch(
@@ -690,6 +698,121 @@ describe("generic Eve Cloudflare host", () => {
     );
     expect(api.status).toBe(200);
     expect(await api.text()).toBe("forwarded");
+  });
+
+  test.each([
+    new Error("container transport failed"),
+    Object.assign(new Error("transient infrastructure failure"), { retryable: true }),
+    new Error("remote exception: stale Worker version"),
+    "stale Worker version",
+  ])("does not replay POST requests after their transport fails: %s", async (error) => {
+    const upstreamFetch = vi.fn(async (request: Request) => {
+      if (request.method === "GET") return new Response("synchronized");
+      expect(await request.text()).toBe("non-idempotent-body");
+      throw error;
+    });
+    const getByName = vi.fn(() => ({ fetch: upstreamFetch }));
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    await expect(worker.fetch(new Request("https://client.invalid/write", {
+      method: "POST",
+      body: "non-idempotent-body",
+    }), { EVE_CONTAINER: { getByName } })).rejects.toBe(error);
+    expect(upstreamFetch).toHaveBeenCalledTimes(2);
+    expect(getByName).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    new Error("health transport failed"),
+    Object.assign(new Error("transient infrastructure failure"), { retryable: true }),
+  ])("does not send an upload when version synchronization fails: %s", async (error) => {
+    const methods: string[] = [];
+    const upstreamFetch = vi.fn(async (request: Request) => {
+      methods.push(request.method);
+      throw error;
+    });
+    const getByName = vi.fn(() => ({ fetch: upstreamFetch }));
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    await expect(worker.fetch(new Request("https://client.invalid/write", {
+      method: "POST",
+      body: "non-idempotent-body",
+    }), { EVE_CONTAINER: { getByName } })).rejects.toBe(error);
+    expect(methods).toEqual(["GET"]);
+    expect(getByName).toHaveBeenCalledTimes(1);
+  });
+
+  test("synchronizes before streaming the original body once without cloning it", async () => {
+    const clone = vi.spyOn(Request.prototype, "clone").mockImplementation(() => {
+      throw new Error("uploads must not be cloned");
+    });
+    const cancel = vi.fn();
+    const methods: string[] = [];
+    const original = new Request("https://client.invalid/write", {
+      method: "POST",
+      headers: {
+        "content-length": "15",
+        "content-type": "application/octet-stream",
+      },
+      body: "streamed-upload",
+    });
+    const upstreamFetch = vi.fn(async (request: Request) => {
+      methods.push(request.method);
+      expect(request.headers.get("x-eden-eve-deployment-id")).toBe(
+        IDENTITY.deploymentId,
+      );
+      if (request.method === "GET") {
+        expect(new URL(request.url).pathname).toBe(EVE_HOST_DEFAULTS.healthPath);
+        expect(request.body).toBeNull();
+        expect(request.headers.get("content-length")).toBeNull();
+        expect(request.headers.get("content-type")).toBeNull();
+        expect(original.bodyUsed).toBe(false);
+        return new Response(new ReadableStream({ cancel }));
+      }
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(request.headers.get("content-length")).toBe("15");
+      expect(request.headers.get("content-type")).toBe("application/octet-stream");
+      expect(await request.text()).toBe("streamed-upload");
+      return new Response("uploaded");
+    });
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    try {
+      const response = await worker.fetch(original, {
+        EVE_CONTAINER: { getByName: () => ({ fetch: upstreamFetch }) },
+      });
+      expect(await response.text()).toBe("uploaded");
+      expect(methods).toEqual(["GET", "POST"]);
+      expect(clone).not.toHaveBeenCalled();
+    } finally {
+      clone.mockRestore();
+    }
+  });
+
+  test("propagates the second stale-Worker failure without a retry loop", async () => {
+    const error = new Error("remote exception: stale Worker version");
+    const upstreamFetch = vi.fn(async (request: Request) => {
+      expect(request.method).toBe("GET");
+      expect(new URL(request.url).pathname).toBe(EVE_HOST_DEFAULTS.healthPath);
+      throw error;
+    });
+    const getByName = vi.fn(() => ({ fetch: upstreamFetch }));
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    await expect(worker.fetch(new Request("https://client.invalid/write", {
+      method: "POST",
+      body: "non-idempotent-body",
+    }), { EVE_CONTAINER: { getByName } })).rejects.toBe(error);
+    expect(upstreamFetch).toHaveBeenCalledTimes(2);
+    expect(getByName).toHaveBeenCalledTimes(2);
   });
 
   test("routes container egress to the public origin back through the container", async () => {
@@ -824,6 +947,12 @@ describe("Eve schedule wake triggers", () => {
         getByName: () => ({
           fetch: async (request: Request) => {
             wakeUrls.push(request.url);
+            expect(request.headers.get("x-eden-eve-deployment-id")).toBe(
+              IDENTITY.deploymentId,
+            );
+            expect(request.headers.get("x-eden-eve-generation-id")).toBe(
+              IDENTITY.generationId,
+            );
             return new Response("ok");
           },
         }),
@@ -864,6 +993,57 @@ describe("Eve schedule wake triggers", () => {
       "https://eden-eve-preview.account.workers.dev/eve/v1/health",
     ]);
   });
+
+  test.each([false, true])(
+    "retries a scheduled stale-Worker wake only once (second attempt fails: %s)",
+    async (secondAttemptFails) => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const error = new Error("remote exception: stale Worker version");
+      let attempts = 0;
+      const wakeFetch = vi.fn(async (request: Request) => {
+        attempts += 1;
+        expect(request.url).toBe(
+          "https://eden-eve-preview.account.workers.dev/eve/v1/health",
+        );
+        expect(request.headers.get("x-eden-eve-deployment-id")).toBe(
+          IDENTITY.deploymentId,
+        );
+        expect(request.headers.get("x-eden-eve-generation-id")).toBe(
+          IDENTITY.generationId,
+        );
+        if (attempts === 1 || secondAttemptFails) throw error;
+        return new Response("awake");
+      });
+      const getByName = vi.fn(() => ({ fetch: wakeFetch }));
+      const worker = createEveHostWorker({
+        publicOrigin: "https://eden-eve-preview.account.workers.dev",
+        ...IDENTITY,
+        schedules: [{ name: "digest", cron: "0 9 * * 1-5" }],
+      });
+      const waited: Promise<unknown>[] = [];
+      try {
+        worker.scheduled?.(
+          { cron: "* * * * *", scheduledTime: Date.parse("2026-10-02T08:57:00Z") },
+          { EVE_CONTAINER: { getByName } },
+          { waitUntil: (task) => { waited.push(task); } },
+        );
+        await Promise.all(waited);
+        expect(waited).toHaveLength(1);
+        expect(wakeFetch).toHaveBeenCalledTimes(2);
+        expect(getByName).toHaveBeenCalledTimes(2);
+        if (secondAttemptFails) {
+          expect(errorSpy).toHaveBeenCalledWith(
+            "The scheduled wake request failed:",
+            error.message,
+          );
+        } else {
+          expect(errorSpy).not.toHaveBeenCalled();
+        }
+      } finally {
+        errorSpy.mockRestore();
+      }
+    },
+  );
 
   test("omits the scheduled handler when no schedules exist", () => {
     const worker = createEveHostWorker({
@@ -995,6 +1175,93 @@ describe("in-place update Durable Object history", () => {
 });
 
 describe("EveHostDurableContainer lifecycle", () => {
+  test("aborts a stale DO before readiness, activity, forwarding, or storage writes", async () => {
+    const stored = new Map<string, unknown>();
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: OLD_IMAGE });
+    const alarms: number[] = [];
+    const abort = vi.fn((reason?: string) => { throw new Error(reason); });
+    const container = hostContainer(stored, runtime, alarms, { abort });
+    await expect(container.fetch(new Request(
+      "https://eden-eve-preview.account.workers.dev/eve/v1/info",
+      { headers: { "x-eden-eve-deployment-id": "dep-current" } },
+    ))).rejects.toThrow("stale Worker version");
+    expect(abort).toHaveBeenCalledExactlyOnceWith("stale Worker version");
+    expect(runtime.state.timeline).toEqual([]);
+    expect(stored.size).toBe(0);
+    expect(alarms).toEqual([]);
+    expect(runtime.running).toBe(true);
+  });
+
+  test("a current Worker resets the old DO, carries files, and only then echoes its started deployment", async () => {
+    const stored = new Map<string, unknown>();
+    const runtime = fakeContainerRuntime({
+      running: true,
+      inspectImage: OLD_IMAGE,
+      carryArchive: "persistent-session-files",
+    });
+    runtime.images.eve = OLD_IMAGE;
+    const abort = vi.fn((reason?: string) => {
+      expect(runtime.state.timeline).toEqual([]);
+      expect(runtime.running).toBe(true);
+      runtime.images.eve = CURRENT_IMAGE;
+      active = hostContainer(stored, runtime);
+      throw new Error(`remote exception: ${reason}`);
+    });
+    const stale = hostContainer(stored, runtime, undefined, {
+      deploymentId: "dep-old",
+      abort,
+    });
+    let active = stale;
+    const prior = await stale.fetch(new Request("https://client.invalid/eve/v1/info", {
+      headers: { "x-eden-eve-deployment-id": "dep-old" },
+    }));
+    expect(prior.headers.get("x-eden-eve-started-deployment")).toBe("dep-old");
+    expect(runtime.state.destroyCalls).toBe(0);
+    runtime.state.timeline.length = 0;
+
+    const payloads: Uint8Array[] = [];
+    const port = runtime.getTcpPort();
+    vi.spyOn(runtime, "getTcpPort").mockReturnValue({
+      fetch: async (request) => {
+        if (request.method === "POST") {
+          payloads.push(new Uint8Array(await request.arrayBuffer()));
+        }
+        return port.fetch(request);
+      },
+    });
+    const getByName = vi.fn(() => {
+      const object = active;
+      return {
+        // Transport the original upload only after the bodyless version
+        // handshake has reset the stale instance and loaded current code.
+        fetch: async (request: Request) => object.fetch(new Request(request)),
+      };
+    });
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    const bytes = new Uint8Array([0, 255, 1, 2, 3]);
+    const response = await worker.fetch(new Request("https://client.invalid/write", {
+      method: "POST",
+      headers: { "x-eden-eve-deployment-id": "spoofed-deployment" },
+      body: bytes,
+    }), { EVE_CONTAINER: { getByName } });
+
+    expect(abort).toHaveBeenCalledExactlyOnceWith("stale Worker version");
+    expect(getByName).toHaveBeenCalledTimes(2);
+    expect(active).not.toBe(stale);
+    expect(runtime.state.timeline).toEqual([
+      "carry-out", "destroy", "start", "health", "carry-in", "health", "forward",
+    ]);
+    expect(runtime.lastStart?.image).toBe(CURRENT_IMAGE);
+    expect(runtime.state.carryInPayloads).toEqual(["persistent-session-files"]);
+    expect(payloads).toEqual([bytes]);
+    expect(response.headers.get("x-eden-eve-started-deployment")).toBe(
+      IDENTITY.deploymentId,
+    );
+  });
+
   test("restores a stored snapshot only when its image matches the configured image", async () => {
     const stored = new Map<string, unknown>([
       ["eden.eve.host.workspace-snapshot", {
@@ -1079,10 +1346,11 @@ describe("EveHostDurableContainer lifecycle", () => {
     ).not.toThrow();
   });
 
-  test("echoes the started deployment only when the served image and deployment id match", async () => {
+  test("keeps same-deployment, headerless, and loopback requests on the current DO", async () => {
     const stored = new Map<string, unknown>();
     const runtime = fakeContainerRuntime();
-    const container = hostContainer(stored, runtime);
+    const abort = vi.fn((reason?: string) => { throw new Error(reason); });
+    const container = hostContainer(stored, runtime, undefined, { abort });
     const response = await container.fetch(
       new Request("https://eden-eve-preview.account.workers.dev/eve/v1/info", {
         headers: { "x-eden-eve-deployment-id": IDENTITY.deploymentId },
@@ -1092,12 +1360,18 @@ describe("EveHostDurableContainer lifecycle", () => {
       IDENTITY.deploymentId,
     );
 
-    const foreign = await container.fetch(
+    const headerless = await container.fetch(
+      new Request("https://eden-eve-preview.account.workers.dev/eve/v1/info"),
+    );
+    expect(headerless.headers.get("x-eden-eve-started-deployment")).toBeNull();
+    const loopback = await container.loopbackFetch(
       new Request("https://eden-eve-preview.account.workers.dev/eve/v1/info", {
         headers: { "x-eden-eve-deployment-id": "dep-other" },
       }),
     );
-    expect(foreign.headers.get("x-eden-eve-started-deployment")).toBeNull();
+    expect(loopback.headers.get("x-eden-eve-started-deployment")).toBeNull();
+    expect(abort).not.toHaveBeenCalled();
+    expect(runtime.state.destroyCalls).toBe(0);
   });
 
   test("alarm snapshots and destroys the idle container", async () => {

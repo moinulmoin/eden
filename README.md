@@ -16,19 +16,19 @@ its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.7.0
+npm install --global @moinulmoin/eden@0.7.1
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.7.0
+pnpm add --global @moinulmoin/eden@0.7.1
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.7.0
+bun add --global @moinulmoin/eden@0.7.1
 ```
 
 Confirm the installation:
@@ -63,6 +63,48 @@ the Eden runtime, so do not force the CLI through `bunx --bun`.
 
 Eden Deploy supports pinned pnpm Eve projects in this release. Bun project
 lockfiles and native Windows are not currently supported.
+
+### Starting from a fresh Eve project
+
+Eden has been validated with Eve `0.68.0` and `0.79.1`. To start on the
+latest validated release:
+
+```sh
+npx eve@0.79.1 init my-agent --non-interactive
+cd my-agent
+npm pkg set packageManager="pnpm@11.21.0" dependencies.eve="0.79.1"
+rm package-lock.json
+```
+
+Eve's initializer uses npm when invoked this way; Eden requires pnpm instead.
+Before installing, create `pnpm-workspace.yaml` (or merge these settings into
+an existing file):
+
+```yaml
+minimumReleaseAgeExclude:
+  - eve@0.79.1
+ignoredOptionalDependencies:
+  - "@mongodb-js/zstd"
+  - node-liblzma
+```
+
+Then install the sandbox dependency and generate the pnpm lockfile:
+
+```sh
+pnpm add just-bash
+```
+
+The optional native archive packages above are not needed by this sandbox;
+without this policy pnpm 11 stops with `ERR_PNPM_IGNORED_BUILDS`. If changing
+the policy after an install, regenerate the lockfile with
+`pnpm install --no-frozen-lockfile`.
+
+Replace the production placeholder in `agent/channels/eve.ts` with your real
+[Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection)
+before deploying: the generated Vercel/localhost authenticators do not grant
+access on Cloudflare. Put your model provider key (for an AI Gateway model,
+`AI_GATEWAY_API_KEY`) and authentication secrets in an environment file outside
+the project, then run `eden deploy --env-file /path/to/preview.env`.
 
 ## Deploy an existing Eve project
 

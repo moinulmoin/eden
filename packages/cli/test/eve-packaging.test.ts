@@ -30,8 +30,10 @@ import {
   createDockerEveProjectBuilder,
   EVE_JUST_BASH_RESUME_ORIGINAL,
   EVE_SANDBOX_RESUME_PATCHED,
+  EVE_SANDBOX_RESUME_PATCHED_LATEST,
   EVE_SANDBOX_RESUME_PATCH_HELPERS,
   EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256,
+  EVE_SANDBOX_RESUME_PATCH_LATEST_SHA256,
   EVE_SANDBOX_RESUME_PATCH_SCRIPT,
   EVE_SANDBOX_RESUME_PATCH_SIGNATURE,
   jsonBytes,
@@ -1475,6 +1477,21 @@ describe("Eve project snapshot/build boundary", () => {
 describe("Eve sandbox-resume patch (eve#4440)", () => {
   const bindingRelativePath =
     "node_modules/eve/dist/src/execution/sandbox/bindings/just-bash.js";
+  const bindings = [
+    {
+      version: "0.68.0/0.71.2/0.72.1",
+      sha256: EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256,
+      replacement: EVE_SANDBOX_RESUME_PATCHED,
+      shape: "legacy",
+    },
+    {
+      version: "0.79.1",
+      sha256: EVE_SANDBOX_RESUME_PATCH_LATEST_SHA256,
+      replacement: EVE_SANDBOX_RESUME_PATCHED_LATEST,
+      shape: "template-key",
+    },
+  ] as const;
+  type BindingShape = (typeof bindings)[number]["shape"];
 
   /** A minimal but parseable module embedding the known resume text. */
   function fixtureModule(resumeText: string): string {
@@ -1487,8 +1504,11 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
     ].join("\n");
   }
 
-  function patcherScriptWithHash(expectedSha256: string): string {
-    const knownLiteral = JSON.stringify(EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256);
+  function patcherScriptWithHash(
+    knownSha256: string,
+    expectedSha256: string,
+  ): string {
+    const knownLiteral = JSON.stringify(knownSha256);
     expect(
       EVE_SANDBOX_RESUME_PATCH_SCRIPT.split(knownLiteral).length - 1,
     ).toBe(1);
@@ -1533,11 +1553,12 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
     };
   }
 
-  test("applies once against a known binding and produces parseable JavaScript", async () => {
+  test.each(bindings)("applies once against $version and produces parseable JavaScript", async (binding) => {
     const root = await createRoot("eden-eve-patch-apply-");
     const fixture = fixtureModule(EVE_JUST_BASH_RESUME_ORIGINAL);
     const bindingPath = await writeEveFixture(root, fixture);
     const script = patcherScriptWithHash(
+      binding.sha256,
       createHash("sha256").update(fixture).digest("hex"),
     );
 
@@ -1549,7 +1570,12 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
 
     const patched = await readFile(bindingPath, "utf8");
     expect(patched).not.toContain(EVE_JUST_BASH_RESUME_ORIGINAL);
-    expect(patched.split(EVE_SANDBOX_RESUME_PATCHED).length - 1).toBe(1);
+    expect(patched.split(binding.replacement).length - 1).toBe(1);
+    expect(patched).not.toContain(
+      binding.shape === "legacy"
+        ? EVE_SANDBOX_RESUME_PATCHED_LATEST
+        : EVE_SANDBOX_RESUME_PATCHED,
+    );
     expect(patched.split(EVE_SANDBOX_RESUME_PATCH_SIGNATURE).length - 1)
       .toBeGreaterThan(0);
     expect(spawnSync(process.execPath, ["--check", bindingPath], {
@@ -1703,8 +1729,6 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
     readonly sessionsDir: string;
     readonly sessionRoot: string;
     resume(
-      context: { readonly sessionsDir: string },
-      artifact: { readonly templateRootPath: string; readonly generation: string },
       state: { readonly generation: string; readonly rootPath: string },
     ): Promise<unknown>;
     readonly openCalls: string[];
@@ -1712,10 +1736,16 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
 
   async function createResumeFixture(
     root: string,
+    shape: BindingShape,
+    generation = "gen-2",
   ): Promise<ResumeFixture> {
-    const templateRoot = join(root, "template");
-    const sessionsDir = join(root, "sessions");
-    const sessionRoot = join(sessionsDir, "session-1");
+    const templateRoot = shape === "legacy"
+      ? join(root, "template")
+      : join(root, "just-bash/templates", generation);
+    const sessionsDir = shape === "legacy"
+      ? join(root, "sessions")
+      : join(root, "just-bash/sessions");
+    const sessionRoot = join(sessionsDir, `${generation}-session-1`);
     const openCalls: string[] = [];
     const harness = new Function(
       "requirePreparedJustBashArtifact",
@@ -1730,31 +1760,47 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
       "rm",
       "readdir",
       "copyDirectoryAtomically",
+      "resolveTemplateRootPath",
       "t",
-      `${EVE_SANDBOX_RESUME_PATCH_HELPERS}\nreturn { ${EVE_SANDBOX_RESUME_PATCHED} };`,
+      `${EVE_SANDBOX_RESUME_PATCH_HELPERS}\nreturn { ${shape === "legacy" ? EVE_SANDBOX_RESUME_PATCHED : EVE_SANDBOX_RESUME_PATCHED_LATEST} };`,
     );
     const scope = harness(
-      (artifact: { readonly templateRootPath: string }) => artifact,
+      (artifact: { readonly templateKey?: string }) =>
+        shape === "legacy" ? artifact : { templateKey: artifact.templateKey },
       (state: { readonly generation: string; readonly rootPath: string }) =>
         state,
       ({ artifact }: {
-        readonly artifact: { readonly generation: string };
-      }) => artifact.generation,
+        readonly artifact: {
+          readonly generation?: string;
+          readonly templateKey?: string;
+        };
+      }) => shape === "legacy" ? artifact.generation : artifact.templateKey,
       (
         context: { readonly sessionsDir: string },
-        artifact: { readonly sessionId: string },
-      ) => join(context.sessionsDir, artifact.sessionId),
+        artifact: {
+          readonly generation?: string;
+          readonly templateKey?: string;
+        },
+      ) => join(
+        context.sessionsDir,
+        `${shape === "legacy" ? artifact.generation : artifact.templateKey}-session-1`,
+      ),
       async (path: string) =>
         await access(path).then(() => true, () => false),
       async (
-        artifact: { readonly templateRootPath: string },
+        template: string | { readonly templateRootPath: string },
         rootPath: string,
       ) => {
+        expect(typeof template).toBe(shape === "legacy" ? "object" : "string");
         if (
           await access(rootPath).then(() => true, () => false)
         ) return;
         await mkdir(dirname(rootPath), { recursive: true });
-        await cp(artifact.templateRootPath, rootPath, { recursive: true });
+        await cp(
+          typeof template === "string" ? template : template.templateRootPath,
+          rootPath,
+          { recursive: true },
+        );
       },
       async (
         _context: unknown,
@@ -1772,13 +1818,21 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
         await mkdir(dirname(to), { recursive: true });
         await cp(from, to, { recursive: true });
       },
+      (storagePath: string, templateKey: string) =>
+        join(storagePath, "just-bash/templates", templateKey),
       { autoInstall: false },
     );
     return {
       templateRoot,
       sessionsDir,
       sessionRoot,
-      resume: scope.resume as ResumeFixture["resume"],
+      resume: (state) => scope.resume(
+        { sessionsDir, storagePath: root },
+        shape === "legacy"
+          ? { templateRootPath: templateRoot, generation }
+          : { templateKey: generation },
+        state,
+      ) as Promise<unknown>,
       openCalls,
     };
   }
@@ -1798,6 +1852,11 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
       "seed\n",
       "utf8",
     );
+    await writeFile(
+      join(templateRoot, "fs/workspace/notes.txt"),
+      "template notes\n",
+      "utf8",
+    );
   }
 
   /** Seeds an existing session root with stale skills and user data. */
@@ -1813,9 +1872,9 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
     );
   }
 
-  test("reopens a session after the template changed and refreshes only its skills", async () => {
+  test.each(bindings)("$version reopens a session after the template changed and refreshes only its skills", async ({ shape }) => {
     const root = await createRoot("eden-eve-patch-resume-");
-    const fixture = await createResumeFixture(root);
+    const fixture = await createResumeFixture(root, shape);
     await writeTemplateFixture(fixture.templateRoot);
     await writeSessionFixture(fixture.sessionRoot);
     await writeFile(
@@ -1825,8 +1884,6 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
     );
 
     await fixture.resume(
-      { sessionsDir: fixture.sessionsDir },
-      { templateRootPath: fixture.templateRoot, generation: "gen-2", sessionId: "session-1" },
       { generation: "gen-1", rootPath: fixture.sessionRoot },
     );
 
@@ -1851,14 +1908,12 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
     ).rejects.toThrow();
   });
 
-  test("recreates a missing session from the current template", async () => {
+  test.each(bindings)("$version recreates a missing session from the current template", async ({ shape }) => {
     const root = await createRoot("eden-eve-patch-resume-missing-");
-    const fixture = await createResumeFixture(root);
+    const fixture = await createResumeFixture(root, shape);
     await writeTemplateFixture(fixture.templateRoot);
 
     await fixture.resume(
-      { sessionsDir: fixture.sessionsDir },
-      { templateRootPath: fixture.templateRoot, generation: "gen-2", sessionId: "session-1" },
       { generation: "gen-1", rootPath: fixture.sessionRoot },
     );
 
@@ -1869,33 +1924,41 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
         "utf8",
       ),
     ).toContain("Say hello (v2)");
+    expect(
+      await readFile(
+        join(fixture.sessionRoot, "fs/workspace/seed.txt"),
+        "utf8",
+      ),
+    ).toBe("seed\n");
   });
 
-  test("keeps throwing for a session root outside the sessions directory", async () => {
+  test.each(bindings)("$version keeps throwing for a session root outside the sessions directory", async ({ shape }) => {
     const root = await createRoot("eden-eve-patch-resume-escape-");
-    const fixture = await createResumeFixture(root);
+    const fixture = await createResumeFixture(root, shape);
     await writeTemplateFixture(fixture.templateRoot);
     const escapedRoot = join(root, "elsewhere", "session-1");
 
     await expect(
       fixture.resume(
-        { sessionsDir: fixture.sessionsDir },
-        { templateRootPath: fixture.templateRoot, generation: "gen-2", sessionId: "session-1" },
         { generation: "gen-1", rootPath: escapedRoot },
       ),
     ).rejects.toThrow("incompatible with this environment");
+    await expect(
+      fixture.resume(
+        { generation: "gen-2", rootPath: escapedRoot },
+      ),
+    ).rejects.toThrow("incompatible with this environment");
     expect(fixture.openCalls).toEqual([]);
+    await expect(access(escapedRoot)).rejects.toThrow();
   });
 
-  test("reopens an unchanged session as-is and recreates a missing one", async () => {
+  test.each(bindings)("$version reopens an unchanged session as-is and recreates a missing one", async ({ shape }) => {
     const root = await createRoot("eden-eve-patch-resume-same-");
-    const fixture = await createResumeFixture(root);
+    const fixture = await createResumeFixture(root, shape, "gen-1");
     await writeTemplateFixture(fixture.templateRoot);
     await writeSessionFixture(fixture.sessionRoot);
 
     await fixture.resume(
-      { sessionsDir: fixture.sessionsDir },
-      { templateRootPath: fixture.templateRoot, generation: "gen-1", sessionId: "session-1" },
       { generation: "gen-1", rootPath: fixture.sessionRoot },
     );
     expect(fixture.openCalls).toEqual([fixture.sessionRoot]);
@@ -1908,25 +1971,21 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
 
     const gone = join(fixture.sessionsDir, "gone");
     await fixture.resume(
-      { sessionsDir: fixture.sessionsDir },
-      { templateRootPath: fixture.templateRoot, generation: "gen-1", sessionId: "session-1" },
       { generation: "gen-1", rootPath: gone },
     );
     expect(fixture.openCalls).toEqual([fixture.sessionRoot, gone]);
     await expect(access(gone)).resolves.toBeUndefined();
   });
 
-  test("leaves session skills untouched when the template has none", async () => {
+  test.each(bindings)("$version leaves session skills untouched when the template has none", async ({ shape }) => {
     const root = await createRoot("eden-eve-patch-resume-noskills-");
-    const fixture = await createResumeFixture(root);
+    const fixture = await createResumeFixture(root, shape);
     await mkdir(join(fixture.templateRoot, "fs/workspace"), {
       recursive: true,
     });
     await writeSessionFixture(fixture.sessionRoot);
 
     await fixture.resume(
-      { sessionsDir: fixture.sessionsDir },
-      { templateRootPath: fixture.templateRoot, generation: "gen-2", sessionId: "session-1" },
       { generation: "gen-1", rootPath: fixture.sessionRoot },
     );
     expect(fixture.openCalls).toEqual([fixture.sessionRoot]);

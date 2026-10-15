@@ -24,6 +24,7 @@ import {
 
 const EVE_CLOUDFLARE_CONTAINERS_CA_PATH =
   "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
+const EVE_HOST_STALE_WORKER_REASON = "stale Worker version";
 
 /**
  * Cloudflare's durable_object containers expose `/dev/kvm`, which makes Eve's
@@ -807,6 +808,15 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   override async fetch(request: Request): Promise<Response> {
     const requestDeploymentId =
       request.headers.get("x-eden-eve-deployment-id") ?? undefined;
+    if (
+      requestDeploymentId !== undefined &&
+      requestDeploymentId !== this.env.EDEN_EVE_DEPLOYMENT_ID
+    ) {
+      // A live container/monitor can pin the DO to an older Worker version.
+      // Reset the DO, not its container or storage; the retry's current code
+      // reconciles the image and carries sandbox sessions through the update.
+      this.ctx.abort(EVE_HOST_STALE_WORKER_REASON);
+    }
     const response = await this.forwardToEve(request);
     // Reporting the verified start back lets deploy health-gate promotion on
     // the served container actually running this generation's image: the
@@ -962,7 +972,9 @@ export interface EveHostWorkerHandler {
 }
 
 interface EveContainerNamespace {
-  getByName(name: string): { fetch(request: Request): Promise<Response> };
+  getByName(name: string): {
+    fetch(request: Request): Promise<Response>;
+  };
 }
 
 export function createEveHostWorker(
@@ -987,6 +999,49 @@ export function createEveHostWorker(
     }
     return namespace.getByName(options.stableContainerInstanceName);
   };
+  const forwardToContainer = async (
+    request: Request,
+    env: EveHostContainerEnvironment,
+  ): Promise<Response> => {
+    const metadata = {
+      publicOrigin: options.publicOrigin,
+      deploymentId: options.deploymentId,
+      generationId: options.generationId,
+      correlationId: globalThis.crypto.randomUUID(),
+      ...(options.runtimeRevisionHandle === undefined
+        ? {}
+        : { runtimeRevisionHandle: options.runtimeRevisionHandle }),
+    };
+    const forwarded = createTrustedEveRequest(request, metadata);
+    // Synchronize the DO version before sending an upload. Cloning a body
+    // would retain an unread tee of the entire upload in isolate memory.
+    const bodyless = forwarded.body === null
+      ? forwarded
+      : createTrustedEveRequest(new Request(
+          new URL(EVE_HOST_DEFAULTS.healthPath, options.publicOrigin),
+          { signal: forwarded.signal },
+        ), metadata);
+    let container = resolveContainer(env);
+    let response: Response;
+    try {
+      response = await container.fetch(bodyless);
+    } catch (error: unknown) {
+      if (
+        !(error instanceof Error) ||
+        !error.message.includes(EVE_HOST_STALE_WORKER_REASON)
+      ) {
+        throw error;
+      }
+      // Only the pre-forwarding stale abort is safe to retry. A failed stub
+      // can remain broken, so resolve it again and retry the bodyless request once.
+      container = resolveContainer(env);
+      response = await container.fetch(bodyless);
+    }
+    if (bodyless === forwarded) return response;
+    await response.body?.cancel();
+    // Stream the original body exactly once, outside the retry path.
+    return container.fetch(forwarded);
+  };
   return {
     async fetch(request, env): Promise<Response> {
       // Queue deliveries to these endpoints arrive through the container's
@@ -995,17 +1050,7 @@ export function createEveHostWorker(
       if (isEveWorkflowInternalRoute(new URL(request.url).pathname)) {
         return new Response(null, { status: 404 });
       }
-      const container = resolveContainer(env);
-      const forwarded = createTrustedEveRequest(request, {
-        publicOrigin: options.publicOrigin,
-        deploymentId: options.deploymentId,
-        generationId: options.generationId,
-        correlationId: globalThis.crypto.randomUUID(),
-        ...(options.runtimeRevisionHandle === undefined
-          ? {}
-          : { runtimeRevisionHandle: options.runtimeRevisionHandle }),
-      });
-      const response = await container.fetch(forwarded);
+      const response = await forwardToContainer(request, env);
       const headers = new Headers(response.headers);
       headers.set("x-eden-eve-worker-name", options.workerName);
       headers.set("x-eden-eve-public-origin", options.publicOrigin);
@@ -1041,10 +1086,9 @@ export function createEveHostWorker(
             // Wake only: the in-process Nitro runner inside the container
             // fires the tick itself, so the schedule runs exactly once.
             ctx.waitUntil(
-              resolveContainer(env)
-                .fetch(new Request(
-                  new URL(EVE_HOST_DEFAULTS.healthPath, options.publicOrigin),
-                ))
+              forwardToContainer(new Request(
+                new URL(EVE_HOST_DEFAULTS.healthPath, options.publicOrigin),
+              ), env)
                 .catch((error: unknown) => {
                   console.error(
                     "The scheduled wake request failed:",

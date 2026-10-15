@@ -319,6 +319,11 @@ Because the every-minute trigger exists to wake the Container, a project
 with schedules pays one scheduled invocation per minute (~43k/month), which
 is well inside the Workers Paid allocation.
 
+After a deploy, Cloudflare can take up to ~17 minutes to start delivering the
+Cron Trigger (observed live). With the default 1-hour sleep the Container stays
+awake through that window, so ticks still fire; with a much shorter sleep
+override, a tick in that window can be missed.
+
 The Container sleeps after 1 hour without requests: Eden snapshots its
 filesystem, then stops it. `EDEN_EVE_CONTAINER_SLEEP_AFTER=<duration>` (for
 example `90s` or `3h`) overrides this at deploy time, up to `345m` (5 h 45

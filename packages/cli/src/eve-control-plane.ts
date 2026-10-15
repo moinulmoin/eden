@@ -1846,10 +1846,16 @@ async function writeEveDeploymentArtifacts(
   return { workerSourcePath, wranglerConfigPath };
 }
 
+/** Deadline for bounded Wrangler reads, secret writes, pushes, and deletions. */
+const WRANGLER_OPERATION_TIMEOUT_MS = 120_000;
+/** Deadline for `wrangler deploy`, whose Container image preparation alone can approach two minutes. */
+const WRANGLER_PUBLICATION_TIMEOUT_MS = 600_000;
+
 function runWranglerWithInput(
   args: readonly string[],
   cwd: string,
   input?: string,
+  timeoutMs: number = WRANGLER_OPERATION_TIMEOUT_MS,
 ): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
   return new Promise((resolveResult) => {
     const child = spawn(
@@ -1884,7 +1890,7 @@ function runWranglerWithInput(
         stdout,
         stderr: "The bounded Wrangler operation timed out.",
       });
-    }, 120_000);
+    }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
@@ -2029,6 +2035,8 @@ function defaultPublicationRunner(): EveDeploymentPublicationRunner {
         "--strict",
       ],
       dirname(request.wranglerConfigPath),
+      undefined,
+      WRANGLER_PUBLICATION_TIMEOUT_MS,
     );
     if (result.exitCode !== 0) {
       return {

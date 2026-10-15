@@ -368,18 +368,21 @@ const IGNORED_BUILDS_GUARD =
  * rewrites one file in the installed Eve copy so an existing session reopens
  * against the current template instead of throwing; user files under
  * `/workspace` always win over the template. The patch applies only when the
- * target file's sha256 equals `EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256`, and it
- * is removed entirely once upstream ships the fix.
+ * target file's sha256 matches a known binding and selects that binding's
+ * replacement; it is removed entirely once upstream ships the fix.
  */
 export const EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256 =
   "0ba0ac3a237c99af2f67a6028f1675bf7c04b22454b4ebfb4cd9d19e5bf5aaf8";
+/** Eve 0.79.1 stores a template key instead of an absolute template path. */
+export const EVE_SANDBOX_RESUME_PATCH_LATEST_SHA256 =
+  "ab8b1ad7398af8f6fd2a1e91eb0d1ff8d2b9b9afe1836234f36ce0e896791c45";
 /** Marker the patched binding always contains; proves the patch shipped. */
 export const EVE_SANDBOX_RESUME_PATCH_SIGNATURE = "edenRefreshJustBashSessionSkills";
 /** Path of the just-bash binding inside the resolved Eve package root. */
 const EVE_JUST_BASH_BINDING_PATH =
   "dist/src/execution/sandbox/bindings/just-bash.js";
 
-/** The exact `resume()` implementation in eve 0.68.0, 0.71.2, and 0.72.1. */
+/** The exact `resume()` implementation in Eve 0.68.0, 0.71.2, 0.72.1, and 0.79.1. */
 export const EVE_JUST_BASH_RESUME_ORIGINAL =
   `async resume(e,n,r){let i=requirePreparedJustBashArtifact(n),a=requireJustBashSessionState(r),o=createSandboxProviderIdentity({artifact:i,version:1}),s=sessionRootPath(e,i);if(a.generation!==o||a.rootPath!==s)throw Error(\`just-bash session state is incompatible with this environment.\`);if(!await pathExists(a.rootPath))throw Error(\`just-bash session root "\${a.rootPath}" no longer exists.\`);return await openHandle(e,a.rootPath,t)}`;
 
@@ -392,6 +395,13 @@ export const EVE_JUST_BASH_RESUME_ORIGINAL =
  */
 export const EVE_SANDBOX_RESUME_PATCHED =
   `async resume(e,n,r){let i=requirePreparedJustBashArtifact(n),a=requireJustBashSessionState(r),o=createSandboxProviderIdentity({artifact:i,version:1}),s=sessionRootPath(e,i);if((a.generation!==o||a.rootPath!==s)&&dirname(a.rootPath)!==dirname(s))throw Error(\`just-bash session state is incompatible with this environment.\`);await ensureSessionRoot(i,a.rootPath);if(a.generation!==o)await edenRefreshJustBashSessionSkills(i.templateRootPath,a.rootPath);return await openHandle(e,a.rootPath,t)}`;
+
+/**
+ * Eve 0.79.1 resolves the current template key under the runtime cache.
+ * Its ensureSessionRoot accepts that path, not the prepared artifact.
+ */
+export const EVE_SANDBOX_RESUME_PATCHED_LATEST =
+  `async resume(e,n,r){let i=requirePreparedJustBashArtifact(n),a=requireJustBashSessionState(r),o=createSandboxProviderIdentity({artifact:i,version:1}),s=sessionRootPath(e,i);if((a.generation!==o||a.rootPath!==s)&&dirname(a.rootPath)!==dirname(s))throw Error(\`just-bash session state is incompatible with this environment.\`);let c=resolveTemplateRootPath(e.storagePath,i.templateKey);await ensureSessionRoot(c,a.rootPath);if(a.generation!==o)await edenRefreshJustBashSessionSkills(c,a.rootPath);return await openHandle(e,a.rootPath,t)}`;
 
 /**
  * Helpers appended to the patched binding. They use only identifiers the
@@ -408,7 +418,7 @@ async function edenFindTemplateSkillsRelativePath(e){let t=[["",0]];for(;t.lengt
 /**
  * The CommonJS patcher the isolated builder runs between the frozen install
  * and `eve build` (and again for the production reinstall). It never touches
- * project files, applies only against the known sha256, verifies the
+ * project files, applies only against known sha256 hashes, verifies the
  * replacement matched exactly once, validates the result with `node --check`,
  * and breaks hardlinks by writing a temp file and renaming it into place.
  */
@@ -417,17 +427,24 @@ export const EVE_SANDBOX_RESUME_PATCH_SCRIPT = `// Eden temporary fix for https:
 // sandbox template changes (skills, agent/sandbox/workspace/, sandbox
 // definition) and never falls back. This rewrites one file in the installed
 // Eve copy so an existing session reopens against the current template. It
-// runs only against the sha256 Eden knows and is removed once upstream
-// ships the fix.
+// runs only against sha256 hashes Eden knows, with a replacement specific to
+// each binding, and is removed once upstream ships the fix.
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
-const KNOWN_SHA256 = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256)};
+const KNOWN_PATCHES = ${JSON.stringify({
+  [EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256]: {
+    original: EVE_JUST_BASH_RESUME_ORIGINAL,
+    replacement: EVE_SANDBOX_RESUME_PATCHED,
+  },
+  [EVE_SANDBOX_RESUME_PATCH_LATEST_SHA256]: {
+    original: EVE_JUST_BASH_RESUME_ORIGINAL,
+    replacement: EVE_SANDBOX_RESUME_PATCHED_LATEST,
+  },
+})};
 const SIGNATURE = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_SIGNATURE)};
 const BINDING_PATH = ${JSON.stringify(EVE_JUST_BASH_BINDING_PATH)};
-const ORIGINAL = ${JSON.stringify(EVE_JUST_BASH_RESUME_ORIGINAL)};
-const PATCHED_RESUME = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCHED)};
 const HELPERS = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_HELPERS)};
 function finish(outcome, detail) {
   console.log("eden-eve-sandbox-resume-patch: " + outcome + " (" + detail + ")");
@@ -452,10 +469,12 @@ if (source.includes(SIGNATURE)) {
   process.exit(0);
 }
 const digest = crypto.createHash("sha256").update(source).digest("hex");
-if (digest !== KNOWN_SHA256) {
+const patch = KNOWN_PATCHES[digest];
+if (patch === undefined) {
   finish("skipped", "sha256 " + digest + " is not a version Eden knows (eve#4440)");
   process.exit(0);
 }
+const { original: ORIGINAL, replacement: PATCHED_RESUME } = patch;
 const first = source.indexOf(ORIGINAL);
 if (first === -1 || source.indexOf(ORIGINAL, first + 1) !== -1) {
   console.error("eden-eve-sandbox-resume-patch: the known resume implementation did not match exactly once; refusing to patch");

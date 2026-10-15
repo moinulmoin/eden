@@ -16,6 +16,14 @@ Update the fixture, its lockfile, and this document together when advancing the
 tested Eve line. Do not replace the exact Eve pin with `latest` in a release
 gate.
 
+The Cloudflare launch gate also uses a separate, fresh project created by
+`npx eve@0.79.1 init <name> --non-interactive`. Keep the older fixture pin:
+it exercises the original prepared-artifact shape, while Eve `0.79.1` uses
+the newer `templateKey` shape. See the
+[fresh-project setup](../README.md#starting-from-a-fresh-eve-project) for the
+npm-to-pnpm conversion, optional-native-dependency policy, and production
+authentication that a new initializer output needs.
+
 The fixture carries its own `pnpm-workspace.yaml`. When the tested Eve release
 is younger than pnpm's `minimumReleaseAge` window, the fixture names that exact
 pin in `minimumReleaseAgeExclude` there; the runner deliberately does not use
@@ -44,6 +52,28 @@ MiniMax free route is a time-limited promotion, so keep the chain current when
 the catalog changes. The fixture declares a 32,000-token logical model window
 so Eve plans compaction below Qwen's lowest context-pricing boundary and every
 fallback runs against the same test budget.
+
+## Sandbox resume compatibility
+
+Eden's temporary [eve#4440](https://github.com/vercel/eve/issues/4440) patch
+recognizes the exact published binding hashes for Eve `0.68.0`, `0.71.2`,
+`0.72.1`, and `0.79.1`; recognizing a hash is not a claim that every one of
+those releases passed the complete live gate.
+
+- `0.68.0`, `0.71.2`, and `0.72.1` expose a prepared `templateRootPath`;
+  session creation accepts the prepared artifact.
+- `0.79.1` exposes a prepared `templateKey`; session creation accepts the
+  template directory resolved with Eve's own `resolveTemplateRootPath`.
+  Its original `resume()` still has the upstream generation-mismatch bug.
+
+Both replacements enforce the original sessions-directory containment,
+recreate a missing root from the current template, and refresh authored
+`$HOME/.agents/skills` on a template-generation change without overwriting
+user workspace files. The prepared cache and session directory remain
+`.eve/sandbox-cache/just-bash/{templates,sessions}` in Eve `0.79.1`, so no
+runtime storage-path migration is necessary. An unknown binding hash remains
+unpatched and prints `! EVE_SANDBOX_RESUME_PATCH`; recognized bindings print
+`✓ EVE_SANDBOX_RESUME_PATCH`.
 
 ## Local production-runtime gate
 
@@ -157,6 +187,97 @@ Verify all three cleanup signals:
 3. querying the exact Worker returns Cloudflare code `10007` or equivalent
    does-not-exist evidence.
 
+## Fresh Eve 0.79.1 launch gate (2026-10-15)
+
+The fresh initializer project used Eve `0.79.1`, AI SDK `7.0.140`,
+just-bash `3.6.0`, pnpm `11.21.0`, Node `24.17.0`,
+`alibaba/qwen3.7-flash` with a 32,000-token logical model window, and a bearer
+authenticator backed by an owner-readable environment file outside the repo.
+The full persistence proof uses `@moinulmoin/eden-world-cloudflare@0.7.0`:
+the default local World cannot preserve the conversation itself across an
+image update.
+
+The published Eden `0.7.0` baseline deployed Eve `0.79.1` but printed
+`! EVE_SANDBOX_RESUME_PATCH`. Its real bash call wrote and read `base-1`;
+`ls ~/.agents/skills` returned exit code 2 because the untouched scaffold
+has no authored skills directory. The local CLI's recognized patch instead
+prints `✓ EVE_SANDBOX_RESUME_PATCH`.
+
+An update exposed a separate native-container runtime issue: a resident
+Durable Object can keep its old Worker code/environment while its container
+monitor remains active. New outer-Worker generation headers alone are not
+proof of a new image. The deployment health gate correctly refused promotion
+(`DEPLOY_INDETERMINATE`), and even a brand-new conversation still saw the
+old skill. The fixed runtime rejects a mismatched deployment before
+forwarding, resets the stale object, and retries the bodyless request once.
+Body-bearing requests synchronize through the same bodyless health path
+before forwarding the original stream exactly once, without cloning it.
+The existing image reconciliation, sandbox carry, and
+`x-eden-eve-started-deployment` health gate then prove the new image.
+
+The awake update printed `✓ updated`; the original conversation read its
+preserved `launch-proof-file` and skill marker `EDEN_LAUNCH_SKILL_V2`
+(exit code 0, empty stderr). A new conversation independently read V2.
+
+The next update started with zero Container instances at `09:33:00Z`, and
+the read-only inventory still showed zero at `09:34:00Z` during the build.
+It also printed `✓ updated`. At `09:36:24Z`, the same conversation read
+`launch-proof-file` and `EDEN_LAUNCH_SKILL_V3` with exit code 0 and empty
+stderr; a new conversation independently read V3.
+
+The sleep/schedule fixture uses `EDEN_EVE_CONTAINER_SLEEP_AFTER=90s` and
+`*/10 * * * *`, not every three minutes: Eden's four-minute wake lead
+intentionally keeps a three-minute schedule continuously awake. The first
+multi-update attempt observed delayed Cron propagation and no ticks yet;
+the original conversation nevertheless read its file and V3 skill again
+after sleep at `09:51:33Z` (exit code 0).
+
+A separate fresh initializer project was then deployed once, without further
+updates, as `eden-launch-sched-proof`. Deployment completed at
+`10:08:58.092Z`; the first Cron invocation was observed at `10:25:46.003Z`
+(16 minutes 47.911 seconds later). Only read-only Container inventory was
+queried while waiting; there were no external HTTP requests to the agent
+between deployment and the final evidence read at `10:41:10Z`.
+
+The persisted schedule records contain exactly one tick at `10:30:00.019Z`
+and exactly one at `10:40:00.011Z`. Between them:
+
+- The native host's idle-sleep alarm ran at `10:33:15Z`, 90 seconds after the
+  preceding Cron health wake.
+- `wrangler containers list --json` showed zero instances at
+  `10:33:57.246Z`, `10:34:59.690Z`, and `10:36:02.476Z`.
+- The next due Cron wake ran at `10:36:45Z`. At `10:41:14.994Z` the evidence
+  tool reported process uptime `266.471219656` seconds, placing the new
+  server process start at approximately `10:36:48.523Z`, before the next tick.
+
+The inventory command also reported zero instances during active execution
+with `durable_object` scheduling, so its count alone is not a reliable wake
+signal. The sleep alarm, restarted-process uptime, and persisted consecutive
+tick records provide the additional sleep/wake evidence. The disposable
+observer's stricter `instances > 0` wake assertion therefore failed despite
+these verified behavior criteria; no runtime change was needed.
+
+This fresh proof also exposed a publication deadline problem: Cloudflare
+image preparation consumed almost all of Wrangler's former 120-second
+budget, leaving a placeholder Worker. Publication now gets 600 seconds;
+other Wrangler operations retain their previous deadlines. Retrying that
+partial target failed closed with `VAL-CLI-007-TARGET-CONFLICT`; it was
+destroyed before the successful fresh-target proof.
+
+Cloudflare reported an active
+[Western Europe Durable Objects incident](https://www.cloudflarestatus.com/incidents/wvzqdm21spz0);
+its relation to the observed propagation and image-preparation delays is
+unproven.
+
+All five disposable targets (`eden-launch-base`, `eden-launch-latest`,
+`eden-launch-proof`, `eden-launch-sched`, and `eden-launch-sched-proof`) were
+removed with `eden destroy`, including the incomplete placeholder
+publication and both repositories retained by the earlier indeterminate
+update. All former origins returned HTTP 404; the final
+`wrangler containers list --json` and registry image query filtered by
+`eden-launch` both returned `[]`. The final build, typecheck, ESLint with
+zero warnings, and all 284 tests passed.
+
 ## What this gate proves
 
 Passing the complete gate proves that the pinned Eve release can be packaged
@@ -165,9 +286,10 @@ the canonical Eve HTTP/auth surface is preserved, and that one real model/tool
 turn crosses the deployed workflow callback path.
 
 It does not prove production durability, horizontal scaling, every Eve authored
-slot, every provider, schedule dispatch, or process-replacement recovery. Eve's
-local Workflow World remains disposable across image updates; container files
-survive sleep via snapshots but reset when an update changes the image. A
-production project still needs the tested durable Postgres World setup in
-[deploy.md](deploy.md#durable-state-postgres-world) and representative
-application-specific tests.
+slot, or every provider. Eve's local Workflow World remains disposable across
+image updates. Container files survive sleep via snapshots, and Eden carries
+conversation sandbox files across an update; other container-local files
+reset with a new image. Production projects still need a durable World and
+representative application-specific tests; see the
+[Postgres World](deploy.md#durable-state-postgres-world) and experimental
+[Cloudflare World](deploy.md#durable-state-on-cloudflare-no-database) recipes.

@@ -1,4 +1,6 @@
+import type * as ChildProcess from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
   lstat,
   mkdir,
@@ -14,7 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
   EVE_CLI_COMMANDS,
@@ -35,6 +37,62 @@ import { EVE_SANDBOX_RESUME_PATCH_SIGNATURE } from "../src/eve-packaging.js";
 import { exactTargetContainerEntries } from "../src/eve-control-plane.js";
 
 const roots: string[] = [];
+
+/**
+ * Wrangler is spawned as `node <wrangler entrypoint> ...args`. While
+ * `intercept` is set, spawns are replaced by a child that exits 1 on the next
+ * turn, and the deadline armed immediately after each spawn is recorded.
+ */
+const fakeWrangler = vi.hoisted(() => ({
+  intercept: false,
+  pending: undefined as readonly string[] | undefined,
+  calls: [] as { readonly args: readonly string[]; readonly timeoutMs: unknown }[],
+}));
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof ChildProcess>();
+  return {
+    ...actual,
+    spawn: ((...spawnArgs: Parameters<typeof actual.spawn>) => {
+      if (!fakeWrangler.intercept) return actual.spawn(...spawnArgs);
+      const argv = spawnArgs[1] as readonly string[];
+      fakeWrangler.pending = argv.slice(1);
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        stdin: { end: () => undefined },
+        kill: () => true,
+      });
+      setImmediate(() => child.emit("close", 1));
+      return child;
+    }) as unknown as typeof actual.spawn,
+  };
+});
+
+async function withFakeWrangler(
+  run: () => Promise<void>,
+): Promise<readonly { readonly args: readonly string[]; readonly timeoutMs: unknown }[]> {
+  const realSetTimeout = globalThis.setTimeout;
+  const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(
+    ((handler: () => void, timeoutMs?: number) => {
+      if (fakeWrangler.pending !== undefined) {
+        fakeWrangler.calls.push({ args: fakeWrangler.pending, timeoutMs });
+        fakeWrangler.pending = undefined;
+      }
+      return realSetTimeout(handler, timeoutMs);
+    }) as unknown as typeof setTimeout,
+  );
+  fakeWrangler.intercept = true;
+  fakeWrangler.calls = [];
+  try {
+    await run();
+    return fakeWrangler.calls;
+  } finally {
+    fakeWrangler.intercept = false;
+    fakeWrangler.pending = undefined;
+    timers.mockRestore();
+  }
+}
 
 async function createRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "eden-cli-eve-namespace-"));
@@ -1192,6 +1250,96 @@ describe("top-level Eden Deploy commands", () => {
     expect(errors.join("\n")).not.toContain("ambiguous cleanup");
   });
 
+  test("gives the default Wrangler deploy publication a 600 second deadline", async () => {
+    const root = await createRoot();
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({
+        name: "eve-publish-deadline",
+        private: true,
+        packageManager: "pnpm@11.21.0",
+      }),
+      "utf8",
+    );
+    await writeFile(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+    const errors: string[] = [];
+
+    const calls = await withFakeWrangler(async () => {
+      await expect(
+        runEdenCli(
+          ["deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eve-publish-deadline",],
+          {
+            cwd: root,
+            stderr: (line) => errors.push(line),
+            eveControlPlane: {
+              artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+              builder: fakeBuilder(),
+              containerImageReference:
+                `registry.example/eve@sha256:${"e".repeat(64)}`,
+              hostRequirements: {
+                architecture: "linux/amd64",
+                world: "supported",
+                sandbox: "supported",
+                privileged: false,
+                devices: "none",
+                kernel: "supported",
+                network: "supported",
+                durableLocalFilesystem: false,
+              },
+              runtimeRunner: async () => ({
+                ok: true,
+                checks: [
+                  {
+                    id: "VAL-BUILD-005",
+                    status: "passed",
+                    message: "Image passed.",
+                  },
+                  {
+                    id: "VAL-BUILD-006",
+                    status: "passed",
+                    message: "Eve start passed.",
+                  },
+                  {
+                    id: "VAL-BUILD-007",
+                    status: "passed",
+                    message: "Health passed.",
+                  },
+                ],
+                imageDigest: `sha256:${"e".repeat(64)}`,
+                cleanup: runtimeCleanup,
+              }),
+              cloudflareRead: async () => ({
+                accountAccess: "available",
+                containerAccess: "available",
+                accountId: "account-test",
+                workersDevSubdomain: "account",
+                target: { state: "absent" },
+              }),
+            },
+          },
+        ),
+      ).resolves.toBe(1);
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.args.slice(0, 2)).toEqual(["deploy", "--config"]);
+    expect(calls[0]?.args.slice(3)).toEqual([
+      "--name",
+      "eve-publish-deadline",
+      "--env",
+      "preview",
+      "--strict",
+    ]);
+    expect(calls[0]?.timeoutMs).toBe(600_000);
+    expect(errors.join("\n")).toContain("DEPLOY_INDETERMINATE");
+  });
+
   test("parses --json on every command", () => {
     for (const command of ["preflight", "deploy", "destroy"] as const) {
       const parsed = parseEveArguments([
@@ -1717,6 +1865,45 @@ describe("eden destroy", () => {
         ),
       ),
     ).resolves.toBeDefined();
+  });
+
+  test("keeps the default Wrangler Worker deletion on the 120 second deadline", async () => {
+    const { root } = await createDeployedFixture();
+    const errors: string[] = [];
+    const calls = await withFakeWrangler(async () => {
+      await expect(
+        runEdenCli(
+          ["destroy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eve-destroy-fixture",
+          "--json",],
+          {
+            cwd: root,
+            stdout: () => undefined,
+            stderr: (line) => errors.push(line),
+            eveControlPlane: {
+              destroyCloudflareRead: async () => ({
+                workerExists: true,
+                containerApplicationId: undefined,
+                accountId: "account-test",
+              }),
+            },
+          },
+        ),
+      ).resolves.toBe(1);
+    });
+
+    expect(calls).toEqual([
+      {
+        args: ["delete", "--name", "eve-destroy-fixture", "--force"],
+        timeoutMs: 120_000,
+      },
+    ]);
+    expect(errors.join("\n")).toContain("EVE_DESTROY_INDETERMINATE");
   });
 
   test("keeps CURRENT and fails when absence cannot be verified after deletion", async () => {
