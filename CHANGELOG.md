@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.2 — 2026-10-19
+
+### Fixed
+
+- The `EVE_WORLD_LOCAL` warning no longer says local Workflow World state is
+  lost when the container sleeps. Since 0.6.0 the container disk is
+  snapshotted on sleep and restored on wake; local World state resets only
+  when the agent is updated.
+
+### Changed
+
+- Checked Eve `0.80.1` and `0.81.0` (current latest): a fresh `eve init`
+  project passes `eden preflight` — frozen install, Eve build, local boot and
+  health — and the temporary eve#4440 fix applies.
+
 ## 0.7.1 — 2026-10-15
 
 ### Fixed

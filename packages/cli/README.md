@@ -12,15 +12,15 @@ If you already have an Eve project, start with `eden deploy`.
 Use any one of these package managers:
 
 ```sh
-npm install --global @moinulmoin/eden@0.7.1
+npm install --global @moinulmoin/eden@0.7.2
 ```
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.7.1
+pnpm add --global @moinulmoin/eden@0.7.2
 ```
 
 ```sh
-bun add --global @moinulmoin/eden@0.7.1
+bun add --global @moinulmoin/eden@0.7.2
 ```
 
 Then confirm the CLI is available:
@@ -102,6 +102,10 @@ eden preflight \
   --name my-eve-preview
 ```
 
+Ship a change by running the same deploy again. Eden updates the target it
+owns in place: same Worker and URL, the new code, and every conversation's
+sandbox files carried into the new Container.
+
 Remove exactly that deployment when finished:
 
 ```sh
@@ -117,7 +121,7 @@ deletes by prefix or broad account search.
 | Command | Purpose |
 | --- | --- |
 | `eden preflight` | Build and inspect an Eve candidate without remote mutation |
-| `eden deploy` | Deploy an existing Eve project to one exact target |
+| `eden deploy` | Deploy an existing Eve project to one exact target, or update one Eden owns in place |
 | `eden destroy` | Remove one exact Eden-owned Eve deployment |
 
 Run `eden <command> --help` for command-specific options.
@@ -125,7 +129,11 @@ Run `eden <command> --help` for command-specific options.
 ## What Eden does not do
 
 - Deploy does not replace the Eve project's providers, databases, Workflow
-  World, authentication, schedules, channels, or sandbox.
+  World, authentication, schedules, or channels.
+- The agent's sandbox is `just-bash`, a simulated shell, not a real Linux VM
+  like Vercel Sandbox. Files, `grep`/`sed`/`jq`/`sqlite3`, and `curl` work;
+  `python`, `git`, and `npm` do not. A custom `agent/sandbox.ts` or
+  `agent/sandbox/Dockerfile` is not supported yet.
 - Container files survive sleep via snapshots, and image updates now carry
   Eve's sandbox sessions — every conversation's files — across the image
   change through the Durable Object's storage (capped at 1 GiB compressed).

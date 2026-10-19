@@ -792,7 +792,7 @@ async function collectEveWorldWarnings(
       warnings.push({
         id: "EVE_WORLD_LOCAL",
         message:
-          "This project uses Eve's default local Workflow World; workflow state lives on the container disk and is lost when the container sleeps.",
+          "This project uses Eve's default local Workflow World; workflow state lives on the container disk, survives sleep, and resets when you update the agent.",
         remediation:
           "Configure a durable Workflow World such as @workflow/world-postgres; see docs/deploy.md#durable-state-postgres-world.",
       });

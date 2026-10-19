@@ -2,7 +2,8 @@
 import ListChecks from "@lucide/astro/icons/list-checks";
 import Info from "@lucide/astro/icons/info";
 import Check from "@lucide/astro/icons/check";
-import Moon from "@lucide/astro/icons/moon";
+import RefreshCw from "@lucide/astro/icons/refresh-cw";
+import Terminal from "@lucide/astro/icons/terminal";
 import CalendarX from "@lucide/astro/icons/calendar-x";
 import Box from "@lucide/astro/icons/box";
 import Package from "@lucide/astro/icons/package";
@@ -11,16 +12,17 @@ import Copy from "@lucide/astro/icons/copy";
 const needs: { text: string; command?: string; code?: string }[] = [
   { text: "macOS or Linux with Node 24.17 or newer" },
   { text: "A Cloudflare account on Workers Paid, which Containers require" },
-  { text: "Wrangler signed in", command: "npx wrangler@4.120.0 login" },
+  { text: "Wrangler signed in", command: "npx wrangler@4.147.0 login" },
   { text: "Docker or OrbStack that builds linux/amd64" },
   { text: "An Eve project with an exact pnpm pin and its root lockfile", code: '"packageManager": "pnpm@…"' },
   { text: "just-bash as a production dependency", command: "pnpm add just-bash" },
 ];
 
 const limits = [
-  { icon: Moon, text: "Disk and memory reset when the Container sleeps", note: "Memory survives with the Postgres World: three steps, any direct Postgres" },
+  { icon: RefreshCw, text: "Updates reset workflow state by default", note: "Files survive sleep and updates; Postgres World keeps runs too" },
   { icon: CalendarX, text: "Only 5-field cron schedules fire while it sleeps", note: "A Cloudflare Cron wakes the Container; others run while it's awake" },
-  { icon: Box, text: "One 1 GiB Container instance", note: "No horizontal scaling or custom domains yet" },
+  { icon: Terminal, text: "The sandbox is just-bash, not a Linux VM", note: "Files, grep, jq and curl work; python, git and npm don't" },
+  { icon: Box, text: "One Container instance (1/2 vCPU, 4 GiB)", note: "No horizontal scaling or custom domains yet" },
   { icon: Package, text: "pnpm projects only", note: "Bun lockfiles and native Windows aren't supported yet" },
 ];
 ---
@@ -69,8 +71,8 @@ const limits = [
       <div class="req__panel req__panel--limits card" data-reveal style="--i:1">
         <div class="req__head">
           <Info class="icon" size={18} aria-hidden="true" />
-          <h3>Honest limits</h3>
-          <span class="mono">in 0.7.1</span>
+          <h3>Good to know</h3>
+          <span class="mono">in 0.7.2</span>
         </div>
         <ul>
           {

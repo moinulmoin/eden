@@ -155,7 +155,7 @@ Eden is free and open source (Apache-2.0). You pay Cloudflare directly, on your 
 
 ---
 
-## Honest limits
+## Good to know
 
 - **Conversation files survive sleep and updates; World state needs a database.** Eden snapshots the container's filesystem when it sleeps and restores it on wake, and an update carries Eve's sandbox sessions across the image change (capped at 1 GiB compressed; `/workspace` outside those sessions resets to the new image). Process-local Workflow World state still needs the Postgres World (three steps, above). Without it, Eden warns you on every deploy.
 - **Snapshots expire after 30 idle days.** An agent woken after a month asleep starts with the image's filesystem, not the snapshot.

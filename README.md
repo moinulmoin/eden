@@ -16,19 +16,19 @@ its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.7.1
+npm install --global @moinulmoin/eden@0.7.2
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.7.1
+pnpm add --global @moinulmoin/eden@0.7.2
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.7.1
+bun add --global @moinulmoin/eden@0.7.2
 ```
 
 Confirm the installation:
@@ -157,6 +157,11 @@ eden preflight \
   --name my-eve-preview
 ```
 
+Ship a change by running the same deploy again. Eden updates the target it
+owns in place: same Worker and URL, the new code, and every conversation's
+sandbox files carried into the new Container. A target Eden does not own still
+fails with `VAL-CLI-007-TARGET-CONFLICT`.
+
 Remove the exact deployment when finished:
 
 ```sh
@@ -174,7 +179,7 @@ The Eve project remains responsible for its:
 - model providers and credentials
 - databases, queues, and external APIs
 - channels, schedules, authentication, and authorization
-- sandbox and Workflow World
+- Workflow World (the sandbox runs as `just-bash`; see [Limits](#limits))
 
 ### Limits
 
