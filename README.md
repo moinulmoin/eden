@@ -3,7 +3,7 @@
 Eden deploys an existing [Vercel Eve](https://github.com/vercel/eve) project to
 your own Cloudflare account through one CLI.
 
-![eden deploy: an Eve project live on workers.dev, a real model reply, then eden destroy](./docs/assets/eden-deploy.gif)
+![eden deploy on Eve 0.81.0: live on workers.dev, a real model reply, an in-place update, then eden destroy (real run, sped up)](./docs/assets/eden-deploy.gif)
 
 Eden installs the project's pinned pnpm lockfile, runs its project-local Eve
 executable, packages the real Node/Nitro server into a Cloudflare Container,
@@ -66,13 +66,13 @@ lockfiles and native Windows are not currently supported.
 
 ### Starting from a fresh Eve project
 
-Eden has been validated with Eve `0.68.0` and `0.79.1`. To start on the
+Eden has been validated with Eve `0.68.0`, `0.79.1`, and `0.81.0`. To start on the
 latest validated release:
 
 ```sh
-npx eve@0.79.1 init my-agent --non-interactive
+npx eve@0.81.0 init my-agent --non-interactive
 cd my-agent
-npm pkg set packageManager="pnpm@11.21.0" dependencies.eve="0.79.1"
+npm pkg set packageManager="pnpm@11.21.0" dependencies.eve="0.81.0"
 rm package-lock.json
 ```
 
@@ -82,7 +82,7 @@ an existing file):
 
 ```yaml
 minimumReleaseAgeExclude:
-  - eve@0.79.1
+  - eve@0.81.0
 ignoredOptionalDependencies:
   - "@mongodb-js/zstd"
   - node-liblzma

@@ -3,7 +3,7 @@
 Eden deploys an existing [Vercel Eve](https://github.com/vercel/eve) project to
 your own Cloudflare account through one CLI.
 
-![eden deploy: an Eve project live on workers.dev, a real model reply, then eden destroy](https://raw.githubusercontent.com/moinulmoin/eden/main/docs/assets/eden-deploy.gif)
+![eden deploy on Eve 0.81.0: live on workers.dev, a real model reply, an in-place update, then eden destroy (real run, sped up)](https://raw.githubusercontent.com/moinulmoin/eden/main/docs/assets/eden-deploy.gif)
 
 If you already have an Eve project, start with `eden deploy`.
 

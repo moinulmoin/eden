@@ -191,7 +191,7 @@ Pick Vercel when you want Eve's full managed platform. Pick Eden when you want y
 ## Tested for real
 
 - A real `eden deploy` to Cloudflare served a real model reply with a tool call, and `eden destroy` then left no Worker, container or image behind.
-- Validated with real Cloudflare deploys on **Eve 0.66.3**, **Eve 0.68.0**, and a fresh **Eve 0.79.1** initializer project: build, production boot, health, sign-in, and a real model and tool call.
+- Validated with real Cloudflare deploys on **Eve 0.66.3**, **Eve 0.68.0**, and fresh **Eve 0.79.1** and **Eve 0.81.0** initializer projects: build, production boot, health, sign-in, and a real model and tool call. On 0.81.0, an in-place update served the new instructions on the same URL.
 - **Memory across a container replacement:** with the Postgres World, an approval requested before the container was destroyed and replaced was approved afterwards and the run finished. Without it, the approval was lost.
 - **Memory across an update:** with the Cloudflare World, an approval requested before `eden deploy` updated the agent with new instructions was approved afterwards on the new code, and the run finished.
 - **Schedules across sleep on Eve `0.79.1`:** a fresh, single-deploy Cloudflare World agent with a ten-minute schedule and a 90-second sleep window fired once at 10:30 UTC and once at 10:40 UTC, with an idle-sleep alarm between them and a Cron wake before the next tick. Its first Cloudflare Cron invocation arrived 16 minutes 48 seconds after deploy completed; allow trigger propagation before expecting scheduled work.

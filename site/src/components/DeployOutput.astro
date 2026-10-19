@@ -13,12 +13,14 @@ type Run = {
 
 const url = "https://my-eve-agent-9e510242.moinulislammoin2019.workers.dev";
 
-// Transcripts come from the recorded 0.2.0 demo run (eden-deploy.gif); only check lines are trimmed.
+// Transcripts come from the recorded Eden 0.7.2 + Eve 0.81.0 run (eden-deploy.gif).
+// Lines are trimmed (checks, warnings, some progress), never rewritten.
+const ask = 'eve remote invoke --url $URL -H "Authorization: Bearer $TOKEN" "In one short sentence: where are you running right now?" | jq -r .outcome.message';
 const runs: Run[] = [
   {
     id: "deploy",
     tab: "eden deploy",
-    time: "112s",
+    time: "215s",
     status: "healthy · promoted",
     lines: [
       ["cmd", "eden deploy --env-file ~/.config/my-eve-agent.env"],
@@ -28,29 +30,53 @@ const runs: Run[] = [
       ["dim", "... checking Cloudflare access and exact target"],
       ["dim", "... building linux/amd64 runtime image, booting eve, checking health"],
       ["dim", "... pushing container image to the Cloudflare registry"],
+      ["dim", "... registering runtime variables"],
       ["dim", "... publishing Worker and Container application"],
-      ["dim", "✓ VAL-BUILD-001 — The exact pnpm pin and one matching regular root lockfile were verified."],
+      ["dim", `... verifying health at ${url}`],
       ["gap", ""],
-      ["ok", "deployed my-eve-agent-9e510242 (preview) · eve 0.66.3"],
+      ["ok", "deployed my-eve-agent-9e510242 (preview) · eve 0.81.0"],
       ["url", url],
-      ["out", "  done in 112s"],
+      ["out", "  done in 215s"],
     ],
   },
   {
     id: "health",
-    tab: "curl /eve/v1/health",
-    time: "1.5s",
-    status: "ready",
+    tab: "health + reply",
+    time: "6.1s",
+    status: "ready · replied",
     lines: [
       ["cmd", `export URL=${url}`],
       ["cmd", "curl -s $URL/eve/v1/health"],
       ["out", '{"ok":true,"status":"ready","workflowId":"workflow//eve//workflowEntry"}'],
+      ["cmd", ask],
+      ["out", "I'm running in a shared workspace environment as an AI agent powered by eve, Vercel's agent framework."],
+    ],
+  },
+  {
+    id: "update",
+    tab: "deploy again",
+    time: "194s",
+    status: "updated · same URL",
+    lines: [
+      ["cmd", "printf '\\n# Style\\n\\nEnd every reply with: (served from your Cloudflare)\\n' >> agent/instructions.md"],
+      ["cmd", "eden deploy --env-file ~/.config/my-eve-agent.env"],
+      ["out", "eden deploy — my-eve-agent-9e510242 (preview)"],
+      ["dim", "... packaging project — snapshot, frozen install, eve build"],
+      ["dim", "... update: Durable Object data is preserved; the running Container restarts on its next request to serve the new image"],
+      ["dim", "... pushing container image to the Cloudflare registry"],
+      ["dim", "... publishing Worker and Container application"],
+      ["gap", ""],
+      ["ok", "updated my-eve-agent-9e510242 (preview) · eve 0.81.0"],
+      ["url", url],
+      ["out", "  done in 194s"],
+      ["cmd", ask],
+      ["out", "I'm running as an AI agent powered by eve, served from your Cloudflare."],
     ],
   },
   {
     id: "destroy",
     tab: "eden destroy",
-    time: "23s",
+    time: "31s",
     status: "absent · verified",
     lines: [
       ["cmd", "eden destroy --name my-eve-agent-9e510242"],
@@ -59,11 +85,10 @@ const runs: Run[] = [
       ["dim", "... reading the exact remote inventory"],
       ["dim", "... deleting Worker my-eve-agent-9e510242"],
       ["dim", "... deleting Container application my-eve-agent-9e510242-container"],
-      ["dim", "... deleting 1 registry image"],
+      ["dim", "... deleting 1 registry repository"],
       ["dim", "... verifying the exact target is absent"],
-      ["dim", "✓ VAL-LIFE-006 — Exact absence was verified; clearing this target's CURRENT pointer only."],
       ["gap", ""],
-      ["ok", "destroyed my-eve-agent-9e510242 (preview) in 23s"],
+      ["ok", "destroyed my-eve-agent-9e510242 (preview) in 31s"],
       ["dim", "  retained: local deployment records under .eden/eve-deploy"],
       ["cmd", "curl -s -o /dev/null -w '%{http_code}' $URL/eve/v1/health; echo ' <- gone'"],
       ["out", "404 <- gone"],
@@ -93,7 +118,7 @@ function renderLines(lines: Run["lines"]) {
   <div class="wrap">
     <div class="output__head">
       <div>
-        <p class="output__eyebrow mono">A real run, not a mockup</p>
+        <p class="output__eyebrow mono">Recorded from a real deploy</p>
         <h2 id="output-title" class="output__title">One command. Live on your Cloudflare.</h2>
       </div>
       <button class="pill-btn output__replay" type="button" data-replay>
@@ -123,7 +148,7 @@ function renderLines(lines: Run["lines"]) {
             ))
           }
         </div>
-        <span class="term__meta mono">eve 0.66.3 · check lines trimmed</span>
+        <span class="term__meta mono">eve 0.81.0 · lines trimmed</span>
       </div>
 
       {

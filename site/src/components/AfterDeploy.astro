@@ -1,0 +1,132 @@
+---
+import RefreshCw from "@lucide/astro/icons/refresh-cw";
+import Moon from "@lucide/astro/icons/moon";
+import CalendarClock from "@lucide/astro/icons/calendar-clock";
+---
+
+<section class="section after" id="after" aria-labelledby="after-title">
+  <div class="wrap">
+    <div class="section-head">
+      <div>
+        <span class="tag">02 · After you deploy</span>
+        <h2 id="after-title" class="section-title">Keep shipping.<br />It keeps running.</h2>
+      </div>
+    </div>
+
+    <ul class="after__list card" data-reveal>
+      <li class="after__item">
+        <span class="icon-tile"><RefreshCw class="icon" aria-hidden="true" /></span>
+        <h3 class="after__title">Update in place</h3>
+        <p class="after__detail">
+          Run <code class="mono">eden deploy</code> again. Same URL, new code, every conversation's files
+          carried over.
+        </p>
+      </li>
+      <li class="after__item">
+        <span class="icon-tile"><Moon class="icon" aria-hidden="true" /></span>
+        <h3 class="after__title">Sleeps when idle</h3>
+        <p class="after__detail">
+          After an hour without traffic it sleeps and saves its disk. The next message wakes it in seconds.
+        </p>
+      </li>
+      <li class="after__item">
+        <span class="icon-tile"><CalendarClock class="icon" aria-hidden="true" /></span>
+        <h3 class="after__title">Schedules on time</h3>
+        <p class="after__detail">Cron schedules wake your agent on time, even while it sleeps.</p>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<style>
+  .after {
+    padding-top: 40px;
+  }
+
+  .after__list {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    list-style: none;
+    box-shadow: 0 5px 0 var(--ink);
+  }
+
+  .after__item {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 28px 28px 30px;
+    transition: background 0.2s;
+  }
+
+  .after__item + .after__item {
+    border-left: 1px solid var(--rule);
+  }
+
+  .after__item:hover {
+    background: #fafaf8;
+  }
+
+  .after__title {
+    margin: 6px 0 0;
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .after__detail {
+    margin: 0;
+    font-size: 15px;
+    line-height: 1.55;
+    color: var(--text-2);
+  }
+
+  .after__detail code {
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: var(--ink);
+    color: var(--paper);
+    font-size: 0.88em;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 900px) {
+    .after {
+      padding-top: 8px;
+    }
+
+    .after__list {
+      grid-template-columns: 1fr;
+    }
+
+    .after__item {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      column-gap: 14px;
+      row-gap: 6px;
+      padding: 18px 16px;
+    }
+
+    .after__item + .after__item {
+      border-left: 0;
+      border-top: 1px solid var(--rule);
+    }
+
+    .after__item .icon-tile {
+      grid-row: span 2;
+      align-self: start;
+    }
+
+    .after__title {
+      margin: 0;
+      font-size: 16px;
+      align-self: center;
+    }
+
+    .after__detail {
+      font-size: 14px;
+    }
+  }
+</style>

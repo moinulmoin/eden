@@ -14,8 +14,8 @@ import Cloud from "@lucide/astro/icons/cloud";
         <h2 id="how-title" class="section-title">Your real Eve server,<br />in a Cloudflare Container.</h2>
       </div>
       <p class="section-intro">
-        Eden doesn't translate your agent into something else. It builds the Eve app you run locally
-        and hosts that same server on your account.
+        The same Eve server you run locally, built on your machine and served from your account.
+        Nothing gets translated.
       </p>
     </div>
 
@@ -26,7 +26,7 @@ import Cloud from "@lucide/astro/icons/cloud";
           <span class="node__step mono">01 · your machine</span>
         </div>
         <h3 class="node__title mono">Eve project</h3>
-        <p class="node__detail">Your agent code, pinned pnpm and root lockfile. Eden doesn't edit them.</p>
+        <p class="node__detail">Your agent, exactly as you wrote it.</p>
       </li>
       <li class="flow flow--wire diagram__wire" aria-hidden="true"></li>
       <li class="node card" data-reveal style="--i:1">
@@ -35,7 +35,7 @@ import Cloud from "@lucide/astro/icons/cloud";
           <span class="node__step mono">02 · local docker</span>
         </div>
         <h3 class="node__title mono">Eden builder</h3>
-        <p class="node__detail">Frozen install, your own Eve build, a linux/amd64 runtime image.</p>
+        <p class="node__detail">Eve's own build, packed into a production image.</p>
       </li>
       <li class="flow flow--wire diagram__wire" aria-hidden="true"></li>
       <li class="zone">
@@ -47,7 +47,7 @@ import Cloud from "@lucide/astro/icons/cloud";
               <span class="node__step mono">03 · edge</span>
             </div>
             <h3 class="node__title mono">Worker</h3>
-            <p class="node__detail">Serves your workers.dev URL and routes requests inward.</p>
+            <p class="node__detail">Your public workers.dev URL, at the edge.</p>
           </li>
           <li class="flow flow--wire diagram__wire diagram__wire--short" aria-hidden="true"></li>
           <li class="node card node--hot" data-reveal style="--i:3">
@@ -56,7 +56,7 @@ import Cloud from "@lucide/astro/icons/cloud";
               <span class="node__step mono">04 · 4 GiB</span>
             </div>
             <h3 class="node__title mono">Container</h3>
-            <p class="node__detail">Your real Node/Nitro Eve server, started by Eve itself.</p>
+            <p class="node__detail">Your Eve server. Sleeps when idle, wakes on the next request.</p>
           </li>
         </ol>
       </li>
@@ -65,7 +65,7 @@ import Cloud from "@lucide/astro/icons/cloud";
     <div class="gate" data-reveal style="--i:4">
       <span class="pulse" aria-hidden="true"></span>
       <code class="gate__req mono"><b>GET</b> /eve/v1/health <span>→ 200</span></code>
-      <p>Eden promotes the deployment only after the new URL answers healthy.</p>
+      <p>Traffic switches only after the new version answers healthy.</p>
     </div>
   </div>
 </section>

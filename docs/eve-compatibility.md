@@ -17,9 +17,9 @@ tested Eve line. Do not replace the exact Eve pin with `latest` in a release
 gate.
 
 The Cloudflare launch gate also uses a separate, fresh project created by
-`npx eve@0.79.1 init <name> --non-interactive`. Keep the older fixture pin:
-it exercises the original prepared-artifact shape, while Eve `0.79.1` uses
-the newer `templateKey` shape. See the
+`npx eve@0.81.0 init <name> --non-interactive`. Keep the older fixture pin:
+it exercises the original prepared-artifact shape, while Eve `0.79.1` and
+later use the newer `templateKey` shape. See the
 [fresh-project setup](../README.md#starting-from-a-fresh-eve-project) for the
 npm-to-pnpm conversion, optional-native-dependency policy, and production
 authentication that a new initializer output needs.
@@ -57,8 +57,9 @@ fallback runs against the same test budget.
 
 Eden's temporary [eve#4440](https://github.com/vercel/eve/issues/4440) patch
 recognizes the exact published binding hashes for Eve `0.68.0`, `0.71.2`,
-`0.72.1`, and `0.79.1`; recognizing a hash is not a claim that every one of
-those releases passed the complete live gate.
+`0.72.1`, and `0.79.1`; Eve `0.80.1` and `0.81.0` ship the same binding as
+`0.79.1`. Recognizing a hash is not a claim that every one of those releases
+passed the complete live gate.
 
 - `0.68.0`, `0.71.2`, and `0.72.1` expose a prepared `templateRootPath`;
   session creation accepts the prepared artifact.
@@ -277,6 +278,39 @@ update. All former origins returned HTTP 404; the final
 `wrangler containers list --json` and registry image query filtered by
 `eden-launch` both returned `[]`. The final build, typecheck, ESLint with
 zero warnings, and all 284 tests passed.
+
+## Fresh Eve 0.81.0 launch run (2026-10-19)
+
+Eve `0.80.1` and `0.81.0` shipped after Eden `0.7.1`. Both releases' just-bash
+binding has the same sha256 as `0.79.1`
+(`ab8b1ad7398af8f6fd2a1e91eb0d1ff8d2b9b9afe1836234f36ce0e896791c45`), so the
+temporary eve#4440 fix applies unchanged. Fresh initializer projects for both
+passed `eden preflight` (published `0.7.1` for `0.80.1`, the `0.7.2` build for
+`0.81.0`).
+
+The live run used the published `@moinulmoin/eden@0.7.2` on a fresh
+`npx eve@0.81.0 init my-eve-agent --non-interactive` project: AI SDK
+`7.0.143`, just-bash `3.6.0`, pnpm `11.21.0`, Node `24.17.0`,
+`alibaba/qwen3.7-flash` with a 32,000-token logical model window, and a bearer
+authenticator backed by an owner-readable environment file outside the repo,
+on the default local Workflow World.
+
+- `eden deploy` printed `✓ EVE_SANDBOX_RESUME_PATCH` and
+  `✓ deployed my-eve-agent-9e510242 (preview) · eve 0.81.0` in 215 seconds.
+- `/eve/v1/health` returned `ready`; unauthenticated `/eve/v1/info` returned
+  401.
+- `eve remote invoke` with the bearer returned a completed model reply in
+  about 6 seconds, and a second turn's `bash` tool call returned
+  `launch-day`.
+- After adding a sign-off rule to `agent/instructions.md`, the same
+  `eden deploy` printed `✓ updated` in 194 seconds on the same URL, and the
+  next reply followed the new instruction.
+- `eden destroy` removed the Worker, Container application, and registry
+  repository in 31 seconds; the origin returned 404 and
+  `wrangler containers list` reported no containers.
+
+The run's captured output is the source of the landing-page terminal and
+`docs/assets/eden-deploy.gif`.
 
 ## What this gate proves
 

@@ -11,22 +11,22 @@ const commands = [
     command: "eden preflight",
     icon: SearchCheck,
     detail:
-      "Read-only check of your Eve project, Cloudflare access and target name. Optional; deploy runs the same checks.",
+      "Checks your project and Cloudflare account without changing anything. Optional.",
     preview: "# read-only: nothing on Cloudflare changes",
   },
   {
     command: "eden deploy",
     icon: Rocket,
     detail:
-      "Builds, publishes and health-checks one exact target. Run it again to update in place; agent files are kept.",
+      "Ships your agent and checks it's healthy. Run it again to update in place.",
     preview: "✓ deployed my-eve-agent-9e510242 (preview) → https://my-eve-agent-9e510242.<you>.workers.dev",
   },
   {
     command: "eden destroy --name",
     icon: Trash,
     detail:
-      "Removes one exact Eden-owned deployment after checking its ownership record. Never touches look-alikes.",
-    preview: "✓ destroyed my-eve-agent-9e510242 (preview) in 23s",
+      "Removes that deployment and everything it created. Nothing else.",
+    preview: "✓ destroyed my-eve-agent-9e510242 (preview) in 31s",
   },
 ];
 ---
@@ -35,7 +35,7 @@ const commands = [
   <div class="wrap">
     <div class="section-head">
       <div>
-        <span class="tag tag--light">03 · The whole CLI</span>
+        <span class="tag tag--light">04 · The whole CLI</span>
         <h2 id="commands-title" class="section-title">Three commands. That's it.</h2>
       </div>
       <span class="json mono"><Braces class="icon" size={14} aria-hidden="true" /> every command takes --json</span>
