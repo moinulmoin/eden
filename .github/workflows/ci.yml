@@ -40,4 +40,8 @@ jobs:
           EDEN_PACKAGE_TEST_TIMEOUT_MS: "600000"
           EDEN_PACKAGE_TEST_SCRIPTS_TIMEOUT_MS: "900000"
       - name: Current Eve compatibility
-        run: pnpm run compat:eve:local
+        # Eve selects microsandbox whenever /dev/kvm exists. Eden's builder and
+        # Container never expose KVM, so the gate builds the same way.
+        run: |
+          sudo rm -f /dev/kvm
+          pnpm run compat:eve:local
