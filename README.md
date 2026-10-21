@@ -41,6 +41,13 @@ Users install only `@moinulmoin/eden`; its companion packages are resolved
 automatically. Bun is supported as an installer only. Node `>=24.17.0` remains
 the Eden runtime, so do not force the CLI through `bunx --bun`.
 
+Using a coding agent (Claude Code, Codex, Cursor, and others)? Install Eden's
+skill so it knows how to deploy, update, and remove Eve agents with Eden:
+
+```sh
+npx skills add moinulmoin/eden
+```
+
 ## Requirements
 
 - macOS or Linux
