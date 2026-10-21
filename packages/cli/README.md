@@ -12,21 +12,21 @@ If you already have an Eve project, start with `eden deploy`.
 Use any one of these package managers:
 
 ```sh
-npm install --global @moinulmoin/eden@0.7.2
+npm install --global @moinulmoin/eden@0.7.3
 ```
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.7.2
+pnpm add --global @moinulmoin/eden@0.7.3
 ```
 
 ```sh
-bun add --global @moinulmoin/eden@0.7.2
+bun add --global @moinulmoin/eden@0.7.3
 ```
 
 Then confirm the CLI is available:
 
 ```sh
-eden --help
+eden --version
 ```
 
 Bun can install Eden, but Eden still runs on Node. Do not use `bunx --bun`.

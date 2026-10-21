@@ -1,6 +1,7 @@
 #!/usr/bin/env -S node --
 
 import {
+  readFileSync,
   realpathSync,
 } from "fs";
 import {
@@ -195,7 +196,27 @@ preflight and deploy default to the current directory, the preview
 environment, and a target name derived from package.json. destroy and
 --env production always require an explicit --name.
 Run eden <preflight|deploy|destroy> --help for command-specific options.
+Run eden --version to print the installed version.
 `;
+
+/** Reads the version from this package's manifest, which npm always ships next to dist/. */
+function edenVersion(): string {
+  const manifest: unknown = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  if (
+    typeof manifest !== "object" ||
+    manifest === null ||
+    !("version" in manifest) ||
+    typeof manifest.version !== "string"
+  ) {
+    throw new EveCliError({
+      code: "VERSION_UNAVAILABLE",
+      message: "The Eden package manifest has no version.",
+    });
+  }
+  return manifest.version;
+}
 
 function defaultStdout(line: string): void {
   process.stdout.write(`${line}\n`);
@@ -358,6 +379,10 @@ export async function runEdenCli(
       args[0] === "-h"
     ) {
       stdout(USAGE.trimEnd());
+      return 0;
+    }
+    if (args[0] === "--version" || args[0] === "-v") {
+      stdout(edenVersion());
       return 0;
     }
     if (!(EVE_CLI_COMMANDS as readonly string[]).includes(args[0] ?? "")) {

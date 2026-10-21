@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.3 — 2026-10-21
+
+### Added
+
+- `eden --version` (or `-v`) prints the installed Eden version. It was
+  previously rejected as an unknown command.
+
 ## 0.7.2 — 2026-10-19
 
 ### Fixed

@@ -16,25 +16,25 @@ its providers and services.
 Use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.7.2
+npm install --global @moinulmoin/eden@0.7.3
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.7.2
+pnpm add --global @moinulmoin/eden@0.7.3
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.7.2
+bun add --global @moinulmoin/eden@0.7.3
 ```
 
 Confirm the installation:
 
 ```sh
-eden --help
+eden --version
 ```
 
 Users install only `@moinulmoin/eden`; its companion packages are resolved
