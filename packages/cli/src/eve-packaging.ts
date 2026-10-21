@@ -310,9 +310,10 @@ export interface EveProjectPackagingResult {
   readonly checks: readonly EvePackagingCheck[];
   /**
    * Outcome of the builder's temporary eve#4440 sandbox-resume patch:
-   * `applied` when the shipped just-bash binding carries it, `skipped` when
-   * the binding is a version Eden does not know, `absent` when this Eve
-   * build has no just-bash binding or packaging never reached the image.
+   * `applied` when the shipped just-bash binding carries it, `fixed` when the
+   * installed Eve already includes the upstream fix, `skipped` when the
+   * binding is a version Eden does not know, `absent` when this Eve build has
+   * no just-bash binding or packaging never reached the image.
    */
   readonly sandboxResumePatch: EveSandboxResumePatchStatus;
   readonly candidateImageId: string | null;
@@ -378,6 +379,39 @@ export const EVE_SANDBOX_RESUME_PATCH_LATEST_SHA256 =
   "ab8b1ad7398af8f6fd2a1e91eb0d1ff8d2b9b9afe1836234f36ce0e896791c45";
 /** Marker the patched binding always contains; proves the patch shipped. */
 export const EVE_SANDBOX_RESUME_PATCH_SIGNATURE = "edenRefreshJustBashSessionSkills";
+/**
+ * First Eve release whose just-bash provider keeps a session's files across
+ * template changes (vercel/eve#5132), so the patch is not needed from here on.
+ */
+export const EVE_SANDBOX_RESUME_FIXED_VERSION = "0.83.0";
+
+/** `major.minor.patch` of a version string; prerelease and build suffixes are dropped. */
+function parseEveRelease(version: unknown): readonly [number, number, number] | null {
+  const match = typeof version === "string"
+    ? /^(\d+)\.(\d+)\.(\d+)/u.exec(version)
+    : null;
+  return match === null
+    ? null
+    : [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/**
+ * True when an installed Eve version already ships the eve#4440 fix. A
+ * prerelease of the fixed version sorts before it (semver), so it may predate
+ * the fix and keeps the patch.
+ */
+export function eveIncludesSandboxResumeFix(version: unknown): boolean {
+  const installed = parseEveRelease(version);
+  const fixed = parseEveRelease(EVE_SANDBOX_RESUME_FIXED_VERSION);
+  if (installed === null || fixed === null) return false;
+  for (let index = 0; index < 3; index += 1) {
+    if (installed[index] !== fixed[index]) {
+      return (installed[index] ?? 0) > (fixed[index] ?? 0);
+    }
+  }
+  return typeof version === "string" && !/^\d+\.\d+\.\d+-/u.test(version);
+}
+
 /** Path of the just-bash binding inside the resolved Eve package root. */
 const EVE_JUST_BASH_BINDING_PATH =
   "dist/src/execution/sandbox/bindings/just-bash.js";
@@ -446,8 +480,22 @@ const KNOWN_PATCHES = ${JSON.stringify({
 const SIGNATURE = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_SIGNATURE)};
 const BINDING_PATH = ${JSON.stringify(EVE_JUST_BASH_BINDING_PATH)};
 const HELPERS = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_HELPERS)};
+const FIXED_VERSION = ${JSON.stringify(EVE_SANDBOX_RESUME_FIXED_VERSION)};
 function finish(outcome, detail) {
   console.log("eden-eve-sandbox-resume-patch: " + outcome + " (" + detail + ")");
+}
+function parseRelease(version) {
+  const match = typeof version === "string" ? /^(\\d+)\\.(\\d+)\\.(\\d+)/.exec(version) : null;
+  return match === null ? null : [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+function includesFix(version) {
+  const installed = parseRelease(version);
+  const fixed = parseRelease(FIXED_VERSION);
+  if (installed === null || fixed === null) return false;
+  for (let index = 0; index < 3; index += 1) {
+    if (installed[index] !== fixed[index]) return installed[index] > fixed[index];
+  }
+  return !/^\\d+\\.\\d+\\.\\d+-/.test(version);
 }
 let packageJsonPath;
 try {
@@ -462,6 +510,16 @@ try {
   source = fs.readFileSync(binding, "utf8");
 } catch {
   finish("absent", "this eve build has no just-bash binding");
+  process.exit(0);
+}
+let eveVersion;
+try {
+  eveVersion = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")).version;
+} catch {
+  eveVersion = undefined;
+}
+if (!source.includes(SIGNATURE) && includesFix(eveVersion)) {
+  finish("fixed", "eve " + eveVersion + " includes the upstream fix for eve#4440");
   process.exit(0);
 }
 if (source.includes(SIGNATURE)) {
@@ -504,7 +562,7 @@ RUN node /tmp/eden-eve-sandbox-resume-patch.cjs
 `;
 
 /** Outcome of the builder's sandbox-resume patch for the packaged image. */
-export type EveSandboxResumePatchStatus = "applied" | "skipped" | "absent";
+export type EveSandboxResumePatchStatus = "applied" | "fixed" | "skipped" | "absent";
 
 const INSTALL_COMMAND = [
   "corepack",
@@ -2304,9 +2362,17 @@ async function detectEveSandboxResumePatch(
       join(dirname(packageJsonPath), EVE_JUST_BASH_BINDING_PATH),
       "utf8",
     );
-    return binding.includes(EVE_SANDBOX_RESUME_PATCH_SIGNATURE)
-      ? "applied"
-      : "skipped";
+    if (binding.includes(EVE_SANDBOX_RESUME_PATCH_SIGNATURE)) return "applied";
+    const version = await readFile(packageJsonPath, "utf8")
+      .then((text): unknown => {
+        const manifest: unknown = JSON.parse(text);
+        return typeof manifest === "object" && manifest !== null &&
+            "version" in manifest
+          ? manifest.version
+          : undefined;
+      })
+      .catch(() => undefined);
+    return eveIncludesSandboxResumeFix(version) ? "fixed" : "skipped";
   } catch {
     return "absent";
   }
@@ -2834,6 +2900,15 @@ export async function buildEveProjectSnapshot(
               status: "pass",
               subject: "eve-sandbox-resume",
               reason: "applied temporary fix for eve#4440",
+              remediation: null,
+            } satisfies EvePackagingCheck]
+          : []),
+        ...(sandboxResumePatch === "fixed"
+          ? [{
+              id: "EVE_SANDBOX_RESUME_PATCH",
+              status: "pass",
+              subject: "eve-sandbox-resume",
+              reason: `not needed: Eve ${EVE_SANDBOX_RESUME_FIXED_VERSION} and later include the fix for eve#4440`,
               remediation: null,
             } satisfies EvePackagingCheck]
           : []),
