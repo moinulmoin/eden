@@ -172,13 +172,14 @@ update instead of failing with `VAL-CLI-007-TARGET-CONFLICT`:
    snapshot tags).
 
 Because conversations survive the image change, a skill change no longer
-breaks existing sessions: Eden's builder also applies a temporary fix for
-Eve's [just-bash resume bug](https://github.com/vercel/eve/issues/4440)
+breaks existing sessions. Eve `0.83.0` and later fix Eve's
+[just-bash resume bug](https://github.com/vercel/eve/issues/4440) upstream
 (Eve would otherwise permanently refuse to resume a conversation after its
-sandbox template changes). The fix is applied inside Eden's throwaway build
-image only, and only for Eve versions whose file matches a known checksum;
-on an unknown Eve version the deploy still succeeds and prints an
-`EVE_SANDBOX_RESUME_PATCH` warning instead.
+sandbox template changes), and preflight reports
+`✓ EVE_SANDBOX_RESUME_PATCH — not needed`. For older Eve versions, Eden's
+builder applies a temporary fix inside its throwaway build image only, and
+only when Eve's file matches a known checksum; on an unknown older version the
+deploy still succeeds and prints an `EVE_SANDBOX_RESUME_PATCH` warning instead.
 
 The summary prints `✓ updated <name>` (in `--json`, `deployment.operation` is
 `update`). A target that exists but isn't provably Eden's still fails with

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Eve `0.83.0` and later include the upstream fix for eve#4440
+  (vercel/eve#5132), so Eden no longer patches their just-bash binding.
+  Preflight and deploy report `✓ EVE_SANDBOX_RESUME_PATCH — not needed`
+  instead of warning that the Eve version is unknown. Eve `0.68.0`–`0.82.0`
+  keep the temporary fix. A prerelease of `0.83.0` still counts as unfixed.
+
 ## 0.7.3 — 2026-10-21
 
 ### Added

@@ -232,9 +232,10 @@ Things that differ from Vercel, and what Eden does about each:
 - **An update starts a new container from a new image.** Eden copies every
   conversation's sandbox files into it before it serves requests.
 - **Eve's `just-bash` sandbox refuses to resume a conversation after a skill
-  change** ([eve#4440](https://github.com/vercel/eve/issues/4440)). Eden applies
-  a small temporary fix at build time, only for Eve versions it recognizes,
-  until Eve ships its own.
+  change** ([eve#4440](https://github.com/vercel/eve/issues/4440)). On Eve
+  `0.68.0`–`0.82.0` Eden applies a small temporary fix at build time, only for
+  Eve files it recognizes. Eve `0.83.0` includes the upstream fix, so Eden
+  leaves it alone there.
 - **Eve prepares its sandbox at build time, on the machine that builds.** A
   real Linux sandbox (microsandbox or Docker) needs KVM or a Docker daemon
   there; Eden's builder has neither, so agents get `just-bash`. microsandbox
