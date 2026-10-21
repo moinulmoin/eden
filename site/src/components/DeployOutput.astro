@@ -104,8 +104,8 @@ function renderLines(lines: Run["lines"]) {
     .map(([kind, text], n) => {
       const prefix =
         kind === "cmd" ? '<span class="ln__pre">› </span>' : kind === "ok" ? '<span class="ln__ok">✓ </span>' : "";
-      const content =
-        kind === "url" ? `  <a class="ln__url" href="${escape(text)}">${escape(text)}</a>` : escape(text);
+      // The recorded deployment was destroyed after the run, so the URL is text, not a link.
+      const content = kind === "url" ? `  <span class="ln__url">${escape(text)}</span>` : escape(text);
       return `<span class="ln ln--${kind}" style="--n:${n}">${prefix}${content}\n</span>`;
     })
     .join("");
