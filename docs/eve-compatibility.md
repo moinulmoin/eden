@@ -312,6 +312,21 @@ on the default local Workflow World.
 The run's captured output is the source of the landing-page terminal and
 `docs/assets/eden-deploy.gif`.
 
+## Fresh Eve 0.82.0 preflight (2026-10-22)
+
+Eve `0.82.0`'s just-bash binding has the same sha256 as `0.79.1`–`0.81.0`
+(`ab8b1ad7398af8f6fd2a1e91eb0d1ff8d2b9b9afe1836234f36ce0e896791c45`), so the
+temporary eve#4440 fix applies unchanged. A fresh
+`npx eve@0.82.0 init my-agent --non-interactive` project, converted to pnpm
+`11.21.0` with `just-bash` `3.6.0` as in the README, passed
+`eden preflight` with the published `@moinulmoin/eden@0.7.3` in 74 seconds:
+frozen install, Eve build, `✓ EVE_SANDBOX_RESUME_PATCH`, linux/amd64 image
+boot and health, and read-only Cloudflare access. No live deploy was run on
+`0.82.0`.
+
+The upstream fix for eve#4440 (vercel/eve#5132) merged after `0.82.0` and is
+queued for Eve `0.83.0`.
+
 ## What this gate proves
 
 Passing the complete gate proves that the pinned Eve release can be packaged

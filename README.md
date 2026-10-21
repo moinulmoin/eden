@@ -1,19 +1,47 @@
 # Eden
 
-Eden deploys an existing [Vercel Eve](https://github.com/vercel/eve) project to
-your own Cloudflare account through one CLI.
+[![npm](https://img.shields.io/npm/v/@moinulmoin/eden?label=npm&color=f38020)](https://www.npmjs.com/package/@moinulmoin/eden)
+[![CI](https://github.com/moinulmoin/eden/actions/workflows/ci.yml/badge.svg)](https://github.com/moinulmoin/eden/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
+
+Deploy an existing [Vercel Eve](https://github.com/vercel/eve) agent to your
+own Cloudflare account with one command. No rewrite.
+[eden.ideaplexa.com](https://eden.ideaplexa.com)
 
 ![eden deploy on Eve 0.81.0: live on workers.dev, a real model reply, an in-place update, then eden destroy (real run, sped up)](./docs/assets/eden-deploy.gif)
 
 Eden installs the project's pinned pnpm lockfile, runs its project-local Eve
 executable, packages the real Node/Nitro server into a Cloudflare Container,
-and publishes a generic Worker in front of it. Eve remains the application and
-workflow authority; Deploy never rewrites the Eve project or silently replaces
-its providers and services.
+and puts a Worker in front of it. Your Eve project stays exactly as you wrote
+it: Eden never rewrites it or swaps out its providers and services.
+
+What you get on your own account:
+
+- your Eve server in a Cloudflare Container, with a Worker and a `workers.dev`
+  URL in front
+- `eden deploy` again updates in place: same URL, new code, every
+  conversation's files kept
+- the container sleeps when idle and wakes on the next request; standard cron
+  schedules still fire while it sleeps
+- `eden destroy` removes exactly what Eden created, nothing else
+
+## Quick start
+
+From inside a pnpm Eve project, with Docker running:
+
+```sh
+npx wrangler@4.147.0 login
+npx @moinulmoin/eden deploy --env-file ~/.config/my-agent/preview.env
+```
+
+The env file holds your model key and auth secrets and lives outside the
+project. Deploy prints the live URL. Run the same command again to ship a
+change. New to Eve, or starting from `eve init`? Check
+[Requirements](#requirements) first.
 
 ## Install
 
-Use npm:
+`npx @moinulmoin/eden` needs no install. For a global `eden` command, use npm:
 
 ```sh
 npm install --global @moinulmoin/eden@0.7.3
@@ -52,7 +80,8 @@ npx skills add moinulmoin/eden
 
 - macOS or Linux
 - Node `>=24.17.0`
-- a Cloudflare account on the Workers Paid plan (required for Containers)
+- a Cloudflare account on the Workers Paid plan ($5/month, required for
+  Containers)
 - Wrangler authentication:
 
   ```sh
@@ -60,21 +89,21 @@ npx skills add moinulmoin/eden
   ```
 
 - Docker or OrbStack with Linux/amd64 container support
-- an existing Eve project with an exact `packageManager: "pnpm@..."` entry
-- the matching root `pnpm-lock.yaml`
+- an Eve project with an exact `packageManager: "pnpm@..."` entry and the
+  matching root `pnpm-lock.yaml`
 - `just-bash` as a production dependency (`pnpm add just-bash`). Eve's
   default sandbox needs it inside Eden's builder, and `eve init` does not
   add it.
 - the providers, credentials, databases, Workflow World, and external services
-  already required by the Eve project
+  the Eve project already needs
 
-Eden Deploy supports pinned pnpm Eve projects in this release. Bun project
-lockfiles and native Windows are not currently supported.
+Bun project lockfiles and native Windows are not supported yet.
 
 ### Starting from a fresh Eve project
 
-Eden has been validated with Eve `0.68.0`, `0.79.1`, and `0.81.0`. To start on the
-latest validated release:
+Eden has been deployed live with Eve `0.68.0`, `0.79.1`, and `0.81.0`, and Eve
+`0.82.0` passes `eden preflight`. To start on the latest live-validated
+release:
 
 ```sh
 npx eve@0.81.0 init my-agent --non-interactive
@@ -102,7 +131,7 @@ pnpm add just-bash
 ```
 
 The optional native archive packages above are not needed by this sandbox;
-without this policy pnpm 11 stops with `ERR_PNPM_IGNORED_BUILDS`. If changing
+without this policy pnpm 11 stops with `ERR_PNPM_IGNORED_BUILDS`. If you change
 the policy after an install, regenerate the lockfile with
 `pnpm install --no-frozen-lockfile`.
 
@@ -111,38 +140,28 @@ Replace the production placeholder in `agent/channels/eve.ts` with your real
 before deploying: the generated Vercel/localhost authenticators do not grant
 access on Cloudflare. Put your model provider key (for an AI Gateway model,
 `AI_GATEWAY_API_KEY`) and authentication secrets in an environment file outside
-the project, then run `eden deploy --env-file /path/to/preview.env`.
+the project.
 
-## Deploy an existing Eve project
+## Deploy
 
 From inside the Eve project:
 
 ```sh
-npx @moinulmoin/eden deploy
+npx @moinulmoin/eden deploy --env-file ~/.config/my-agent/preview.env
 ```
 
-With no flags, `deploy` uses the current directory, the `preview` environment,
-and a target name derived deterministically from the project's `package.json`
-name. Deploy performs all required checks inline. A separate preflight is
-optional.
+With no other flags, `deploy` uses the current directory, the `preview`
+environment, and a target name derived from the project's `package.json` name.
+Every check runs inline before anything changes on Cloudflare. A successful
+deploy prints progress lines, then the target, the Eve version, and the public
+`workers.dev` URL on its own line.
 
-Explicit selectors still work, and `--name` is required for `--env
-production` and `destroy`:
+Eden passes env-file values through its protected deployment path. They are
+never placed in command arguments, image layers, generated artifacts, or
+normal logs.
 
-```sh
-eden deploy \
-  --project ./my-eve-app \
-  --env preview \
-  --name my-eve-preview
-```
-
-A successful deployment prints progress lines followed by a summary with the
-target, the Eve version, and the public `workers.dev` URL on its own line. The
-authored Eve directory is unchanged. All three commands accept `--json` for
-the machine-readable result object.
-
-If the project needs runtime values, provide an explicit environment file
-outside source control:
+Explicit selectors work too. `--name` is required for `--env production` and
+for `destroy`:
 
 ```sh
 eden deploy \
@@ -152,66 +171,55 @@ eden deploy \
   --env-file ~/.config/my-eve-app/preview.env
 ```
 
-Eden passes values through its protected deployment path. Values are not placed
-in command arguments, image layers, generated artifacts, or normal logs.
-
-Run the optional read-only diagnostic when troubleshooting:
-
-```sh
-eden preflight \
-  --project ./my-eve-app \
-  --env preview \
-  --name my-eve-preview
-```
-
-Ship a change by running the same deploy again. Eden updates the target it
+**Ship a change** by running the same deploy again. Eden updates the target it
 owns in place: same Worker and URL, the new code, and every conversation's
-sandbox files carried into the new Container. A target Eden does not own still
-fails with `VAL-CLI-007-TARGET-CONFLICT`.
+sandbox files carried into the new Container. A target Eden does not own fails
+with `VAL-CLI-007-TARGET-CONFLICT` instead of being overwritten.
 
-Remove the exact deployment when finished:
+**Remove it** when finished:
 
 ```sh
 eden destroy --name my-eve-preview
 ```
 
-Destroy always requires an explicit `--name`. It also requires Eden's
-immutable ownership record, verifies the current remote identity, and never
-broadens cleanup to similarly named resources.
+Destroy always requires an explicit `--name` and Eden's ownership record. It
+verifies the remote identity first and never touches similarly named
+resources.
 
-### What Deploy preserves
+**Troubleshoot** with the read-only `eden preflight`, which builds and boots the
+agent locally and checks Cloudflare access without changing anything. All
+three commands accept `--json`.
 
-The Eve project remains responsible for its:
+### What stays with your Eve project
+
+Eden deploys; your Eve project still owns its:
 
 - model providers and credentials
 - databases, queues, and external APIs
 - channels, schedules, authentication, and authorization
 - Workflow World (the sandbox runs as `just-bash`; see [Limits](#limits))
 
-### Limits
+## Limits
 
-- Container disk survives sleep (Eden snapshots the filesystem and restores
-  it on wake), and updates carry Eve's sandbox sessions — every
-  conversation's files — across the image change through the Durable Object's
-  storage (capped at 1 GiB compressed). Local Workflow World state is not
-  durable across an update, and Eden warns about it. Durable state takes
-  three steps with the Postgres World (any direct, unpooled Postgres); see
-  [docs/deploy.md](docs/deploy.md#durable-state-postgres-world).
-- Schedules with standard 5-field cron fire while the Container sleeps (a
-  Cloudflare Cron Trigger wakes it); others only run while it is awake. See
-  [docs/deploy.md](docs/deploy.md#schedules).
-- One logical Container instance (`standard-1`: 1/2 vCPU, 4 GiB); no
-  horizontal scaling or custom domains in this release.
-- The agent's sandbox is `just-bash`, a simulated shell — not a real Linux VM
-  like Vercel Sandbox. Files, `grep`/`sed`/`jq`/`sqlite3`, and `curl` work;
-  `python`, `git`, `npm`, and other real programs do not, and the sandbox has
+- **Sandbox:** the agent's shell is `just-bash`, a simulated shell, not a real
+  Linux VM like Vercel Sandbox. Files, `grep`/`sed`/`jq`/`sqlite3`, and `curl`
+  work; `python`, `git`, `npm`, and other real programs do not. The sandbox has
   unrestricted internet access.
-- A project that picks its own sandbox in `agent/sandbox.ts` (Docker,
-  microsandbox, or Vercel Sandbox) or adds `agent/sandbox/Dockerfile` is not
-  supported yet: the first three fail at build, and the Dockerfile silently
-  falls back to `just-bash`.
+- **Custom sandboxes:** a project that picks its own sandbox in
+  `agent/sandbox.ts` (Docker, microsandbox, or Vercel Sandbox) fails at build,
+  and `agent/sandbox/Dockerfile` silently falls back to `just-bash`.
+- **State:** container disk survives sleep, and updates carry every
+  conversation's files (up to 1 GiB compressed) through Durable Object storage.
+  Local Workflow World state resets on update, and Eden warns about it. To keep
+  in-flight runs across updates, use the Postgres World (any direct, unpooled
+  Postgres); see [docs/deploy.md](docs/deploy.md#durable-state-postgres-world).
+- **Schedules:** standard 5-field cron schedules fire while the Container sleeps
+  (a Cloudflare Cron Trigger wakes it); others only run while it is awake. See
+  [docs/deploy.md](docs/deploy.md#schedules).
+- **Scale:** one Container instance per agent (`standard-1`: 1/2 vCPU, 4 GiB),
+  `workers.dev` URL only. No horizontal scaling or custom domains yet.
 
-### What we found running Eve on Cloudflare
+## What we found running Eve on Cloudflare
 
 Things that differ from Vercel, and what Eden does about each:
 
@@ -239,11 +247,12 @@ Things that differ from Vercel, and what Eden does about each:
 
 | Command | Purpose |
 | --- | --- |
-| `eden preflight` | Inspect an Eve candidate without remote mutation |
-| `eden deploy` | Deploy an Eve project to one exact target, or update a target Eden owns in place (state is kept) |
+| `eden deploy` | Deploy an Eve project to one exact target, or update a target Eden owns in place |
 | `eden destroy` | Remove one exact Eden-owned Eve deployment |
+| `eden preflight` | Build and check an Eve project locally without changing anything on Cloudflare |
 
-Run `eden <command> --help` for command-specific options.
+Run `eden <command> --help` for options and `eden --version` for the installed
+version.
 
 ## Develop from source
 
@@ -270,11 +279,13 @@ The landing page at eden.ideaplexa.com lives in `site/` (Astro). Run it with
 
 ## Documentation
 
-- [Documentation index](./docs/README.md): find every guide
+- [Documentation index](./docs/README.md): every guide
 - [Installation](./docs/install.md): Node, npm/pnpm/Bun, Cloudflare, containers,
   updates, uninstallation, and PATH problems
-- [Eden Deploy](./docs/deploy.md): complete existing-Eve preview deployment,
-  verification, exact cleanup, durability, and current limits
+- [Deploy](./docs/deploy.md): preview deployment, verification, exact cleanup,
+  durability, and current limits
+- [Eve compatibility](./docs/eve-compatibility.md): every Eve version Eden has
+  been checked against, and how
 - [Validation](./docs/validation.md): maintainer runbook for the Eve
   compatibility gate and deployed cleanup checks
 
