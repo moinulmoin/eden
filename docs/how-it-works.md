@@ -110,7 +110,9 @@ both:
   mostly Eve's server starting; the container itself starts in about a second.
 - Cloudflare deletes a snapshot 30 days after it was created or last
   restored. Every wake, including a scheduled one, restores the snapshot and
-  resets those 30 days.
+  resets those 30 days. If the snapshot is gone, Eden starts the container
+  from the image and restores the conversation files it saved at sleep, so
+  those files survive; everything else on the disk starts fresh.
 
 ## Schedules
 

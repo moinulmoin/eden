@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- A sleeping agent whose disk snapshot no longer exists now wakes. Cloudflare
+  deletes a snapshot 30 days after it was created or last restored; before
+  this fix, every request to that agent failed with HTTP 500 because Eden kept
+  starting the container from the missing snapshot. Eden now forgets the
+  missing snapshot, starts from the image, and restores the carried
+  conversation files in the same request.
+- An update no longer replaces the last good copy of the conversation files
+  with a partial one when `tar` fails while copying them. The failed copy is
+  discarded and the previous copy is kept.
+
 ### Documentation
 
 - New guides: [How Eden works](docs/how-it-works.md),

@@ -152,6 +152,13 @@ interface EveStoredContainerSnapshot {
   readonly at: number;
 }
 
+/** Cloudflare rejects a start from a deleted snapshot through `monitor()`
+ * with `Snapshot "<id>" was not found.` (observed live 2026-10-22). */
+function isMissingContainerSnapshot(error: unknown): boolean {
+  return error instanceof Error &&
+    /Snapshot ".*" was not found/u.test(error.message);
+}
+
 interface EveContainerLoopbackNamespace {
   getByName(name: string): {
     loopbackFetch(request: Request): Promise<Response>;
@@ -323,6 +330,8 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   private carryOutQueue: Promise<void> = Promise.resolve();
   /** True only while the last start was fresh from `images.eve`, not a snapshot. */
   private pendingCarryRestore = false;
+  /** True while the current container start came from a stored snapshot. */
+  private startedFromSnapshot = false;
   /** Shared single-flight carry restore for the current container generation. */
   private carryRestorePromise: Promise<void> | undefined;
   private readonly envVars: Record<string, string>;
@@ -425,8 +434,20 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
         this.monitorAttached = false;
         this.recordContainerStopped();
       },
-      () => {
+      (error: unknown) => {
         this.monitorAttached = false;
+        if (this.startedFromSnapshot && isMissingContainerSnapshot(error)) {
+          // Cloudflare deletes a snapshot 30 days after it was created or
+          // last restored, and a start from it never runs. Forget it and keep
+          // the in-flight readiness attempt: its next start uses the image and
+          // restores the carried conversation files instead.
+          this.startedFromSnapshot = false;
+          console.error(
+            "The Eve workspace snapshot no longer exists; starting from the image.",
+          );
+          void this.ctx.storage.delete(EVE_HOST_CONTAINER_SNAPSHOT_KEY);
+          return;
+        }
         this.recordContainerStopped();
       },
     );
@@ -514,6 +535,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     // pending. A start from the configured image (an update) has no sandbox
     // sessions yet; a same-image snapshot wake already contains them.
     this.pendingCarryRestore = snapshotId === undefined;
+    this.startedFromSnapshot = snapshotId !== undefined;
     // Both start sources run `expectedImage` (a snapshot is only restored
     // from that image).
     await this.ctx.storage.put(EVE_HOST_CONTAINER_STARTED_IMAGE_KEY, expectedImage);
@@ -605,7 +627,10 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       [
         "sh",
         "-c",
-        `cd ${EVE_HOST_SANDBOX_CARRY_SOURCE} && [ -d sessions ] && tar -czf - sessions || true`,
+        // No sessions directory exits 0 with no bytes (nothing to carry); a
+        // tar failure must surface as a non-zero exit so the previous carry
+        // is kept instead of being replaced by a partial archive.
+        `if [ -d ${EVE_HOST_SANDBOX_CARRY_SOURCE}/sessions ]; then cd ${EVE_HOST_SANDBOX_CARRY_SOURCE} && tar -czf - sessions; fi`,
       ],
       { stdout: "pipe", stderr: "pipe" },
     );
