@@ -97,7 +97,7 @@ not placed in argv, image layers, generated artifacts, or normal logs.
 Reserved host variables such as `HOST`, `PORT`, `NITRO_*`, `NODE_ENV`,
 `NODE_EXTRA_CA_CERTS`, and Eden's identity variables are rejected.
 
-### Optional read-only preflight
+### Optional preflight
 
 `deploy` runs every required check inline. Preflight is useful when diagnosing a
 project before allowing remote mutation:
@@ -112,7 +112,8 @@ eden preflight \
 
 Omit `--env-file` when the project needs no additional runtime values.
 Preflight builds and inspects the candidate but does not publish Cloudflare
-resources.
+resources. With the Postgres World it does run the World's idempotent schema
+migration against the database in your env file, exactly as deploy does.
 
 ### Deploy
 

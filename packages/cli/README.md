@@ -92,8 +92,8 @@ eden deploy \
   --env-file ~/.config/my-eve-app/preview.env
 ```
 
-`eden preflight` is an optional read-only diagnostic. You do not need to run it
-before `deploy`:
+`eden preflight` is an optional diagnostic that changes nothing on
+Cloudflare. You do not need to run it before `deploy`:
 
 ```sh
 eden preflight \

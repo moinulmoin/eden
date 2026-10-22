@@ -186,8 +186,10 @@ Destroy always requires an explicit `--name` and Eden's ownership record. It
 verifies the remote identity first and never touches similarly named
 resources.
 
-**Troubleshoot** with the read-only `eden preflight`, which builds and boots the
-agent locally and checks Cloudflare access without changing anything. All
+**Troubleshoot** with `eden preflight`, which builds and boots the agent
+locally and checks Cloudflare access without changing anything on Cloudflare.
+With the Postgres World it also runs the World's idempotent schema migration
+against your database. All
 three commands accept `--json`.
 
 ### What stays with your Eve project
