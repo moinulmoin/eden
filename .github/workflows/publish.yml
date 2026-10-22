@@ -41,6 +41,8 @@ jobs:
               throw new Error(`invalid release tag: v${version}`);
             }
           ' "$version"
+          grep -q "^## $version " CHANGELOG.md ||
+            { echo "CHANGELOG.md has no '## $version' section"; exit 1; }
           printf 'value=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Enable pinned pnpm
@@ -99,10 +101,19 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Create GitHub release
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Create GitHub release from the CHANGELOG section
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: >-
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            index($0, "## " v " ") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
-          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-notes.md
