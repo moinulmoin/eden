@@ -151,6 +151,11 @@ Run `eden <command> --help` for command-specific options.
 - [Documentation index](https://github.com/moinulmoin/eden/blob/main/docs/README.md)
 - [Installation](https://github.com/moinulmoin/eden/blob/main/docs/install.md)
 - [Deploying Eve projects](https://github.com/moinulmoin/eden/blob/main/docs/deploy.md)
+- [How Eden works](https://github.com/moinulmoin/eden/blob/main/docs/how-it-works.md)
+- [Security](https://github.com/moinulmoin/eden/blob/main/docs/security.md)
+- [FAQ](https://github.com/moinulmoin/eden/blob/main/docs/faq.md)
+- [Reference](https://github.com/moinulmoin/eden/blob/main/docs/reference.md)
+- [Troubleshooting](https://github.com/moinulmoin/eden/blob/main/docs/troubleshooting.md)
 - [Validation and cleanup](https://github.com/moinulmoin/eden/blob/main/docs/validation.md)
 
 ## License

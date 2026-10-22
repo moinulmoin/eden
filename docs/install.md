@@ -97,6 +97,9 @@ The Eve project must contain all of the following at its selected root:
 - an exact `packageManager: "pnpm@..."` value in `package.json`
 - the matching root `pnpm-lock.yaml`
 - a project-local Eve executable resolved through `node_modules/.bin/eve`
+- `just-bash` as a production dependency (`pnpm add just-bash`). Eve's
+  default sandbox needs it inside Eden's builder, and `eve init` does not add
+  it.
 - the providers, databases, Workflow World, credentials, and external services
   that the Eve application already requires
 

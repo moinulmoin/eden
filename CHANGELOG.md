@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- New guides: [How Eden works](docs/how-it-works.md),
+  [Security](docs/security.md), [FAQ](docs/faq.md),
+  [Reference](docs/reference.md), and
+  [Troubleshooting](docs/troubleshooting.md).
+- Fixed: `docs/deploy.md` said an `--env-file` inside the project fails the
+  deploy with `SECRET_EXCLUSION_FAILED`. Eden leaves that file out of the
+  image instead; keep it outside the project so it stays out of your
+  repository.
+- Updates now document that only the variables in the current deploy's
+  `--env-file` reach the new container, so pass the same file on every
+  deploy.
+- `docs/install.md` lists the required `just-bash` production dependency.
+
 ## 0.7.3 — 2026-10-21
 
 ### Added

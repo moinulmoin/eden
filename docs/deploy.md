@@ -146,7 +146,9 @@ services work from the deployed environment.
 
 ## Updating an agent
 
-Run `eden deploy` again with the same project, environment, and name. When
+Run `eden deploy` again with the same project, environment, name, and
+`--env-file`. Only the variables in this deploy's env file reach the new
+container, so an update without it starts the agent with none of them. When
 Eden's immutable deployment record proves it owns the existing target (same
 account, project, and exact Worker and Container names), deploy becomes an
 update instead of failing with `VAL-CLI-007-TARGET-CONFLICT`:
@@ -421,9 +423,9 @@ the Eve runtime plugin.
 
 ### 3. Environment file
 
-Create the `--env-file` **outside the project root** — a file inside the
-project is snapshotted into the image and the deploy fails with
-`SECRET_EXCLUSION_FAILED`:
+Create the `--env-file` **outside the project root** and outside source
+control. Eden leaves an env file inside the project out of the image, but
+keeping it outside keeps it out of your repository:
 
 ```text
 WORKFLOW_POSTGRES_URL=postgres://<direct-unpooled-host>/<database>
@@ -458,13 +460,7 @@ hangs with headers only, the URL is pooled — fix step 3.
 
 ## Common failures
 
-| Symptom | Check |
-| --- | --- |
-| `eden` is not found | Follow the PATH section in [Install Eden](./install.md). |
-| Project or lockfile validation fails | Confirm the selected root, exact pnpm `packageManager`, root lockfile, frozen install, and project-local Eve executable. |
-| Docker build cannot start | Start Docker or OrbStack and verify Linux/amd64 support with `docker version`. |
-| Cloudflare account or origin resolution fails | Run `npx wrangler@4.147.0 whoami` and confirm the intended account and workers.dev subdomain. |
-| Health never reaches ready | Inspect the Eve project's provider, Workflow World, and startup requirements; Eden does not replace them. |
-| Destroy refuses cleanup | Preserve the target records and inspect the reported ownership or identity mismatch. Never broaden deletion by prefix. |
+See [Troubleshooting](./troubleshooting.md) for every failure and warning
+code, grouped by the stage where it appears, with the fix for each.
 
 Return to the [documentation index](./README.md).

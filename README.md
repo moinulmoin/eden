@@ -284,6 +284,15 @@ The landing page at eden.ideaplexa.com lives in `site/` (Astro). Run it with
   updates, uninstallation, and PATH problems
 - [Deploy](./docs/deploy.md): preview deployment, verification, exact cleanup,
   durability, and current limits
+- [How Eden works](./docs/how-it-works.md): the Worker, Durable Object, and
+  Container, deploy steps, sleep and wake, updates, and where data lives
+- [Security](./docs/security.md): secrets, what is public, the sandbox, and
+  what Eden can change in your account
+- [FAQ](./docs/faq.md): cost, project changes, timings, and comparisons
+- [Reference](./docs/reference.md): commands, flags, env-file rules, and what
+  Eden creates
+- [Troubleshooting](./docs/troubleshooting.md): failure and warning codes
+  with fixes
 - [Eve compatibility](./docs/eve-compatibility.md): every Eve version Eden has
   been checked against, and how
 - [Validation](./docs/validation.md): maintainer runbook for the Eve
