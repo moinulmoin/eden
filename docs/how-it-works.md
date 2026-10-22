@@ -109,7 +109,8 @@ both:
   written by the agent are still there. A wake takes about 10–15 seconds,
   mostly Eve's server starting; the container itself starts in about a second.
 - Cloudflare deletes a snapshot 30 days after it was created or last
-  restored. An agent with schedules wakes often enough to keep it fresh.
+  restored. Every wake, including a scheduled one, restores the snapshot and
+  resets those 30 days.
 
 ## Schedules
 
