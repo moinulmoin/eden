@@ -44,6 +44,9 @@ interface FakeRuntimeOptions {
   readonly carryInExitCode?: number;
   /** Makes every exec call throw, simulating a dead runtime. */
   readonly execFails?: boolean;
+  /** Snapshot ids Cloudflare no longer has: a start from one never runs and
+   * `monitor()` rejects with `Snapshot "<id>" was not found.` (observed live). */
+  readonly missingSnapshotIds?: readonly string[];
 }
 
 const CARRY_OUT_SCRIPT = "tar -czf - sessions";
@@ -94,6 +97,8 @@ function fakeContainerRuntime(options: FakeRuntimeOptions = {}) {
     carryInPayloads: [] as string[],
     /** Order of container events, e.g. ["carry-out","destroy","start"]. */
     timeline: [] as string[],
+    /** Set when the last start came from a snapshot Cloudflare no longer has. */
+    startFailure: undefined as Error | undefined,
   };
   const runtime: FakeContainerRuntime & {
     lastStart?: {
@@ -107,7 +112,12 @@ function fakeContainerRuntime(options: FakeRuntimeOptions = {}) {
     },
     images: { eve: CURRENT_IMAGE },
     start(startOptions) {
-      state.running = true;
+      const missingSnapshot = startOptions.containerSnapshot !== undefined &&
+        (options.missingSnapshotIds ?? []).includes(startOptions.containerSnapshot.id);
+      state.running = !missingSnapshot;
+      state.startFailure = missingSnapshot
+        ? new Error(`Snapshot "${startOptions.containerSnapshot?.id}" was not found.`)
+        : undefined;
       // Cloudflare's inspect() reports an empty image for a snapshot restore.
       state.image = startOptions.containerSnapshot === undefined
         ? startOptions.image ?? state.image
@@ -121,7 +131,10 @@ function fakeContainerRuntime(options: FakeRuntimeOptions = {}) {
       };
     },
     monitor() {
-      return new Promise<void>(() => {});
+      const failure = state.startFailure;
+      return failure === undefined
+        ? new Promise<void>(() => {})
+        : Promise.reject(failure);
     },
     async destroy() {
       state.destroyCalls += 1;
@@ -149,6 +162,9 @@ function fakeContainerRuntime(options: FakeRuntimeOptions = {}) {
     getTcpPort() {
       return {
         fetch: async (request: Request) => {
+          if (!state.running) {
+            throw new Error("The container is not listening on port 8080");
+          }
           state.timeline.push(
             new URL(request.url).pathname === EVE_HOST_DEFAULTS.healthPath
               ? "health"
@@ -200,6 +216,7 @@ interface FakeContainerRuntime {
     carryOutCalls: number;
     carryInCalls: number;
     carryInPayloads: string[];
+    startFailure: Error | undefined;
     timeline: string[];
   };
   readonly running: boolean;
@@ -1485,6 +1502,33 @@ describe("sandbox session carry across image updates", () => {
     expect(runtime.lastStart?.containerSnapshot).toEqual({ id: "snap-ok" });
     expect(runtime.state.carryInCalls).toBe(0);
     expect(runtime.state.timeline).toEqual(["start", "health"]);
+  });
+
+  test("wakes from the image with the carried files when the stored snapshot is gone", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const carryId = "carry-at-sleep";
+    const stored = new Map<string, unknown>([
+      ["eden.eve.host.workspace-snapshot", {
+        id: "snap-expired",
+        image: CURRENT_IMAGE,
+        at: 0,
+      }],
+      [CARRY_META_KEY, { id: carryId, chunks: 1, bytes: 18, at: 0 }],
+      [`${CARRY_META_KEY}.${carryId}.0`, new TextEncoder().encode("conversation-files")],
+    ]);
+    const runtime = fakeContainerRuntime({ missingSnapshotIds: ["snap-expired"] });
+    const container = hostContainer(stored, runtime);
+
+    const response = await container.fetch(
+      new Request("https://eden-eve-preview.account.workers.dev/eve/v1/info"),
+    );
+
+    expect(response.status).toBe(200);
+    expect(runtime.state.running).toBe(true);
+    expect(runtime.lastStart).toEqual({ image: CURRENT_IMAGE });
+    expect(runtime.state.carryInPayloads).toEqual(["conversation-files"]);
+    expect(stored.has("eden.eve.host.workspace-snapshot")).toBe(false);
+    errorSpy.mockRestore();
   });
 
   test("alarm carries sessions out together with the snapshot", async () => {
