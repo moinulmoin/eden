@@ -16,7 +16,7 @@ Eden has three commands and two top-level switches.
 | `eden destroy` | Remove the exact owned Eve target |
 
 `eden --help` (or `-h`) prints the top-level usage. `eden --version` (or `-v`)
-prints the installed version, for example `0.7.3`. Running `eden` with no
+prints the installed version, for example `0.7.4`. Running `eden` with no
 arguments prints the same usage. An unknown command fails with
 `COMMAND_UNKNOWN`.
 

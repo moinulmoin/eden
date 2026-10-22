@@ -1,6 +1,6 @@
 {
   "name": "eden",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "private": true,
   "type": "module",
   "description": "Deploy existing Eve projects to your own Cloudflare account.",
