@@ -73,18 +73,18 @@ export interface EveNodeImage {
   readonly digest: string;
 }
 
+export type EvePackageManager = "pnpm" | "npm";
+export type EveInstallCommand =
+  | readonly ["corepack", "pnpm", "install", "--frozen-lockfile"]
+  | readonly ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"];
+
 export interface EveProjectBuilderRequest {
   readonly generationRoot: string;
   readonly snapshotRoot: string;
   readonly inputManifestPath: string;
   readonly dockerfilePath: string | undefined;
   readonly packageManagerVersion: string;
-  readonly installCommand: readonly [
-    "corepack",
-    "pnpm",
-    "install",
-    "--frozen-lockfile",
-  ];
+  readonly installCommand: EveInstallCommand;
   readonly buildCommand: readonly ["./node_modules/.bin/eve", "build"];
   readonly platform: "linux/amd64";
   readonly sourceDigest: string;
@@ -134,7 +134,7 @@ export interface EveProjectInputManifest {
   readonly requestedRoot: string;
   readonly canonicalRoot: string;
   readonly projectId: string;
-  readonly packageManager: "pnpm";
+  readonly packageManager: EvePackageManager;
   readonly packageManagerVersion: string;
   readonly packageJsonSha256: string;
   readonly lockfileSha256: string;
@@ -187,14 +187,9 @@ export interface EveProjectBuildCandidate {
   readonly generationRoot: string;
   readonly snapshotRoot: string;
   readonly inputManifestPath: string;
-  readonly packageManager: "pnpm";
+  readonly packageManager: EvePackageManager;
   readonly packageManagerVersion: string;
-  readonly installCommand: readonly [
-    "corepack",
-    "pnpm",
-    "install",
-    "--frozen-lockfile",
-  ];
+  readonly installCommand: EveInstallCommand;
   readonly buildCommand: readonly ["./node_modules/.bin/eve", "build"];
   readonly eveExecutable: "node_modules/.bin/eve";
   readonly eveVersion: string;
@@ -210,14 +205,9 @@ export interface EveProjectBuildCandidate {
 
 export interface EveProjectToolchain {
   readonly nodeVersion: "24.17.0";
-  readonly packageManager: "pnpm";
+  readonly packageManager: EvePackageManager;
   readonly packageManagerVersion: string;
-  readonly installCommand: readonly [
-    "corepack",
-    "pnpm",
-    "install",
-    "--frozen-lockfile",
-  ];
+  readonly installCommand: EveInstallCommand;
   readonly buildCommand: readonly ["./node_modules/.bin/eve", "build"];
   readonly startCommand: readonly [
     "./node_modules/.bin/eve",
@@ -296,7 +286,7 @@ export interface EveProjectPackagingResult {
       readonly sha256: string;
     };
     readonly lockfile: {
-      readonly path: "pnpm-lock.yaml";
+      readonly path: "pnpm-lock.yaml" | "package-lock.json";
       readonly sha256: string;
     };
     readonly sourceDigest: string;
@@ -512,6 +502,9 @@ const INSTALL_COMMAND = [
   "install",
   "--frozen-lockfile",
 ] as const;
+const NPM_INSTALL_COMMAND = ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"] as const;
+// Install this exact isolated manager without consulting project npm configuration.
+const NPM_VERSION = "11.13.0";
 const BUILD_COMMAND = ["./node_modules/.bin/eve", "build"] as const;
 const EVE_ENTRYPOINT = ".output/server/index.mjs" as const;
 const EVE_EXCLUDED_DIRECTORY_NAMES = new Set([
@@ -546,6 +539,7 @@ const EVE_COMPETING_LOCKFILES = new Set([
   "bun.lock",
   "bun.lockb",
   "npm-shrinkwrap.json",
+  "pnpm-lock.yaml",
   "package-lock.json",
   "yarn.lock",
 ]);
@@ -562,6 +556,9 @@ interface CapturedInputs {
 
 interface ProjectContract {
   readonly projectId: string;
+  readonly packageManager: EvePackageManager;
+  readonly lockfilePath: "pnpm-lock.yaml" | "package-lock.json";
+  readonly installCommand: EveInstallCommand;
   readonly packageManagerVersion: string;
   readonly packageJsonSha256: string;
   readonly lockfileSha256: string;
@@ -966,41 +963,76 @@ function validateProjectContract(inputs: CapturedInputs): ProjectContract {
       remediation: "Add a non-empty package.json name and retry.",
     });
   }
-  const packageManagerVersion = parsePnpmVersion(packageValue.packageManager);
+  const npmLock = inputs.files.find((file) => file.relativePath === "package-lock.json");
+  const packageManager = npmLock === undefined ? "pnpm" : "npm";
+  const lockfilePath = packageManager === "npm" ? "package-lock.json" : "pnpm-lock.yaml";
+  const npmPin = typeof packageValue.packageManager === "string"
+    ? /^npm@((?:[7-9]|[1-9][0-9]+)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))$/u.exec(packageValue.packageManager)?.[1]
+    : undefined;
+  const packageManagerVersion = packageManager === "pnpm"
+    ? parsePnpmVersion(packageValue.packageManager)
+    : npmPin ?? NPM_VERSION;
   const lockFiles = inputs.files.filter((file) =>
-    file.relativePath === "pnpm-lock.yaml" ||
-    file.relativePath.endsWith("/pnpm-lock.yaml")
+    file.relativePath === lockfilePath || file.relativePath.endsWith(`/${lockfilePath}`)
   );
-  if (lockFiles.length !== 1 || lockFiles[0]?.relativePath !== "pnpm-lock.yaml") {
+  if (lockFiles.length !== 1 || lockFiles[0]?.relativePath !== lockfilePath) {
     throw new EvePackagingError({
       code: "DEPENDENCY_AMBIGUITY",
-      subject: "pnpm-lock.yaml",
-      reason: "The selected Eve root must contain exactly one regular root pnpm-lock.yaml.",
+      subject: lockfilePath,
+      reason: "The selected Eve root must contain exactly one regular root lockfile.",
       remediation: "Remove competing or nested lockfiles and retry with the matching root lockfile.",
     });
   }
   const competing = inputs.files.find((file) =>
-    EVE_COMPETING_LOCKFILES.has(basename(file.relativePath))
+    EVE_COMPETING_LOCKFILES.has(basename(file.relativePath)) && file.relativePath !== lockfilePath
   );
   if (competing !== undefined) {
     throw new EvePackagingError({
       code: "DEPENDENCY_AMBIGUITY",
       subject: competing.relativePath,
       reason: "A competing package-manager lockfile was found at the selected Eve root.",
-      remediation: "Keep only the pinned pnpm toolchain and its matching root lockfile.",
+      remediation: "Keep only one supported package manager and its matching root lockfile.",
+    });
+  }
+  if (packageManager === "npm" && packageValue.packageManager !== undefined &&
+      npmPin === undefined) {
+    throw new EvePackagingError({
+      code: "UNSUPPORTED_TOOLCHAIN",
+      subject: "package.json.packageManager",
+      reason: "npm projects may omit packageManager or declare an exact npm version (major 7 or newer).",
+      remediation: `Remove the optional packageManager field to use npm@${NPM_VERSION}, or declare an exact npm@<major>.<minor>.<patch> pin.`,
     });
   }
   const lockfile = lockFiles[0];
-  if (lockfile === undefined || !lockfileMatchesPnpm(packageManagerVersion, lockfile.bytes)) {
+  let npmLockValid = false;
+  if (packageManager === "npm" && lockfile !== undefined) {
+    try {
+      const parsed = JSON.parse(lockfile.bytes.toString("utf8"));
+      npmLockValid = (parsed.lockfileVersion === 2 || parsed.lockfileVersion === 3) &&
+        parsed.packages !== null && typeof parsed.packages === "object" &&
+        !Array.isArray(parsed.packages) && parsed.packages[""] !== undefined;
+      for (const entry of Object.values(parsed.packages ?? {})) {
+        const dependency = entry as { resolved?: unknown };
+        if (typeof dependency.resolved === "string" &&
+            !dependency.resolved.startsWith("https://registry.npmjs.org/")) npmLockValid = false;
+      }
+    } catch { npmLockValid = false; }
+  }
+  if (lockfile === undefined || (packageManager === "pnpm"
+      ? !lockfileMatchesPnpm(packageManagerVersion, lockfile.bytes)
+      : !npmLockValid)) {
     throw new EvePackagingError({
       code: "DEPENDENCY_AMBIGUITY",
-      subject: "pnpm-lock.yaml",
-      reason: "The root pnpm-lock.yaml is malformed or does not match the exact packageManager pin.",
-      remediation: "Regenerate the lockfile with the declared pnpm version, without changing it during packaging.",
+      subject: lockfilePath,
+      reason: "The root lockfile is malformed or incompatible with the selected package manager or public registry.",
+      remediation: "Regenerate the root lockfile with the selected manager and public npm registry; private registries and project .npmrc configuration are not supported.",
     });
   }
   return {
     projectId,
+    packageManager,
+    lockfilePath,
+    installCommand: packageManager === "npm" ? NPM_INSTALL_COMMAND : INSTALL_COMMAND,
     packageManagerVersion,
     packageJsonSha256: packageFile.sha256,
     lockfileSha256: lockfile.sha256,
@@ -1556,6 +1588,8 @@ async function writeDockerBuildFiles(options: {
   readonly snapshotRoot: string;
   readonly dockerfilePath: string;
   readonly nodeImage: EveNodeImage;
+  readonly packageManager: EvePackageManager;
+  readonly lockfilePath: "pnpm-lock.yaml" | "package-lock.json";
   readonly packageManagerVersion: string;
   readonly lockfileSha256: string;
 }): Promise<void> {
@@ -1564,7 +1598,7 @@ async function writeDockerBuildFiles(options: {
     "The Linux/amd64 builder requires an immutable Node 24 image digest.",
     "Supply a verified Node 24 image reference and sha256 digest.",
   );
-  const installSources = ["package.json", "pnpm-lock.yaml"];
+  const installSources = ["package.json", options.lockfilePath];
   if (
     (await lstat(join(options.snapshotRoot, "pnpm-workspace.yaml"))
       .catch(() => undefined))?.isFile() === true
@@ -1576,17 +1610,27 @@ async function writeDockerBuildFiles(options: {
       `COPY --from=builder ${JSON.stringify([`/workspace/${name}`, `/app/${name}`])}`
     )
     .join("\n");
+  const npm = options.packageManager === "npm";
+  const lockCheck = `test "$(sha256sum ${options.lockfilePath} | cut -d ' ' -f1)" = "${options.lockfileSha256}"`;
+  const managerSetup = npm
+    ? `npm install --global npm@${options.packageManagerVersion} --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/ && test "$(npm --version)" = "${options.packageManagerVersion}"`
+    : `corepack enable && corepack prepare pnpm@${options.packageManagerVersion} --activate && test "$(corepack pnpm --version)" = "${options.packageManagerVersion}"`;
+  const install = npm
+    ? "npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/"
+    : "corepack pnpm install --frozen-lockfile --config.node-linker=hoisted --config.strict-dep-builds=false";
+  const productionInstall = npm
+    ? `${install} --omit=dev`
+    : "corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted --config.strict-dep-builds=false";
+  const policy = npm ? "" : ` && ${IGNORED_BUILDS_GUARD}`;
   const dockerfile = `# syntax=docker/dockerfile:1
 FROM --platform=linux/amd64 ${image} AS builder
 WORKDIR /workspace
 COPY ${JSON.stringify([...installSources, "./"])}
-RUN corepack enable \\
-  && corepack prepare pnpm@${options.packageManagerVersion} --activate \\
-  && test "$(corepack pnpm --version)" = "${options.packageManagerVersion}" \\
-  && test "$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)" = "${options.lockfileSha256}" \\
-  && corepack pnpm install --frozen-lockfile --config.node-linker=hoisted --config.strict-dep-builds=false \\
-  && ${IGNORED_BUILDS_GUARD}
-${EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP}RUN test "$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)" = "${options.lockfileSha256}"
+RUN ${managerSetup} \\
+  && ${lockCheck} \\
+  && ${install}${policy} \\
+  && ${lockCheck}
+${EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP}RUN ${lockCheck}
 COPY . ./
 RUN test -x ./node_modules/.bin/eve \\
   && ./node_modules/.bin/eve build \\
@@ -1594,10 +1638,10 @@ RUN test -x ./node_modules/.bin/eve \\
 
 FROM builder AS runtime-deps
 RUN rm -rf node_modules \\
-  && corepack pnpm install --frozen-lockfile --prod --config.node-linker=hoisted --config.strict-dep-builds=false \\
-  && ${IGNORED_BUILDS_GUARD} \\
+  && ${productionInstall}${policy} \\
+  && ${lockCheck} \\
   && for l in node_modules/.bin/*; do t=$(readlink "$l") || continue; case "$t" in /*) ln -sfn "$(realpath --relative-to=node_modules/.bin "$t")" "$l" ;; esac; done
-${EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP}
+${EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP}RUN ${lockCheck}
 
 FROM --platform=linux/amd64 ${image} AS runtime
 WORKDIR /app
@@ -2172,13 +2216,24 @@ function classifyPnpmInstallFailure(stderr: string): EvePackagingError | undefin
   return undefined;
 }
 
+function classifyNpmInstallFailure(stderr: string): EvePackagingError | undefined {
+  if (!/\bnpm (?:ci|install|error|ERR!)/u.test(stderr)) return undefined;
+  const code = /npm (?:error|ERR!) code ([A-Z0-9_]+)/u.exec(stderr)?.[1];
+  return new EvePackagingError({
+    code: "DEPENDENCY_AMBIGUITY",
+    subject: code === undefined ? "frozen npm install" : `npm ${code}`,
+    reason: "The isolated pinned npm install could not complete with the captured lockfile and disabled lifecycle scripts.",
+    remediation: "Fix the reported npm failure; regenerate package-lock.json with the selected exact npm version if it is out of sync. Use public registry dependencies without .npmrc credentials or dependency build scripts.",
+  });
+}
+
 function classifyEveBuildFailure(stderr: string): EvePackagingError {
   if (/\bjust-bash\b/u.test(stderr)) {
     return new EvePackagingError({
       code: "EVE_BUILD_FAILED",
       subject: "eve build",
       reason: "The project-local Eve build failed inside the isolated Linux/amd64 builder because Eve's default sandbox needs just-bash where no Docker daemon or /dev/kvm exists.",
-      remediation: "Declare just-bash as a production dependency of the Eve project, regenerate pnpm-lock.yaml, and retry.",
+      remediation: "Declare just-bash as a production dependency of the Eve project, regenerate its package-manager lockfile, and retry.",
     });
   }
   return new EvePackagingError({
@@ -2201,6 +2256,9 @@ function classifyDockerBuildFailure(error: unknown): EvePackagingError {
     if (/\beve\b/u.test(step) && /\bbuild\b/u.test(step)) {
       return classifyEveBuildFailure(stderr);
     }
+    if (/\bnpm\b/u.test(step)) {
+      return classifyNpmInstallFailure(`npm ci\n${stderr}`) as EvePackagingError;
+    }
     if (/pnpm|corepack/u.test(step)) {
       const pnpmFailure = classifyPnpmInstallFailure(stderr);
       if (pnpmFailure !== undefined) return pnpmFailure;
@@ -2214,6 +2272,8 @@ function classifyDockerBuildFailure(error: unknown): EvePackagingError {
   }
   const pnpmFailure = classifyPnpmInstallFailure(stderr);
   if (pnpmFailure !== undefined) return pnpmFailure;
+  const npmFailure = classifyNpmInstallFailure(stderr);
+  if (npmFailure !== undefined) return npmFailure;
   if (/\bjust-bash\b|Cannot find package/u.test(stderr)) {
     return classifyEveBuildFailure(stderr);
   }
@@ -2510,7 +2570,7 @@ export async function buildEveProjectSnapshot(
     requestedRoot: roots.requestedRoot,
     canonicalRoot: roots.canonicalRoot,
     projectId: contract.projectId,
-    packageManager: "pnpm",
+    packageManager: contract.packageManager,
     packageManagerVersion: contract.packageManagerVersion,
     packageJsonSha256: contract.packageJsonSha256,
     lockfileSha256: contract.lockfileSha256,
@@ -2566,6 +2626,8 @@ export async function buildEveProjectSnapshot(
         snapshotRoot,
         dockerfilePath,
         nodeImage,
+        packageManager: contract.packageManager,
+        lockfilePath: contract.lockfilePath,
         packageManagerVersion: contract.packageManagerVersion,
         lockfileSha256: contract.lockfileSha256,
       });
@@ -2579,7 +2641,7 @@ export async function buildEveProjectSnapshot(
       inputManifestPath,
       dockerfilePath: actualDockerfilePath,
       packageManagerVersion: contract.packageManagerVersion,
-      installCommand: INSTALL_COMMAND,
+      installCommand: contract.installCommand,
       buildCommand: BUILD_COMMAND,
       platform: "linux/amd64",
       sourceDigest: initialInputs.sourceDigest,
@@ -2621,7 +2683,7 @@ export async function buildEveProjectSnapshot(
     }
 
     const snapshotLockfile = await readStableFile(
-      join(snapshotRoot, "pnpm-lock.yaml"),
+      join(snapshotRoot, contract.lockfilePath),
       snapshotRoot,
     );
     if (
@@ -2630,9 +2692,9 @@ export async function buildEveProjectSnapshot(
     ) {
       const dependencyError = new EvePackagingError({
         code: "DEPENDENCY_AMBIGUITY",
-        subject: "pnpm-lock.yaml",
+        subject: contract.lockfilePath,
         reason: "The frozen install changed the captured lockfile bytes.",
-        remediation: "Use the exact declared pnpm version with pnpm install --frozen-lockfile.",
+        remediation: "Use the selected exact package manager with its frozen install command.",
       });
       const cleanupError = await discardBuiltCandidate();
       return blockedResult(cleanupError ?? dependencyError, { writtenPaths });
@@ -2648,9 +2710,9 @@ export async function buildEveProjectSnapshot(
     await writeJson(runtimeManifestPath, {
       version: 1,
       generationId: basename(generationRoot),
-      packageManager: "pnpm",
+      packageManager: contract.packageManager,
       packageManagerVersion: contract.packageManagerVersion,
-      installCommand: INSTALL_COMMAND,
+      installCommand: contract.installCommand,
       buildCommand: BUILD_COMMAND,
       startCommand: START_COMMAND,
       sourceDigest: initialInputs.sourceDigest,
@@ -2717,7 +2779,7 @@ export async function buildEveProjectSnapshot(
         sha256: contract.packageJsonSha256,
       },
       lockfile: {
-        path: "pnpm-lock.yaml" as const,
+        path: contract.lockfilePath,
         sha256: contract.lockfileSha256,
       },
       sourceDigest: initialInputs.sourceDigest,
@@ -2728,9 +2790,9 @@ export async function buildEveProjectSnapshot(
       generationRoot,
       snapshotRoot,
       inputManifestPath,
-      packageManager: "pnpm",
+      packageManager: contract.packageManager,
       packageManagerVersion: contract.packageManagerVersion,
-      installCommand: INSTALL_COMMAND,
+      installCommand: contract.installCommand,
       buildCommand: BUILD_COMMAND,
       eveExecutable: "node_modules/.bin/eve",
       eveVersion: eve.version,
@@ -2768,9 +2830,9 @@ export async function buildEveProjectSnapshot(
       snapshot,
       toolchain: {
         nodeVersion: "24.17.0",
-        packageManager: "pnpm",
+        packageManager: contract.packageManager,
         packageManagerVersion: contract.packageManagerVersion,
-        installCommand: INSTALL_COMMAND,
+        installCommand: contract.installCommand,
         buildCommand: BUILD_COMMAND,
         startCommand: START_COMMAND,
         eveExecutable: eve.path as "node_modules/.bin/eve",
@@ -2804,7 +2866,7 @@ export async function buildEveProjectSnapshot(
           id: "VAL-BUILD-001",
           status: "pass",
           subject: "package-manager",
-          reason: "The exact pnpm pin and one matching regular root lockfile were verified.",
+          reason: "The selected package manager and one matching regular root lockfile were verified.",
           remediation: null,
         },
         {
@@ -2947,7 +3009,9 @@ export async function revalidateEveProjectCandidateInputs(
   }
   const observedLatest = latest ?? fail();
   const packageFile = observedLatest.files.find((file) => file.relativePath === "package.json");
-  const lockfile = observedLatest.files.find((file) => file.relativePath === "pnpm-lock.yaml");
+  const lockfile = observedLatest.files.find((file) =>
+    file.relativePath === (candidate.packageManager === "npm" ? "package-lock.json" : "pnpm-lock.yaml")
+  );
   if (
     packageFile === undefined ||
     lockfile === undefined ||

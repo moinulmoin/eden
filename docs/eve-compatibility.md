@@ -21,8 +21,8 @@ The Cloudflare launch gate also uses a separate, fresh project created by
 it exercises the original prepared-artifact shape, while Eve `0.79.1` and
 later use the newer `templateKey` shape. See the
 [fresh-project setup](../README.md#starting-from-a-fresh-eve-project) for the
-npm-to-pnpm conversion, optional-native-dependency policy, and production
-authentication that a new initializer output needs.
+sandbox dependency and production authentication that a new initializer output
+needs. npm projects now retain their generated `package-lock.json`.
 
 The fixture carries its own `pnpm-workspace.yaml`. When the tested Eve release
 is younger than pnpm's `minimumReleaseAge` window, the fixture names that exact
@@ -318,14 +318,41 @@ Eve `0.82.0`'s just-bash binding has the same sha256 as `0.79.1`–`0.81.0`
 (`ab8b1ad7398af8f6fd2a1e91eb0d1ff8d2b9b9afe1836234f36ce0e896791c45`), so the
 temporary eve#4440 fix applies unchanged. A fresh
 `npx eve@0.82.0 init my-agent --non-interactive` project, converted to pnpm
-`11.21.0` with `just-bash` `3.6.0` as in the README, passed
+`11.21.0` with `just-bash` `3.6.0` using the setup documented at that time, passed
 `eden preflight` with the published `@moinulmoin/eden@0.7.3` in 74 seconds:
 frozen install, Eve build, `✓ EVE_SANDBOX_RESUME_PATCH`, linux/amd64 image
-boot and health, and read-only Cloudflare access. No live deploy was run on
-`0.82.0`.
+boot and health, and read-only Cloudflare access. This pnpm run did not include
+a live deploy; the later npm launch run below did.
 
 The upstream fix for eve#4440 (vercel/eve#5132) merged after `0.82.0` and is
 queued for Eve `0.83.0`.
+
+## Fresh Eve 0.82.0 npm launch run (2026-10-22)
+
+A fresh `npx eve@0.82.0 init <name> --non-interactive` project retained its
+generated v3 `package-lock.json` and no `packageManager` declaration. No
+conversion to pnpm was performed.
+
+- Pristine preflight failed after 16 seconds, reporting
+  `EVE_JUST_BASH_MISSING`, `EVE_AUTH_SCAFFOLD`, and `EVE_WORLD_LOCAL`, plus the
+  missing-`just-bash` build remediation.
+- After `npm install just-bash@3.6.0`, bearer authentication, and model
+  `alibaba/qwen3.7-flash` with `modelContextWindowTokens: 32000`, preflight
+  passed in 74 seconds and deployment completed in 174 seconds.
+- The deployed `eden-npm-1022.moinulislammoin2019.workers.dev` returned health
+  HTTP 200 and unauthenticated info HTTP 401. An authenticated session returned
+  HTTP 202 and streamed a real model reply: `message.completed` containing
+  `EDEN_NPM_LIVE_OK`, followed by `turn.completed`.
+
+This run used the default local Workflow World. `eden destroy` completed in
+42 seconds and verified deletion of the Worker, Container application, and
+registry repository. Independent checks returned HTTP 404 from the former
+health URL, `No containers found.` from `wrangler containers list`, and
+Cloudflare code `10007` (Worker does not exist) from `wrangler deployments list`.
+
+The unchanged pnpm compatibility fixture (Eve `0.68.0`, pnpm `11.21.0`) also
+passed preflight in 65 seconds, including frozen install, Linux/amd64 runtime
+boot and health, and read-only Cloudflare target checks.
 
 ## What this gate proves
 

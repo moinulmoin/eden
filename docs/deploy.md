@@ -26,8 +26,9 @@ Before deploying, confirm:
 - `npx wrangler@4.147.0 whoami` shows the intended Cloudflare account on the
   Workers Paid plan, which Containers requires.
 - Docker or OrbStack is running with Linux/amd64 support.
-- The selected Eve root contains `package.json` and `pnpm-lock.yaml`.
-- `package.json` has an exact `packageManager: "pnpm@..."` value.
+- The selected Eve root contains `package.json` and one `package-lock.json`
+  (npm), or `pnpm-lock.yaml` with an exact `packageManager: "pnpm@..."` pin.
+- No competing package-manager lockfiles are present.
 - The matching dependencies are installed and `node_modules/.bin/eve` resolves
   to the project-local Eve package.
 - The project declares `just-bash` as a production dependency (Eve `^3.1.0`;
@@ -41,15 +42,22 @@ Before deploying, confirm:
 From the Eve project root, these checks should succeed:
 
 ```sh
-node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).packageManager"
-test -f pnpm-lock.yaml
-pnpm install --frozen-lockfile
+test -f package-lock.json
+npm ci --ignore-scripts --no-audit --no-fund
 test -x node_modules/.bin/eve
 docker version
 ```
 
-Eden supports pinned pnpm Eve projects in this release. Bun lockfiles and
-native Windows are not supported.
+For pnpm instead, check `packageManager` for the exact pin, check for
+`pnpm-lock.yaml`, and run `pnpm install --frozen-lockfile`.
+
+Eden supports npm projects as-is with v2/v3 lockfiles, defaulting to npm
+`11.13.0` when `packageManager` is absent or using an exact npm pin at version
+7 or newer. Exact-pinned pnpm projects are also supported.
+npm dependency lifecycle scripts do not run. Mixed lockfiles, Bun lockfiles,
+and native Windows are not supported. `.npmrc` is excluded from build layers;
+private registries and installs that need project `.npmrc` configuration are
+unsupported.
 
 ## First successful preview deployment
 
@@ -402,8 +410,11 @@ version must match the `@workflow/world` version your Eve release bundles.
 Eve `0.68.0` bundles `@workflow/world` `5.0.0-beta.39` and pairs with:
 
 ```sh
-pnpm add @workflow/world-postgres@5.0.0-beta.47
+npm add @workflow/world-postgres@5.0.0-beta.47
 ```
+
+Use `pnpm add` instead for a pnpm project; keep the existing package manager
+and its matching lockfile.
 
 For other Eve versions, install the `@workflow/world-postgres` release whose
 `@workflow/world` dependency matches the one Eve bundles; `eden preflight`

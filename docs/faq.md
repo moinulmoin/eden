@@ -27,8 +27,9 @@ for current rates.
 
 Not your agent code. The project does need:
 
-- pnpm, with an exact `packageManager: "pnpm@..."` pin and a `pnpm-lock.yaml`
-- `just-bash` as a production dependency (`pnpm add just-bash`); a fresh
+- npm with one root `package-lock.json`, or pnpm with an exact
+  `packageManager: "pnpm@..."` pin and matching `pnpm-lock.yaml`; no mixed lockfiles
+- `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`); a fresh
   `eve init` project does not include it
 - a real [Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection);
   the generated Vercel and localhost ones do not grant access on Cloudflare
@@ -39,14 +40,19 @@ all three.
 
 ### Which Eve versions work?
 
-Eden has been deployed live with Eve `0.68.0`, `0.79.1`, and `0.81.0`, and Eve
-`0.82.0` passes `eden preflight`. See
+Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, and
+`0.82.0`, including a fresh npm project on `0.82.0`. See
 [Eve compatibility](./eve-compatibility.md).
 
-### Are Bun, npm, or Windows supported?
+### Are npm, Bun, or Windows supported?
 
-Not yet. Eden needs a pnpm project, runs on Node `>=24.17.0`, and supports
-macOS and Linux. Bun can install the Eden CLI, but Eden itself runs on Node.
+npm projects deploy as-is using frozen `npm ci` installs; no pnpm conversion is
+needed. Exact-pinned pnpm projects are also supported. Eden runs on Node
+`>=24.17.0` on macOS and Linux; Bun project lockfiles and native Windows are not
+supported. Bun can install the Eden CLI, but Eden itself runs on Node.
+
+`.npmrc` is excluded from build layers. Private registries and installs requiring
+project `.npmrc` configuration are not supported.
 
 ## Secrets and safety
 

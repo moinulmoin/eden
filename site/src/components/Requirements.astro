@@ -14,8 +14,8 @@ const needs: { text: string; command?: string; code?: string }[] = [
   { text: "A Cloudflare account on Workers Paid, which Containers require" },
   { text: "Wrangler signed in", command: "npx wrangler@4.147.0 login" },
   { text: "Docker or OrbStack that builds linux/amd64" },
-  { text: "An Eve project with an exact pnpm pin and its root lockfile", code: '"packageManager": "pnpm@…"' },
-  { text: "just-bash as a production dependency", command: "pnpm add just-bash" },
+  { text: "An Eve project with its root lockfile: npm, or pnpm with an exact pin", code: "package-lock.json" },
+  { text: "just-bash as a production dependency", command: "npm install just-bash" },
 ];
 
 const limits = [
@@ -23,7 +23,7 @@ const limits = [
   { icon: CalendarX, text: "Only 5-field cron schedules fire while it sleeps", note: "A Cloudflare Cron wakes the Container; others run while it's awake" },
   { icon: Terminal, text: "The sandbox is just-bash, not a Linux VM", note: "Files, grep, jq and curl work; python, git and npm don't" },
   { icon: Box, text: "One Container instance (1/2 vCPU, 4 GiB)", note: "No horizontal scaling or custom domains yet" },
-  { icon: Package, text: "pnpm projects only", note: "Bun lockfiles and native Windows aren't supported yet" },
+  { icon: Package, text: "npm and pnpm projects", note: "Dependency install scripts don't run on npm; Bun lockfiles and native Windows aren't supported yet" },
 ];
 ---
 
@@ -72,7 +72,7 @@ const limits = [
         <div class="req__head">
           <Info class="icon" size={18} aria-hidden="true" />
           <h3>Good to know</h3>
-          <span class="mono">in 0.7.4</span>
+          <span class="mono">in 0.8.0</span>
         </div>
         <ul>
           {

@@ -44,9 +44,14 @@ until the checks in steps 1–4 have passed.
    build`). Eden copies your project into a throwaway Linux/amd64 Docker
    builder, leaving out `node_modules`, `.git`, build caches, your env file,
    any `.env*` file, and credential files such as `.npmrc`, `*.pem`, and
-   `*.key`. Inside the builder it runs `pnpm install --frozen-lockfile` and your
-   project's own `eve build`. The builder has no KVM and no Docker daemon, so
-   Eve's default sandbox resolves to `just-bash` (see [Limits](#limits)).
+   `*.key`. Inside the builder it runs the exact-pinned npm version (default
+   `11.13.0` when undeclared, npm 7 or newer when pinned) with frozen
+   `npm ci --ignore-scripts --no-audit --no-fund` (no dependency lifecycle
+   scripts), or the exact-pinned `pnpm install --frozen-lockfile`, then your
+   project's own `eve build`.
+   Private registries and project `.npmrc`-dependent installs are unsupported.
+   The builder has no KVM and no Docker daemon, so Eve's default sandbox
+   resolves to `just-bash` (see [Limits](#limits)).
 3. **Check Cloudflare** (`checking Cloudflare access and exact target`): your
    login resolves to exactly one account, and the target name is either free
    or already owned by Eden (then this deploy is an update).

@@ -33,19 +33,19 @@ Choose one installer.
 ### npm
 
 ```sh
-npm install --global @moinulmoin/eden@0.7.4
+npm install --global @moinulmoin/eden@0.8.0
 ```
 
 ### pnpm
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.7.4
+pnpm add --global @moinulmoin/eden@0.8.0
 ```
 
 ### Bun
 
 ```sh
-bun add --global @moinulmoin/eden@0.7.4
+bun add --global @moinulmoin/eden@0.8.0
 ```
 
 Bun is an installer only. Do not run Eden with `bunx --bun`.
@@ -94,16 +94,24 @@ docker version
 
 The Eve project must contain all of the following at its selected root:
 
-- an exact `packageManager: "pnpm@..."` value in `package.json`
-- the matching root `pnpm-lock.yaml`
+- one root `package-lock.json` for npm, or an exact
+  `packageManager: "pnpm@..."` value with the matching root `pnpm-lock.yaml`
+- no competing package-manager lockfiles
 - a project-local Eve executable resolved through `node_modules/.bin/eve`
-- `just-bash` as a production dependency (`pnpm add just-bash`). Eve's
+- `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`). Eve's
   default sandbox needs it inside Eden's builder, and `eve init` does not add
   it.
 - the providers, databases, Workflow World, credentials, and external services
   that the Eve application already requires
 
 Eden does not add or replace those project-owned services.
+
+npm projects default to npm `11.13.0` when `packageManager` is absent, or use
+an exact npm pin at version 7 or newer. Frozen `npm ci --ignore-scripts`
+installs require a v2/v3 lockfile; dependency lifecycle scripts do not run.
+pnpm projects use their exact pin and frozen
+lockfile. `.npmrc` is excluded from the build, so private registries and project
+`.npmrc`-dependent installs are unsupported.
 
 Continue with [Deploy an existing Eve project](./deploy.md).
 

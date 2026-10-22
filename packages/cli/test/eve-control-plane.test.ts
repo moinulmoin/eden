@@ -2066,6 +2066,54 @@ describe("Workflow World warnings", () => {
     };
   }
 
+  test.each([
+    { manager: "npm@11.11.1", custom: false },
+    { manager: "pnpm@11.21.0", custom: false },
+    { manager: "pnpm@11.21.0", custom: true },
+  ])("reports generated setup hints for $manager (custom=$custom)", async ({ manager, custom }) => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    await writeFile(join(root, "package.json"), JSON.stringify({
+      name: "eve-setup-fixture",
+      private: true,
+      packageManager: manager,
+    }));
+    await mkdir(join(root, "agent/channels"), { recursive: true });
+    await writeFile(join(root, "agent/agent.ts"), custom
+      ? 'export default defineAgent({ model: "test", sandbox: customSandbox });'
+      : 'export default defineAgent({ model: "test", reasoning: "high" });');
+    await writeFile(join(root, "agent/channels/eve.ts"), custom
+      ? 'export default eveChannel({ auth: [myAuthenticator()] });'
+      : `import { eveChannel } from "eve/channels/eve";
+import { localDev, placeholderAuth, vercelOidc } from "eve/channels/auth";
+export default eveChannel({
+  auth: [
+    // Eve 0.82 initializer defaults.
+    vercelOidc(),
+    localDev(),
+    placeholderAuth(),
+  ],
+});`);
+    const output: string[] = [];
+    await runEdenCli(["preflight", "--project", root, "--name", "eve-setup", "--json"], {
+      cwd: root,
+      stdout: (line) => output.push(line),
+      eveControlPlane: passingControlPlane(root),
+    });
+    const result = JSON.parse(output[0] as string) as {
+      warnings: { id: string; remediation?: string }[];
+    };
+    const ids = result.warnings.map((warning) => warning.id);
+    if (custom) {
+      expect(ids).not.toContain("EVE_AUTH_SCAFFOLD");
+      expect(ids).not.toContain("EVE_JUST_BASH_MISSING");
+    } else {
+      expect(ids).toContain("EVE_AUTH_SCAFFOLD");
+      expect(ids).toContain("EVE_JUST_BASH_MISSING");
+      expect(result.warnings.filter((warning) => warning.id === "EVE_WORLD_LOCAL")).toHaveLength(1);
+    }
+  });
+
   test("warns when the compiled agent uses Eve's default local World", async () => {
     const root = await createRoot();
     await writeFixtureProject(root);

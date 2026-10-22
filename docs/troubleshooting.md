@@ -186,23 +186,25 @@ This covers the package manager and the lockfile:
 
 | Message fragment | Cause | Fix |
 | --- | --- | --- |
-| `requires packageManager to pin an exact pnpm version` | `package.json` has no `packageManager` field. | Set `package.json` `packageManager` to an exact value such as `pnpm@11.21.0`. |
-| `supports only an exact pnpm@<major>.<minor>.<patch> pin` | The pin is a range, a tag, or another package manager. | Replace ranges, tags, and other package managers with an exact pnpm pin. |
-| `must contain exactly one regular root pnpm-lock.yaml` | No root lockfile, or competing nested lockfiles. | Remove competing or nested lockfiles and retry with the matching root lockfile. |
-| `A competing package-manager lockfile was found` | Another package manager's lockfile sits at the root. | Keep only the pinned pnpm toolchain and its matching root lockfile. |
-| `is malformed or does not match the exact packageManager pin` | The lockfile does not match the declared pnpm version. | Regenerate the lockfile with the declared pnpm version and retry without changing it during packaging. |
-| `could not complete without changing or bypassing the lockfile` | The frozen install failed with `ERR_PNPM_OUTDATED_LOCKFILE` or `ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY`. | Regenerate `pnpm-lock.yaml` with the declared pnpm version and retry without relaxing frozen mode. |
+| Missing or unsupported package manager declaration | pnpm has no exact pin, or `packageManager` declares an unsupported manager/version. | For pnpm, use an exact pin such as `pnpm@11.21.0`. For npm, omit `packageManager` to use npm `11.13.0`, or declare an exact npm pin at version 7 or newer, with a root `package-lock.json`. |
+| Missing or malformed root lockfile | The selected manager's regular root lockfile is absent or invalid. | Regenerate the matching `package-lock.json` (npm lockfile v2/v3) or `pnpm-lock.yaml` locally, then retry. |
+| `A competing package-manager lockfile was found` | Another package manager's lockfile is present. | Keep only the selected manager's root lockfile; do not convert a valid npm project to pnpm. |
+| `is malformed or does not match the exact packageManager pin` | The pnpm lockfile does not match the declared pnpm version. | Regenerate the lockfile with the declared pnpm version and retry without changing it during packaging. |
+| `could not complete without changing or bypassing the lockfile` | Frozen dependency installation found an out-of-date or incomplete lockfile. | Regenerate the selected manager's lockfile locally, then retry without relaxing frozen mode (`npm ci` or `pnpm install --frozen-lockfile`). |
 | `refused dependency build scripts that the project pnpm policy neither allows nor ignores` | The frozen install failed with `ERR_PNPM_IGNORED_BUILDS`. | Name the dependency under `allowBuilds` or `ignoredBuiltDependencies` in the project `pnpm-workspace.yaml` and retry. The known-optional `cbor-extract` addon is already exempted by Eden. |
 | `The isolated pinned pnpm install failed with ERR_PNPM_…` | Any other pnpm failure inside the isolated builder. | Fix the reported pnpm failure without relaxing the frozen lockfile or the declared pnpm pin, then retry. |
+| npm dependency installation fails | The lockfile needs private registry configuration, unsupported dependency scripts, or other unavailable install inputs. | Use public registry dependencies that work with `npm ci --ignore-scripts`; `.npmrc` is excluded and private registries are unsupported. |
 
-Run these from the Eve project root to check the same things Eden checks:
+For npm, run these from the Eve project root:
 
 ```sh
-node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).packageManager"
-test -f pnpm-lock.yaml
-pnpm install --frozen-lockfile
+test -f package-lock.json
+npm ci --ignore-scripts --no-audit --no-fund
 test -x node_modules/.bin/eve
 ```
+
+For pnpm, inspect the exact `packageManager` pin, check for `pnpm-lock.yaml`,
+and run `pnpm install --frozen-lockfile` instead.
 
 ### `VAL-CROSS-004` — the source changed while Eden was reading it
 
@@ -374,10 +376,10 @@ regenerate the lockfile, and retry:
 ```
 
 Eve `^3.1.0` is the range Eden's build has been exercised with. Then
-reinstall so the lockfile matches:
+reinstall using the project's package manager so the lockfile matches:
 
 ```sh
-pnpm install
+npm install # or pnpm install for a pnpm project
 ```
 
 Eden reports this as `VAL-BUILD-004` with
@@ -736,6 +738,14 @@ template is absent. Eden extracts Eve's prepared templates from the
 builder's `.eve/sandbox-cache` into the runtime image. A failure to extract
 them reports `UNSUPPORTED_EVE_OUTPUT` with `Rebuild the candidate so the
 isolated builder extracts a regular .eve/sandbox-cache directory.`
+
+### Project setup warnings
+
+| Warning | Meaning | Action |
+| --- | --- | --- |
+| `EVE_JUST_BASH_MISSING` | Eve's default sandbox needs a missing production dependency inside the isolated builder. | Run `npm add just-bash` for npm, or `pnpm add just-bash` for pnpm, and retain the updated matching lockfile. |
+| `EVE_AUTH_SCAFFOLD` | The project still uses generated authentication that does not grant production access on Cloudflare. | Replace the generated Vercel/localhost placeholder with your real [Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection), and supply its secrets through your external env file. |
+| `EVE_WORLD_LOCAL` | Default local Workflow World state lives on container disk and resets on image updates. | Configure a durable Workflow World before relying on workflow state across updates; see below. |
 
 ### `EVE_WORLD_LOCAL`
 

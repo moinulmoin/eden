@@ -16,7 +16,7 @@ Eden has three commands and two top-level switches.
 | `eden destroy` | Remove the exact owned Eve target |
 
 `eden --help` (or `-h`) prints the top-level usage. `eden --version` (or `-v`)
-prints the installed version, for example `0.7.4`. Running `eden` with no
+prints the installed version, for example `0.8.0`. Running `eden` with no
 arguments prints the same usage. An unknown command fails with
 `COMMAND_UNKNOWN`.
 
@@ -419,8 +419,9 @@ image identity and never runs a broad Docker cleanup.
 | --- | --- |
 | Node | `>=24.17.0` |
 | Wrangler | `4.147.0`, installed as a direct dependency of the CLI |
-| Project package manager | An exact `pnpm@<major>.<minor>.<patch>` pin in `package.json`; a range, a tag, or another package manager fails |
-| Project lockfile | One root `pnpm-lock.yaml`. pnpm 9 and newer require `lockfileVersion: '9'`, pnpm 7 and 8 require `lockfileVersion: '6'`, older pnpm requires `lockfileVersion: '5'` |
+| Project package manager | npm defaults to `11.13.0` when `packageManager` is absent, or uses an exact `npm@<major>.<minor>.<patch>` pin with major 7 or newer. pnpm requires an exact `pnpm@<major>.<minor>.<patch>` pin; ranges and tags are rejected |
+| Project lockfile | Exactly one regular root lockfile for the selected manager; mixed locks are rejected. npm accepts `package-lock.json` v2/v3 and uses `npm ci --ignore-scripts --no-audit --no-fund` (production adds `--omit=dev`); dependency lifecycle scripts do not run. pnpm 9 and newer require `lockfileVersion: '9'`, pnpm 7 and 8 require `lockfileVersion: '6'`, older pnpm requires `lockfileVersion: '5'` |
+| Registry configuration | `.npmrc` is excluded from build layers; private registries and installs requiring project `.npmrc` configuration are unsupported |
 | `just-bash` | A production dependency of the Eve project. Eve's default sandbox needs it inside Eden's builder, which has no Docker daemon and no `/dev/kvm`; without it the build fails and asks for the declaration |
 | Docker | Docker or OrbStack with `linux/amd64` support. Eden selects no other architecture |
 | Builder image | `node:24.17.0-bookworm-slim`, built and run as `linux/amd64` |

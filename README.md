@@ -10,7 +10,7 @@ own Cloudflare account with one command. No rewrite.
 
 ![eden deploy on Eve 0.81.0: live on workers.dev, a real model reply, an in-place update, then eden destroy (real run, sped up)](./docs/assets/eden-deploy.gif)
 
-Eden installs the project's pinned pnpm lockfile, runs its project-local Eve
+Eden installs the project's npm or pinned pnpm lockfile, runs its project-local Eve
 executable, packages the real Node/Nitro server into a Cloudflare Container,
 and puts a Worker in front of it. Your Eve project stays exactly as you wrote
 it: Eden never rewrites it or swaps out its providers and services.
@@ -27,7 +27,7 @@ What you get on your own account:
 
 ## Quick start
 
-From inside a pnpm Eve project, with Docker running:
+From inside an npm or pnpm Eve project, with Docker running:
 
 ```sh
 npx wrangler@4.147.0 login
@@ -44,19 +44,19 @@ change. New to Eve, or starting from `eve init`? Check
 `npx @moinulmoin/eden` needs no install. For a global `eden` command, use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.7.4
+npm install --global @moinulmoin/eden@0.8.0
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.7.4
+pnpm add --global @moinulmoin/eden@0.8.0
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.7.4
+bun add --global @moinulmoin/eden@0.8.0
 ```
 
 Confirm the installation:
@@ -89,9 +89,9 @@ npx skills add moinulmoin/eden
   ```
 
 - Docker or OrbStack with Linux/amd64 container support
-- an Eve project with an exact `packageManager: "pnpm@..."` entry and the
-  matching root `pnpm-lock.yaml`
-- `just-bash` as a production dependency (`pnpm add just-bash`). Eve's
+- an Eve project with one root `package-lock.json`, or an exact
+  `packageManager: "pnpm@..."` entry and matching root `pnpm-lock.yaml`
+- `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`). Eve's
   default sandbox needs it inside Eden's builder, and `eve init` does not
   add it.
 - the providers, credentials, databases, Workflow World, and external services
@@ -99,41 +99,31 @@ npx skills add moinulmoin/eden
 
 Bun project lockfiles and native Windows are not supported yet.
 
+npm projects deploy without package-manager conversion: Eden defaults to npm
+`11.13.0`, or uses an exact `npm@<major>.<minor>.<patch>` pin (npm 7 or newer).
+It uses frozen `npm ci --ignore-scripts` installs with a v2/v3
+`package-lock.json`; dependency lifecycle scripts do not run, and preflight
+names production dependencies that have one.
+Keep only one package manager's lockfile; mixed lockfiles are
+rejected. `.npmrc` is excluded from build layers, so private registries and
+installs that require project `.npmrc` configuration are not supported.
+
 ### Starting from a fresh Eve project
 
-Eden has been deployed live with Eve `0.68.0`, `0.79.1`, and `0.81.0`, and Eve
-`0.82.0` passes `eden preflight`. To start on the latest live-validated
-release:
+Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, and
+`0.82.0`, including a fresh npm project on `0.82.0`. To start on the latest
+live-validated release:
 
 ```sh
-npx eve@0.81.0 init my-agent --non-interactive
+npx eve@0.82.0 init my-agent --non-interactive
 cd my-agent
-npm pkg set packageManager="pnpm@11.21.0" dependencies.eve="0.81.0"
-rm package-lock.json
+npm pkg set dependencies.eve="0.82.0"
+npm add just-bash
 ```
 
-Eve's initializer uses npm when invoked this way; Eden requires pnpm instead.
-Before installing, create `pnpm-workspace.yaml` (or merge these settings into
-an existing file):
-
-```yaml
-minimumReleaseAgeExclude:
-  - eve@0.81.0
-ignoredOptionalDependencies:
-  - "@mongodb-js/zstd"
-  - node-liblzma
-```
-
-Then install the sandbox dependency and generate the pnpm lockfile:
-
-```sh
-pnpm add just-bash
-```
-
-The optional native archive packages above are not needed by this sandbox;
-without this policy pnpm 11 stops with `ERR_PNPM_IGNORED_BUILDS`. If you change
-the policy after an install, regenerate the lockfile with
-`pnpm install --no-frozen-lockfile`.
+Keep the generated `package-lock.json`; Eden installs it with `npm ci` without
+converting the project to pnpm. See the recorded
+[npm launch run](./docs/eve-compatibility.md#fresh-eve-0820-npm-launch-run-2026-10-22).
 
 Replace the production placeholder in `agent/channels/eve.ts` with your real
 [Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection)

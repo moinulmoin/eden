@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.0 — 2026-10-22
+
+### Added
+
+- Deploy npm Eve projects directly from their root `package-lock.json` with
+  frozen `npm ci` installs, without converting to pnpm. Exact-pinned pnpm
+  remains supported; mixed package-manager lockfiles are rejected. `.npmrc`
+  remains excluded from build layers, and private registries remain unsupported.
+- Preflight reports actionable setup guidance for a missing `just-bash`
+  production dependency, generated production authentication placeholders, and
+  local Workflow World durability. Add the sandbox dependency, configure a real
+  authenticator for Cloudflare, and choose durable World storage before relying
+  on state across image updates.
+- Preflight names npm production dependencies that have install scripts.
+  Eden's npm install does not run them, so a package that builds or downloads
+  its native addon there (for example `better-sqlite3`) would fail at runtime.
+  Use a package without one, or switch to exact-pinned pnpm and list it under
+  `allowBuilds`.
+
 ## 0.7.4 — 2026-10-22
 
 ### Fixed

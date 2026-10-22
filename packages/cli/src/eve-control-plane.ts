@@ -773,10 +773,99 @@ function pooledPostgresReason(
 }
 
 /**
- * Non-blocking World warnings. The container wipes its disk on sleep, so the
- * default local World loses pending approvals and sessions; and a pooled
- * Postgres URL breaks the World streamer, which relies on LISTEN/NOTIFY.
+ * Recognizes the generated channel, not arbitrary user authentication policies.
+ * The calls below match the Eve 0.82 initializer's agent/channels/eve.ts.
  */
+async function collectEveSetupWarnings(
+  projectRoot: string,
+): Promise<EvePreflightWarning[]> {
+  const warnings: EvePreflightWarning[] = [];
+  const source = async (path: string): Promise<string> => {
+    try {
+      return await readFile(join(projectRoot, path), "utf8");
+    } catch {
+      return "";
+    }
+  };
+  const channel = (await source("agent/channels/eve.ts"))
+    .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/gu, "")
+    .replace(/\s+/gu, "");
+  if (
+    /exportdefaulteveChannel\(\{auth:\[vercelOidc\(\),localDev\(\),placeholderAuth\(\),?\],?\}\);?$/u
+      .test(channel)
+  ) {
+    warnings.push({
+      id: "EVE_AUTH_SCAFFOLD",
+      message: "Eve's generated channel auth does not grant Cloudflare callers access.",
+      remediation: "Replace agent/channels/eve.ts auth with your app's authenticator; put credentials in --env-file.",
+    });
+  }
+  try {
+    const manifest = JSON.parse(await source("package.json")) as {
+      dependencies?: Record<string, unknown>;
+      packageManager?: string;
+    };
+    const agent = await source("agent/agent.ts");
+    if (/export\s+default\s+defineAgent\s*\(\s*\{\s*model\s*:\s*["'][^"']+["']\s*,\s*reasoning\s*:\s*["'][^"']+["']\s*,?\s*\}\s*\)/u.test(agent)) {
+      warnings.push({
+        id: "EVE_WORLD_LOCAL",
+        message: "Local World stores memory on container disk; updates or a lost sleep snapshot reset sessions and approvals.",
+        remediation: "Configure @workflow/world-postgres; see docs/deploy.md#durable-state-postgres-world.",
+      });
+    }
+    if (
+      manifest.dependencies?.["just-bash"] === undefined &&
+      agent.length > 0 &&
+      !/\bsandbox\s*:/u.test(agent)
+    ) {
+      const command = manifest.packageManager?.startsWith("pnpm@")
+        ? "pnpm add just-bash"
+        : "npm install just-bash";
+      warnings.push({
+        id: "EVE_JUST_BASH_MISSING",
+        message: "Eve's default sandbox needs the just-bash production dependency in Eden's builder.",
+        remediation: `Run ${command}, commit the updated manifest and lockfile, then retry.`,
+      });
+    }
+    if (!manifest.packageManager?.startsWith("pnpm@")) {
+      const lockText = await source("package-lock.json");
+      // Same trust level as the manifest above: npm wrote it; packaging validates it.
+      const lock = JSON.parse(lockText === "" ? "{}" : lockText) as {
+        packages?: Record<string, {
+          hasInstallScript?: boolean;
+          dev?: boolean;
+          optional?: boolean;
+          devOptional?: boolean;
+        }>;
+      };
+      const entries = lock.packages ?? {};
+      const skipped = new Set<string>();
+      for (const [path, entry] of Object.entries(entries)) {
+        const at = path.lastIndexOf("node_modules/");
+        if (
+          at !== -1 &&
+          entry.hasInstallScript === true &&
+          entry.dev !== true &&
+          entry.optional !== true &&
+          entry.devOptional !== true
+        ) {
+          skipped.add(path.slice(at + "node_modules/".length));
+        }
+      }
+      if (skipped.size > 0) {
+        warnings.push({
+          id: "EVE_NPM_INSTALL_SCRIPTS_SKIPPED",
+          message: `Eden's npm install skips dependency install scripts; these production dependencies have one and may fail at runtime: ${[...skipped].sort().join(", ")}.`,
+          remediation: "Use packages that need no install script, or switch to exact-pinned pnpm and list them under allowBuilds in pnpm-workspace.yaml.",
+        });
+      }
+    }
+  } catch {
+    // Packaging reports invalid manifests; setup hints must not mask that result.
+  }
+  return warnings;
+}
+
 async function collectEveWorldWarnings(
   candidate: EveProjectBuildCandidate | undefined,
   runtimeConfig: EveRuntimeConfig | undefined,
@@ -792,7 +881,7 @@ async function collectEveWorldWarnings(
       warnings.push({
         id: "EVE_WORLD_LOCAL",
         message:
-          "This project uses Eve's default local Workflow World; workflow state lives on the container disk, survives sleep, and resets when you update the agent.",
+          "Local World stores memory on container disk; updates or a lost sleep snapshot reset sessions and approvals.",
         remediation:
           "Configure a durable Workflow World such as @workflow/world-postgres; see docs/deploy.md#durable-state-postgres-world.",
       });
@@ -3222,6 +3311,8 @@ async function collectEvePreflight(
     };
   }
 
+  warnings.push(...await collectEveSetupWarnings(request.projectRoot));
+
   eveProgress(
     options,
     "packaging project — snapshot, frozen install, eve build",
@@ -3361,6 +3452,9 @@ async function collectEvePreflight(
   if (workflowWorld === "@moinulmoin/eden-world-cloudflare") {
     checks.push(check("EVE-WORLD", "passed", "world: Cloudflare Durable Object"));
   }
+  // Compiled configuration supersedes the early generated-source hint.
+  const localHint = warnings.findIndex((warning) => warning.id === "EVE_WORLD_LOCAL");
+  if (localHint !== -1) warnings.splice(localHint, 1);
   warnings.push(
     ...(await collectEveWorldWarnings(candidate, undefined)),
   );

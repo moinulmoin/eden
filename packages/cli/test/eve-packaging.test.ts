@@ -231,6 +231,96 @@ afterEach(async () => {
 });
 
 describe("Eve project snapshot/build boundary", () => {
+  test.each([undefined, "npm@11.13.0"])("packages npm locks without converting source (%s)", async (packageManager) => {
+    const root = await createRoot("eden-eve-package-npm-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root, { packageJson: JSON.stringify({
+      name: "eve-fixture", ...(packageManager === undefined ? {} : { packageManager }),
+    }) });
+    await rm(join(root, "pnpm-lock.yaml"));
+    const lock = JSON.stringify({ name: "eve-fixture", lockfileVersion: 3, packages: { "": { name: "eve-fixture" } } });
+    await writeFile(join(root, "package-lock.json"), lock);
+    await writeFile(join(root, ".npmrc"), "//registry.npmjs.org/:_authToken=excluded\n");
+    const { builder, requests } = fakeBuilder(writeSuccessfulBuild);
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+      nodeImage: { reference: "node:24.17.0-bookworm-slim", digest: `sha256:${"0".repeat(64)}` },
+    });
+    expect(result.status).toBe("ready");
+    expect(result.toolchain).toMatchObject({
+      packageManager: "npm", packageManagerVersion: "11.13.0",
+      installCommand: ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+      lockfileUnchanged: true,
+    });
+    expect(result.project?.lockfile.path).toBe("package-lock.json");
+    expect(await readFile(join(root, "package-lock.json"), "utf8")).toBe(lock);
+    expect(await readFile(join(requests[0]!.snapshotRoot, "package-lock.json"), "utf8")).toBe(lock);
+    await expect(access(join(requests[0]!.snapshotRoot, ".npmrc"))).rejects.toThrow();
+    const dockerfile = await readFile(join(artifacts, "generation-one/container/Dockerfile"), "utf8");
+    expect(dockerfile).toContain("npm install --global npm@11.13.0 --ignore-scripts");
+    expect(dockerfile).toContain("npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/");
+    expect(dockerfile).toContain("--omit=dev");
+    expect(dockerfile.match(/sha256sum package-lock.json/gu)?.length).toBe(5);
+    expect(dockerfile).not.toContain("corepack pnpm");
+  });
+
+  test("rejects npm lock mutation by an isolated builder", async () => {
+    const root = await createRoot("eden-eve-package-npm-mutation-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root, { packageJson: JSON.stringify({ name: "eve-fixture" }) });
+    await rm(join(root, "pnpm-lock.yaml"));
+    await writeFile(join(root, "package-lock.json"), JSON.stringify({ lockfileVersion: 3, packages: { "": {} } }));
+    const { builder } = fakeBuilder(async (request) => {
+      await writeSuccessfulBuild(request);
+      await writeFile(join(request.snapshotRoot, "package-lock.json"), "{}");
+    });
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root, artifactRoot: join(artifacts, "generation-one"), builder,
+    });
+    expect(result.error).toMatchObject({ code: "SOURCE_RACE", subject: "package-lock.json" });
+  });
+
+  test.each([
+    ["invalid lock", "{}"],
+    ["private registry", JSON.stringify({ lockfileVersion: 3, packages: {
+      "": {}, "node_modules/private": { resolved: "https://private.example/package.tgz" },
+    } })],
+  ])("rejects unsupported npm inputs: %s", async (_name, lock) => {
+    const root = await createRoot("eden-eve-package-npm-invalid-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root, { packageJson: JSON.stringify({ name: "eve-fixture" }) });
+    await rm(join(root, "pnpm-lock.yaml"));
+    await writeFile(join(root, "package-lock.json"), lock);
+    const { builder, requests } = fakeBuilder(writeSuccessfulBuild);
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root, artifactRoot: join(artifacts, "generation-one"), builder,
+    });
+    expect(result.error?.code).toBe("DEPENDENCY_AMBIGUITY");
+    expect(requests).toHaveLength(0);
+  });
+
+  test("classifies npm ci failures without relabeling Eve builds", async () => {
+    const root = await createRoot("eden-eve-package-npm-failure-");
+    const artifacts = await createRoot("eden-eve-package-artifacts-");
+    await writeProject(root, { packageJson: JSON.stringify({ name: "eve-fixture" }) });
+    await rm(join(root, "pnpm-lock.yaml"));
+    await writeFile(join(root, "package-lock.json"), JSON.stringify({ lockfileVersion: 3, packages: { "": {} } }));
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      buildStderr: 'ERROR: process "/bin/sh -c npm ci --ignore-scripts" did not complete: npm error code EUSAGE\n',
+    });
+    const builder = createDockerEveProjectBuilder({
+      dockerCommand: fakeDocker.command,
+      nodeImage: { reference: "node:24.17.0-bookworm-slim", digest: `sha256:${"0".repeat(64)}` },
+    });
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root, artifactRoot: join(artifacts, "generation-one"), builder,
+    });
+    expect(result.error).toMatchObject({ code: "DEPENDENCY_AMBIGUITY", subject: "npm EUSAGE" });
+    expect(result.error?.remediation).toContain("package-lock.json");
+  });
+
   test("accepts the canonical pinned-pnpm project and selects project-local Eve", async () => {
     const root = await createRoot("eden-eve-package-valid-");
     const artifacts = await createRoot("eden-eve-package-artifacts-");

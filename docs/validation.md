@@ -42,8 +42,9 @@ broaden to similarly named resources.
 
 ## Provisional limits
 
-- Pinned pnpm Eve projects only; Bun project lockfiles and native Windows are
-  not currently supported.
+- npm projects with one root `package-lock.json` and exact-pinned pnpm projects
+  are supported; mixed locks, Bun project lockfiles, and native Windows are not.
+- `.npmrc` is excluded from build layers; private registries are unsupported.
 - One logical Container instance per deployment; no horizontal scaling or
   custom domains.
 - Container-local disk survives sleep via filesystem snapshots but resets on
