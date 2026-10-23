@@ -27,12 +27,11 @@ const EVE_CLOUDFLARE_CONTAINERS_CA_PATH =
 const EVE_HOST_STALE_WORKER_REASON = "stale Worker version";
 
 /**
- * Cloudflare's durable_object containers expose `/dev/kvm`, which makes Eve's
- * `DefaultSandbox` pick microsandbox at runtime, while Eden's isolated builder
- * (no KVM, no Docker daemon) prepared the just-bash template — every sandbox
- * tool then fails with a provider mismatch. Hiding the device before Eve
- * starts keeps runtime selection equal to the build's. Same Eve start
- * command as the image entrypoint.
+ * Cloudflare's durable_object containers expose `/dev/kvm`, which makes Eve
+ * versions before 0.83 pick microsandbox at runtime, although Eden's isolated
+ * builder prepared just-bash. Hide it to keep those versions' provider
+ * selection aligned. Eve 0.83 removed microsandbox and records its provider
+ * during build; the device removal remains for older supported Eve releases.
  */
 const EVE_HOST_ENTRYPOINT = Object.freeze([
   "/bin/sh",

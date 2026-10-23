@@ -46,6 +46,7 @@ import {
 } from "./eve.js";
 import {
   buildEveProjectSnapshot,
+  checkEveSandboxProvider,
   createDockerEveProjectBuilder,
   revalidateEveProjectCandidateInputs,
   EvePackagingError,
@@ -531,6 +532,7 @@ function mapPackagingCheck(value: EvePackagingCheck): EvePreflightCheck {
       case "DOCKER_PLATFORM_BLOCKED":
         return "VAL-BUILD-005";
       case "EVE_SANDBOX_RESUME_PATCH":
+      case "EVE_SANDBOX_PROVIDER":
         return value.id;
       default:
         return `EVE-${value.id}`;
@@ -3297,6 +3299,28 @@ async function collectEvePreflight(
         "Exact target conflict checks were blocked before any remote read.",
       ),
     );
+    return {
+      result: {
+        command: request.command === "deploy" ? "eve deploy" : "eve preflight",
+        ok: false,
+        environment: request.environment,
+        name: request.name,
+        checks,
+        warnings,
+        candidate: null,
+      },
+      runtimeConfig,
+    };
+  }
+
+  const sandboxProvider = await checkEveSandboxProvider(request.projectRoot);
+  if (sandboxProvider !== undefined) {
+    checks.push(check(
+      sandboxProvider.code,
+      "failed",
+      sandboxProvider.message,
+      sandboxProvider.remediation,
+    ));
     return {
       result: {
         command: request.command === "deploy" ? "eve deploy" : "eve preflight",

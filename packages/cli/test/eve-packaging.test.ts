@@ -27,6 +27,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import {
   buildEveProjectSnapshot,
+  checkEveSandboxProvider,
   createDockerEveProjectBuilder,
   EVE_JUST_BASH_RESUME_ORIGINAL,
   EVE_SANDBOX_RESUME_PATCHED,
@@ -135,7 +136,8 @@ async function writeFakeDockerCommand(
   root: string,
   options: {
     readonly buildStderr?: string;
-    readonly sandboxCache?: "present" | "absent" | "escaping-symlink" | "special-file";
+    readonly eveVersion?: string;
+    readonly sandboxCache?: "present" | "absent" | "escaping-symlink" | "special-file" | "unsupported-provider";
   } = {},
 ): Promise<{ readonly command: string; readonly log: string }> {
   const command = join(root, "fake-docker.cjs");
@@ -184,7 +186,7 @@ else if (args[0] === "build") {
     fs.mkdirSync(path.join(eve, "bin"), { recursive: true });
     fs.writeFileSync(
       path.join(eve, "package.json"),
-      JSON.stringify({ name: "eve", version: "0.31.3" }),
+      JSON.stringify({ name: "eve", version: ${JSON.stringify(options.eveVersion ?? "0.31.3")} }),
     );
     fs.writeFileSync(path.join(eve, "bin/eve.js"), "#!/usr/bin/env node\\n");
     fs.chmodSync(path.join(eve, "bin/eve.js"), 0o755);
@@ -197,12 +199,14 @@ else if (args[0] === "build") {
     } else {
       const template = path.join(
         destination,
-        "just-bash/templates/7bc778099a3b436ce4ad98ba",
+        sandboxCacheMode === "unsupported-provider"
+          ? "docker/templates/7bc778099a3b436ce4ad98ba"
+          : "just-bash/templates/7bc778099a3b436ce4ad98ba",
       );
       fs.mkdirSync(path.join(template, "fs/workspace"), { recursive: true });
       fs.writeFileSync(
         path.join(template, "metadata.json"),
-        JSON.stringify({ templateKey: "7bc778099a3b436ce4ad98ba" }) + "\\n",
+        JSON.stringify({ version: 1, env: { HOME: "/home/agent" } }) + "\\n",
       );
       if (sandboxCacheMode === "escaping-symlink") {
         fs.symlinkSync("/etc/hostname", path.join(template, "fs/escape"));
@@ -231,6 +235,51 @@ afterEach(async () => {
 });
 
 describe("Eve project snapshot/build boundary", () => {
+  test.each([
+    { version: "0.68.0", provider: undefined, failed: false },
+    { version: "0.82.0", provider: "DefaultSandbox", failed: false },
+    { version: "0.83.0", provider: undefined, failed: true },
+    { version: "0.83.0-canary.1", provider: "DefaultSandbox", failed: true },
+    { version: "1.0.0", provider: undefined, failed: true },
+    { version: "0.82.0", provider: "DockerSandbox", failed: true },
+    { version: "0.83.0", provider: "JustBashSandbox", failed: false },
+  ])("gates Eve $version with $provider at the explicit-provider boundary", async ({ version, provider, failed }) => {
+    const root = await createRoot("eden-eve-sandbox-provider-");
+    await writeProject(root);
+    if (provider !== undefined) {
+      await mkdir(join(root, "agent/sandbox"), { recursive: true });
+      const specifier = provider === "JustBashSandbox" ? "eve/sandbox/just-bash" : "eve/sandbox";
+      await writeFile(join(root, "agent/sandbox/sandbox.ts"),
+        `import { ${provider} } from '${specifier}';\nexport const environment = ${provider}.environment();\nexport default defineSandbox(() => environment.open());\n`);
+    }
+    const error = await checkEveSandboxProvider(root, version);
+    expect(error?.code).toBe(failed ? "EVE_SANDBOX_PROVIDER" : undefined);
+    if (failed) expect(error?.remediation).toContain("pnpm add just-bash");
+  });
+
+  test.each(["npm", "pnpm"])("uses the locked Eve version rather than an older declared range (%s)", async (manager) => {
+    const root = await createRoot("eden-eve-sandbox-locked-");
+    await writeProject(root, { packageJson: JSON.stringify({
+      name: "eve-fixture",
+      dependencies: { eve: ">=0.68.0" },
+    }) });
+    if (manager === "npm") {
+      await writeFile(join(root, "package-lock.json"), JSON.stringify({
+        packages: { "node_modules/eve": { version: "0.83.0" } },
+      }));
+    } else {
+      await writeFile(join(root, "pnpm-lock.yaml"), `lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      eve:
+        specifier: '>=0.68.0'
+        version: 0.83.0(zod@4.5.4)
+`);
+    }
+    expect((await checkEveSandboxProvider(root))?.code).toBe("EVE_SANDBOX_PROVIDER");
+  });
+
   test.each([undefined, "npm@11.13.0"])("packages npm locks without converting source (%s)", async (packageManager) => {
     const root = await createRoot("eden-eve-package-npm-");
     const artifacts = await createRoot("eden-eve-package-artifacts-");
@@ -1238,11 +1287,18 @@ describe("Eve project snapshot/build boundary", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test("extracts the prepared sandbox template into the generation snapshot", async () => {
+  test.each(["0.82.0", "0.83.0"])("extracts the prepared JustBash sandbox template for Eve %s into the generation snapshot", async (eveVersion) => {
     const root = await createRoot("eden-eve-package-sandbox-extract-");
     const artifacts = await createRoot("eden-eve-package-sandbox-artifacts-");
     await writeProject(root);
-    const fakeDocker = await writeFakeDockerCommand(artifacts);
+    await mkdir(join(root, "agent"), { recursive: true });
+    await writeFile(join(root, "agent/sandbox.ts"),
+      `import { defineSandbox } from 'eve/sandbox';
+import { JustBashSandbox } from 'eve/sandbox/just-bash';
+export const environment = JustBashSandbox.environment();
+export default defineSandbox(() => environment.open());
+`);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, { eveVersion });
     const builder = createDockerEveProjectBuilder({
       nodeImage: {
         reference: "node:24.17.0-bookworm-slim",
@@ -1321,6 +1377,36 @@ describe("Eve project snapshot/build boundary", () => {
     const snapshotPath = result.snapshot?.path as string;
     await expect(lstat(join(snapshotPath, ".eve"))).rejects.toMatchObject({
       code: "ENOENT",
+    });
+  });
+
+  test("rejects a prepared native provider template with JustBash remediation", async () => {
+    const root = await createRoot("eden-eve-package-sandbox-provider-");
+    const artifacts = await createRoot("eden-eve-package-sandbox-provider-artifacts-");
+    await writeProject(root);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, {
+      sandboxCache: "unsupported-provider",
+    });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "EVE_SANDBOX_PROVIDER",
+      candidate: null,
+      error: {
+        subject: ".eve/sandbox-cache/docker",
+        remediation: expect.stringContaining("explicit JustBash"),
+      },
     });
   });
 

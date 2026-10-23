@@ -40,6 +40,7 @@ export type EvePackagingCode =
   | "DEPENDENCY_AMBIGUITY"
   | "SOURCE_RACE"
   | "EVE_BUILD_FAILED"
+  | "EVE_SANDBOX_PROVIDER"
   | "UNSUPPORTED_EVE_OUTPUT"
   | "RUNTIME_CLOSURE_INCOMPLETE"
   | "SECRET_EXCLUSION_FAILED"
@@ -400,6 +401,78 @@ export function eveIncludesSandboxResumeFix(version: unknown): boolean {
     }
   }
   return typeof version === "string" && !/^\d+\.\d+\.\d+-/u.test(version);
+}
+
+/**
+ * Eve 0.83's DefaultSandbox has no provider in Eden's isolated builder:
+ * production no longer falls back to JustBash when Docker is unavailable.
+ * This is a source-level compatibility hint, not an execution of user code;
+ * the resolved installed version is checked again after the frozen build.
+ */
+export async function checkEveSandboxProvider(
+  projectRoot: string,
+  resolvedVersion?: string,
+): Promise<EvePackagingError | undefined> {
+  const source = async (path: string): Promise<string> =>
+    readFile(join(projectRoot, path), "utf8").catch(() => "");
+  const json = async (path: string): Promise<Record<string, unknown>> => {
+    try {
+      const value: unknown = JSON.parse(await source(path));
+      return value !== null && typeof value === "object" && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : {};
+    } catch {
+      return {};
+    }
+  };
+  const manifest = await json("package.json");
+  const dependencies = manifest.dependencies as Record<string, unknown> | undefined;
+  const lock = await json("package-lock.json");
+  const packages = lock.packages as Record<string, { version?: string }> | undefined;
+  const pnpmLock = await source("pnpm-lock.yaml");
+  const pnpmVersion = /^\s{6}eve:\s*\r?\n\s{8}specifier:[^\n]*\r?\n\s{8}version:\s*['"]?(\d+\.\d+\.\d+(?:-[^('"\s]+)?)/mu
+    .exec(pnpmLock)?.[1];
+  const installed = await json("node_modules/eve/package.json");
+  const declared = typeof dependencies?.eve === "string"
+    ? /^[~^]?(\d+\.\d+\.\d+)/u.exec(dependencies.eve)?.[1]
+    : undefined;
+  const version = resolvedVersion ?? packages?.["node_modules/eve"]?.version ??
+    pnpmVersion ?? installed.version ?? declared;
+  const release = parseEveRelease(version);
+  const requiresExplicit = release !== null &&
+    (release[0] > 0 || release[1] >= 83);
+  const directory = await lstat(join(projectRoot, "agent/sandbox"))
+    .catch(() => undefined);
+  const path = directory?.isDirectory() === true
+    ? "agent/sandbox/sandbox.ts"
+    : "agent/sandbox.ts";
+  const module = (await source(path)).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/gu, "");
+  const otherProvider = /\b(DefaultSandbox|DockerSandbox|VercelSandbox|VmSandbox|VMSandbox)\b/u
+    .exec(module)?.[1];
+  const justBash = /import\s*\{[^}]*?\bJustBashSandbox(?:\s+as\s+(\w+))?\s*(?:,|\})[^;]*?from\s*["']eve\/sandbox\/just-bash["']/u
+    .exec(module);
+  const binding = justBash?.[1] ?? "JustBashSandbox";
+  const explicit = justBash !== null &&
+    new RegExp(`\\b${binding}\\s*\\.\\s*environment\\s*\\(`, "u").test(module) &&
+    /\bexport\s+default\b/u.test(module);
+  if (explicit && otherProvider === undefined) return undefined;
+  if (!requiresExplicit && (module.trim() === "" || otherProvider === "DefaultSandbox")) {
+    return undefined;
+  }
+  const command = typeof manifest.packageManager === "string" &&
+      manifest.packageManager.startsWith("pnpm@")
+    ? "pnpm add just-bash"
+    : "npm install just-bash";
+  return new EvePackagingError({
+    code: "EVE_SANDBOX_PROVIDER",
+    subject: path,
+    reason: otherProvider === undefined || otherProvider === "DefaultSandbox"
+      ? requiresExplicit
+        ? `Eve ${String(version)} requires an explicit JustBash sandbox in ${path} on Eden; DefaultSandbox has no provider in Eden's isolated builder because production builds do not fall back to just-bash.`
+        : `${path} does not select a supported JustBash environment; Eden cannot run custom or native sandbox providers.`
+      : `${path} selects ${otherProvider}, which Eden does not support; use explicit JustBash instead.`,
+    remediation: `Run ${command} (production dependency), then create or replace ${path} with:\nimport { defineSandbox } from 'eve/sandbox';\nimport { JustBashSandbox } from 'eve/sandbox/just-bash';\nexport const environment = JustBashSandbox.environment();\nexport default defineSandbox(() => environment.open());\nCommit the module, package.json, and updated lockfile, then retry eden preflight. See docs/deploy.md. Do not set EVE_DEV.`,
+  });
 }
 
 /** Path of the just-bash binding inside the resolved Eve package root. */
@@ -2053,6 +2126,14 @@ async function scanGeneratedSandboxCache(
       const relativePath = relativeDirectory.length === 0
         ? entry.name
         : `${relativeDirectory}/${entry.name}`;
+      if (relativeDirectory === "" && entry.name !== "just-bash") {
+        throw new EvePackagingError({
+          code: "EVE_SANDBOX_PROVIDER",
+          subject: `${EVE_SANDBOX_CACHE_ROOT}/${entry.name}`,
+          reason: `The Eve build prepared a ${entry.name} sandbox template; Eden supports only just-bash templates.`,
+          remediation: "Replace the sandbox module with the explicit JustBash environment in docs/deploy.md, run npm install just-bash (or pnpm add just-bash), commit the module and lockfile, then retry eden preflight without EVE_DEV.",
+        });
+      }
       const candidate = join(directory, entry.name);
       if (entry.isSymbolicLink()) {
         throw new EvePackagingError({
@@ -2684,6 +2765,8 @@ export async function buildEveProjectSnapshot(
       roots.requestedRoot,
     );
     if (afterCopyRace !== undefined) return blockedResult(afterCopyRace, { writtenPaths });
+    const sandboxProvider = await checkEveSandboxProvider(snapshotRoot);
+    if (sandboxProvider !== undefined) throw sandboxProvider;
 
     const nodeImage = options.nodeImage ?? options.builder.nodeImage;
     let actualDockerfilePath: string | undefined;
@@ -2767,6 +2850,8 @@ export async function buildEveProjectSnapshot(
     }
 
     const eve = await resolveProjectLocalEve(snapshotRoot);
+    const sandboxProviderAfterBuild = await checkEveSandboxProvider(snapshotRoot, eve.version);
+    if (sandboxProviderAfterBuild !== undefined) throw sandboxProviderAfterBuild;
     const sandboxResumePatch = await detectEveSandboxResumePatch(snapshotRoot);
     const output = await scanGeneratedOutput(snapshotRoot);
     const sandboxCache = await scanGeneratedSandboxCache(snapshotRoot);

@@ -2114,6 +2114,54 @@ export default eveChannel({
     }
   });
 
+  test.each([
+    { command: "preflight", directory: false, provider: undefined },
+    { command: "deploy", directory: true, provider: undefined },
+    { command: "preflight", directory: false, provider: "DefaultSandbox" },
+    { command: "preflight", directory: true, provider: "DockerSandbox" },
+    { command: "deploy", directory: false, provider: "VercelSandbox" },
+  ])("rejects unsupported 0.83 sandbox before building or remote access ($command, $provider, directory=$directory)", async ({ command, directory, provider }) => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    await writeFile(join(root, "package.json"), JSON.stringify({
+      name: "eve-sandbox-fixture",
+      dependencies: { eve: "^0.83.0" },
+    }));
+    const modulePath = directory ? "agent/sandbox/sandbox.ts" : "agent/sandbox.ts";
+    await mkdir(join(root, directory ? "agent/sandbox" : "agent"), { recursive: true });
+    if (provider !== undefined) {
+      await writeFile(join(root, modulePath),
+        `import { ${provider} } from "eve/sandbox";\nexport const environment = ${provider}.environment();\nexport default defineSandbox(() => environment.open());\n`);
+    }
+    const output: string[] = [];
+    const build = vi.fn();
+    const cloudflareRead = vi.fn();
+    await expect(runEdenCli([command, "--project", root, "--name", "eve-sandbox", "--json"], {
+      cwd: root,
+      stdout: (line) => output.push(line),
+      eveControlPlane: {
+        ...passingControlPlane(root),
+        builder: { build },
+        cloudflareRead,
+      },
+    })).resolves.toBe(1);
+    const result = JSON.parse(output[0] as string) as {
+      ok: boolean;
+      candidate: unknown;
+      checks: { id: string; status: string; message: string; remediation: string }[];
+    };
+    const diagnostic = result.checks.find((value) => value.id === "EVE_SANDBOX_PROVIDER");
+    expect(result.ok).toBe(false);
+    expect(result.candidate).toBeNull();
+    expect(diagnostic?.status).toBe("failed");
+    expect(diagnostic?.remediation).toContain(modulePath);
+    expect(diagnostic?.remediation).toContain("npm install just-bash");
+    expect(diagnostic?.remediation).toContain("export default defineSandbox(() => environment.open());");
+    if (provider !== undefined) expect(diagnostic?.message).toContain(provider);
+    expect(build).not.toHaveBeenCalled();
+    expect(cloudflareRead).not.toHaveBeenCalled();
+  });
+
   test("warns when the compiled agent uses Eve's default local World", async () => {
     const root = await createRoot();
     await writeFixtureProject(root);
