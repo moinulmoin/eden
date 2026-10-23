@@ -50,8 +50,11 @@ until the checks in steps 1–4 have passed.
    scripts), or the exact-pinned `pnpm install --frozen-lockfile`, then your
    project's own `eve build`.
    Private registries and project `.npmrc`-dependent installs are unsupported.
-   The builder has no KVM and no Docker daemon, so Eve's default sandbox
-   resolves to `just-bash` (see [Limits](#limits)).
+   The builder has no Docker daemon. Eve `0.83.0` and later require a
+   project-owned, explicit `JustBashSandbox` selection; Eden rejects the
+   production default and other providers rather than substituting one.
+   Older Eve defaults still resolve to `just-bash`: Eden hides `/dev/kvm`
+   so they do not select microsandbox (see [Limits](#limits)).
 3. **Check Cloudflare** (`checking Cloudflare access and exact target`): your
    login resolves to exactly one account, and the target name is either free
    or already owned by Eden (then this deploy is an update).
@@ -157,12 +160,19 @@ Worker, same URL, same Durable Object.
 If copying the conversation files fails, the update still goes ahead and
 those conversations lose their sandbox files.
 
-Eve rejects resuming a just-bash conversation after a skill change
-([eve#4440](https://github.com/vercel/eve/issues/4440)). Eden's builder applies
-a small temporary fix to Eve's just-bash binding inside the throwaway build
-container only, and only when the file matches a checksum Eden recognizes.
-On an unrecognized Eve version the deploy still succeeds and prints an
-`EVE_SANDBOX_RESUME_PATCH` warning.
+Eve `0.83.0` and later stable releases fix the
+[just-bash resume bug](https://github.com/vercel/eve/issues/4440) upstream;
+Eden leaves their binding unchanged and reports
+`✓ EVE_SANDBOX_RESUME_PATCH — not needed`. For older Eve releases, Eden's
+builder applies a temporary fix inside the throwaway build container only,
+and only when the binding matches a recognized checksum. An unknown older
+binding is left unchanged and prints an `EVE_SANDBOX_RESUME_PATCH` warning.
+
+Eve `0.83.0` keeps the same just-bash sessions directory, but changes the
+sandbox state protocol and enforces a session-owner Eve version check. A live
+`0.82.0` → `0.83.0` update returned HTTP 409 `session_stranded` on the old
+session before sandbox access; start a new session after that version upgrade.
+This is distinct from updating skills or agent code on the same Eve version.
 
 On Vercel each run stays on the deployment that started it. Off Vercel there
 is no pinning: sessions, pending approvals, and sleeping steps that started
@@ -201,12 +211,14 @@ Eden reports a target conflict instead of guessing.
 
 - **Sandbox:** `just-bash`, a simulated shell. Files, `grep`/`sed`/`jq`/
   `sqlite3`, and `curl` work; `python`, `git`, `npm`, and other real programs
-  do not. Eve prepares its sandbox during `eve build`, and a real Linux
-  sandbox (microsandbox or Docker) needs KVM or a Docker daemon on the build
-  machine, which Eden's builder does not have. microsandbox does run inside a
-  Cloudflare container, but preparing it there added about 7 minutes to every
-  deploy in testing, so Eden does not use it yet. The sandbox has unrestricted
-  internet access.
+  do not. Eve prepares its sandbox during `eve build`. Eden's builder has no
+  Docker daemon, so Eve `0.83.0` and later must
+  [explicitly select `JustBashSandbox`](./deploy.md#sandbox-setup); its
+  production default does not fall back. Other providers are unsupported.
+  On older Eve releases, Eden hides `/dev/kvm` to avoid selecting
+  microsandbox. Historical preparation of microsandbox inside a Cloudflare
+  container added about 7 minutes per deploy in testing; Eve `0.83.0` removed
+  that provider. The sandbox has unrestricted internet access.
 - **Scale:** one container per agent, `workers.dev` URL only. No horizontal
   scaling or custom domains yet.
 - **Plan:** Cloudflare Containers need the Workers Paid plan.

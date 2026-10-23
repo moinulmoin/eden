@@ -422,7 +422,7 @@ image identity and never runs a broad Docker cleanup.
 | Project package manager | npm defaults to `11.13.0` when `packageManager` is absent, or uses an exact `npm@<major>.<minor>.<patch>` pin with major 7 or newer. pnpm requires an exact `pnpm@<major>.<minor>.<patch>` pin; ranges and tags are rejected |
 | Project lockfile | Exactly one regular root lockfile for the selected manager; mixed locks are rejected. npm accepts `package-lock.json` v2/v3 and uses `npm ci --ignore-scripts --no-audit --no-fund` (production adds `--omit=dev`); dependency lifecycle scripts do not run. pnpm 9 and newer require `lockfileVersion: '9'`, pnpm 7 and 8 require `lockfileVersion: '6'`, older pnpm requires `lockfileVersion: '5'` |
 | Registry configuration | `.npmrc` is excluded from build layers; private registries and installs requiring project `.npmrc` configuration are unsupported |
-| `just-bash` | A production dependency of the Eve project. Eve's default sandbox needs it inside Eden's builder, which has no Docker daemon and no `/dev/kvm`; without it the build fails and asks for the declaration |
+| `just-bash` | A production dependency of the Eve project. Eve `0.83.0` and later must explicitly select `JustBashSandbox` ([setup](./deploy.md#sandbox-setup)); the production default has no provider in Eden's isolated builder and no longer falls back. Eden's builder has no Docker daemon and hides `/dev/kvm` for older Eve releases, whose default still resolves to `just-bash` |
 | Docker | Docker or OrbStack with `linux/amd64` support. Eden selects no other architecture |
 | Builder image | `node:24.17.0-bookworm-slim`, built and run as `linux/amd64` |
 | Container instance | `standard-1` (1/2 vCPU, 4 GiB) |

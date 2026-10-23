@@ -362,21 +362,24 @@ Worker target. The same `wrangler whoami` and `wrangler login` check applies.
 
 ### `Cannot find package 'just-bash'` inside the builder
 
-Eve's default sandbox needs `just-bash`, and Eden's isolated builder has no
-Docker daemon and no `/dev/kvm`, so Eve cannot install the sandbox package
-there. Declare `just-bash` as a production dependency of the Eve project,
-regenerate the lockfile, and retry:
+Declare `just-bash` as a production dependency of the Eve project and update
+the lockfile:
 
-```json
-{
-  "dependencies": {
-    "just-bash": "3.4.2"
-  }
-}
+```sh
+npm install just-bash
+# For a pnpm project: pnpm add just-bash
 ```
 
-Eve `^3.1.0` is the range Eden's build has been exercised with. Then
-reinstall using the project's package manager so the lockfile matches:
+On Eve `0.83.0` and later, installing the dependency is not sufficient:
+explicitly select `JustBashSandbox` using the
+[sandbox setup](./deploy.md#sandbox-setup). The production default has no
+provider in Eden's isolated builder and does not fall back to `just-bash`.
+Older Eve releases still use
+their existing default fallback inside Eden's builder, which has no Docker
+daemon and hides `/dev/kvm`.
+
+For an already-declared dependency with an out-of-date lockfile, reinstall
+using the project's package manager:
 
 ```sh
 npm install # or pnpm install for a pnpm project
@@ -397,14 +400,28 @@ build Linux/amd64 images, and retry without changing the project inputs:
 docker version
 ```
 
-### A custom sandbox is not supported
+### `EVE_SANDBOX_PROVIDER` — select explicit JustBash
 
-A custom `agent/sandbox.ts` or `agent/sandbox/Dockerfile` is not supported
-yet. Eden requires a sandbox that can prewarm without privileged, device, or
-host-kernel access. If the project's sandbox reports an unknown requirement,
-the deploy fails with `VAL-BUILD-007` and the message
-`The selected Eve sandbox has an unknown or unsupported Container host
-requirement.`
+Eden supports only `just-bash`, including a project-owned module that explicitly
+selects `JustBashSandbox`. On Eve `0.83.0` and later, leaving the default selected
+fails before the snapshot, build, or remote reads:
+
+```text
+Eve <version> requires an explicit JustBash sandbox in <path> on Eden; DefaultSandbox has no provider in Eden's isolated builder because production builds do not fall back to just-bash.
+```
+
+Follow the [sandbox setup](./deploy.md#sandbox-setup): install `just-bash` as a
+production dependency and define the module in `agent/sandbox.ts`, or
+`agent/sandbox/sandbox.ts` when the directory already exists. Commit the module,
+manifest, and updated lockfile, then retry `eden preflight`. Do not set `EVE_DEV`.
+
+A module selecting Docker, Vercel Sandbox, or another provider fails with the
+same diagnostic and names the selected provider. A sandbox Dockerfile does not
+make those providers supported. Eve `0.83.0` removed microsandbox; on older
+versions Eden still hides `/dev/kvm` to preserve default `just-bash` selection.
+
+An unsupported Container host requirement can also fail with `VAL-BUILD-007`:
+`The selected Eve sandbox has an unknown or unsupported Container host requirement.`
 
 A sandbox that never prepares a template also leaves the deployed agent
 without one. Eden ships the prepared template at `/workspace/.eve/sandbox-cache`,
@@ -439,7 +456,7 @@ the unsupported capability:
 | Message fragment | Fix |
 | --- | --- |
 | `The selected Workflow World has an unknown or unsupported Container host requirement.` | Configure a project-owned Eve-compatible World whose runtime requirements are supported by a disposable Linux/amd64 Container. |
-| `The selected Eve sandbox has an unknown or unsupported Container host requirement.` | Use a sandbox that can prewarm without privileged, device, or host-kernel access, or run the project outside Eden Deploy. |
+| `The selected Eve sandbox has an unknown or unsupported Container host requirement.` | Select `JustBashSandbox` using the [sandbox setup](./deploy.md#sandbox-setup), or run the project outside Eden Deploy. Other sandbox providers are unsupported. |
 | `requires privileged Container execution outside the hosting contract.` | Remove the privileged requirement. Eden does not adapt or substitute the runtime. |
 | `requires a device or unknown device capability outside the hosting contract.` | Remove the device requirement. Eden does not grant devices. |
 | `requires an unknown or unsupported host-kernel capability.` | Use only the documented process, network, and disposable-filesystem capabilities of the Linux/amd64 Container. |
@@ -469,6 +486,10 @@ range.` Free a local port in that range and retry.
 
 The deploy still succeeds. Pin Eve to a version Eden knows, or update Eden so
 its known Eve versions include yours.
+
+This warning applies to older or otherwise unrecognized bindings. Eve
+`0.83.0` and later stable releases include the upstream fix and instead report
+`✓ EVE_SANDBOX_RESUME_PATCH — not needed`; Eden does not patch them.
 
 ### `CLEANUP_UNVERIFIED` — owned local resources were not proven absent
 

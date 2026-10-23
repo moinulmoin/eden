@@ -91,9 +91,10 @@ npx skills add moinulmoin/eden
 - Docker or OrbStack with Linux/amd64 container support
 - an Eve project with one root `package-lock.json`, or an exact
   `packageManager: "pnpm@..."` entry and matching root `pnpm-lock.yaml`
-- `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`). Eve's
-  default sandbox needs it inside Eden's builder, and `eve init` does not
-  add it.
+- `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`).
+  On Eve `0.83.0` and later, explicitly select `JustBashSandbox` as shown
+  [below](#starting-from-a-fresh-eve-project); the production default no longer
+  falls back to it.
 - the providers, credentials, databases, Workflow World, and external services
   the Eve project already needs
 
@@ -110,16 +111,36 @@ installs that require project `.npmrc` configuration are not supported.
 
 ### Starting from a fresh Eve project
 
-Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, and
-`0.82.0`, including a fresh npm project on `0.82.0`. To start on the latest
-live-validated release:
+Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, `0.82.0`,
+and `0.83.0`, including a fresh npm project on `0.82.0` and sandbox-file carry
+plus a queued task across a same-version skill update on `0.83.0`.
+These recorded live runs
+are listed in [Eve compatibility](./docs/eve-compatibility.md). To start a new
+project on Eve `0.83.0`:
 
 ```sh
-npx eve@0.82.0 init my-agent --non-interactive
+npx eve@0.83.0 init my-agent --non-interactive
 cd my-agent
-npm pkg set dependencies.eve="0.82.0"
+npm pkg set dependencies.eve="0.83.0"
 npm add just-bash
 ```
+
+Explicitly select the supported sandbox in `agent/sandbox.ts`. If the project
+already has an `agent/sandbox/` directory, use `agent/sandbox/sandbox.ts` instead:
+
+```ts
+import { defineSandbox } from 'eve/sandbox';
+import { JustBashSandbox } from 'eve/sandbox/just-bash';
+
+export const environment = JustBashSandbox.environment();
+export default defineSandbox(() => environment.open());
+```
+
+Eve `0.83.0` no longer falls back to `just-bash` in production; its default
+selects Vercel Sandbox or Docker when available, neither of which is available
+inside Eden's isolated builder.
+Eden rejects that default early with setup instructions. Older Eve versions
+keep their existing default-to-`just-bash` behavior in Eden.
 
 Keep the generated `package-lock.json`; Eden installs it with `npm ci` without
 converting the project to pnpm. See the recorded
@@ -197,11 +218,16 @@ Eden deploys; your Eve project still owns its:
   Linux VM like Vercel Sandbox. Files, `grep`/`sed`/`jq`/`sqlite3`, and `curl`
   work; `python`, `git`, `npm`, and other real programs do not. The sandbox has
   unrestricted internet access.
-- **Custom sandboxes:** a project that picks its own sandbox in
-  `agent/sandbox.ts` (Docker, microsandbox, or Vercel Sandbox) fails at build,
-  and `agent/sandbox/Dockerfile` silently falls back to `just-bash`.
+- **Sandbox selection:** Eden supports only `just-bash`, including the explicit
+  `JustBashSandbox` module above. Docker, Vercel Sandbox, and other providers
+  are unsupported. A sandbox Dockerfile is not a way to run a Linux VM in Eden.
+  microsandbox applies only to older Eve releases; Eve `0.83.0` removed it.
 - **State:** container disk survives sleep, and updates carry every
   conversation's files (up to 1 GiB compressed) through Durable Object storage.
+  **Eve `0.82.0` → `0.83.0` upgrades do not preserve usable existing sessions:**
+  a live Cloudflare World run returned HTTP 409 `session_stranded` on the old
+  session after a successful update, before sandbox access. Start a new session
+  after that upgrade; carrying its files does not bypass Eve's version check.
   Local Workflow World state resets on update, and Eden warns about it. To keep
   in-flight runs across updates, use the Postgres World (any direct, unpooled
   Postgres); see [docs/deploy.md](docs/deploy.md#durable-state-postgres-world).

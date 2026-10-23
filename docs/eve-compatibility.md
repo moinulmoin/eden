@@ -16,10 +16,11 @@ Update the fixture, its lockfile, and this document together when advancing the
 tested Eve line. Do not replace the exact Eve pin with `latest` in a release
 gate.
 
-The Cloudflare launch gate also uses a separate, fresh project created by
-`npx eve@0.81.0 init <name> --non-interactive`. Keep the older fixture pin:
-it exercises the original prepared-artifact shape, while Eve `0.79.1` and
-later use the newer `templateKey` shape. See the
+Recorded Cloudflare launch gates also use separate fresh initializer projects,
+including Eve `0.81.0`, `0.82.0`, and `0.83.0` below. The current fresh-project
+instructions pin `0.83.0`. Keep the older fixture pin: it exercises the original
+prepared-artifact shape, while Eve
+`0.79.1` and later use the newer `templateKey` shape. See the
 [fresh-project setup](../README.md#starting-from-a-fresh-eve-project) for the
 sandbox dependency and production authentication that a new initializer output
 needs. npm projects now retain their generated `package-lock.json`.
@@ -30,12 +31,12 @@ pin in `minimumReleaseAgeExclude` there; the runner deliberately does not use
 `--ignore-workspace`, so the exception also applies inside Eden's generated
 image, which copies `pnpm-workspace.yaml` before both frozen installs.
 
-Eve's default `eve init` scaffold selects the `just-bash` sandbox provider but
-does not declare it: a fresh scaffold must add `just-bash` as a production
-dependency (the fixture pins `3.4.2`, which Eve 0.68.0's `^3.1.0`
-optional peer resolves) or `eve build` inside Eden's isolated builder —
-which has no Docker daemon or `/dev/kvm` — fails with
-`Cannot find package 'just-bash'`. The fixture's `pnpm-workspace.yaml` also
+Before Eve `0.83.0`, the default sandbox falls back to `just-bash` in Eden's
+isolated builder. The project must declare `just-bash` as a production
+dependency (the fixture pins `3.4.2`, which Eve 0.68.0's `^3.1.0` optional peer
+resolves), or the build fails with `Cannot find package 'just-bash'`.
+The builder has no Docker daemon, and Eden hides `/dev/kvm` to avoid the older
+microsandbox selection. The fixture's `pnpm-workspace.yaml` also
 lists `@mongodb-js/zstd` and `node-liblzma` under
 `ignoredOptionalDependencies` so the frozen installs skip just-bash's optional
 native archives. This is a scaffold-side project dependency, not an
@@ -53,12 +54,92 @@ the catalog changes. The fixture declares a 32,000-token logical model window
 so Eve plans compaction below Qwen's lowest context-pricing boundary and every
 fallback runs against the same test budget.
 
+## Eve 0.83.0 sandbox selection
+
+Eve `0.83.0` removed microsandbox and changed `DefaultSandbox`: production no
+longer falls back to `just-bash`; that fallback is only for development and
+evaluation. Eden has no nested Docker daemon, so install `just-bash` as a
+production dependency and explicitly select it in `agent/sandbox.ts`, or
+`agent/sandbox/sandbox.ts` if the project already has `agent/sandbox/`:
+
+```ts
+import { defineSandbox } from 'eve/sandbox';
+import { JustBashSandbox } from 'eve/sandbox/just-bash';
+
+export const environment = JustBashSandbox.environment();
+export default defineSandbox(() => environment.open());
+```
+
+Eden accepts this explicit provider and rejects other providers. With Eve
+`0.83.0` and later, leaving the production default selected fails early with
+`EVE_SANDBOX_PROVIDER` and setup instructions; do not enable `EVE_DEV` to bypass
+production selection. Older Eve releases keep their existing default behavior.
+
+The `0.83.0` sessions directory remains
+`/workspace/.eve/sandbox-cache/just-bash/sessions`. Eden carries that same
+directory across image updates, but Eve's state protocol changed. Source-level
+fallback to fresh sandbox state for incompatible older state is separate from
+whether Eve permits the old session to execute; the live upgrade below was
+rejected before sandbox access.
+
+## Eve 0.82.0 to 0.83.0 live upgrade (2026-10-23)
+
+A project using Cloudflare World `0.8.0` deployed Eve `0.82.0`; session
+`wrun_01M5M1RCHS9F5CPA22J7XRMJG9` ran bash and wrote `upgrade-proof.txt`.
+After upgrading to Eve `0.83.0` with an explicit `JustBashSandbox` module,
+Eden deployed the update successfully. A POST to the same session returned:
+
+```json
+{"code":"session_stranded","error":"This session is no longer available.","ok":false,"eveVersion":"0.82.0"}
+```
+
+The response was HTTP 409 and occurred before sandbox access. Neither a fresh
+sandbox nor a sandbox resume error was observed. Eve `0.83.0`'s
+`execution/session-inbox/runnable-owner.js` checks that the owner's
+`EVE_VERSION_ATTRIBUTE` equals the installed Eve version in
+`isRunnableOwnerRun`; `routesToOwnerDeployment` applies only when
+`deploymentAffinity` is true. Carrying sandbox files does not bypass that
+session-owner check. Start a new session after this version upgrade.
+
+A new `0.83.0` Cloudflare World session ran bash successfully. A separate live
+local World `0.83.0` run passed multi-step queue execution with two bash tools.
+The same-version carry and queued-task proof below passed separately; it does
+not change the cross-version session limitation.
+
+## Eve 0.83.0 skill-update carry and queued task (2026-10-23)
+
+With Eve `0.83.0`, explicit `JustBashSandbox`, and Cloudflare World `0.8.0`,
+session `wrun_01M5M2HC2S9PDVHRGVD6HGM221` wrote `/workspace/carry-proof.txt`
+containing `eden083-carry-marker`. At `09:47:55.770Z` it queued a durable
+`delayed_marker` task with a `900000` ms delay. A skill was then added at
+`agent/skills/carry-proof/SKILL.md`, and Eden redeployed the same target with
+`ok: true`.
+
+After the update, bash in the same session returned exit code 0 at
+`10:02:57.283Z` with:
+
+```text
+eden083-carry-marker
+post-update-bash-ok
+```
+
+The delayed task completed at `10:03:00.116Z`, after the update. A subsequent
+bash call read `delayed-marker.txt`, returning `eden083-queued-across-update`
+with exit code 0. This establishes same-version sandbox-file carry and
+continuation of a pending durable queued task across a skill update for this
+Cloudflare World setup.
+
+The separate local World `0.83.0` run passed multi-step queue execution with
+two bash tools. Postgres was not checked on `0.83.0`; the earlier proof
+database expired and its environment file was deleted.
+
+
 ## Sandbox resume compatibility
 
 Eden's temporary [eve#4440](https://github.com/vercel/eve/issues/4440) patch
 recognizes the exact published binding hashes for Eve `0.68.0`, `0.71.2`,
-`0.72.1`, and `0.79.1`; Eve `0.80.1` and `0.81.0` ship the same binding as
-`0.79.1`. Recognizing a hash is not a claim that every one of those releases
+`0.72.1`, and `0.79.1`; Eve `0.80.1`, `0.81.0`, and `0.82.0` ship the same
+binding as `0.79.1`. Recognizing a hash is not a claim that every release
 passed the complete live gate.
 
 - `0.68.0`, `0.71.2`, and `0.72.1` expose a prepared `templateRootPath`;
@@ -75,6 +156,11 @@ user workspace files. The prepared cache and session directory remain
 runtime storage-path migration is necessary. An unknown binding hash remains
 unpatched and prints `! EVE_SANDBOX_RESUME_PATCH`; recognized bindings print
 `✓ EVE_SANDBOX_RESUME_PATCH`.
+
+Eve `0.83.0` and later stable releases include the upstream fix
+(vercel/eve#5132). Eden leaves those bindings unchanged and reports
+`✓ EVE_SANDBOX_RESUME_PATCH — not needed`. A prerelease of `0.83.0` still
+uses the older checksum-based decision.
 
 ## Local production-runtime gate
 
@@ -324,8 +410,8 @@ frozen install, Eve build, `✓ EVE_SANDBOX_RESUME_PATCH`, linux/amd64 image
 boot and health, and read-only Cloudflare access. This pnpm run did not include
 a live deploy; the later npm launch run below did.
 
-The upstream fix for eve#4440 (vercel/eve#5132) merged after `0.82.0` and is
-queued for Eve `0.83.0`.
+The upstream fix for eve#4440 (vercel/eve#5132) merged after `0.82.0` and
+shipped in Eve `0.83.0`.
 
 ## Fresh Eve 0.82.0 npm launch run (2026-10-22)
 

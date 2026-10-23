@@ -31,17 +31,21 @@ Not your agent code. The project does need:
   `packageManager: "pnpm@..."` pin and matching `pnpm-lock.yaml`; no mixed lockfiles
 - `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`); a fresh
   `eve init` project does not include it
+- on Eve `0.83.0` and later, an explicit `JustBashSandbox` module; the production
+  default has no provider in Eden's builder and does not fall back to `just-bash`
 - a real [Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection);
   the generated Vercel and localhost ones do not grant access on Cloudflare
 
 The README's
 [fresh project steps](../README.md#starting-from-a-fresh-eve-project) cover
-all three.
+the setup, including the sandbox module.
 
 ### Which Eve versions work?
 
-Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, and
-`0.82.0`, including a fresh npm project on `0.82.0`. See
+Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, `0.82.0`,
+and `0.83.0`. The `0.83.0` Cloudflare World run preserved sandbox files and a
+queued task across a same-version skill update. Upgrading from `0.82.0` to
+`0.83.0` requires new sessions; the old session returned `session_stranded`. See
 [Eve compatibility](./eve-compatibility.md).
 
 ### Are npm, Bun, or Windows supported?
@@ -124,12 +128,16 @@ database, if you use one, is not touched.
 
 ### Why no real Linux sandbox with python and git?
 
-Eve prepares its sandbox during `eve build`. A real Linux sandbox
-(microsandbox or Docker) needs KVM or a Docker daemon on the build machine,
-and Eden's builder has neither, so agents get Eve's `just-bash`, a simulated
-shell. microsandbox does run inside a Cloudflare container, but preparing it
-there added about 7 minutes to every deploy in testing, so Eden does not use
-it yet.
+Eve prepares its sandbox during `eve build`. Eden's builder has no Docker
+daemon, and Eden supports only `just-bash`, a simulated shell. On Eve `0.83.0`
+and later, [select it explicitly](./deploy.md#sandbox-setup); the production
+default no longer falls back to it.
+
+Older Eve releases could select microsandbox when `/dev/kvm` was visible.
+Eden hides that device in its builder to keep their existing `just-bash`
+selection. Historical microsandbox preparation inside a Cloudflare container
+added about 7 minutes per deploy in testing; that is not an available provider
+on Eve `0.83.0`, which removed microsandbox.
 
 ### How is this different from running on Vercel?
 

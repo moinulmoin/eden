@@ -107,11 +107,13 @@ the [reference](./reference.md).
 
 ## What Eden changes in Eve
 
-Nothing in your project. Inside the throwaway build container only, Eden
-applies a small temporary fix to Eve's just-bash binding for
-[eve#4440](https://github.com/vercel/eve/issues/4440), and only when the file
-matches a checksum Eden recognizes. On any other Eve version the file is left
-alone and the deploy prints an `EVE_SANDBOX_RESUME_PATCH` warning.
+Nothing in your project. Eve `0.83.0` and later stable releases include the
+upstream [eve#4440](https://github.com/vercel/eve/issues/4440) fix; Eden leaves
+their just-bash binding unchanged and reports
+`✓ EVE_SANDBOX_RESUME_PATCH — not needed`. For older Eve releases, Eden applies
+a temporary fix inside the throwaway build container only, and only when the
+binding matches a recognized checksum. An unknown older binding is left
+unchanged and prints an `EVE_SANDBOX_RESUME_PATCH` warning.
 
 ## The Eden packages
 

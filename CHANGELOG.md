@@ -9,6 +9,24 @@
   Preflight and deploy report `✓ EVE_SANDBOX_RESUME_PATCH — not needed`
   instead of warning that the Eve version is unknown. Eve `0.68.0`–`0.82.0`
   keep the temporary fix. A prerelease of `0.83.0` still counts as unfixed.
+- Support Eve `0.83.0`'s explicit `JustBashSandbox` setup. Eden accepts that
+  provider, rejects other providers, and fails early with setup instructions
+  when a project still selects Eve's production default. Projects
+  must install `just-bash` as a production dependency and select it in
+  `agent/sandbox.ts` (or `agent/sandbox/sandbox.ts` when the directory exists).
+  Older Eve releases retain their existing default-to-`just-bash` behavior.
+- Pin the fresh-project instructions to Eve `0.83.0`, document microsandbox's
+  removal in that release, and distinguish session-directory carry from
+  cross-version session compatibility. A live Eve `0.82.0` → `0.83.0` update
+  using Cloudflare World `0.8.0` deployed successfully, but the old session
+  returned HTTP 409 `session_stranded` before sandbox access. New `0.83.0`
+  sessions ran bash. Start new sessions after this version upgrade; Eve's
+  source-level fallback for incompatible sandbox state was not reached.
+- Live-validated Eve `0.83.0` with explicit JustBash: local World multi-step
+  queue execution with two bash tools, and Cloudflare World `0.8.0` sandbox-file
+  carry plus a delayed durable queued task completing after a same-version
+  skill update. Postgres was not checked on this Eve release; the prior proof
+  database expired and its environment file was deleted.
 
 ## 0.8.0 — 2026-10-22
 

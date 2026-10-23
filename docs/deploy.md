@@ -31,11 +31,11 @@ Before deploying, confirm:
 - No competing package-manager lockfiles are present.
 - The matching dependencies are installed and `node_modules/.bin/eve` resolves
   to the project-local Eve package.
-- The project declares `just-bash` as a production dependency (Eve `^3.1.0`;
-  for example `just-bash: "3.4.2"`). Eve's default sandbox falls back to
-  `just-bash` inside Eden's isolated builder, which has no Docker daemon or
-  `/dev/kvm`; without the declaration `eve build` fails with
-  `Cannot find package 'just-bash'`.
+- The project declares `just-bash` as a production dependency
+  (`npm add just-bash` or `pnpm add just-bash`).
+- Eve `0.83.0` and later explicitly select `JustBashSandbox` using the
+  [sandbox setup](#sandbox-setup) below. The production default no longer
+  falls back to `just-bash`; Eden's builder has no Docker daemon.
 - Every provider, credential, database, external API, and Workflow World
   required by the Eve project is reachable from Cloudflare.
 
@@ -58,6 +58,38 @@ npm dependency lifecycle scripts do not run. Mixed lockfiles, Bun lockfiles,
 and native Windows are not supported. `.npmrc` is excluded from build layers;
 private registries and installs that need project `.npmrc` configuration are
 unsupported.
+
+### Sandbox setup
+
+Eden supports only `just-bash`. Add it as a production dependency and keep
+the lockfile in sync:
+
+```sh
+npm install just-bash
+# For a pnpm project: pnpm add just-bash
+```
+
+On Eve `0.83.0` and later, create or update `agent/sandbox.ts`. If
+`agent/sandbox/` already exists, use `agent/sandbox/sandbox.ts` instead:
+
+```ts
+import { defineSandbox } from 'eve/sandbox';
+import { JustBashSandbox } from 'eve/sandbox/just-bash';
+
+export const environment = JustBashSandbox.environment();
+export default defineSandbox(() => environment.open());
+```
+
+Eve `0.83.0`'s production default selects Vercel Sandbox or Docker when
+available, but neither is available in Eden's isolated builder. Its `just-bash`
+fallback is limited to development and evaluation. Eden rejects the production
+default early rather than substituting a provider. Docker, Vercel Sandbox,
+and other providers are unsupported, even when selected by a project module.
+Eve releases before `0.83.0` retain their existing default-to-`just-bash`
+behavior in Eden's isolated builder, where no Docker daemon is available and
+Eden hides `/dev/kvm` to avoid selecting the older microsandbox provider.
+Eve `0.83.0` removed microsandbox.
+
 
 ## First successful preview deployment
 
@@ -182,8 +214,8 @@ update instead of failing with `VAL-CLI-007-TARGET-CONFLICT`:
    the previous generation's registry repository (every tag, including
    snapshot tags).
 
-Because conversations survive the image change, a skill change no longer
-breaks existing sessions. Eve `0.83.0` and later fix Eve's
+A skill change need not break an existing just-bash session. Eve `0.83.0`
+and later stable releases fix Eve's
 [just-bash resume bug](https://github.com/vercel/eve/issues/4440) upstream
 (Eve would otherwise permanently refuse to resume a conversation after its
 sandbox template changes), and preflight reports
@@ -191,6 +223,20 @@ sandbox template changes), and preflight reports
 builder applies a temporary fix inside its throwaway build image only, and
 only when Eve's file matches a known checksum; on an unknown older version the
 deploy still succeeds and prints an `EVE_SANDBOX_RESUME_PATCH` warning instead.
+
+Eve `0.83.0` still stores just-bash sessions under
+`/workspace/.eve/sandbox-cache/just-bash/sessions`, so Eden carries the same
+directory. However, upgrading Eve is not the same as updating skills or agent
+code on the same Eve version. In a live `0.82.0` → `0.83.0` update using
+Cloudflare World `0.8.0`, deployment succeeded, but the old session returned
+HTTP 409 `session_stranded` before sandbox access. New `0.83.0` sessions could
+run bash. Plan to start new sessions after this upgrade; directory carry does
+not bypass Eve's runnable-owner version check.
+
+Separately, Eve's sandbox state protocol changed and its source can fall back
+to fresh sandbox state for an incompatible older session. That source behavior
+was not reached in the live upgrade: neither a fresh sandbox nor a sandbox
+resume error was observed. See the [recorded upgrade result](./eve-compatibility.md#eve-0820-to-0830-live-upgrade-2026-10-23).
 
 The summary prints `✓ updated <name>` (in `--json`, `deployment.operation` is
 `update`). A target that exists but isn't provably Eden's still fails with
@@ -388,6 +434,11 @@ the Postgres World
 (`@workflow/world-postgres`) end to end: a pending tool approval survived a
 full `eden destroy` + `eden deploy` container replacement. This section is
 the tested recipe; other durable Worlds are project-owned and untested here.
+
+That result is historical, not a new Eve `0.83.0` Postgres validation. The
+database used for those proof notes has expired and its environment file was
+deleted; the notes do not provide a reachable database or reusable credentials.
+Use a current project-owned database and environment file for a new run.
 
 Any Postgres reachable from Cloudflare works — for example a Neon project or
 a Supabase project. Cloudflare itself has no hosted Postgres; the database
