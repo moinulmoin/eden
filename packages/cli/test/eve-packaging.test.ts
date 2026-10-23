@@ -261,7 +261,7 @@ describe("Eve project snapshot/build boundary", () => {
     const root = await createRoot("eden-eve-sandbox-locked-");
     await writeProject(root, { packageJson: JSON.stringify({
       name: "eve-fixture",
-      dependencies: { eve: ">=0.68.0" },
+      dependencies: { eve: "^0.82.0" },
     }) });
     if (manager === "npm") {
       await writeFile(join(root, "package-lock.json"), JSON.stringify({
@@ -273,7 +273,7 @@ importers:
   .:
     dependencies:
       eve:
-        specifier: '>=0.68.0'
+        specifier: ^0.82.0
         version: 0.83.0(zod@4.5.4)
 `);
     }

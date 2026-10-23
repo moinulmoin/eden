@@ -13,7 +13,10 @@
   provider, rejects other providers, and fails early with setup instructions
   when a project still selects Eve's production default. Projects
   must install `just-bash` as a production dependency and select it in
-  `agent/sandbox.ts` (or `agent/sandbox/sandbox.ts` when the directory exists).
+  `agent/sandbox.ts` or `agent/sandbox/sandbox.ts` (any source extension Eve
+  accepts). If the source check cannot recognize the module, for example
+  because it imports the environment from another file, Eden checks after
+  `eve build` that a just-bash sandbox template was prepared instead.
   Older Eve releases retain their existing default-to-`just-bash` behavior.
 - Pin the fresh-project instructions to Eve `0.83.0` and document
   microsandbox's removal in that release.

@@ -59,8 +59,8 @@ fallback runs against the same test budget.
 Eve `0.83.0` removed microsandbox and changed `DefaultSandbox`: production no
 longer falls back to `just-bash`; that fallback is only for development and
 evaluation. Eden has no nested Docker daemon, so install `just-bash` as a
-production dependency and explicitly select it in `agent/sandbox.ts`, or
-`agent/sandbox/sandbox.ts` if the project already has `agent/sandbox/`:
+production dependency and explicitly select it in `agent/sandbox.ts` (or
+`agent/sandbox/sandbox.ts`; use one, not both):
 
 ```ts
 import { defineSandbox } from 'eve/sandbox';

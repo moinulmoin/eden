@@ -403,11 +403,26 @@ export function eveIncludesSandboxResumeFix(version: unknown): boolean {
   return typeof version === "string" && !/^\d+\.\d+\.\d+-/u.test(version);
 }
 
+/** Eve 0.83.0 and later no longer fall back to just-bash in production builds. */
+function eveRequiresExplicitJustBash(version: unknown): boolean {
+  const release = parseEveRelease(version);
+  return release !== null && (release[0] > 0 || release[1] >= 83);
+}
+
+/** Eve maps either path, with any source extension, to its single sandbox slot. */
+const EVE_SANDBOX_MODULE_PATHS = ["agent/sandbox", "agent/sandbox/sandbox"].flatMap((base) =>
+  ["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx"].map((extension) => `${base}.${extension}`));
+
+function justBashRemediation(command: string, path: string): string {
+  return `Run ${command} (production dependency), then create or replace ${path} with:\nimport { defineSandbox } from 'eve/sandbox';\nimport { JustBashSandbox } from 'eve/sandbox/just-bash';\nexport const environment = JustBashSandbox.environment();\nexport default defineSandbox(() => environment.open());\nCommit the module, package.json, and updated lockfile, then retry eden preflight. See docs/deploy.md. Do not set EVE_DEV.`;
+}
+
 /**
- * Eve 0.83's DefaultSandbox has no provider in Eden's isolated builder:
- * production no longer falls back to JustBash when Docker is unavailable.
- * This is a source-level compatibility hint, not an execution of user code;
- * the resolved installed version is checked again after the frozen build.
+ * Early, source-level rejection of sandbox setups that cannot work in Eden's
+ * isolated builder: a native provider named in the sandbox module, or, on Eve
+ * 0.83.0 and later, DefaultSandbox (no module, or one that names it without
+ * JustBash). Anything it cannot recognize is left to
+ * checkPreparedJustBashTemplate, which inspects what `eve build` produced.
  */
 export async function checkEveSandboxProvider(
   projectRoot: string,
@@ -438,40 +453,62 @@ export async function checkEveSandboxProvider(
     : undefined;
   const version = resolvedVersion ?? packages?.["node_modules/eve"]?.version ??
     pnpmVersion ?? installed.version ?? declared;
-  const release = parseEveRelease(version);
-  const requiresExplicit = release !== null &&
-    (release[0] > 0 || release[1] >= 83);
-  const directory = await lstat(join(projectRoot, "agent/sandbox"))
-    .catch(() => undefined);
-  const path = directory?.isDirectory() === true
-    ? "agent/sandbox/sandbox.ts"
-    : "agent/sandbox.ts";
-  const module = (await source(path)).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/gu, "");
+  const requiresExplicit = eveRequiresExplicitJustBash(version);
+  let path: string | undefined;
+  for (const candidate of EVE_SANDBOX_MODULE_PATHS) {
+    if ((await lstat(join(projectRoot, candidate)).catch(() => undefined))?.isFile() === true) {
+      path = candidate;
+      break;
+    }
+  }
+  const module = path === undefined
+    ? ""
+    : (await source(path)).replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/gu, "");
   const otherProvider = /\b(DefaultSandbox|DockerSandbox|VercelSandbox|VmSandbox|VMSandbox)\b/u
     .exec(module)?.[1];
   const justBash = /import\s*\{[^}]*?\bJustBashSandbox(?:\s+as\s+(\w+))?\s*(?:,|\})[^;]*?from\s*["']eve\/sandbox\/just-bash["']/u
     .exec(module);
   const binding = justBash?.[1] ?? "JustBashSandbox";
   const explicit = justBash !== null &&
-    new RegExp(`\\b${binding}\\s*\\.\\s*environment\\s*\\(`, "u").test(module) &&
-    /\bexport\s+default\b/u.test(module);
-  if (explicit && otherProvider === undefined) return undefined;
-  if (!requiresExplicit && (module.trim() === "" || otherProvider === "DefaultSandbox")) {
-    return undefined;
-  }
+    new RegExp(`\\b${binding}\\s*\\.\\s*environment\\s*\\(`, "u").test(module);
+  const native = otherProvider !== undefined && otherProvider !== "DefaultSandbox";
+  const usesDefault = path === undefined || (otherProvider === "DefaultSandbox" && !explicit);
+  if (!native && !(requiresExplicit && usesDefault)) return undefined;
+  const target = path ?? "agent/sandbox.ts";
   const command = typeof manifest.packageManager === "string" &&
       manifest.packageManager.startsWith("pnpm@")
     ? "pnpm add just-bash"
     : "npm install just-bash";
   return new EvePackagingError({
     code: "EVE_SANDBOX_PROVIDER",
-    subject: path,
-    reason: otherProvider === undefined || otherProvider === "DefaultSandbox"
-      ? requiresExplicit
-        ? `Eve ${String(version)} requires an explicit JustBash sandbox in ${path} on Eden; DefaultSandbox has no provider in Eden's isolated builder because production builds do not fall back to just-bash.`
-        : `${path} does not select a supported JustBash environment; Eden cannot run custom or native sandbox providers.`
-      : `${path} selects ${otherProvider}, which Eden does not support; use explicit JustBash instead.`,
-    remediation: `Run ${command} (production dependency), then create or replace ${path} with:\nimport { defineSandbox } from 'eve/sandbox';\nimport { JustBashSandbox } from 'eve/sandbox/just-bash';\nexport const environment = JustBashSandbox.environment();\nexport default defineSandbox(() => environment.open());\nCommit the module, package.json, and updated lockfile, then retry eden preflight. See docs/deploy.md. Do not set EVE_DEV.`,
+    subject: target,
+    reason: native
+      ? `${target} selects ${otherProvider}, which Eden does not support; use explicit JustBash instead.`
+      : path === undefined
+        ? `Eve ${String(version)} has no sandbox module, so it uses DefaultSandbox, which has no provider in Eden's isolated builder: production builds no longer fall back to just-bash.`
+        : `${target} selects DefaultSandbox, which has no provider in Eden's isolated builder on Eve ${String(version)}: production builds no longer fall back to just-bash.`,
+    remediation: justBashRemediation(command, target),
+  });
+}
+
+/**
+ * Ground truth after `eve build`: on Eve 0.83.0 and later an agent whose
+ * sandbox resolved to no provider prepares no template and would fail to open
+ * its sandbox on Cloudflare, however its sandbox module is written.
+ */
+async function checkPreparedJustBashTemplate(
+  snapshotRoot: string,
+  version: string,
+): Promise<EvePackagingError | undefined> {
+  if (!eveRequiresExplicitJustBash(version)) return undefined;
+  const templatesPath = `${EVE_SANDBOX_CACHE_ROOT}/just-bash/templates`;
+  const templates = await readdir(join(snapshotRoot, templatesPath)).catch(() => []);
+  if (templates.length > 0) return undefined;
+  return new EvePackagingError({
+    code: "EVE_SANDBOX_PROVIDER",
+    subject: templatesPath,
+    reason: `Eve ${version} built no just-bash sandbox template, so the agent's sandbox would fail to open on Cloudflare; its sandbox module does not resolve to JustBash.`,
+    remediation: justBashRemediation("npm install just-bash (or pnpm add just-bash)", "agent/sandbox.ts"),
   });
 }
 
@@ -2855,6 +2892,8 @@ export async function buildEveProjectSnapshot(
     const sandboxResumePatch = await detectEveSandboxResumePatch(snapshotRoot);
     const output = await scanGeneratedOutput(snapshotRoot);
     const sandboxCache = await scanGeneratedSandboxCache(snapshotRoot);
+    const preparedTemplate = await checkPreparedJustBashTemplate(snapshotRoot, eve.version);
+    if (preparedTemplate !== undefined) throw preparedTemplate;
     await assertGeneratedTreesExcludeSecrets(snapshotRoot);
     const snapshotSourceDigest = await snapshotDigest(snapshotRoot);
     const runtimeManifestPath = join(generationRoot, "runtime-manifest.json");

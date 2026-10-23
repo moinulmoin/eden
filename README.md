@@ -125,8 +125,8 @@ npm pkg set dependencies.eve="0.83.0"
 npm add just-bash
 ```
 
-Explicitly select the supported sandbox in `agent/sandbox.ts`. If the project
-already has an `agent/sandbox/` directory, use `agent/sandbox/sandbox.ts` instead:
+Explicitly select the supported sandbox in `agent/sandbox.ts` (Eve also accepts
+`agent/sandbox/sandbox.ts`; use one, not both):
 
 ```ts
 import { defineSandbox } from 'eve/sandbox';

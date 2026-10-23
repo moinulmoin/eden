@@ -411,9 +411,14 @@ Eve <version> requires an explicit JustBash sandbox in <path> on Eden; DefaultSa
 ```
 
 Follow the [sandbox setup](./deploy.md#sandbox-setup): install `just-bash` as a
-production dependency and define the module in `agent/sandbox.ts`, or
-`agent/sandbox/sandbox.ts` when the directory already exists. Commit the module,
-manifest, and updated lockfile, then retry `eden preflight`. Do not set `EVE_DEV`.
+production dependency and define the module in `agent/sandbox.ts` (or
+`agent/sandbox/sandbox.ts`, not both). Commit the module, manifest, and updated
+lockfile, then retry `eden preflight`. Do not set `EVE_DEV`.
+
+If the message says Eve `built no just-bash sandbox template`, the sandbox
+module passed the source check but `eve build` did not resolve it to JustBash,
+for example because a helper file it imports returns `DefaultSandbox`. Select
+`JustBashSandbox` as above.
 
 A module selecting Docker, Vercel Sandbox, or another provider fails with the
 same diagnostic and names the selected provider. A sandbox Dockerfile does not

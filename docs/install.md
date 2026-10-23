@@ -100,8 +100,8 @@ The Eve project must contain all of the following at its selected root:
 - a project-local Eve executable resolved through `node_modules/.bin/eve`
 - `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`)
 - on Eve `0.83.0` and later, an explicit `JustBashSandbox` selection in
-  `agent/sandbox.ts` (or `agent/sandbox/sandbox.ts` when `agent/sandbox/`
-  exists); follow the [complete setup](./deploy.md#sandbox-setup)
+  `agent/sandbox.ts` (or `agent/sandbox/sandbox.ts`); follow the
+  [complete setup](./deploy.md#sandbox-setup)
 - the providers, databases, Workflow World, credentials, and external services
   that the Eve application already requires
 
