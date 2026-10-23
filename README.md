@@ -224,10 +224,11 @@ Eden deploys; your Eve project still owns its:
   microsandbox applies only to older Eve releases; Eve `0.83.0` removed it.
 - **State:** container disk survives sleep, and updates carry every
   conversation's files (up to 1 GiB compressed) through Durable Object storage.
-  **Eve `0.82.0` → `0.83.0` upgrades do not preserve usable existing sessions:**
-  a live Cloudflare World run returned HTTP 409 `session_stranded` on the old
-  session after a successful update, before sandbox access. Start a new session
-  after that upgrade; carrying its files does not bypass Eve's version check.
+  **Changing the Eve version ends existing sessions:** Eve refuses to continue
+  a session on a different Eve version, so after an Eve upgrade old sessions
+  return HTTP 409 `session_stranded` (observed live on `0.82.0` → `0.83.0`)
+  and users start new ones. Skill and code updates on the same Eve version
+  keep sessions.
   Local Workflow World state resets on update, and Eden warns about it. To keep
   in-flight runs across updates, use the Postgres World (any direct, unpooled
   Postgres); see [docs/deploy.md](docs/deploy.md#durable-state-postgres-world).

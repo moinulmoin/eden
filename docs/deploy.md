@@ -226,17 +226,14 @@ deploy still succeeds and prints an `EVE_SANDBOX_RESUME_PATCH` warning instead.
 
 Eve `0.83.0` still stores just-bash sessions under
 `/workspace/.eve/sandbox-cache/just-bash/sessions`, so Eden carries the same
-directory. However, upgrading Eve is not the same as updating skills or agent
-code on the same Eve version. In a live `0.82.0` → `0.83.0` update using
-Cloudflare World `0.8.0`, deployment succeeded, but the old session returned
-HTTP 409 `session_stranded` before sandbox access. New `0.83.0` sessions could
-run bash. Plan to start new sessions after this upgrade; directory carry does
-not bypass Eve's runnable-owner version check.
-
-Separately, Eve's sandbox state protocol changed and its source can fall back
-to fresh sandbox state for an incompatible older session. That source behavior
-was not reached in the live upgrade: neither a fresh sandbox nor a sandbox
-resume error was observed. See the [recorded upgrade result](./eve-compatibility.md#eve-0820-to-0830-live-upgrade-2026-10-23).
+directory. Changing the Eve version is different from updating skills or agent
+code: Eve refuses to continue a session on a different Eve version unless the
+World routes each run back to the deployment that started it, which Vercel
+does and Eden's Cloudflare World does not. In a live `0.82.0` → `0.83.0`
+update, deployment succeeded, the old session returned HTTP 409
+`session_stranded` before sandbox access, and new sessions ran bash. Plan to
+start new sessions after any Eve upgrade. See the
+[recorded upgrade result](./eve-compatibility.md#eve-0820-to-0830-live-upgrade-2026-10-23).
 
 The summary prints `✓ updated <name>` (in `--json`, `deployment.operation` is
 `update`). A target that exists but isn't provably Eden's still fails with

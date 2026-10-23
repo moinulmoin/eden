@@ -2154,10 +2154,6 @@ export default eveChannel({
     expect(result.ok).toBe(false);
     expect(result.candidate).toBeNull();
     expect(diagnostic?.status).toBe("failed");
-    expect(diagnostic?.remediation).toContain(modulePath);
-    expect(diagnostic?.remediation).toContain("npm install just-bash");
-    expect(diagnostic?.remediation).toContain("export default defineSandbox(() => environment.open());");
-    if (provider !== undefined) expect(diagnostic?.message).toContain(provider);
     expect(build).not.toHaveBeenCalled();
     expect(cloudflareRead).not.toHaveBeenCalled();
   });

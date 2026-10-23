@@ -15,18 +15,19 @@
   must install `just-bash` as a production dependency and select it in
   `agent/sandbox.ts` (or `agent/sandbox/sandbox.ts` when the directory exists).
   Older Eve releases retain their existing default-to-`just-bash` behavior.
-- Pin the fresh-project instructions to Eve `0.83.0`, document microsandbox's
-  removal in that release, and distinguish session-directory carry from
-  cross-version session compatibility. A live Eve `0.82.0` → `0.83.0` update
-  using Cloudflare World `0.8.0` deployed successfully, but the old session
-  returned HTTP 409 `session_stranded` before sandbox access. New `0.83.0`
-  sessions ran bash. Start new sessions after this version upgrade; Eve's
-  source-level fallback for incompatible sandbox state was not reached.
+- Pin the fresh-project instructions to Eve `0.83.0` and document
+  microsandbox's removal in that release.
+- Document that changing the Eve version ends existing sessions. Eve refuses
+  to continue a session on a different Eve version unless the World routes
+  each run back to the deployment that started it, which Vercel does and
+  Eden's Cloudflare World does not (the check is in Eve `0.82.0` and
+  `0.83.0`). A live Eve `0.82.0` → `0.83.0` update deployed successfully; the
+  old session then returned HTTP 409 `session_stranded` and new sessions ran
+  bash. Skill and code updates on the same Eve version keep sessions.
 - Live-validated Eve `0.83.0` with explicit JustBash: local World multi-step
   queue execution with two bash tools, and Cloudflare World `0.8.0` sandbox-file
   carry plus a delayed durable queued task completing after a same-version
-  skill update. Postgres was not checked on this Eve release; the prior proof
-  database expired and its environment file was deleted.
+  skill update. Postgres World was not checked on this Eve release.
 
 ## 0.8.0 — 2026-10-22
 

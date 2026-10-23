@@ -44,8 +44,8 @@ the setup, including the sandbox module.
 
 Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, `0.82.0`,
 and `0.83.0`. The `0.83.0` Cloudflare World run preserved sandbox files and a
-queued task across a same-version skill update. Upgrading from `0.82.0` to
-`0.83.0` requires new sessions; the old session returned `session_stranded`. See
+queued task across a same-version skill update. Changing the Eve version ends
+existing sessions (they return `session_stranded`); start new ones. See
 [Eve compatibility](./eve-compatibility.md).
 
 ### Are npm, Bun, or Windows supported?

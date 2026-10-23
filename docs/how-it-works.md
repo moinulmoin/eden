@@ -168,11 +168,11 @@ builder applies a temporary fix inside the throwaway build container only,
 and only when the binding matches a recognized checksum. An unknown older
 binding is left unchanged and prints an `EVE_SANDBOX_RESUME_PATCH` warning.
 
-Eve `0.83.0` keeps the same just-bash sessions directory, but changes the
-sandbox state protocol and enforces a session-owner Eve version check. A live
-`0.82.0` → `0.83.0` update returned HTTP 409 `session_stranded` on the old
-session before sandbox access; start a new session after that version upgrade.
-This is distinct from updating skills or agent code on the same Eve version.
+Eve `0.83.0` keeps the same just-bash sessions directory. Changing the Eve
+version still ends existing sessions: Eve only continues a session on the Eve
+version that started it, so after an upgrade old sessions return HTTP 409
+`session_stranded` (observed live on `0.82.0` → `0.83.0`). Updating skills or
+agent code on the same Eve version keeps sessions.
 
 On Vercel each run stays on the deployment that started it. Off Vercel there
 is no pinning: sessions, pending approvals, and sleeping steps that started

@@ -93,13 +93,13 @@ Eden deployed the update successfully. A POST to the same session returned:
 {"code":"session_stranded","error":"This session is no longer available.","ok":false,"eveVersion":"0.82.0"}
 ```
 
-The response was HTTP 409 and occurred before sandbox access. Neither a fresh
-sandbox nor a sandbox resume error was observed. Eve `0.83.0`'s
-`execution/session-inbox/runnable-owner.js` checks that the owner's
-`EVE_VERSION_ATTRIBUTE` equals the installed Eve version in
-`isRunnableOwnerRun`; `routesToOwnerDeployment` applies only when
-`deploymentAffinity` is true. Carrying sandbox files does not bypass that
-session-owner check. Start a new session after this version upgrade.
+The response was HTTP 409 and occurred before sandbox access. Eve's
+`execution/session-inbox/runnable-owner.js` (`isRunnableOwnerRun`, present in
+both `0.82.0` and `0.83.0`) only runs a session whose recorded Eve version
+equals the installed one, unless the World reports `deploymentAffinity`, which
+Eden's Cloudflare World does not. So any Eve version change ends existing
+sessions; carrying sandbox files does not change that. Start new sessions
+after an Eve upgrade.
 
 A new `0.83.0` Cloudflare World session ran bash successfully. A separate live
 local World `0.83.0` run passed multi-step queue execution with two bash tools.
