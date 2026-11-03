@@ -319,12 +319,20 @@ function parseEnvironmentText(
   return Object.freeze(values);
 }
 
+/**
+ * Values shorter than this are not masked: substring masking of `1`, `8`, or
+ * `eve` garbled every message and matched Eden's own random revision IDs,
+ * failing deploys. Credentials are longer; short values are still delivered
+ * only through the protected channels, just not masked if a tool echoes them.
+ */
+const MIN_REDACTED_RUNTIME_VALUE_LENGTH = 8;
+
 class EveRuntimeRedactionRegistry {
   readonly handle = `eve-runtime-redaction-${randomUUID()}`;
   private readonly values = new Set<string>();
 
   register(value: string): void {
-    if (value.length > 0) this.values.add(value);
+    if (value.length >= MIN_REDACTED_RUNTIME_VALUE_LENGTH) this.values.add(value);
   }
 
   redact(value: string): string {

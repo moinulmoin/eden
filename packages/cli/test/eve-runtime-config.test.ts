@@ -419,6 +419,34 @@ describe("Eve runtime configuration", () => {
     config.dispose();
   });
 
+  test("deploys an env file with a short setting beside a credential", async () => {
+    const root = await createRoot();
+    const apiKey = "sk-test-0123456789abcdef";
+    const envPath = await writeEnv(root, `AI_GATEWAY_API_KEY=${apiKey}\nWORKFLOW_SPEC_VERSION=8\n`);
+    const config = await readEveRuntimeConfig(envPath);
+    // This handle contains "8", like most random revision IDs do.
+    const handle = "eve-runtime-handle-00000000-0000-4000-8000-000000000000";
+    let stored: Readonly<Record<string, string>> | undefined;
+
+    const injection = await prepareEveRuntimeInjection(config, {
+      mode: "deploy",
+      targetId: "exact-target",
+      protectedStore: {
+        async put(request) {
+          stored = { ...request.values };
+          return { revision: request.revision, handle };
+        },
+      },
+    });
+
+    expect(injection.protectedHandle).toBe(handle);
+    expect(stored).toEqual({ AI_GATEWAY_API_KEY: apiKey, WORKFLOW_SPEC_VERSION: "8" });
+    const output = redactEveRuntimeOutput(`handle ${handle} key ${apiKey}`);
+    expect(output).toContain(handle);
+    expect(output).not.toContain(apiKey);
+    config.dispose();
+  });
+
   test("returns a typed failure for malformed protected-store metadata", async () => {
     const root = await createRoot();
     const envPath = await writeEnv(root, "OPAQUE_VALUE=value\n");
