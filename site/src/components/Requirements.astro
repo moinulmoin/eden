@@ -16,6 +16,7 @@ const needs: { text: string; command?: string; code?: string }[] = [
   { text: "Docker or OrbStack that builds linux/amd64" },
   { text: "An Eve project with its root lockfile: npm, or pnpm with an exact pin", code: "package-lock.json" },
   { text: "just-bash as a production dependency", command: "npm install just-bash" },
+  { text: "On Eve 0.83 and later, JustBash selected in agent/sandbox.ts", code: "JustBashSandbox.environment()" },
 ];
 
 const limits = [
@@ -72,7 +73,7 @@ const limits = [
         <div class="req__head">
           <Info class="icon" size={18} aria-hidden="true" />
           <h3>Good to know</h3>
-          <span class="mono">in 0.8.0</span>
+          <span class="mono">in 0.9.0</span>
         </div>
         <ul>
           {
