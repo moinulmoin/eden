@@ -43,8 +43,9 @@ the setup, including the sandbox module.
 ### Which Eve versions work?
 
 Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, `0.82.0`,
-and `0.83.0`. The `0.83.0` Cloudflare World run preserved sandbox files and a
-queued task across a same-version skill update. Changing the Eve version ends
+`0.83.0`, `0.91.0`, and `1.0.0-rc.3`. The `0.83.0` Cloudflare World run
+preserved sandbox files and a queued task across a same-version skill update.
+Changing the Eve version ends
 existing sessions (they return `session_stranded`); start new ones. See
 [Eve compatibility](./eve-compatibility.md).
 

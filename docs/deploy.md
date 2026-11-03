@@ -69,8 +69,9 @@ npm install just-bash
 # For a pnpm project: pnpm add just-bash
 ```
 
-On Eve `0.83.0` and later, create or update `agent/sandbox.ts` (Eve also
-accepts `agent/sandbox/sandbox.ts`; use one, not both):
+On Eve `0.83.0` and later, create or update `agent/sandbox.ts`, or
+`agent/sandbox/sandbox.ts` if the project has an `agent/sandbox/` folder (Eve
+ignores or rejects `agent/sandbox.ts` next to that folder):
 
 ```ts
 import { defineSandbox } from 'eve/sandbox';

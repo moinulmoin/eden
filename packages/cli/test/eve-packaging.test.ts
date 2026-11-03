@@ -1380,6 +1380,42 @@ export default defineSandbox(() => environment.open());
     });
   });
 
+  test("blocks an Eve 0.83 build that prepared no just-bash template though the sandbox module passed the source check", async () => {
+    const root = await createRoot("eden-eve-package-sandbox-unresolved-");
+    const artifacts = await createRoot("eden-eve-package-sandbox-unresolved-artifacts-");
+    await writeProject(root);
+    await mkdir(join(root, "agent"), { recursive: true });
+    // The provider hides in a helper, so only the build output shows what Eve selected.
+    await writeFile(join(root, "agent/sandbox.ts"), `import { defineSandbox } from 'eve/sandbox';
+import { environment } from './sandbox-env';
+export { environment };
+export default defineSandbox(() => environment.open());
+`);
+    await writeFile(join(root, "agent/sandbox-env.ts"), `import { DefaultSandbox } from 'eve/sandbox';
+export const environment = DefaultSandbox.environment();
+`);
+    const fakeDocker = await writeFakeDockerCommand(artifacts, { eveVersion: "0.83.0", sandboxCache: "absent" });
+    const builder = createDockerEveProjectBuilder({
+      nodeImage: {
+        reference: "node:24.17.0-bookworm-slim",
+        digest: `sha256:${"0".repeat(64)}`,
+      },
+      dockerCommand: fakeDocker.command,
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      returnCode: "EVE_SANDBOX_PROVIDER",
+      candidate: null,
+    });
+  });
+
   test("rejects a prepared native provider template with JustBash remediation", async () => {
     const root = await createRoot("eden-eve-package-sandbox-provider-");
     const artifacts = await createRoot("eden-eve-package-sandbox-provider-artifacts-");
@@ -1898,6 +1934,48 @@ describe("Eve sandbox-resume patch (eve#4440)", () => {
         value.id === "EVE_SANDBOX_RESUME_PATCH"
       ),
     ).toBe(false);
+  });
+
+  test.each([
+    { eveVersion: "0.83.0", outcome: "fixed" },
+    { eveVersion: "0.83.0-beta.1", outcome: "skipped" },
+  ])("reports Eve $eveVersion's unpatched just-bash binding as $outcome", async ({ eveVersion, outcome }) => {
+    const root = await createRoot("eden-eve-patch-fixed-");
+    const artifacts = await createRoot("eden-eve-patch-fixed-artifacts-");
+    await writeProject(root);
+    await mkdir(join(root, "agent"), { recursive: true });
+    await writeFile(join(root, "agent/sandbox.ts"), `import { defineSandbox } from 'eve/sandbox';
+import { JustBashSandbox } from 'eve/sandbox/just-bash';
+export const environment = JustBashSandbox.environment();
+export default defineSandbox(() => environment.open());
+`);
+    const { builder } = fakeBuilder(async (request) => {
+      await writeSuccessfulBuild(request);
+      await writeFile(
+        join(request.snapshotRoot, "node_modules/eve/package.json"),
+        JSON.stringify({ name: "eve", version: eveVersion, bin: "bin/eve.js" }),
+      );
+      await mkdir(dirname(join(request.snapshotRoot, bindingRelativePath)), { recursive: true });
+      await writeFile(
+        join(request.snapshotRoot, bindingRelativePath),
+        fixtureModule(EVE_JUST_BASH_RESUME_ORIGINAL),
+      );
+      const template = join(request.snapshotRoot, ".eve/sandbox-cache/just-bash/templates/7bc778099a3b436ce4ad98ba");
+      await mkdir(join(template, "fs/workspace"), { recursive: true });
+      await writeFile(join(template, "metadata.json"), `${JSON.stringify({ version: 1 })}\n`);
+    });
+
+    const result = await buildEveProjectSnapshot({
+      projectRoot: root,
+      artifactRoot: join(artifacts, "generation-one"),
+      builder,
+    });
+
+    expect(result.status).toBe("ready");
+    expect(result.sandboxResumePatch).toBe(outcome);
+    expect(result.checks.some((value) =>
+      value.id === "EVE_SANDBOX_RESUME_PATCH" && value.status === "pass"
+    )).toBe(outcome === "fixed");
   });
 
   interface ResumeFixture {

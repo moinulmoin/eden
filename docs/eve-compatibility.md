@@ -17,8 +17,9 @@ tested Eve line. Do not replace the exact Eve pin with `latest` in a release
 gate.
 
 Recorded Cloudflare launch gates also use separate fresh initializer projects,
-including Eve `0.81.0`, `0.82.0`, and `0.83.0` below. The current fresh-project
-instructions pin `0.83.0`. Keep the older fixture pin: it exercises the original
+including Eve `0.81.0`, `0.82.0`, `0.83.0`, `0.91.0`, and `1.0.0-rc.3` below.
+The current fresh-project instructions pin `0.91.0`. Keep the older fixture
+pin: it exercises the original
 prepared-artifact shape, while Eve
 `0.79.1` and later use the newer `templateKey` shape. See the
 [fresh-project setup](../README.md#starting-from-a-fresh-eve-project) for the
@@ -59,8 +60,8 @@ fallback runs against the same test budget.
 Eve `0.83.0` removed microsandbox and changed `DefaultSandbox`: production no
 longer falls back to `just-bash`; that fallback is only for development and
 evaluation. Eden has no nested Docker daemon, so install `just-bash` as a
-production dependency and explicitly select it in `agent/sandbox.ts` (or
-`agent/sandbox/sandbox.ts`; use one, not both):
+production dependency and explicitly select it in `agent/sandbox.ts`, or in
+`agent/sandbox/sandbox.ts` when an `agent/sandbox/` folder exists:
 
 ```ts
 import { defineSandbox } from 'eve/sandbox';
@@ -133,6 +134,22 @@ The separate local World `0.83.0` run passed multi-step queue execution with
 two bash tools. Postgres was not checked on `0.83.0`; the earlier proof
 database expired and its environment file was deleted.
 
+## Eve 0.91.0 and 1.0.0-rc.3 (2026-11-04)
+
+Fresh `eve init` projects on both releases, with `just-bash`, an explicit
+`JustBashSandbox` module, a bearer authenticator, and Cloudflare World `0.8.0`,
+passed preflight, deployed, and ran a bash tool call in a live session
+(`EDEN_RC3_BASH_OK` and `EDEN_091_BASH_OK`, exit code 0, turn completed). The
+`0.91.0` env file also held `WORKFLOW_SPEC_VERSION=8` and a one-character value,
+which failed deploys before 0.9.0.
+
+Eve `1.0.0-rc.3` creates Workflow spec 9 runs by default, which need a World
+capability Eden's Cloudflare World does not declare. That did not break the
+live run: Eve creates runs at the World's declared spec version (8). Eve
+`0.90.0` and later answer `GET /eve/v1/info` with 403 for non-operator
+principals; Eden does not call it. Without a sandbox module, released Eden 0.8.0
+deployed a `1.0.0-rc.3` project whose bash call then failed with
+`DefaultSandbox has no sandbox provider for this build`.
 
 ## Sandbox resume compatibility
 

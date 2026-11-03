@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-11-04
+
+Eden 0.8.0 does not work with a fresh project on Eve `0.83.0` or later,
+including `npx eve init` today (Eve `1.0.0-rc.3`): it deploys, but the agent's
+sandbox fails to open ("DefaultSandbox has no sandbox provider for this
+build"). Upgrade to 0.9.0 and add the sandbox module below.
+
+### Fixed
+
+- `eden deploy` no longer fails with "The protected Eve runtime store returned
+  value-bearing metadata." when the env file holds a short value such as
+  `WORKFLOW_SPEC_VERSION=8` or `FLAG=1`. Eden masked every env value in its
+  output, so a short value matched its own random revision IDs and garbled
+  messages. Values shorter than 8 characters are no longer masked; they are
+  still delivered only through Cloudflare secrets.
+- When `eve build` fails, preflight now shows the error Eve printed (the last
+  20 lines, after `Eve reported:`) instead of only "The project-local Eve build
+  failed".
 
 ### Changed
 
@@ -13,13 +30,16 @@
   provider, rejects other providers, and fails early with setup instructions
   when a project still selects Eve's production default. Projects
   must install `just-bash` as a production dependency and select it in
-  `agent/sandbox.ts` or `agent/sandbox/sandbox.ts` (any source extension Eve
-  accepts). If the source check cannot recognize the module, for example
-  because it imports the environment from another file, Eden checks after
-  `eve build` that a just-bash sandbox template was prepared instead.
+  `agent/sandbox.ts`, or in `agent/sandbox/sandbox.ts` when an `agent/sandbox/`
+  folder exists (any source extension Eve accepts). Preflight rejects
+  `agent/sandbox.ts` next to an `agent/sandbox/` folder: Eve 0.83–0.86 silently
+  ignores that module and 0.87 and later fail the build. If the source check
+  cannot recognize the module, for example because it imports the environment
+  from another file, Eden checks after `eve build` that a just-bash sandbox
+  template was prepared instead.
   Older Eve releases retain their existing default-to-`just-bash` behavior.
-- Pin the fresh-project instructions to Eve `0.83.0` and document
-  microsandbox's removal in that release.
+- Pin the fresh-project instructions to Eve `0.91.0` and document
+  microsandbox's removal in Eve `0.83.0`.
 - Document that changing the Eve version ends existing sessions. Eve refuses
   to continue a session on a different Eve version unless the World routes
   each run back to the deployment that started it, which Vercel does and
@@ -30,7 +50,9 @@
 - Live-validated Eve `0.83.0` with explicit JustBash: local World multi-step
   queue execution with two bash tools, and Cloudflare World `0.8.0` sandbox-file
   carry plus a delayed durable queued task completing after a same-version
-  skill update. Postgres World was not checked on this Eve release.
+  skill update. Also live-validated Eve `0.91.0` and `1.0.0-rc.3` with Cloudflare
+  World `0.8.0`: deploy, a session, and a bash tool call. Postgres World was not
+  checked on these Eve releases.
 
 ## 0.8.0 — 2026-10-22
 

@@ -112,21 +112,23 @@ installs that require project `.npmrc` configuration are not supported.
 ### Starting from a fresh Eve project
 
 Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, `0.82.0`,
-and `0.83.0`, including a fresh npm project on `0.82.0` and sandbox-file carry
-plus a queued task across a same-version skill update on `0.83.0`.
-These recorded live runs
+`0.83.0`, `0.91.0`, and `1.0.0-rc.3`, including a fresh npm project on `0.82.0`
+and sandbox-file carry plus a queued task across a same-version skill update on
+`0.83.0`. These recorded live runs
 are listed in [Eve compatibility](./docs/eve-compatibility.md). To start a new
-project on Eve `0.83.0`:
+project on Eve `0.91.0`, the latest stable release:
 
 ```sh
-npx eve@0.83.0 init my-agent --non-interactive
+npx eve@0.91.0 init my-agent --non-interactive
 cd my-agent
-npm pkg set dependencies.eve="0.83.0"
+npm pkg set dependencies.eve="0.91.0"
 npm add just-bash
 ```
 
-Explicitly select the supported sandbox in `agent/sandbox.ts` (Eve also accepts
-`agent/sandbox/sandbox.ts`; use one, not both):
+Explicitly select the supported sandbox in `agent/sandbox.ts`. If the project
+has an `agent/sandbox/` folder (for example `agent/sandbox/workspace/`), put
+the module in `agent/sandbox/sandbox.ts` instead; Eve ignores or rejects
+`agent/sandbox.ts` next to that folder:
 
 ```ts
 import { defineSandbox } from 'eve/sandbox';

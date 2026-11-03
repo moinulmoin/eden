@@ -409,7 +409,11 @@ function eveRequiresExplicitJustBash(version: unknown): boolean {
   return release !== null && (release[0] > 0 || release[1] >= 83);
 }
 
-/** Eve maps either path, with any source extension, to its single sandbox slot. */
+/**
+ * Eve reads its sandbox module from either path, with any source extension.
+ * When `agent/sandbox/` exists only the nested module counts: Eve 0.83–0.86
+ * silently ignores `agent/sandbox.ts` and 0.87+ fails the build.
+ */
 const EVE_SANDBOX_MODULE_PATHS = ["agent/sandbox", "agent/sandbox/sandbox"].flatMap((base) =>
   ["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx"].map((extension) => `${base}.${extension}`));
 
@@ -454,6 +458,8 @@ export async function checkEveSandboxProvider(
   const version = resolvedVersion ?? packages?.["node_modules/eve"]?.version ??
     pnpmVersion ?? installed.version ?? declared;
   const requiresExplicit = eveRequiresExplicitJustBash(version);
+  const sandboxDirectory = (await lstat(join(projectRoot, "agent/sandbox")).catch(() => undefined))
+    ?.isDirectory() === true;
   let path: string | undefined;
   for (const candidate of EVE_SANDBOX_MODULE_PATHS) {
     if ((await lstat(join(projectRoot, candidate)).catch(() => undefined))?.isFile() === true) {
@@ -473,8 +479,11 @@ export async function checkEveSandboxProvider(
     new RegExp(`\\b${binding}\\s*\\.\\s*environment\\s*\\(`, "u").test(module);
   const native = otherProvider !== undefined && otherProvider !== "DefaultSandbox";
   const usesDefault = path === undefined || (otherProvider === "DefaultSandbox" && !explicit);
-  if (!native && !(requiresExplicit && usesDefault)) return undefined;
-  const target = path ?? "agent/sandbox.ts";
+  const shadowed = requiresExplicit && sandboxDirectory && path?.startsWith("agent/sandbox.") === true;
+  if (!native && !shadowed && !(requiresExplicit && usesDefault)) return undefined;
+  const target = shadowed || (path === undefined && sandboxDirectory)
+    ? "agent/sandbox/sandbox.ts"
+    : path ?? "agent/sandbox.ts";
   const command = typeof manifest.packageManager === "string" &&
       manifest.packageManager.startsWith("pnpm@")
     ? "pnpm add just-bash"
@@ -482,12 +491,16 @@ export async function checkEveSandboxProvider(
   return new EvePackagingError({
     code: "EVE_SANDBOX_PROVIDER",
     subject: target,
-    reason: native
+    reason: shadowed
+      ? `${String(path)} sits beside the agent/sandbox/ directory, where Eve ${String(version)} reads only agent/sandbox/sandbox.ts: Eve 0.83–0.86 ignores ${String(path)} and falls back to DefaultSandbox, and 0.87 and later fail the build.`
+      : native
       ? `${target} selects ${otherProvider}, which Eden does not support; use explicit JustBash instead.`
       : path === undefined
         ? `Eve ${String(version)} has no sandbox module, so it uses DefaultSandbox, which has no provider in Eden's isolated builder: production builds no longer fall back to just-bash.`
         : `${target} selects DefaultSandbox, which has no provider in Eden's isolated builder on Eve ${String(version)}: production builds no longer fall back to just-bash.`,
-    remediation: justBashRemediation(command, target),
+    remediation: shadowed
+      ? `Move ${String(path)} to agent/sandbox/sandbox.ts (delete it instead if agent/sandbox/sandbox.ts already exists), then retry eden preflight.`
+      : justBashRemediation(command, target),
   });
 }
 
@@ -508,7 +521,7 @@ async function checkPreparedJustBashTemplate(
     code: "EVE_SANDBOX_PROVIDER",
     subject: templatesPath,
     reason: `Eve ${version} built no just-bash sandbox template, so the agent's sandbox would fail to open on Cloudflare; its sandbox module does not resolve to JustBash.`,
-    remediation: justBashRemediation("npm install just-bash (or pnpm add just-bash)", "agent/sandbox.ts"),
+    remediation: justBashRemediation("npm install just-bash (or pnpm add just-bash)", "agent/sandbox.ts (agent/sandbox/sandbox.ts when agent/sandbox/ exists)"),
   });
 }
 
@@ -2403,20 +2416,38 @@ function classifyNpmInstallFailure(stderr: string): EvePackagingError | undefine
   });
 }
 
+/**
+ * The failing BuildKit step's own output (`#<step> <seconds> <line>`), last 20
+ * lines, so Eve's error reaches the user instead of a generic build failure.
+ */
+function failingDockerStepOutput(stderr: string): string | undefined {
+  const step = [...stderr.matchAll(/^#(\d+) ERROR:/gmu)].at(-1)?.[1];
+  if (step === undefined) return undefined;
+  const lines = [...stderr.matchAll(new RegExp(`^#${step} \\d+\\.\\d+ (.*)$`, "gmu"))]
+    .map((match) => (match[1] ?? "").trimEnd())
+    .filter((line) => line.length > 0)
+    .slice(-20);
+  if (lines.length === 0) return undefined;
+  const output = lines.join("\n");
+  return output.length > 2000 ? `…${output.slice(-2000)}` : output;
+}
+
 function classifyEveBuildFailure(stderr: string): EvePackagingError {
+  const output = failingDockerStepOutput(stderr);
+  const reported = output === undefined ? "" : `\nEve reported:\n${output}`;
   if (/\bjust-bash\b/u.test(stderr)) {
     return new EvePackagingError({
       code: "EVE_BUILD_FAILED",
       subject: "eve build",
-      reason: "The project-local Eve build failed inside the isolated Linux/amd64 builder because Eve's default sandbox needs just-bash where no Docker daemon or /dev/kvm exists.",
+      reason: `The project-local Eve build failed inside the isolated Linux/amd64 builder because Eve's default sandbox needs just-bash where no Docker daemon or /dev/kvm exists.${reported}`,
       remediation: "Declare just-bash as a production dependency of the Eve project, regenerate its package-manager lockfile, and retry.",
     });
   }
   return new EvePackagingError({
     code: "EVE_BUILD_FAILED",
     subject: "eve build",
-    reason: "The project-local Eve build failed inside the isolated Linux/amd64 builder.",
-    remediation: "Fix the project-local Eve build and retry without changing the authored project during packaging.",
+    reason: `The project-local Eve build failed inside the isolated Linux/amd64 builder.${reported}`,
+    remediation: "Fix the error Eve reported (run eve build locally to reproduce it) and retry.",
   });
 }
 

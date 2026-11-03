@@ -219,8 +219,8 @@ the project, then retry.
 Eden runs the project's own `eve build` inside an isolated Linux/amd64
 builder. When that build fails, the message is
 `The project-local Eve build failed inside the isolated Linux/amd64 builder.`
-Fix the project-local Eve build and retry without changing the authored
-project during packaging.
+followed by `Eve reported:` and the last lines Eve printed. Fix that error
+(running `eve build` locally usually reproduces it) and retry.
 
 The same check also carries the build-output problems, which report as
 `UNSUPPORTED_EVE_OUTPUT`:
@@ -411,9 +411,14 @@ Eve <version> requires an explicit JustBash sandbox in <path> on Eden; DefaultSa
 ```
 
 Follow the [sandbox setup](./deploy.md#sandbox-setup): install `just-bash` as a
-production dependency and define the module in `agent/sandbox.ts` (or
-`agent/sandbox/sandbox.ts`, not both). Commit the module, manifest, and updated
-lockfile, then retry `eden preflight`. Do not set `EVE_DEV`.
+production dependency and define the module in `agent/sandbox.ts`, or in
+`agent/sandbox/sandbox.ts` when an `agent/sandbox/` folder exists. Commit the
+module, manifest, and updated lockfile, then retry `eden preflight`. Do not set
+`EVE_DEV`.
+
+If the message says the module `sits beside the agent/sandbox/ directory`, move
+it to `agent/sandbox/sandbox.ts`: Eve 0.83–0.86 silently ignores it there and
+0.87 and later fail the build.
 
 If the message says Eve `built no just-bash sandbox template`, the sandbox
 module passed the source check but `eve build` did not resolve it to JustBash,
