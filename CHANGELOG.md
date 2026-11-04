@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-11-04
 
 Eve upgrades on the Cloudflare World no longer end existing conversations, and
 the agent's sandbox can no longer reach the World's internal API. Update both

@@ -20,10 +20,10 @@ const needs: { text: string; command?: string; code?: string }[] = [
 ];
 
 const limits = [
-  { icon: RefreshCw, text: "Updates reset workflow state by default", note: "Files survive sleep and updates; Postgres World keeps runs too" },
+  { icon: RefreshCw, text: "Updates reset workflow state by default", note: "Files survive sleep and updates; the Cloudflare World keeps sessions across Eve upgrades" },
   { icon: CalendarX, text: "Only 5-field cron schedules fire while it sleeps", note: "A Cloudflare Cron wakes the Container; others run while it's awake" },
   { icon: Terminal, text: "The sandbox is just-bash, not a Linux VM", note: "Files, grep, jq and curl work; python, git and npm don't" },
-  { icon: Box, text: "One Container instance (1/2 vCPU, 4 GiB)", note: "No horizontal scaling or custom domains yet" },
+  { icon: Box, text: "One Container instance (1/2 vCPU, 4 GiB)", note: "Plus older Eve versions until their sessions end; no horizontal scaling or custom domains yet" },
   { icon: Package, text: "npm and pnpm projects", note: "Dependency install scripts don't run on npm; Bun lockfiles and native Windows aren't supported yet" },
 ];
 ---
@@ -73,7 +73,7 @@ const limits = [
         <div class="req__head">
           <Info class="icon" size={18} aria-hidden="true" />
           <h3>Good to know</h3>
-          <span class="mono">in 0.9.0</span>
+          <span class="mono">in 0.10.0</span>
         </div>
         <ul>
           {
