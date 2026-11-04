@@ -26,6 +26,98 @@ const EVE_CLOUDFLARE_CONTAINERS_CA_PATH =
   "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
 const EVE_HOST_STALE_WORKER_REASON = "stale Worker version";
 
+interface EveDeploymentImage {
+  readonly image: string;
+  readonly generationId: string;
+  readonly runtimeRevisionHandle?: string;
+  readonly releaseId?: string;
+  readonly eveVersion?: string;
+  readonly affinityContract?: number;
+}
+
+function deploymentImages(env: EveHostContainerEnvironment): Record<string, EveDeploymentImage> {
+  const raw = env.EDEN_EVE_DEPLOYMENTS;
+  return typeof raw === "string" ? JSON.parse(raw) as Record<string, EveDeploymentImage> : {};
+}
+
+function deploymentInstance(env: EveHostContainerEnvironment, deploymentId: string, base = env.EVE_CONTAINER_INSTANCE_NAME): string {
+  if (typeof base !== "string") throw new Error("The Container instance identity is unavailable.");
+  // Existing runs used this identity before affinity was introduced.
+  return env.EDEN_EVE_DEPLOYMENTS === undefined || deploymentId === "eden-cloudflare" ? base : `${base}:${deploymentId}`;
+}
+
+function deploymentRequest(request: Request, deploymentId: string): Request {
+  const headers = new Headers(request.headers);
+  headers.set("x-eden-eve-deployment-id", deploymentId);
+  return new Request(request, { headers });
+}
+
+async function sandboxSessionDirectory(sessionId: string): Promise<string> {
+  // Eve 0.91.0 and 1.0.0-rc.3 just-bash both use provider identity version 2.
+  // Sorting these keys produces ordinary compact JSON. The adjacent braces
+  // in Eve's template literal close the interpolation and object separately.
+  const identity = JSON.stringify({ sessionId, version: 2 });
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 24);
+}
+
+const EVE_HOST_IMPORT_SANDBOXES = String.raw`
+const fs = require("node:fs/promises");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { createReadStream } = require("node:fs");
+async function digest(file) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest("hex");
+}
+async function equal(a, b) {
+  const [x, y] = await Promise.all([fs.lstat(a), fs.lstat(b)]);
+  if (x.isSymbolicLink() || y.isSymbolicLink()) {
+    return x.isSymbolicLink() && y.isSymbolicLink() && await fs.readlink(a) === await fs.readlink(b);
+  }
+  if (x.isDirectory() && y.isDirectory()) {
+    const [left, right] = await Promise.all([fs.readdir(a), fs.readdir(b)]);
+    left.sort(); right.sort();
+    if (left.length !== right.length || left.some((name, i) => name !== right[i])) return false;
+    for (const name of left) if (!await equal(path.join(a, name), path.join(b, name))) return false;
+    return true;
+  }
+  return x.isFile() && y.isFile() && x.size === y.size && await digest(a) === await digest(b);
+}
+async function publish(from, to) {
+  // Both paths are on the destination workspace filesystem. Linux performs
+  // one atomic directory publication; an existing destination is never replaced.
+  const script = "import ctypes,os,sys;libc=ctypes.CDLL(None,use_errno=True);result=libc.renameat2(-100,os.fsencode(sys.argv[1]),-100,os.fsencode(sys.argv[2]),1);err=ctypes.get_errno();sys.exit(0) if result==0 else (_ for _ in ()).throw(OSError(err,os.strerror(err)))";
+  const { spawnSync } = require("node:child_process");
+  const result = spawnSync("python3", ["-c", script, from, to], { encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    // A racing destination creation is a conflict unless its complete tree
+    // is identical. Never merge into or overwrite a live session directory.
+    if (!await equal(from, to)) throw new Error(result.stderr || "Atomic sandbox publication failed");
+  }
+}
+(async () => {
+  const [stage, root] = process.argv.slice(1);
+  const source = path.join(stage, "sessions");
+  await fs.mkdir(path.join(root, "sessions"), { recursive: true });
+  const pending = [];
+  for (const name of await fs.readdir(source)) {
+    const from = path.join(source, name);
+    const to = path.join(root, "sessions", name);
+    let exists = true;
+    try { await fs.lstat(to); } catch (error) { if (error.code !== "ENOENT") throw error; exists = false; }
+    if (exists) {
+      if (!await equal(from, to)) throw new Error("Sandbox import conflicts with an existing target session: " + name);
+    } else pending.push([from, to]);
+  }
+  // Validate every conflict before publishing. Never replace a directory
+  // that may belong to a turn already running on the target.
+  for (const [from, to] of pending) await publish(from, to);
+})().catch(error => { console.error(error.message); process.exitCode = 1; });
+`;
+
 /**
  * Cloudflare's durable_object containers expose `/dev/kvm`, which makes Eve
  * versions before 0.83 pick microsandbox at runtime, although Eden's isolated
@@ -161,15 +253,20 @@ function isMissingContainerSnapshot(error: unknown): boolean {
 interface EveContainerLoopbackNamespace {
   getByName(name: string): {
     loopbackFetch(request: Request): Promise<Response>;
+    exportSandboxSessions(deploymentId: string, sessionId: string): Promise<Response>;
+    importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string): Promise<void>;
+    retire(deploymentId: string): Promise<void>;
   };
 }
 
 /** The deployment's single SQLite-backed Workflow World. */
-export class EdenWorldDurableObject {
+export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnvironment> {
   private readonly core: WorldCore;
 
   constructor(ctx: DurableObjectState, env: EveHostContainerEnvironment) {
+    super(ctx, env);
     this.core = new WorldCore({
+      ...(env.EDEN_EVE_DEPLOYMENT_ID === undefined ? {} : { currentDeploymentId: env.EDEN_EVE_DEPLOYMENT_ID }),
       sql: {
         exec: ctx.storage.sql.exec.bind(ctx.storage.sql),
         transactionSync: ctx.storage.transactionSync.bind(ctx.storage),
@@ -179,50 +276,79 @@ export class EdenWorldDurableObject {
         if (atMs === null) await ctx.storage.deleteAlarm();
         else await ctx.storage.setAlarm(atMs);
       },
+      retireDeployment: async (deploymentId) => {
+        if (deploymentId === env.EDEN_EVE_DEPLOYMENT_ID) throw new Error("Cannot retire the current ingress deployment.");
+        const namespace = env.EVE_CONTAINER as EveContainerLoopbackNamespace;
+        await namespace.getByName(deploymentInstance(env, deploymentId)).retire(deploymentId);
+      },
       delivery: {
         deliver: async (message) => {
           const origin = env.EVE_PUBLIC_ORIGIN;
-          const instance = env.EVE_CONTAINER_INSTANCE_NAME;
-          if (typeof origin !== "string" || typeof instance !== "string") {
+          const deploymentId = env.EDEN_EVE_DEPLOYMENTS === undefined ? env.EDEN_EVE_DEPLOYMENT_ID! : message.deploymentId ?? "eden-cloudflare";
+          let sandboxTransferCompleted = false;
+          const settleUnstarted = async (): Promise<void> => {
+            const world = env.EDEN_WORLD as {
+              getByName(name: string): { deliverySettled(messageId: string, attempt: number): Promise<void> };
+            };
+            await world.getByName("world").deliverySettled(message.messageId, message.attempt);
+          };
+          if (typeof origin !== "string") {
+            await settleUnstarted();
             throw new Error("The World queue Container identity is unavailable.");
           }
           const namespace = env.EVE_CONTAINER as EveContainerLoopbackNamespace;
-          const response = await namespace.getByName(instance).loopbackFetch(
-            new Request(new URL(`/.well-known/workflow/v1/${message.path}`, origin), {
-              method: "POST",
-              headers: {
-                ...message.headers,
-                "content-type": "application/json",
-                "x-vqs-queue-name": message.queueName,
-                "x-vqs-message-id": message.messageId,
-                "x-vqs-message-attempt": String(message.attempt),
-              },
-              body: message.body as Uint8Array<ArrayBuffer>,
-            }),
-          );
-          // Body transport errors must remain retryable; an HTTP status alone
-          // is not an acknowledgement of a streamed Container response.
-          const body = await response.text();
-          let result: { timeoutSeconds?: number } | null = null;
-          try {
-            result = JSON.parse(body) as { timeoutSeconds?: number };
-          } catch {
-            // World-local also accepts successful non-JSON responses.
+          const target = namespace.getByName(deploymentInstance(env, deploymentId));
+          if (message.sourceDeploymentId && message.sourceDeploymentId !== deploymentId && message.sandboxSessionId) {
+            try {
+              await target.importSandboxSessions(message.sourceDeploymentId, deploymentId, message.messageId, message.sandboxSessionId);
+            } catch (error) {
+              await settleUnstarted();
+              throw error;
+            }
+            sandboxTransferCompleted = true;
           }
-          const timeout = result?.timeoutSeconds;
-          return {
-            ok: response.ok && timeout === undefined,
-            ...(typeof timeout === "number" && timeout >= 0
-              ? { retryAfterMs: timeout * 1_000 }
-              : {}),
-          };
+          try {
+            const response = await target.loopbackFetch(
+              deploymentRequest(new Request(new URL(`/.well-known/workflow/v1/${message.path}`, origin), {
+                method: "POST",
+                headers: {
+                  ...message.headers,
+                  "content-type": "application/json",
+                  "x-vqs-queue-name": message.queueName,
+                  "x-vqs-message-id": message.messageId,
+                  "x-vqs-message-attempt": String(message.attempt),
+                },
+                body: message.body as Uint8Array<ArrayBuffer>,
+              }), deploymentId),
+            );
+            // Body transport errors must remain retryable; an HTTP status alone
+            // is not an acknowledgement of a streamed Container response.
+            const body = await response.text();
+            let result: { timeoutSeconds?: number } | null = null;
+            try {
+              result = JSON.parse(body) as { timeoutSeconds?: number };
+            } catch {
+              // World-local also accepts successful non-JSON responses.
+            }
+            const timeout = result?.timeoutSeconds;
+            return {
+              ok: response.ok && timeout === undefined,
+              sandboxTransferCompleted,
+              ...(typeof timeout === "number" && timeout >= 0
+                ? { retryAfterMs: timeout * 1_000 }
+                : {}),
+            };
+          } catch (error) {
+            if (!sandboxTransferCompleted) throw error;
+            return { ok: false, sandboxTransferCompleted: true };
+          }
         },
       },
     });
     void ctx.blockConcurrencyWhile(async () => this.core.migrate());
   }
 
-  async fetch(request: Request): Promise<Response> {
+  override async fetch(request: Request): Promise<Response> {
     if (request.method !== "POST") return new Response(null, { status: 405 });
     const result = await this.core.handleRpc(new Uint8Array(await request.arrayBuffer()));
     return new Response(result as Uint8Array<ArrayBuffer>, {
@@ -230,7 +356,21 @@ export class EdenWorldDurableObject {
     });
   }
 
-  async alarm(): Promise<void> {
+  deploymentBusy(deploymentId: string): boolean {
+    const activity = this.core.deploymentActivity(deploymentId);
+    return activity.activeDeliveries > 0 || activity.unfinishedTransfers > 0;
+  }
+
+  deliverySettled(messageId: string, attempt: number): void {
+    this.core.deliverySettled(messageId, attempt);
+  }
+
+  async controlFetch(request: Request): Promise<Response> {
+    const result = await this.core.handleControlRpc(new Uint8Array(await request.arrayBuffer()));
+    return new Response(result as Uint8Array<ArrayBuffer>, { headers: { "content-type": "application/cbor" } });
+  }
+
+  override async alarm(): Promise<void> {
     await this.core.runAlarm();
   }
 }
@@ -250,9 +390,12 @@ export class EdenWorldDurableObject {
 export async function routeEveOutboundRequest(
   request: Request,
   env: EveHostContainerEnvironment,
+  sourceDeploymentId?: string,
 ): Promise<Response> {
   const publicOrigin = env.EVE_PUBLIC_ORIGIN;
-  const instanceName = env.EVE_CONTAINER_INSTANCE_NAME;
+  const deploymentId = sourceDeploymentId ?? "eden-cloudflare";
+  const instanceName = typeof deploymentId === "string"
+    ? deploymentInstance(env, deploymentId) : undefined;
   if (
     typeof publicOrigin !== "string" ||
     typeof instanceName !== "string"
@@ -285,7 +428,7 @@ export async function routeEveOutboundRequest(
       "The configured Container binding is unavailable to the outbound handler.",
     );
   }
-  return namespace.getByName(instanceName).loopbackFetch(request);
+  return namespace.getByName(instanceName).loopbackFetch(deploymentRequest(request, deploymentId!));
 }
 
 /**
@@ -303,7 +446,8 @@ export async function routeEveOutboundRequest(
  */
 export class EveHostLoopback extends WorkerEntrypoint<EveHostContainerEnvironment> {
   override async fetch(request: Request): Promise<Response> {
-    return routeEveOutboundRequest(request, this.env);
+    const props = this.ctx.props as { deploymentId?: string };
+    return routeEveOutboundRequest(request, this.env, props.deploymentId);
   }
 }
 
@@ -337,6 +481,115 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   private readonly envVars: Record<string, string>;
   private readonly sleepAfterMs: number;
   private readonly readiness: EveReadinessGate;
+  private deploymentId: string | undefined;
+  private readonly imports = new Map<string, Promise<void>>();
+  private importQueue: Promise<void> = Promise.resolve();
+  private activeExports = 0;
+  private activeDeliveries = 0;
+  private activeForwarding = 0;
+  private schedulerRoleReconcile: Promise<void> | undefined;
+  private retainedFences: Promise<void> | undefined;
+
+  private async identifyDeployment(requested?: string): Promise<string> {
+    const affinity = this.env.EDEN_EVE_DEPLOYMENTS !== undefined;
+    let stored = affinity ? this.deploymentId ?? await this.ctx.storage.get<string>("eden.eve.host.deployment-id") : undefined;
+    const namespace = this.env.EVE_CONTAINER as DurableObjectNamespace;
+    const legacy = affinity && this.ctx.id.equals(namespace.idFromName(this.env.EVE_CONTAINER_INSTANCE_NAME!));
+    if (legacy && stored !== undefined && stored !== "eden-cloudflare" && deploymentImages(this.env)[stored] === undefined) stored = undefined;
+    const id = !affinity ? this.env.EDEN_EVE_DEPLOYMENT_ID : requested ?? stored ?? (legacy ? "eden-cloudflare" : this.env.EDEN_EVE_DEPLOYMENT_ID);
+    if (!id || (stored !== undefined && stored !== id)) {
+      throw new Error("The Container deployment identity does not match its persisted owner.");
+    }
+    const record = deploymentImages(this.env)[id];
+    if (stored === undefined) await this.ctx.storage.put("eden.eve.host.deployment-id", id);
+    this.deploymentId = id;
+    this.envVars.EDEN_EVE_DEPLOYMENT_ID = id;
+    this.envVars.EDEN_EVE_RELEASE_ID = record?.releaseId ?? this.env.EDEN_EVE_RELEASE_ID ?? id;
+    this.envVars.EVE_SCHEDULES_DISABLED = id === this.env.EDEN_EVE_DEPLOYMENT_ID ? "false" : "true";
+    this.envVars.EDEN_EVE_GENERATION_ID = record?.generationId ?? this.env.EDEN_EVE_GENERATION_ID!;
+    if (record?.runtimeRevisionHandle !== undefined) {
+      this.envVars.EDEN_EVE_RUNTIME_REVISION = record.runtimeRevisionHandle;
+    } else {
+      delete this.envVars.EDEN_EVE_RUNTIME_REVISION;
+    }
+    return id;
+  }
+
+  private async fenceRetainedSchedules(): Promise<void> {
+    if (this.deploymentId !== this.env.EDEN_EVE_DEPLOYMENT_ID) return;
+    this.retainedFences ??= (async () => {
+      const namespace = this.env.EVE_CONTAINER as EveContainerNamespace;
+      for (const id of Object.keys(deploymentImages(this.env))) {
+        if (id === this.deploymentId) continue;
+        const request = new Request(new URL("/__eden/internal/fence-schedules", this.env.EVE_PUBLIC_ORIGIN), {
+          headers: {
+            "x-eden-eve-deployment-id": id,
+            "x-eden-eve-release-id": this.env.EDEN_EVE_RELEASE_ID ?? this.env.EDEN_EVE_DEPLOYMENT_ID!,
+          },
+        });
+        let response: Response;
+        try { response = await namespace.getByName(deploymentInstance(this.env, id)).fetch(request); }
+        catch (error) {
+          if (!(error instanceof Error) || !error.message.includes(EVE_HOST_STALE_WORKER_REASON)) throw error;
+          response = await namespace.getByName(deploymentInstance(this.env, id)).fetch(request);
+        }
+        if (!response.ok) throw new Error(`Cannot fence schedules on retained deployment ${id}.`);
+        await response.body?.cancel();
+      }
+    })().catch((error) => { this.retainedFences = undefined; throw error; });
+    await this.retainedFences;
+  }
+
+  private async deploymentBusy(deploymentId: string): Promise<boolean> {
+    if (this.activeDeliveries > 0 || this.activeExports > 0 || this.imports.size > 0) return true;
+    if (!this.env.EDEN_EVE_WORLD_CLOUDFLARE) return false;
+    const world = this.env.EDEN_WORLD as { getByName(name: string): { deploymentBusy(deploymentId: string): Promise<boolean> } };
+    return world.getByName("world").deploymentBusy(deploymentId);
+  }
+
+  private async reconcileSchedulerRole(): Promise<void> {
+    const runtime = this.containerRuntime();
+    if (this.deploymentId !== this.env.EDEN_EVE_DEPLOYMENT_ID || !runtime?.running) return;
+    if (await this.ctx.storage.get<boolean>("eden.eve.host.started-schedules-disabled") !== true) return;
+    this.schedulerRoleReconcile ??= (async () => {
+      await this.ctx.storage.put("eden.eve.host.scheduler-fence-pending", true);
+      const canRestart = async (): Promise<boolean> => {
+        if (this.activeForwarding > 0 || this.activeExports > 0 || this.imports.size > 0) return false;
+        if (!this.env.EDEN_EVE_WORLD_CLOUDFLARE) return true;
+        const world = this.env.EDEN_WORLD as { getByName(name: string): { deploymentBusy(deploymentId: string): Promise<boolean> } };
+        return !await world.getByName("world").deploymentBusy(this.deploymentId!);
+      };
+      if (!await canRestart()) {
+        throw new EveHostError("HOST_READINESS_UNPROVEN", "Scheduler promotion awaits active retained deployment work.");
+      }
+      const snapshot = await runtime.snapshotContainer({ name: "eden-workspace" });
+      const image = (await runtime.inspect().catch(() => null))?.image ||
+        await this.ctx.storage.get<string>(EVE_HOST_CONTAINER_STARTED_IMAGE_KEY) || this.expectedImage(runtime);
+      if (!image) throw new Error("Cannot identify the scheduler promotion snapshot image.");
+      await this.ctx.storage.put(EVE_HOST_CONTAINER_SNAPSHOT_KEY, { id: snapshot.id, image, at: Date.now() } satisfies EveStoredContainerSnapshot);
+      if (!await canRestart()) {
+        throw new EveHostError("HOST_READINESS_UNPROVEN", "Scheduler promotion awaits active retained deployment work.");
+      }
+      await runtime.destroy(new Error("scheduler-role-promotion"));
+      const stoppedAt = Date.now();
+      while (runtime.running && Date.now() - stoppedAt < 10_000) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      }
+      if (runtime.running) {
+        throw new EveHostError("HOST_READINESS_UNPROVEN", "The previous scheduler process has not stopped.");
+      }
+      this.recordContainerStopped();
+    })().finally(() => { this.schedulerRoleReconcile = undefined; });
+    await this.schedulerRoleReconcile;
+  }
+
+  private expectedImage(runtime: EveContainerRuntime): string | undefined {
+    const id = this.deploymentId;
+    if (id === undefined) throw new Error("Container deployment identity has not been resolved.");
+    const record = deploymentImages(this.env)[id];
+    if (this.env.EDEN_EVE_DEPLOYMENTS !== undefined && record === undefined && id !== "eden-cloudflare") throw new Error(`Deployment ${id} has no retained Container image.`);
+    return runtime.images[record?.image ?? "eve"];
+  }
 
   constructor(
     ctx: DurableObjectState,
@@ -410,6 +663,10 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       // DO restarts lose the inactivity timeout; the monitor for this
       // container generation is also gone, so both are re-attached here.
       this.ctx.blockConcurrencyWhile(async () => {
+        if (env.EDEN_EVE_DEPLOYMENTS !== undefined) {
+          await this.identifyDeployment();
+          await this.registerLoopbackIntercept(runtime);
+        }
         await runtime.setInactivityTimeout(this.inactivityTimeoutMs);
         this.attachMonitor(runtime);
       });
@@ -473,7 +730,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       entryFactory as (options: {
         props: Record<string, string>;
       }) => unknown
-    )({ props: {} });
+    )({ props: { deploymentId: await this.identifyDeployment() } });
     await runtime.interceptOutboundHttps(
       new URL(this.env.EVE_PUBLIC_ORIGIN ?? "").hostname,
       entrypoint,
@@ -488,7 +745,8 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   private async touchActivity(): Promise<void> {
     const now = Date.now();
     await this.ctx.storage.put(EVE_HOST_CONTAINER_ACTIVITY_KEY, now);
-    await this.ctx.storage.setAlarm(now + this.sleepAfterMs);
+    const fencing = await this.ctx.storage.get<boolean>("eden.eve.host.scheduler-fence-pending") === true;
+    await this.ctx.storage.setAlarm(fencing ? now : now + this.sleepAfterMs);
   }
 
   /**
@@ -507,7 +765,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       );
     }
     if (runtime.running) return;
-    const expectedImage = runtime.images["eve"];
+    const expectedImage = this.expectedImage(runtime);
     if (expectedImage === undefined) {
       throw new EveHostError(
         "HOST_READINESS_UNPROVEN",
@@ -521,6 +779,14 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
         storedSnapshot.image === expectedImage
       ? storedSnapshot.id
       : undefined;
+    // Persist the fresh-start restore obligation before the process exists:
+    // a DO replacement must not mistake a partially restored process for ready.
+    if (snapshotId === undefined) {
+      await this.ctx.storage.put("eden.eve.host.restore-pending", globalThis.crypto.randomUUID());
+    } else {
+      await this.ctx.storage.delete("eden.eve.host.restore-pending");
+    }
+    await this.ctx.storage.put("eden.eve.host.started-schedules-disabled", this.envVars.EVE_SCHEDULES_DISABLED === "true");
     runtime.start({
       ...(snapshotId === undefined
         ? { image: expectedImage }
@@ -530,12 +796,19 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       env: this.envVars,
       entrypoint: EVE_HOST_ENTRYPOINT,
     });
+    console.log("eden.container.start", JSON.stringify({
+      deploymentId: this.deploymentId, image: expectedImage,
+      source: snapshotId === undefined ? "image" : "snapshot",
+    }));
     // Set before any await: a failure below makes the readiness retry see a
     // running container and skip this method, so the restore must already be
     // pending. A start from the configured image (an update) has no sandbox
     // sessions yet; a same-image snapshot wake already contains them.
     this.pendingCarryRestore = snapshotId === undefined;
     this.startedFromSnapshot = snapshotId !== undefined;
+    // A fresh process receives the retained scheduler fence even when its
+    // filesystem came from a snapshot of the formerly-current deployment.
+    await this.ctx.storage.delete("eden.eve.host.scheduler-fence-pending");
     // Both start sources run `expectedImage` (a snapshot is only restored
     // from that image).
     await this.ctx.storage.put(EVE_HOST_CONTAINER_STARTED_IMAGE_KEY, expectedImage);
@@ -557,7 +830,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     if (this.imageVerified) return;
     const runtime = this.containerRuntime();
     if (runtime === undefined || !runtime.running) return;
-    const expectedImage = runtime.images["eve"];
+    const expectedImage = this.expectedImage(runtime);
     let info: { readonly image?: string } | null;
     try {
       info = await runtime.inspect();
@@ -600,9 +873,10 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
    */
   private carrySandboxSessionsOut(
     runtime: EveContainerRuntime,
+    required = false,
   ): Promise<void> {
     const run = this.carryOutQueue.then(() =>
-      this.carrySandboxSessionsOutNow(runtime)
+      this.carrySandboxSessionsOutNow(runtime, required)
     );
     this.carryOutQueue = run.then(
       () => undefined,
@@ -613,6 +887,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
 
   private async carrySandboxSessionsOutNow(
     runtime: EveContainerRuntime,
+    required = false,
   ): Promise<void> {
     const previous = await this.ctx.storage.get<EveStoredSandboxCarry>(
       EVE_HOST_SANDBOX_CARRY_KEY,
@@ -687,6 +962,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       await reader.cancel().catch(() => undefined);
       if (overflowed) {
         await discardWrittenChunks();
+        if (required) throw new Error("The imported sandbox carry exceeds the archive limit.");
         console.error(
           `The Eve sandbox session carry exceeded ${EVE_HOST_CARRY_LIMITS.maxBytes} compressed bytes; keeping the previous carry.`,
         );
@@ -705,6 +981,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     }
     if (exitCode !== 0) {
       await discardWrittenChunks();
+      if (required) throw new Error(`The imported sandbox carry failed with exit code ${exitCode}.`);
       console.error(
         `The Eve sandbox session carry failed with exit code ${exitCode}; keeping the previous carry.`,
       );
@@ -736,9 +1013,18 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
    * the same promise, and no request is forwarded before it settles.
    */
   private async restoreCarriedSandboxSessions(): Promise<void> {
-    if (!this.pendingCarryRestore) return;
-    this.carryRestorePromise ??= this.carrySandboxSessionsIn();
-    await this.carryRestorePromise;
+    const restoreGeneration = await this.ctx.storage.get<string>("eden.eve.host.restore-pending");
+    if (!this.pendingCarryRestore && restoreGeneration === undefined) return;
+    const required = await this.ctx.storage.get<boolean>("eden.eve.host.has-imported-sandboxes") === true;
+    this.carryRestorePromise ??= this.carrySandboxSessionsIn(required);
+    try { await this.carryRestorePromise; } catch (error) {
+      this.carryRestorePromise = undefined;
+      throw error;
+    }
+    if (restoreGeneration !== undefined &&
+      await this.ctx.storage.get<string>("eden.eve.host.restore-pending") === restoreGeneration) {
+      await this.ctx.storage.delete("eden.eve.host.restore-pending");
+    }
     this.pendingCarryRestore = false;
   }
 
@@ -749,12 +1035,15 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
    * failure is logged and swallowed: the agent still serves, only the
    * carried files are missing.
    */
-  private async carrySandboxSessionsIn(): Promise<void> {
+  private async carrySandboxSessionsIn(required = false): Promise<void> {
     try {
       const carry = await this.ctx.storage.get<EveStoredSandboxCarry>(
         EVE_HOST_SANDBOX_CARRY_KEY,
       );
-      if (carry === undefined) return;
+      if (carry === undefined) {
+        if (required) throw new Error("The imported sandbox carry is missing.");
+        return;
+      }
       let nextChunk = 0;
       const archive = new ReadableStream<Uint8Array>({
         pull: async (controller) => {
@@ -780,11 +1069,16 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       if (runtime === undefined) {
         throw new Error("the Container runtime is unavailable");
       }
+      const restoreGeneration = await this.ctx.storage.get<string>("eden.eve.host.restore-pending");
+      const stageId = await sandboxSessionDirectory(restoreGeneration ?? carry.id);
+      const stage = `${EVE_HOST_SANDBOX_CARRY_SOURCE}/.eden-restores/${stageId}`;
       const exec = await runtime.exec(
         [
           "sh",
           "-c",
-          `mkdir -p ${EVE_HOST_SANDBOX_CARRY_SOURCE} && tar -xzf - -C ${EVE_HOST_SANDBOX_CARRY_SOURCE}`,
+          required
+            ? `rm -rf ${stage} && mkdir -p ${stage} && tar -xzf - -C ${stage}`
+            : `mkdir -p ${EVE_HOST_SANDBOX_CARRY_SOURCE} && tar -xzf - -C ${EVE_HOST_SANDBOX_CARRY_SOURCE}`,
         ],
         { stdin: archive, stderr: "pipe" },
       );
@@ -795,11 +1089,23 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
         exitCode = -1;
       }
       if (exitCode !== 0) {
+        if (required) throw new Error(`The imported sandbox restore failed with exit code ${exitCode}.`);
         console.error(
           `The Eve sandbox session restore failed with exit code ${exitCode}; the agent serves without the carried files.`,
         );
       }
+      if (required) {
+        const publish = await runtime.exec(
+          ["node", "-e", EVE_HOST_IMPORT_SANDBOXES, stage, EVE_HOST_SANDBOX_CARRY_SOURCE],
+          { stdout: "ignore", stderr: "pipe" },
+        );
+        const error = publish.stderr === null ? "" : await new Response(publish.stderr).text();
+        if (await publish.exitCode !== 0) throw new Error(`The imported sandbox restore publication failed: ${error}`);
+        const cleanup = await runtime.exec(["rm", "-rf", stage], { stdout: "ignore", stderr: "ignore" });
+        await cleanup.exitCode;
+      }
     } catch (error: unknown) {
+      if (required) throw error;
       console.error(
         "The Eve sandbox session restore failed; the agent serves without the carried files:",
         error instanceof Error ? error.message : "unknown",
@@ -809,7 +1115,11 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
 
   async ensureEveReady(
     signal: AbortSignal = new AbortController().signal,
+    requireSchedulerRole = true,
   ): Promise<EveHostReadinessEvidence> {
+    await this.identifyDeployment();
+    await this.fenceRetainedSchedules();
+    if (requireSchedulerRole) await this.reconcileSchedulerRole();
     await this.reconcileRunningImage();
     if (this.readinessEvidence !== undefined) {
       return this.readinessEvidence;
@@ -833,14 +1143,17 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   override async fetch(request: Request): Promise<Response> {
     const requestDeploymentId =
       request.headers.get("x-eden-eve-deployment-id") ?? undefined;
-    if (
-      requestDeploymentId !== undefined &&
-      requestDeploymentId !== this.env.EDEN_EVE_DEPLOYMENT_ID
-    ) {
-      // A live container/monitor can pin the DO to an older Worker version.
-      // Reset the DO, not its container or storage; the retry's current code
-      // reconciles the image and carries sandbox sessions through the update.
+    const requestedRelease = request.headers.get("x-eden-eve-release-id") ?? requestDeploymentId;
+    if (requestedRelease !== undefined && requestedRelease !== (this.env.EDEN_EVE_RELEASE_ID ?? this.env.EDEN_EVE_DEPLOYMENT_ID)) {
       this.ctx.abort(EVE_HOST_STALE_WORKER_REASON);
+    }
+    await this.identifyDeployment(requestDeploymentId);
+    if (new URL(request.url).pathname === "/__eden/internal/fence-schedules") {
+      if (this.deploymentId !== this.env.EDEN_EVE_DEPLOYMENT_ID) {
+        await this.ctx.storage.put("eden.eve.host.scheduler-fence-pending", true);
+        await this.ctx.storage.setAlarm(Date.now());
+      }
+      return new Response(null, { status: 204 });
     }
     const response = await this.forwardToEve(request);
     // Reporting the verified start back lets deploy health-gate promotion on
@@ -850,12 +1163,12 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     // deployment.
     if (
       requestDeploymentId !== undefined &&
-      requestDeploymentId === this.env.EDEN_EVE_DEPLOYMENT_ID &&
+      requestDeploymentId === this.deploymentId &&
       this.readinessEvidence !== undefined &&
       this.imageVerified
     ) {
       const headers = new Headers(response.headers);
-      headers.set("x-eden-eve-started-deployment", requestDeploymentId);
+      headers.set("x-eden-eve-started-deployment", this.env.EDEN_EVE_RELEASE_ID ?? requestDeploymentId);
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -865,31 +1178,220 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     return response;
   }
 
+  async retire(deploymentId: string): Promise<void> {
+    // World routes the fenced target to its named DO. Retirement must not
+    // restore or trust a stored owner left by an earlier retirement attempt.
+    if (await this.deploymentBusy(deploymentId)) {
+      throw new Error("Cannot retire a deployment with active deliveries or transfers.");
+    }
+    const runtime = this.containerRuntime();
+    if (runtime?.running) await runtime.destroy(new Error("deployment-retired"));
+    this.recordContainerStopped();
+    await this.ctx.storage.deleteAll();
+  }
+
+  /** Read-only export: never replace the source carry or stop its process. */
+  async exportSandboxSessions(deploymentId: string, sessionId: string): Promise<Response> {
+    this.activeExports += 1;
+    let released = false;
+    const release = (): void => {
+      if (!released) this.activeExports -= 1;
+      released = true;
+    };
+    try {
+      await this.identifyDeployment(deploymentId);
+      await this.ensureEveReady(undefined, false);
+      await this.touchActivity();
+      const directory = await sandboxSessionDirectory(sessionId);
+      const runtime = this.containerRuntime()!;
+      const exec = await runtime.exec([
+        "sh", "-c",
+        `if [ -d ${EVE_HOST_SANDBOX_CARRY_SOURCE}/sessions/${directory} ]; then cd ${EVE_HOST_SANDBOX_CARRY_SOURCE} && tar -czf - sessions/${directory}; fi`,
+      ], { stdout: "pipe", stderr: "ignore" });
+      if (exec.stdout === null) throw new Error("Sandbox export stdout is unavailable.");
+      const reader = exec.stdout.getReader();
+      let bytes = 0;
+      const archive = new ReadableStream<Uint8Array>({
+        pull: async (controller) => {
+          try {
+            const result = await reader.read();
+            if (result.done) {
+              if (await exec.exitCode !== 0) throw new Error("The source sandbox archive failed.");
+              release();
+              controller.close();
+              return;
+            }
+            bytes += result.value.byteLength;
+            if (bytes > EVE_HOST_CARRY_LIMITS.maxBytes) throw new Error("The source sandbox archive exceeds the carry limit.");
+            controller.enqueue(result.value);
+          } catch (error) {
+            release();
+            await reader.cancel().catch(() => undefined);
+            controller.error(error);
+          }
+        },
+        cancel: async () => { release(); await reader.cancel(); },
+      });
+      return new Response(archive, { headers: { "content-type": "application/gzip" } });
+    } catch (error) { release(); throw error; }
+  }
+
+  /** Retry-idempotent imports finish before the migrated queue is dispatched. */
+  async importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string): Promise<void> {
+    await this.identifyDeployment(deploymentId);
+    const key = `eden.eve.host.sandbox-import.v2.${sourceDeploymentId}.${sessionId}.${transferId}`;
+    if (await this.ctx.storage.get<boolean>(key)) {
+      await this.ensureEveReady(undefined, false);
+      return;
+    }
+    const existing = this.imports.get(key);
+    if (existing !== undefined) return existing;
+    const run = this.importQueue.then(async () => {
+      await this.ensureEveReady(undefined, false);
+      if (await this.ctx.storage.get<boolean>(key)) return;
+      await this.touchActivity();
+      const namespace = this.env.EVE_CONTAINER as EveContainerLoopbackNamespace;
+      const response = await namespace.getByName(deploymentInstance(this.env, sourceDeploymentId))
+        .exportSandboxSessions(sourceDeploymentId, sessionId);
+      if (!response.ok || response.body === null) throw new Error("The source sandbox archive is unavailable.");
+      const stageId = await sandboxSessionDirectory(JSON.stringify([sourceDeploymentId, sessionId, transferId]));
+      const stage = `${EVE_HOST_SANDBOX_CARRY_SOURCE}/.eden-imports/${stageId}`;
+      const runtime = this.containerRuntime()!;
+      const extract = await runtime.exec([
+        "sh", "-c",
+        `rm -rf ${stage} && mkdir -p ${stage} && cat > ${stage}/archive.tgz && if [ -s ${stage}/archive.tgz ]; then tar -xzf ${stage}/archive.tgz -C ${stage}; else mkdir -p ${stage}/sessions; fi`,
+      ], { stdin: response.body, stdout: "ignore", stderr: "ignore" });
+      if (await extract.exitCode !== 0) throw new Error(`Sandbox archive extraction failed; staging retained at ${stage}.`);
+      const publish = await runtime.exec([
+        "node", "-e", EVE_HOST_IMPORT_SANDBOXES, stage, EVE_HOST_SANDBOX_CARRY_SOURCE,
+      ], { stdout: "ignore", stderr: "pipe" });
+      const errorText = publish.stderr === null ? "" : await new Response(publish.stderr).text();
+      if (await publish.exitCode !== 0) throw new Error(`Sandbox import refused: ${errorText.trim()}; staging retained at ${stage}.`);
+      // Persist imports before acknowledging them, including crash recovery.
+      // An older whole-container snapshot must not hide the refreshed carry.
+      await this.ctx.storage.delete(EVE_HOST_CONTAINER_SNAPSHOT_KEY);
+      await this.carrySandboxSessionsOut(runtime, true);
+      await this.ctx.storage.put("eden.eve.host.has-imported-sandboxes", true);
+      await this.ctx.storage.put(key, true);
+      const cleanup = await runtime.exec(["rm", "-rf", stage], { stdout: "ignore", stderr: "ignore" });
+      await cleanup.exitCode;
+    });
+    this.importQueue = run.catch(() => undefined);
+    this.imports.set(key, run);
+    try { await run; } finally { this.imports.delete(key); }
+  }
+
   /**
    * Queue deliveries and loopback traffic enter here: same readiness and
    * forwarding as `fetch` without the deployment-header echo rules (the
    * loopback path is not a deployment-health signal).
    */
   async loopbackFetch(request: Request): Promise<Response> {
+    await this.identifyDeployment(request.headers.get("x-eden-eve-deployment-id") ?? undefined);
     return this.forwardToEve(request);
   }
 
-  private async forwardToEve(request: Request): Promise<Response> {
-    await this.ensureEveReady(request.signal);
-    await this.touchActivity();
-    const runtime = this.containerRuntime();
-    if (runtime === undefined) {
-      throw new EveHostError(
-        "HOST_READINESS_UNPROVEN",
-        "The Container runtime is unavailable on this Durable Object.",
-      );
+  private async settleQueueDelivery(request: Request): Promise<void> {
+    if (!this.env.EDEN_EVE_WORLD_CLOUDFLARE ||
+      !new URL(request.url).pathname.startsWith("/.well-known/workflow/v1/")) return;
+    const messageId = request.headers.get("x-vqs-message-id");
+    const attempt = Number(request.headers.get("x-vqs-message-attempt"));
+    if (!messageId || !Number.isSafeInteger(attempt) || attempt < 1) {
+      throw new Error("The completed queue delivery has no exact attempt identity.");
     }
-    const url = new URL(request.url);
-    return runtime
-      .getTcpPort(EVE_HOST_DEFAULTS.internalPort)
-      .fetch(
-        new Request(`http://container${url.pathname}${url.search}`, request),
+    const world = this.env.EDEN_WORLD as {
+      getByName(name: string): { deliverySettled(messageId: string, attempt: number): Promise<void> };
+    };
+    // Resolve the current World actor rather than relying on the dispatcher
+    // instance that initiated this potentially long-lived HTTP request.
+    await world.getByName("world").deliverySettled(messageId, attempt);
+  }
+
+  private async forwardToEve(request: Request): Promise<Response> {
+    this.activeDeliveries += 1;
+    let released = false;
+    let forwarding = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      this.activeDeliveries -= 1;
+      if (forwarding) this.activeForwarding -= 1;
+      this.ctx.waitUntil(this.touchActivity());
+    };
+    try {
+      // Already-pinned work must be able to drain a scheduler-disabled
+      // promoted instance; public readiness waits for its safe role restart.
+      const workflowDelivery = new URL(request.url).pathname.startsWith("/.well-known/workflow/v1/");
+      await this.ensureEveReady(request.signal, !workflowDelivery);
+      await this.touchActivity();
+      const runtime = this.containerRuntime();
+      if (runtime === undefined) throw new Error("The Container runtime is unavailable.");
+      const url = new URL(request.url);
+      forwarding = true;
+      this.activeForwarding += 1;
+      const upstreamInit: RequestInit & { duplex: "half" } = {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+        redirect: request.redirect,
+        duplex: "half",
+        // A dispatcher replacement must not cancel the actual queue handler.
+        ...(workflowDelivery ? {} : { signal: request.signal }),
+      };
+      const response = await runtime.getTcpPort(EVE_HOST_DEFAULTS.internalPort).fetch(
+        new Request(`http://container${url.pathname}${url.search}`, upstreamInit),
       );
+      if (response.body === null) {
+        await this.settleQueueDelivery(request);
+        release();
+        return response;
+      }
+      const reader = response.body.getReader();
+      let downstreamCancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull: async (controller) => {
+          try {
+            const result = await reader.read();
+            if (result.done) {
+              await this.settleQueueDelivery(request);
+              release();
+              if (!downstreamCancelled) controller.close();
+            }
+            else if (!downstreamCancelled) controller.enqueue(result.value);
+          } catch (error) {
+            if (!downstreamCancelled) {
+              release();
+              controller.error(error);
+            }
+          }
+        },
+        cancel: async (reason) => {
+          if (!workflowDelivery) {
+            try { await reader.cancel(reason); } finally { release(); }
+            return;
+          }
+          downstreamCancelled = true;
+          // Keep observing the upstream invocation independently of its old
+          // dispatcher consumer. Only actual EOF permits exact settlement.
+          this.ctx.waitUntil((async () => {
+            try {
+              while (!(await reader.read()).done) { /* Discard the response body. */ }
+              await this.settleQueueDelivery(request);
+            } finally {
+              release();
+            }
+          })());
+        },
+      });
+      return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+    } catch (error) {
+      try {
+        if (!forwarding) await this.settleQueueDelivery(request);
+      } finally {
+        release();
+      }
+      throw error;
+    }
   }
 
   /**
@@ -900,11 +1402,17 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
    * for the running container stops.
    */
   override async alarm(): Promise<void> {
+    const deploymentId = await this.identifyDeployment();
     const runtime = this.containerRuntime();
     const lastActivity =
       (await this.ctx.storage.get<number>(EVE_HOST_CONTAINER_ACTIVITY_KEY)) ?? 0;
     const now = Date.now();
-    if (now - lastActivity < this.sleepAfterMs) {
+    if (await this.deploymentBusy(deploymentId)) {
+      await this.ctx.storage.setAlarm(now + this.sleepAfterMs);
+      return;
+    }
+    const fencePending = await this.ctx.storage.get<boolean>("eden.eve.host.scheduler-fence-pending") === true;
+    if (!fencePending && now - lastActivity < this.sleepAfterMs) {
       await this.ctx.storage.setAlarm(lastActivity + this.sleepAfterMs);
       return;
     }
@@ -929,7 +1437,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
         name: "eden-workspace",
       });
       const image = (await runtime.inspect().catch(() => null))?.image ??
-        runtime.images["eve"] ??
+        this.expectedImage(runtime) ??
         "";
       const record: EveStoredContainerSnapshot = {
         id: snapshot.id,
@@ -943,14 +1451,19 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       // underneath it. Keep running and re-arm sleep from that activity.
       const activityAfterSnapshot =
         (await this.ctx.storage.get<number>(EVE_HOST_CONTAINER_ACTIVITY_KEY)) ?? 0;
-      if (activityAfterSnapshot !== lastActivity) {
+      if (activityAfterSnapshot !== lastActivity || await this.deploymentBusy(deploymentId)) {
         await this.ctx.storage.setAlarm(activityAfterSnapshot + this.sleepAfterMs);
         return;
       }
       await runtime.destroy(new Error("idle-snapshot-done"));
       this.recordContainerStopped();
+      await this.ctx.storage.delete("eden.eve.host.scheduler-fence-pending");
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "unknown";
+      if (await this.deploymentBusy(deploymentId)) {
+        await this.touchActivity();
+        return;
+      }
       if (attempts + 1 >= EVE_HOST_SNAPSHOT_MAX_ATTEMPTS) {
         console.error(
           `The Eve workspace snapshot failed ${attempts + 1} times; destroying the container without it: ${message}`,
@@ -980,6 +1493,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
 export interface EveHostWorkerOptions extends EveHostForwardingMetadata {
   readonly workerName: string;
   readonly stableContainerInstanceName: string;
+  readonly deployments?: Readonly<Record<string, EveDeploymentImage>>;
   readonly schedules?: readonly EveScheduleCronEntry[];
 }
 
@@ -1022,7 +1536,7 @@ export function createEveHostWorker(
         "The configured Container binding is unavailable.",
       );
     }
-    return namespace.getByName(options.stableContainerInstanceName);
+    return namespace.getByName(deploymentInstance(env, options.deploymentId, options.stableContainerInstanceName));
   };
   const forwardToContainer = async (
     request: Request,
@@ -1031,6 +1545,7 @@ export function createEveHostWorker(
     const metadata = {
       publicOrigin: options.publicOrigin,
       deploymentId: options.deploymentId,
+      releaseId: options.releaseId ?? options.deploymentId,
       generationId: options.generationId,
       correlationId: globalThis.crypto.randomUUID(),
       ...(options.runtimeRevisionHandle === undefined
@@ -1069,10 +1584,24 @@ export function createEveHostWorker(
   };
   return {
     async fetch(request, env): Promise<Response> {
+      if (new URL(request.url).pathname === "/__eden/world/rpc") {
+        if (request.method !== "POST") return new Response(null, { status: 405 });
+        const token = env.EDEN_EVE_CONTROL_TOKEN;
+        const authorization = request.headers.get("authorization") ?? "";
+        if (typeof token !== "string" || token.length === 0) return new Response(null, { status: 404 });
+        // Hash both values to fixed lengths before comparing every byte.
+        const digest = async (value: string) => new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+        const [expected, supplied] = await Promise.all([digest(`Bearer ${token}`), digest(authorization)]);
+        let mismatch = 0;
+        for (let index = 0; index < expected.length; index += 1) mismatch |= expected[index]! ^ supplied[index]!;
+        if (mismatch !== 0) return new Response(null, { status: 401 });
+        const world = env.EDEN_WORLD as { getByName(name: string): { controlFetch(request: Request): Promise<Response> } } | undefined;
+        return world === undefined ? new Response(null, { status: 404 }) : world.getByName("world").controlFetch(request);
+      }
       // Queue deliveries to these endpoints arrive through the container's
       // intercepted outbound loopback instead, so any request that reaches
       // the public Worker fetch path is external and unauthenticated.
-      if (isEveWorkflowInternalRoute(new URL(request.url).pathname)) {
+      if (isEveWorkflowInternalRoute(new URL(request.url).pathname) || new URL(request.url).pathname.startsWith("/__eden/internal/")) {
         return new Response(null, { status: 404 });
       }
       const response = await forwardToContainer(request, env);
@@ -1080,10 +1609,11 @@ export function createEveHostWorker(
       headers.set("x-eden-eve-worker-name", options.workerName);
       headers.set("x-eden-eve-public-origin", options.publicOrigin);
       headers.set("x-eden-eve-deployment-id", options.deploymentId);
+      headers.set("x-eden-eve-release-id", options.releaseId ?? options.deploymentId);
       headers.set("x-eden-eve-generation-id", options.generationId);
       headers.set(
         "x-eden-eve-container-instance",
-        options.stableContainerInstanceName,
+        deploymentInstance(env, options.deploymentId, options.stableContainerInstanceName),
       );
       if (options.runtimeRevisionHandle !== undefined) {
         headers.set(

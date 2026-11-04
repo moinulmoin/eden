@@ -1016,6 +1016,7 @@ COPY node_modules /candidate/node_modules
 ${sandboxContextCopy}${sourceEntries.map((entry) => `COPY ${JSON.stringify([entry, `/candidate/${entry}`])}`).join("\n")}
 
 FROM --platform=linux/amd64 ${imageReference(nodeImage)} AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
 ENV HOST=0.0.0.0 \\
     NITRO_HOST=0.0.0.0 \\
@@ -1188,6 +1189,8 @@ function runtimeContainerEnvironment(
     ...(request.workflowWorld === "@moinulmoin/eden-world-cloudflare"
       ? {
           EDEN_WORLD_URL: `${request.publicOrigin ?? "http://localhost:8080"}/__eden/world/rpc`,
+          EDEN_EVE_DEPLOYMENT_ID: `eden-smoke-${request.candidate.generationId}`,
+          EDEN_EVE_RELEASE_ID: `eden-smoke-${request.candidate.generationId}`,
           CBOR_NATIVE_ACCELERATION_DISABLED: "true",
         }
       : {}),

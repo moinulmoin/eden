@@ -1,3 +1,4 @@
+import { setTimeout as waitForActivation } from "node:timers/promises";
 import {
   createRequire,
 } from "node:module";
@@ -77,6 +78,8 @@ import {
   type EveRuntimeProtectedStore,
 } from "./eve-runtime-config.js";
 import {
+  EDEN_AFFINITY_CONTRACT,
+  callDeploymentControlRpc,
   createEveHostConfig,
   generateEveHostWorkerSource,
   parseEveScheduleCron,
@@ -268,6 +271,11 @@ export interface EveDeploymentIdentity {
   readonly sourceDigest: string;
   readonly generationId: string;
   readonly deploymentId: string;
+  readonly releaseId?: string;
+  readonly eveVersion?: string;
+  readonly affinityContract?: number;
+  readonly retainedDeployments?: Readonly<Record<string, EveAffinityDeployment>>;
+  readonly pendingRetirements?: Readonly<Record<string, EveAffinityDeployment>>;
   readonly environment: EveCliEnvironment;
   readonly name: string;
   readonly accountId: string;
@@ -284,6 +292,82 @@ export interface EveDeploymentIdentity {
 export type EveDeploymentIdentityProof = Partial<EveDeploymentIdentity> & {
   /** The deployment the serving Container verifiably started under; set only by a deployed Eden host that proves its running image before stamping. */
   readonly startedDeploymentId?: string;
+};
+
+export interface EveAffinityDeployment {
+  readonly image: string;
+  readonly generationId: string;
+  readonly runtimeRevisionHandle?: string;
+  readonly eveVersion?: string;
+  readonly affinityContract?: number;
+  readonly releaseId?: string;
+}
+
+export interface EveDeploymentDrainState {
+  readonly liveRuns: number;
+  readonly liveSessions: number;
+  readonly pendingMessages: number;
+  readonly unfinishedTransfers: number;
+  readonly drained: boolean;
+}
+
+export type EveDeploymentRpcRunner = (request: {
+  readonly origin: string;
+  readonly operation: "deployments.drainState" | "deployments.retire";
+  readonly deploymentIds: readonly string[];
+  readonly runtimeConfig?: EveRuntimeConfig;
+  readonly controlToken: string;
+}) => Promise<unknown>;
+
+function validateDeploymentDrainStates(
+  value: unknown,
+  ids: readonly string[],
+): Record<string, EveDeploymentDrainState> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw deploymentFailure("EVE_AFFINITY_DRAIN_UNPROVEN", "The authenticated World did not return deployment drain states.");
+  }
+  const states = value as Record<string, EveDeploymentDrainState>;
+  for (const id of ids) {
+    const state = states[id];
+    if (typeof state !== "object" || state === null ||
+        typeof state.drained !== "boolean" ||
+        [state.liveRuns, state.liveSessions, state.pendingMessages, state.unfinishedTransfers]
+          .some((count) => !Number.isSafeInteger(count) || count < 0) ||
+        state.drained !== (state.liveRuns + state.liveSessions + state.pendingMessages + state.unfinishedTransfers === 0)) {
+      throw deploymentFailure("EVE_AFFINITY_DRAIN_UNPROVEN", `The authenticated World returned an invalid drain state for ${id}.`);
+    }
+  }
+  return states;
+}
+
+const defaultDeploymentRpc: EveDeploymentRpcRunner = async (request) => {
+  // A successful Cloudflare secret write creates an active deployment, but
+  // existing stateless Worker isolates may briefly serve the preceding secret.
+  // Only the first read-only drain call following our own rotation may wait
+  // for that exact in-memory credential. All other failures remain terminal.
+  const activationRead = request.operation === "deployments.drainState";
+  const deadline = Date.now() + 60_000;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw deploymentFailure("EVE_AFFINITY_CONTROL_ACTIVATION_TIMEOUT",
+        "The freshly rotated deployment-control credential did not activate within 60 seconds; publication was refused.");
+    }
+    try {
+      return await callDeploymentControlRpc({
+        origin: request.origin,
+        token: request.controlToken,
+        operation: request.operation,
+        args: [{ deploymentIds: request.deploymentIds }],
+        signal: AbortSignal.timeout(remaining),
+      });
+    } catch (error: unknown) {
+      if (!activationRead || typeof error !== "object" || error === null ||
+          !("status" in error) || error.status !== 401) throw error;
+      const delay = Math.min(1_000, deadline - Date.now());
+      if (delay > 0) await waitForActivation(delay);
+    }
+  }
 };
 
 export interface EveDeploymentPublicationRequest {
@@ -409,6 +493,7 @@ export interface EvePreflightOptions {
   readonly protectedStore?: EveRuntimeProtectedStore;
   readonly publish?: EveDeploymentPublicationRunner;
   readonly publishImage?: EveImagePublicationRunner;
+  readonly deploymentRpc?: EveDeploymentRpcRunner;
   readonly compensate?: EveDeploymentCompensationRunner;
   readonly health?: EveDeploymentHealthRunner;
   readonly afterPromotion?: () => void | Promise<void>;
@@ -659,6 +744,8 @@ async function readInstalledManifest(
   packageName: string,
 ): Promise<
   | {
+    readonly version?: string;
+    readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean } };
     readonly devDependencies?: Readonly<Record<string, string>>;
     readonly dependencies?: Readonly<Record<string, string>>;
     readonly peerDependencies?: Readonly<Record<string, string>>;
@@ -672,6 +759,8 @@ async function readInstalledManifest(
         "utf8",
       ),
     ) as {
+      readonly version?: string;
+      readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean } };
       readonly devDependencies?: Readonly<Record<string, string>>;
       readonly dependencies?: Readonly<Record<string, string>>;
       readonly peerDependencies?: Readonly<Record<string, string>>;
@@ -1130,6 +1219,7 @@ interface WranglerJsonResult {
 
 async function readWranglerJson(
   args: readonly string[],
+  timeoutMs: number = 30_000,
 ): Promise<WranglerJsonResult> {
   try {
     const result = await execFileAsync(
@@ -1139,7 +1229,7 @@ async function readWranglerJson(
         env: safeWranglerEnvironment(),
         cwd: wranglerCwd,
         maxBuffer: 2 * 1024 * 1024,
-        timeout: 30_000,
+        timeout: timeoutMs,
       },
     );
     const parsed = JSON.parse(result.stdout.trim()) as unknown;
@@ -1573,12 +1663,26 @@ async function resolveEveTargetOwnership(
     );
   const remoteProven = evidence !== undefined && workerProven && containerProven;
   if (!remoteProven) {
+    const failures: string[] = [];
+    if (evidence === undefined) failures.push("provider evidence unavailable");
+    if (result.target.observed?.worker === true) {
+      if (evidence?.settingsReadable !== true) failures.push("Worker settings unreadable");
+      else if (evidence.workerDeploymentId === undefined) failures.push("Worker deployment stamp absent");
+      else if (!recordedDeploymentIds.has(evidence.workerDeploymentId)) failures.push("Worker deployment stamp differs from recorded identities");
+    }
+    if (result.target.observed?.container === true) {
+      if (evidence?.containerSchedulingPolicy !== "durable_object") failures.push("Container scheduling policy unproven");
+      if (evidence?.containerNamespaceId === undefined) failures.push("Container namespace unreadable");
+      if (evidence?.workerContainerNamespaceId === undefined) failures.push("Worker Container binding namespace unreadable");
+      if (evidence?.containerNamespaceId !== undefined && evidence.workerContainerNamespaceId !== undefined &&
+          evidence.containerNamespaceId !== evidence.workerContainerNamespaceId) failures.push("Container and Worker binding namespaces differ");
+    }
     return {
       ...result,
       target: {
         ...result.target,
         message:
-          "The exact Worker or Container target exists, and although a local Eden record matches, provider state cannot prove it is the one Eden deployed — the target may have been recreated outside Eden.",
+          `The exact Worker or Container target exists, and although a local Eden record matches, provider state cannot prove it is the one Eden deployed — the target may have been recreated outside Eden. Unproven: ${failures.join("; ")}.`,
         remediation:
           "Inspect the Worker at its workers.dev origin and the recorded deployment history before redeploying; if it is not Eden's, deploy under a different --name or delete it yourself.",
       },
@@ -1813,11 +1917,16 @@ function transportIdentityMatches(
     "generationId",
     "stableWorkersDevOrigin",
     "workerName",
-    "stableContainerInstanceName",
   ];
   if (!required.every((key) => observed[key] === expected[key])) {
     return false;
   }
+  const expectedInstance = expected.retainedDeployments === undefined ||
+      expected.deploymentId === "eden-cloudflare"
+    ? expected.stableContainerInstanceName
+    : `${expected.stableContainerInstanceName}:${expected.deploymentId}`;
+  if (observed.stableContainerInstanceName !== expectedInstance ||
+      observed.releaseId !== expected.releaseId) return false;
   return expected.runtimeRevisionHandle === undefined
     ? observed.runtimeRevisionHandle === undefined
     : observed.runtimeRevisionHandle === expected.runtimeRevisionHandle;
@@ -1834,6 +1943,7 @@ function identityMatches(
     "sourceDigest",
     "generationId",
     "deploymentId",
+    "releaseId",
     "environment",
     "name",
     "accountId",
@@ -1865,6 +1975,11 @@ function safeIdentity(identity: EveDeploymentIdentity): Record<string, unknown> 
     sourceDigest: identity.sourceDigest,
     generationId: identity.generationId,
     deploymentId: identity.deploymentId,
+    releaseId: identity.releaseId,
+    eveVersion: identity.eveVersion,
+    affinityContract: identity.affinityContract,
+    retainedDeployments: identity.retainedDeployments,
+    pendingRetirements: identity.pendingRetirements,
     environment: identity.environment,
     name: identity.name,
     accountId: identity.accountId,
@@ -2187,6 +2302,7 @@ function responseIdentity(
   read("sourceDigest", "x-eden-eve-source-digest");
   read("generationId", "x-eden-eve-generation-id");
   read("deploymentId", "x-eden-eve-deployment-id");
+  read("releaseId", "x-eden-eve-release-id");
   read("environment", "x-eden-eve-environment");
   read("name", "x-eden-eve-name");
   read("accountId", "x-eden-eve-account-id");
@@ -2249,7 +2365,7 @@ function defaultHealthRunner(): EveDeploymentHealthRunner {
         // generation's image (the host stamps the header only after
         // inspecting the running instance).
         if (
-          observedIdentity.startedDeploymentId !== request.identity.deploymentId
+          observedIdentity.startedDeploymentId !== (request.identity.releaseId ?? request.identity.deploymentId)
         ) {
           lastReason =
             "The served Container has not verifiably started this deployment's image yet; waiting for the rollout to land.";
@@ -2409,9 +2525,10 @@ async function writeEveDeploymentRecord(
   hostConfig: EveHostConfig,
   status: EveDeploymentStatus,
   extra: Record<string, unknown> = {},
+  filename = "deployment.json",
 ): Promise<void> {
   await writeFile(
-    join(candidate.generationRoot, "deployment.json"),
+    join(candidate.generationRoot, filename),
     `${JSON.stringify({
       version: 1,
       status,
@@ -2426,6 +2543,11 @@ async function writeEveDeploymentRecord(
       flag: "wx",
     },
   );
+}
+
+async function deploymentRecordPath(generationRoot: string): Promise<string> {
+  const path = join(generationRoot, "deployment.json");
+  return await lstat(path).then(() => path, () => join(generationRoot, "deployment-intent.json"));
 }
 
 async function writeEveIndeterminateEvidence(
@@ -2531,6 +2653,13 @@ async function runEveDeployment(
   }
   const priorIdentity = prior?.identity;
   const priorDurableObjects = prior?.durableObjects;
+  const worldManifest = collected.workflowWorld === "@moinulmoin/eden-world-cloudflare"
+    ? await readInstalledManifest(candidate.snapshotRoot, collected.workflowWorld)
+    : undefined;
+  const affinityEnabled = worldManifest?.eden?.capabilities?.deploymentAffinity === true;
+  if (!affinityEnabled && priorIdentity?.retainedDeployments !== undefined) {
+    throw deploymentFailure("EVE_AFFINITY_REQUIRED", "This target retains affinity deployments; install a World package declaring deploymentAffinity before updating it.");
+  }
   const superseded = isUpdate
     ? {
       generationId: priorIdentity?.generationId,
@@ -2548,9 +2677,13 @@ async function runEveDeployment(
       resultWarnings.push({
         id: "EVE_UPDATE_IN_FLIGHT",
         message:
-          "This update replaces the running Container; durable World runs in flight resume on the new code — Cloudflare has no deployment pinning, so keep step names and payload shapes backward compatible.",
+          affinityEnabled
+            ? "This update retains pinned deployments until their sessions, queue messages, and transfers drain."
+            : "This update replaces the running Container; an Eve version change can strand existing sessions because the installed World does not declare deployment affinity.",
         remediation:
-          "Let pending approvals and long runs settle before updating, or keep step names, queue names, and serialized payloads compatible across the change.",
+          affinityEnabled
+            ? "End old sessions to allow their deployment images to retire."
+            : "Let sessions settle before changing Eve versions, or install an affinity-capable World package.",
       });
     }
     if (
@@ -2619,6 +2752,82 @@ async function runEveDeployment(
     request.environment,
     request.name,
   );
+  const releaseId = `eve-deploy-${randomUUID()}`;
+  let previousEveVersion = priorIdentity?.eveVersion;
+  if (previousEveVersion === undefined && prior !== undefined) {
+    previousEveVersion = (await readInstalledManifest(join(prior.generationRoot, "container/snapshot"), "eve"))?.version;
+  }
+  const retainedDeployments: Record<string, EveAffinityDeployment> = {
+    ...priorIdentity?.retainedDeployments,
+  };
+  if (affinityEnabled && priorIdentity?.retainedDeployments === undefined &&
+      priorIdentity?.containerImage !== undefined && priorIdentity.generationId !== undefined) {
+    retainedDeployments["eden-cloudflare"] = {
+      image: priorIdentity.containerImage,
+      generationId: priorIdentity.generationId,
+      ...(previousEveVersion === undefined ? {} : { eveVersion: previousEveVersion }),
+      affinityContract: EDEN_AFFINITY_CONTRACT,
+      ...(priorIdentity.runtimeRevisionHandle === undefined ? {} : { runtimeRevisionHandle: priorIdentity.runtimeRevisionHandle }),
+    };
+  }
+  const matchingDeployment = Object.entries(retainedDeployments).find(([, entry]) =>
+    entry.eveVersion === candidate.eveVersion && entry.affinityContract === EDEN_AFFINITY_CONTRACT
+  )?.[0];
+  const deploymentId = !affinityEnabled ? releaseId : matchingDeployment ??
+    `eden-affinity-${createHash("sha256").update(`${candidate.eveVersion}:${EDEN_AFFINITY_CONTRACT}`).digest("hex").slice(0, 24)}`;
+  const retiringDeployments: Record<string, EveAffinityDeployment> = { ...priorIdentity?.pendingRetirements };
+  delete retiringDeployments[deploymentId];
+  if (priorIdentity?.deploymentId !== undefined) delete retiringDeployments[priorIdentity.deploymentId];
+  for (const id of prior?.protectedDeploymentIds ?? []) delete retiringDeployments[id];
+  const controlToken = `${randomUUID()}${randomUUID()}`;
+  if (affinityEnabled) {
+    await (options.protectedStore ?? defaultProtectedStore(request.name)).put({
+      targetId: targetKey, revision: `eve-affinity-control-${randomUUID()}`,
+      inputIdentity: {
+        token: `eve-affinity-control-input-${randomUUID()}`,
+        byteLength: Buffer.byteLength(controlToken),
+        digest: createHash("sha256").update(controlToken).digest("hex"),
+      },
+      variableNames: ["EDEN_EVE_CONTROL_TOKEN"], values: { EDEN_EVE_CONTROL_TOKEN: controlToken },
+    });
+  }
+  if (affinityEnabled && priorIdentity?.retainedDeployments !== undefined) {
+    const ids = Object.keys(retainedDeployments);
+    const raw = await (options.deploymentRpc ?? defaultDeploymentRpc)({
+      origin: stableWorkersDevOrigin, operation: "deployments.drainState", deploymentIds: ids,
+      controlToken,
+      ...(collected.runtimeConfig === undefined ? {} : { runtimeConfig: collected.runtimeConfig }),
+    });
+    const states = validateDeploymentDrainStates(raw, ids);
+    const eligible = ids.filter((id) =>
+      id !== deploymentId && id !== priorIdentity.deploymentId &&
+      !prior?.protectedDeploymentIds?.includes(id) && states[id]?.drained === true
+    );
+    const remainingCount = ids.length - eligible.length + (deploymentId in retainedDeployments ? 0 : 1);
+    if (remainingCount <= 10 && eligible.length > 0) {
+      // Drain snapshots are not fences. Retire only noncurrent targets, and
+      // obtain the World's durable admission fence before dropping routes.
+      const retired = await (options.deploymentRpc ?? defaultDeploymentRpc)({
+        origin: stableWorkersDevOrigin, operation: "deployments.retire",
+        deploymentIds: eligible, controlToken,
+        ...(collected.runtimeConfig === undefined ? {} : { runtimeConfig: collected.runtimeConfig }),
+      });
+      if (typeof retired !== "object" || retired === null || !("retired" in retired) ||
+          !Array.isArray(retired.retired) ||
+          eligible.some((id) => !(retired.retired as unknown[]).includes(id))) {
+        throw deploymentFailure("EVE_AFFINITY_RETIRE_UNPROVEN", "The World did not prove the noncurrent deployments durably fenced for retirement.");
+      }
+      for (const id of eligible) {
+        retiringDeployments[id] = retainedDeployments[id]!;
+        delete retainedDeployments[id];
+      }
+    }
+    if (Object.keys(retainedDeployments).length + (deploymentId in retainedDeployments ? 0 : 1) > 10) {
+      const blockers = Object.entries(states).filter(([id]) => id in retainedDeployments)
+        .map(([id, state]) => `${id}: ${state.liveSessions} live sessions, ${state.liveRuns} live runs, ${state.pendingMessages} pending messages, ${state.unfinishedTransfers} unfinished transfers`);
+      throw deploymentFailure("EVE_AFFINITY_LIMIT", `Deployment refused before publication: at most 10 affinity deployments may be retained. Blocking deployments: ${blockers.join("; ")}`);
+    }
+  }
   let imageReference = options.containerImageReference;
   if (imageReference !== undefined) {
     if (imageDigestFromReference(imageReference) !== imageDigest) {
@@ -2637,7 +2846,7 @@ async function runEveDeployment(
       );
     }
     const imageRepository =
-      `eden-eve-${targetKey}-${candidate.generationId}`;
+      `eden-eve-${targetKey}-${affinityEnabled ? deploymentId : candidate.generationId}`;
     const imageTag = `${imageRepository}:${EVE_REGISTRY_IMAGE_TAG}`;
     const targetImageReference =
       `registry.cloudflare.com/${accountId}/${imageRepository}@${imageDigest}`;
@@ -2721,7 +2930,6 @@ async function runEveDeployment(
       throw deploymentFailure("DEPLOY_INDETERMINATE", reason);
     }
   }
-  const deploymentId = `eve-deploy-${randomUUID()}`;
   const containerApplicationName = boundedResourceName(request.name, "container");
   const stableContainerInstanceName = boundedResourceName(request.name, "instance");
   const runtimeVariableNames = candidate.runtimeVariableNames;
@@ -2730,6 +2938,23 @@ async function runEveDeployment(
     sourceDigest: candidate.sourceDigest,
     generationId: candidate.generationId,
     deploymentId,
+    releaseId,
+    eveVersion: candidate.eveVersion,
+    ...(affinityEnabled ? {
+      affinityContract: EDEN_AFFINITY_CONTRACT,
+      retainedDeployments: {
+        ...retainedDeployments,
+        [deploymentId]: {
+          image: imageReference,
+          generationId: candidate.generationId,
+          eveVersion: candidate.eveVersion,
+          affinityContract: EDEN_AFFINITY_CONTRACT,
+          releaseId,
+          ...(runtimeInjection?.protectedHandle === undefined ? {} : { runtimeRevisionHandle: runtimeInjection.protectedHandle }),
+        },
+      },
+      pendingRetirements: retiringDeployments,
+    } : {}),
     environment: request.environment,
     name: request.name,
     accountId,
@@ -2750,6 +2975,10 @@ async function runEveDeployment(
     containerApplicationName: identity.containerApplicationName,
     stableContainerInstanceName: identity.stableContainerInstanceName,
     deploymentId: identity.deploymentId,
+    ...(identity.releaseId === undefined ? {} : { releaseId: identity.releaseId }),
+    ...(identity.eveVersion === undefined ? {} : { eveVersion: identity.eveVersion }),
+    ...(identity.affinityContract === undefined ? {} : { affinityContract: identity.affinityContract }),
+    ...(identity.retainedDeployments === undefined ? {} : { retainedDeployments: identity.retainedDeployments }),
     generationId: identity.generationId,
     stableWorkersDevOrigin: identity.stableWorkersDevOrigin,
     containerImage: identity.containerImage,
@@ -2815,6 +3044,8 @@ async function runEveDeployment(
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
   };
+  await writeEveDeploymentRecord(candidate, identity, hostConfig, "indeterminate",
+    { evidence: "publication-intent" }, "deployment-intent.json");
   try {
     eveProgress(options, "publishing Worker and Container application");
     publication = await publishOne(publicationRequest);
@@ -3124,7 +3355,32 @@ async function runEveDeployment(
   );
   await options.afterPromotion?.();
   let supersededImageCleanup: EvePreflightCheck | undefined;
-  if (isUpdate) {
+  if (affinityEnabled && Object.keys(retiringDeployments).length > 0) {
+    const ids = Object.keys(retiringDeployments);
+    try {
+      const result = await (options.deploymentRpc ?? defaultDeploymentRpc)({
+        origin: stableWorkersDevOrigin, operation: "deployments.retire", deploymentIds: ids,
+        controlToken,
+        ...(collected.runtimeConfig === undefined ? {} : { runtimeConfig: collected.runtimeConfig }),
+      });
+      if (typeof result !== "object" || result === null ||
+          !("retired" in result) || !Array.isArray(result.retired) ||
+          ids.some((id) => !(result.retired as unknown[]).includes(id))) throw new Error("Retirement was not proven.");
+      for (const [id, retained] of Object.entries(retiringDeployments)) {
+        const repository = ownedRegistryRepository({
+          ...identity, deploymentId: id, containerImage: retained.image, generationId: retained.generationId,
+        }, request.environment, request.name, accountId);
+        if (repository !== undefined && await (options.deleteRegistryRepository ??
+            defaultRegistryRepositoryDelete)({ repository }) === "indeterminate") {
+          throw new Error(`Repository deletion was not proven: ${repository}`);
+        }
+      }
+      supersededImageCleanup = check("VAL-LIFE-007", "passed", "Drained deployment instances and their owned registry repositories were retired.");
+    } catch {
+      supersededImageCleanup = check("VAL-LIFE-007", "failed", "The deployment is healthy, but drained resource retirement was not proven; exact pending retirement records were retained for retry.", "Retry deploy to finish only recorded drained resource cleanup.");
+    }
+  }
+  if (isUpdate && !affinityEnabled) {
     // The superseded generation's registry repository is generation-scoped
     // and no longer referenced once CURRENT promotes this generation; only
     // then is it safe to delete. Every tag in the repository goes with it —
@@ -3977,6 +4233,13 @@ interface EveDestroyRecord {
     readonly containerApplicationName?: unknown;
     readonly stableContainerInstanceName?: unknown;
     readonly containerImage?: unknown;
+    readonly deploymentId?: unknown;
+    readonly eveVersion?: unknown;
+    readonly affinityContract?: unknown;
+    readonly releaseId?: unknown;
+    readonly retainedDeployments?: unknown;
+    readonly pendingRetirements?: unknown;
+    readonly runtimeRevisionHandle?: unknown;
     readonly accountId?: unknown;
     readonly environment?: unknown;
     readonly name?: unknown;
@@ -3990,6 +4253,13 @@ type VerifiedEveDestroyIdentity = {
   readonly containerApplicationName: string;
   readonly stableContainerInstanceName: string;
   readonly containerImage?: string;
+  readonly deploymentId?: string;
+  readonly eveVersion?: string;
+  readonly affinityContract?: number;
+  readonly releaseId?: string;
+  readonly runtimeRevisionHandle?: string;
+  readonly retainedDeployments?: Readonly<Record<string, EveAffinityDeployment>>;
+  readonly pendingRetirements?: Readonly<Record<string, EveAffinityDeployment>>;
   readonly accountId: string;
   readonly environment: string;
   readonly name: string;
@@ -4035,7 +4305,7 @@ async function readEveDestroyRecord(
     );
   }
   const parsed = await parseEveDestroyRecord(
-    join(generationRoot, "deployment.json"),
+    await deploymentRecordPath(generationRoot),
     environment,
     name,
   );
@@ -4072,7 +4342,7 @@ async function readEveDestroyRecordFromGenerations(
     const details = await lstat(generationRoot).catch(() => undefined);
     if (details === undefined || !details.isDirectory()) continue;
     const recordDetails = await lstat(
-      join(generationRoot, "deployment.json"),
+      await deploymentRecordPath(generationRoot),
     ).catch(() => undefined);
     if (recordDetails !== undefined && recordDetails.isFile()) {
       withRecords.push({
@@ -4084,7 +4354,7 @@ async function readEveDestroyRecordFromGenerations(
   withRecords.sort((left, right) => right.modifiedAt - left.modifiedAt);
   for (const { generationRoot } of withRecords) {
     const parsed = await parseEveDestroyRecord(
-      join(generationRoot, "deployment.json"),
+      await deploymentRecordPath(generationRoot),
       environment,
       name,
     );
@@ -4137,7 +4407,29 @@ async function parseEveDestroyRecord(
   if (identity.environment !== environment || identity.name !== name) {
     return undefined;
   }
+  const metadata: Partial<VerifiedEveDestroyIdentity> = {};
+  for (const key of ["deploymentId", "eveVersion", "releaseId", "runtimeRevisionHandle"] as const) {
+    if (typeof identity[key] === "string") Object.assign(metadata, { [key]: identity[key] });
+  }
+  if (typeof identity.affinityContract === "number") Object.assign(metadata, { affinityContract: identity.affinityContract });
+  for (const key of ["retainedDeployments", "pendingRetirements"] as const) {
+    const value = identity[key];
+    if (value === undefined) continue;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    for (const [id, deployment] of Object.entries(value)) {
+      if (!/^(?:eden-cloudflare|eden-affinity-[a-f0-9]{24})$/u.test(id) ||
+          typeof deployment !== "object" || deployment === null ||
+          typeof deployment.image !== "string" || imageDigestFromReference(deployment.image) === undefined ||
+          typeof deployment.generationId !== "string" ||
+          (deployment.eveVersion !== undefined && typeof deployment.eveVersion !== "string") ||
+          (deployment.affinityContract !== undefined && typeof deployment.affinityContract !== "number") ||
+          (deployment.releaseId !== undefined && typeof deployment.releaseId !== "string") ||
+          (deployment.runtimeRevisionHandle !== undefined && typeof deployment.runtimeRevisionHandle !== "string")) return undefined;
+    }
+    Object.assign(metadata, { [key]: value });
+  }
   const verified: VerifiedEveDestroyIdentity = {
+    ...metadata,
     workerName: identity.workerName as string,
     containerApplicationName: identity.containerApplicationName as string,
     stableContainerInstanceName:
@@ -4175,6 +4467,7 @@ interface EveDeploymentRecord {
   readonly status: EveDeploymentStatus | undefined;
   /** Every deploymentId this target's records have ever published, used to prove a live remote Worker is one Eden deployed. */
   readonly deploymentIds: readonly string[];
+  readonly protectedDeploymentIds?: readonly string[];
   /** True when the recorded Worker carried `EDEN_EVE_WORLD_CLOUDFLARE`. */
   readonly worldCloudflare: boolean;
   /**
@@ -4233,7 +4526,7 @@ async function readEveDeploymentRecord(
   const deploymentIds = new Set<string>();
   for (const entry of entries) {
     const generationRoot = join(generationsRoot, entry);
-    const recordPath = join(generationRoot, "deployment.json");
+    const recordPath = await deploymentRecordPath(generationRoot);
     const details = await lstat(recordPath).catch(() => undefined);
     if (details === undefined || !details.isFile()) continue;
     const parsed = await parseEveDeploymentRecord(
@@ -4279,7 +4572,7 @@ async function readEveDeploymentRecord(
         live = pinned;
       } else {
         const parsed = await parseEveDeploymentRecord(
-          join(generationRoot, "deployment.json"),
+          await deploymentRecordPath(generationRoot),
           environment,
           name,
         );
@@ -4303,10 +4596,30 @@ async function readEveDeploymentRecord(
   const historySource = scanned.find(
     (entry) => entry.record.durableObjects !== undefined,
   );
+  // CURRENT is only a health/promotion pointer. A newer uncertain publication
+  // may already serve sessions; preserve every such image until a later deploy
+  // can prove it drained, never infer absence from a failed health check.
+  const unresolved = scanned.filter((entry) => entry.modifiedAt > live.modifiedAt);
+  const retainedDeployments = { ...live.record.identity.retainedDeployments };
+  const pendingRetirements = { ...live.record.identity.pendingRetirements };
+  const protectedDeploymentIds = new Set<string>();
+  if (live.record.identity.retainedDeployments === undefined) {
+    protectedDeploymentIds.add("eden-cloudflare");
+  }
+  for (const entry of unresolved.slice().reverse()) {
+    Object.assign(retainedDeployments, entry.record.identity.retainedDeployments);
+    Object.assign(pendingRetirements, entry.record.identity.pendingRetirements);
+    if (entry.record.deploymentId !== undefined) protectedDeploymentIds.add(entry.record.deploymentId);
+  }
   return {
     recordPath: live.record.recordPath,
     generationRoot: live.generationRoot,
-    identity: live.record.identity,
+    identity: {
+      ...live.record.identity,
+      ...(Object.keys(retainedDeployments).length === 0 ? {} : { retainedDeployments }),
+      ...(Object.keys(pendingRetirements).length === 0 ? {} : { pendingRetirements }),
+    },
+    protectedDeploymentIds: [...protectedDeploymentIds],
     status: live.record.status,
     deploymentIds: [...deploymentIds],
     worldCloudflare: live.record.worldCloudflare,
@@ -4429,7 +4742,7 @@ async function defaultDestroyTargetRead(
       "images",
       "list",
       "--json",
-    ]);
+    ], WRANGLER_OPERATION_TIMEOUT_MS);
     const tagsByRepository = registryTagsByRepository(images.value);
     if (!images.failed && tagsByRepository !== undefined) {
       const present: string[] = [];
@@ -4521,12 +4834,13 @@ async function defaultContainerDelete(
 async function defaultRegistryRepositoryDelete(
   request: { readonly repository: string },
 ): Promise<"deleted" | "absent" | "indeterminate"> {
+  // Catalog reads include Cloudflare snapshot tags and can exceed 30 seconds.
   const images = await readWranglerJson([
     "containers",
     "images",
     "list",
     "--json",
-  ]);
+  ], WRANGLER_OPERATION_TIMEOUT_MS);
   const collection = jsonCollection(images.value);
   if (images.failed || collection === undefined) return "indeterminate";
   const entry = collection.find(
@@ -4556,9 +4870,14 @@ async function defaultRegistryRepositoryDelete(
       deletedAny = true;
       continue;
     }
-    if (!/(?:does not exist|not found|404)/iu.test(result.stderr)) {
-      return "indeterminate";
-    }
+  }
+  const after = await readWranglerJson(
+    ["containers", "images", "list", "--json"],
+    WRANGLER_OPERATION_TIMEOUT_MS,
+  );
+  const remaining = after.failed ? undefined : registryTagsByRepository(after.value);
+  if (remaining === undefined || (remaining.get(request.repository)?.length ?? 0) > 0) {
+    return "indeterminate";
   }
   return deletedAny ? "deleted" : "absent";
 }
@@ -4584,23 +4903,13 @@ function ownedRegistryRepository(
   ) {
     return undefined;
   }
-  const repository = `eden-eve-${
-    stableDeploymentKey(
-      identity.projectId,
-      identity.accountId,
-      environment,
-      name,
-    )
-  }-${identity.generationId}`;
-  const expected =
-    `registry.cloudflare.com/${identity.accountId}/${repository}@`;
-  if (
-    !identity.containerImage.startsWith(expected) ||
-    imageDigestFromReference(identity.containerImage) === undefined
-  ) {
-    return undefined;
-  }
-  return repository;
+  const prefix = `eden-eve-${stableDeploymentKey(identity.projectId, identity.accountId, environment, name)}-`;
+  const suffixes = [identity.generationId];
+  if (identity.retainedDeployments !== undefined && identity.deploymentId !== undefined) suffixes.push(identity.deploymentId);
+  if (imageDigestFromReference(identity.containerImage) === undefined) return undefined;
+  return suffixes.map((suffix) => `${prefix}${suffix}`).find((repository) =>
+    identity.containerImage!.startsWith(`registry.cloudflare.com/${identity.accountId}/${repository}@`)
+  );
 }
 
 /**
@@ -4668,6 +4977,17 @@ async function collectEveDestroyRegistryRepositories(
   );
   const entries = await readdir(generationsRoot).catch(() => []);
   const repositories = new Set<string>();
+  const addRetained = (identity: VerifiedEveDestroyIdentity): void => {
+    for (const [id, retained] of Object.entries({
+      ...identity.retainedDeployments, ...identity.pendingRetirements,
+    })) {
+      const repository = ownedRegistryRepository({
+        ...identity, deploymentId: id, containerImage: retained.image, generationId: retained.generationId,
+      }, environment, name, record.accountId);
+      if (repository !== undefined) repositories.add(repository);
+    }
+  };
+  addRetained(record);
   const targetKey = record.projectId === undefined
     ? undefined
     : stableDeploymentKey(
@@ -4679,7 +4999,7 @@ async function collectEveDestroyRegistryRepositories(
   for (const entry of entries) {
     const generationRoot = join(generationsRoot, entry);
     const parsed = await parseEveDestroyRecord(
-      join(generationRoot, "deployment.json"),
+      await deploymentRecordPath(generationRoot),
       environment,
       name,
     );
@@ -4692,6 +5012,7 @@ async function collectEveDestroyRegistryRepositories(
         record.accountId,
       );
     if (deployedRepository !== undefined) repositories.add(deployedRepository);
+    if (parsed !== undefined) addRetained(parsed.identity);
     if (targetKey === undefined) continue;
     const attemptRepository = await attemptRegistryRepository(
       join(generationRoot, "deployment-attempt.json"),

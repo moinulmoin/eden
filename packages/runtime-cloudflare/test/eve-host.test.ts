@@ -261,6 +261,7 @@ function hostContainer(
   const container = new EveHostDurableContainer(
     {
       container: runtime,
+      waitUntil: (promise: Promise<unknown>) => { void promise; },
       abort: options.abort ?? ((reason?: string) => {
         throw new Error(reason);
       }),
@@ -405,6 +406,7 @@ describe("generic Eve Cloudflare host", () => {
       EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
       EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
       EDEN_EVE_DEPLOYMENT_ID: IDENTITY.deploymentId,
+      EDEN_EVE_RELEASE_ID: IDENTITY.deploymentId,
       EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
       EVE_RUNTIME_VARIABLE_NAMES: ["EVE_AUTH_SECRET", "WORKFLOW_API_URL"],
       EDEN_EVE_RUNTIME_REVISION: "revision-1",
@@ -858,6 +860,7 @@ describe("generic Eve Cloudflare host", () => {
           sql: { exec: () => [] },
           get: async () => undefined,
           put: async () => undefined,
+          delete: async () => undefined,
           setAlarm: async () => undefined,
         },
         blockConcurrencyWhile: (callback: () => Promise<void>) => {

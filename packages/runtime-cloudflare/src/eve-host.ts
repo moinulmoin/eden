@@ -1,3 +1,19 @@
+export const EDEN_AFFINITY_CONTRACT = 1;
+
+/** Keeps the root declaration and module-load surfaces provider-independent. */
+export async function callDeploymentControlRpc(options: {
+  readonly origin: string;
+  readonly token: string;
+  readonly operation: "deployments.drainState" | "deployments.retire";
+  readonly args: unknown[];
+  readonly signal?: AbortSignal;
+}): Promise<unknown> {
+  // The World implementation is optional for root-module consumers. A static
+  // provider import would break that intentionally provider-free load boundary.
+  const world = await import("@moinulmoin/eden-world-cloudflare/core");
+  return world.callDeploymentControlRpc(options);
+}
+
 export const EVE_HOST_DEFAULTS = {
   compatibilityDate: "2026-04-01",
   healthPath: "/eve/v1/health",
@@ -316,12 +332,34 @@ export interface EveHostIdentity {
   readonly stableContainerInstanceName: string;
   readonly deploymentId: string;
   readonly generationId: string;
+  readonly releaseId?: string;
+  readonly eveVersion?: string;
+  readonly affinityContract?: number;
+}
+
+export interface EveRetainedDeployment {
+  readonly image: string;
+  readonly generationId: string;
+  readonly runtimeRevisionHandle?: string;
+  readonly releaseId?: string;
+  readonly eveVersion?: string;
+  readonly affinityContract?: number;
+}
+
+export interface EveDeploymentRoute {
+  readonly image: string;
+  readonly generationId: string;
+  readonly runtimeRevisionHandle?: string;
+  readonly releaseId?: string;
+  readonly eveVersion?: string;
+  readonly affinityContract?: number;
 }
 
 export interface EveHostConfigRequest extends EveHostIdentity {
   readonly accountId?: string;
   readonly stableWorkersDevOrigin: string;
   readonly containerImage: string;
+  readonly retainedDeployments?: Readonly<Record<string, EveRetainedDeployment>>;
   readonly containerImageBuildContext?: string;
   readonly runtimeVariableNames?: readonly string[];
   readonly runtimeRevisionHandle?: string;
@@ -373,6 +411,8 @@ export interface EveHostWranglerConfig {
     readonly EVE_CONTAINER_INSTANCE_NAME: string;
     readonly EDEN_EVE_DEPLOYMENT_ID: string;
     readonly EDEN_EVE_GENERATION_ID: string;
+    readonly EDEN_EVE_DEPLOYMENTS?: string;
+    readonly EDEN_EVE_RELEASE_ID: string;
     readonly EVE_RUNTIME_VARIABLE_NAMES: readonly string[];
     readonly EDEN_EVE_RUNTIME_REVISION?: string;
     readonly EDEN_EVE_CONTAINER_SLEEP_AFTER?: string;
@@ -384,9 +424,7 @@ export interface EveHostWranglerConfig {
       readonly name: string;
       readonly class_name: string;
       readonly scheduling_policy: "durable_object";
-      readonly images: {
-        readonly eve: { readonly image: string };
-      };
+      readonly images: Readonly<Record<string, { readonly image: string }>>;
     },
   ];
   readonly durable_objects: {
@@ -404,6 +442,8 @@ export interface EveHostContainerConfig {
   readonly publicOrigin: string;
   readonly deploymentId: string;
   readonly generationId: string;
+  readonly deployments?: Readonly<Record<string, EveDeploymentRoute>>;
+  readonly releaseId?: string;
   readonly runtimeRevisionHandle?: string;
   readonly schedules: readonly EveScheduleCronEntry[];
 }
@@ -528,11 +568,43 @@ export function createEveHostConfig(
   if (request.containerSleepAfter !== undefined) {
     parseEveSleepAfterMs(request.containerSleepAfter);
   }
+  const retainedDeployments = {
+    ...request.retainedDeployments,
+    [request.deploymentId]: {
+      image: request.containerImage,
+      releaseId: request.releaseId ?? request.deploymentId,
+      ...(request.eveVersion === undefined ? {} : { eveVersion: request.eveVersion }),
+      affinityContract: request.affinityContract ?? EDEN_AFFINITY_CONTRACT,
+      generationId: request.generationId,
+      ...(request.runtimeRevisionHandle === undefined
+        ? {}
+        : { runtimeRevisionHandle: request.runtimeRevisionHandle }),
+    },
+  };
+  const images: Record<string, { image: string }> = {};
+  const deployments: Record<string, EveDeploymentRoute> = {};
+  for (const [deploymentId, retained] of Object.entries(retainedDeployments)) {
+    assertNonEmpty(deploymentId, "retained deployment identity");
+    assertNonEmpty(retained.generationId, "retained generation identity");
+    assertContainerImage(retained.image);
+    const image = `deployment_${Array.from(new TextEncoder().encode(deploymentId), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+    images[image] = { image: retained.image };
+    deployments[deploymentId] = {
+      image,
+      generationId: retained.generationId,
+      ...(retained.releaseId === undefined ? {} : { releaseId: retained.releaseId }),
+      ...(retained.eveVersion === undefined ? {} : { eveVersion: retained.eveVersion }),
+      ...(retained.affinityContract === undefined ? {} : { affinityContract: retained.affinityContract }),
+      ...(retained.runtimeRevisionHandle === undefined
+        ? {}
+        : { runtimeRevisionHandle: retained.runtimeRevisionHandle }),
+    };
+  }
   const container = {
     name: request.containerApplicationName,
     class_name: "EveHostDurableContainer",
     scheduling_policy: "durable_object",
-    images: { eve: { image: request.containerImage } },
+    images: request.retainedDeployments === undefined ? { eve: { image: request.containerImage } } : images,
   } as const;
   const worldCloudflare =
     request.workflowWorld === "@moinulmoin/eden-world-cloudflare";
@@ -629,7 +701,9 @@ export function createEveHostConfig(
         EVE_PUBLIC_ORIGIN: request.stableWorkersDevOrigin,
         EVE_CONTAINER_INSTANCE_NAME: request.stableContainerInstanceName,
         EDEN_EVE_DEPLOYMENT_ID: request.deploymentId,
+        EDEN_EVE_RELEASE_ID: request.releaseId ?? request.deploymentId,
         EDEN_EVE_GENERATION_ID: request.generationId,
+        ...(request.retainedDeployments === undefined ? {} : { EDEN_EVE_DEPLOYMENTS: JSON.stringify(deployments) }),
         EVE_RUNTIME_VARIABLE_NAMES: request.runtimeVariableNames ?? [],
         ...(request.runtimeRevisionHandle === undefined
           ? {}
@@ -656,7 +730,9 @@ export function createEveHostConfig(
       port: EVE_HOST_DEFAULTS.internalPort,
       publicOrigin: request.stableWorkersDevOrigin,
       deploymentId: request.deploymentId,
+      releaseId: request.releaseId ?? request.deploymentId,
       generationId: request.generationId,
+      ...(request.retainedDeployments === undefined ? {} : { deployments }),
       ...(request.runtimeRevisionHandle === undefined
         ? {}
         : { runtimeRevisionHandle: request.runtimeRevisionHandle }),
@@ -673,7 +749,9 @@ export function generateEveHostWorkerSource(
     publicOrigin: request.config.container.publicOrigin,
     workerName: request.config.worker.name,
     deploymentId: request.config.container.deploymentId,
+    releaseId: request.config.container.releaseId ?? request.config.container.deploymentId,
     generationId: request.config.container.generationId,
+    ...(request.config.container.deployments === undefined ? {} : { deployments: request.config.container.deployments }),
     stableContainerInstanceName: request.config.container.instanceName,
     ...(request.config.container.runtimeRevisionHandle === undefined
       ? {}
@@ -707,6 +785,7 @@ export function generateEveHostWorkerSource(
 }
 
 export interface EveHostForwardingMetadata {
+  readonly releaseId?: string;
   readonly publicOrigin: string;
   readonly deploymentId: string;
   readonly generationId: string;
@@ -771,6 +850,7 @@ export function createTrustedEveRequest(
   headers.set("x-forwarded-proto", edgeProtocol);
   headers.set("x-eden-eve-public-origin", metadata.publicOrigin);
   headers.set("x-eden-eve-deployment-id", metadata.deploymentId);
+  headers.set("x-eden-eve-release-id", metadata.releaseId ?? metadata.deploymentId);
   headers.set("x-eden-eve-generation-id", metadata.generationId);
   headers.set("x-eden-eve-correlation-id", metadata.correlationId);
   if (metadata.runtimeRevisionHandle !== undefined) {
@@ -808,6 +888,9 @@ export interface EveHostContainerEnvironment {
   readonly EVE_CONTAINER_INSTANCE_NAME?: string;
   readonly EDEN_EVE_DEPLOYMENT_ID?: string;
   readonly EDEN_EVE_GENERATION_ID?: string;
+  readonly EDEN_EVE_RELEASE_ID?: string;
+  readonly EDEN_EVE_CONTROL_TOKEN?: string;
+  readonly EDEN_EVE_DEPLOYMENTS?: string;
   readonly EDEN_EVE_RUNTIME_REVISION?: string;
   readonly EDEN_EVE_CONTAINER_SLEEP_AFTER?: string;
   readonly EDEN_EVE_WORLD_CLOUDFLARE?: boolean;
@@ -866,6 +949,11 @@ const RESERVED_EVE_HOST_VARIABLES = new Set([
   "EDEN_WORLD_URL",
   "EDEN_EVE_DEPLOYMENT_ID",
   "EDEN_EVE_GENERATION_ID",
+  "EDEN_EVE_DEPLOYMENTS",
+  "EDEN_EVE_RELEASE_ID",
+  "EDEN_AFFINITY_CONTRACT",
+  "EDEN_EVE_CONTROL_TOKEN",
+  "EVE_SCHEDULES_DISABLED",
   "EDEN_EVE_RUNTIME_REVISION",
 ]);
 

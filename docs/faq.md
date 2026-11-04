@@ -13,10 +13,12 @@ only plan requirement.
 ### What does it cost to run?
 
 The Workers Paid plan, plus Cloudflare's usage pricing for the container while
-it is awake. Eden runs one `standard-1` container (1/2 vCPU, 4 GiB) per agent
-and puts it to sleep after 1 hour without requests; a sleeping container is
-not billed. An agent with schedules also gets one Cron Trigger invocation per
-minute (about 43,000 a month), which is well inside the Workers Paid
+it is awake. Eden runs a `standard-1` container (1/2 vCPU, 4 GiB) per
+deployment and puts each instance to sleep independently after 1 hour without
+requests, never during an in-flight delivery or transfer. A sleeping container
+is not billed. Affinity can retain several images and instances until old
+sessions end. An agent with schedules also gets one Cron Trigger invocation
+per minute (about 43,000 a month), which is well inside the Workers Paid
 allocation. See Cloudflare's
 [Containers pricing](https://developers.cloudflare.com/containers/platform/pricing/)
 for current rates.
@@ -45,8 +47,9 @@ the setup, including the sandbox module.
 Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, `0.82.0`,
 `0.83.0`, `0.91.0`, and `1.0.0-rc.3`. The `0.83.0` Cloudflare World run
 preserved sandbox files and a queued task across a same-version skill update.
-Changing the Eve version ends
-existing sessions (they return `session_stranded`); start new ones. See
+With an updated Cloudflare World declaring `deploymentAffinity`, Eve
+upgrades keep existing sessions working. Update both the CLI and the World
+package. Older Worlds still warn that upgrades can return `session_stranded`. See
 [Eve compatibility](./eve-compatibility.md).
 
 ### Are npm, Bun, or Windows supported?
@@ -91,21 +94,43 @@ in about a second. See [Sleep and wake](./how-it-works.md#sleep-and-wake).
 ### Do schedules run while the agent sleeps?
 
 Yes, for standard 5-field cron expressions: a Cloudflare Cron Trigger wakes
-the container in time. Other expressions only run while the container is
-awake. See [Schedules](./how-it-works.md#schedules).
+the container in time. During an Eve upgrade, a scheduled job can fire on
+both versions until the old version finishes its running work and file
+transfers. Eden then stops its schedules. Other expressions only run while
+the container is awake. See
+[Schedules](./how-it-works.md#schedules).
 
 ### Does my data survive sleep and updates?
 
-Files the agent writes survive sleep. On an update, every conversation's
-sandbox files are carried over (up to 1 GiB compressed); Eve's default local
-Workflow World resets. For durable sessions and approvals across updates, use
-the [Postgres World](./deploy.md#durable-state-postgres-world). The full
-picture is in [Where your data lives](./how-it-works.md#where-your-data-lives).
+Files the agent writes survive sleep. Same-version updates carry conversation
+sandbox files (up to 1 GiB compressed); Eve's default local Workflow World
+resets. With the updated Cloudflare World, sessions keep their ID, history,
+and sandbox files across Eve upgrades. Interrupted file transfers can be
+retried without overwriting active files. Postgres also provides durable
+state across updates.
+See [Where your data lives](./how-it-works.md#where-your-data-lives).
 
 ### How do I ship a change?
 
-Run the same `eden deploy` again, with the same `--env-file`. Eden updates the
-target in place: same URL, new code.
+Run the same `eden deploy` again, with the same `--env-file`. The public URL
+stays the same. The same Eve version updates in place, so running work uses
+the new code. Keep code and state backward-compatible.
+
+With a World declaring `deploymentAffinity`, a new Eve version keeps the old
+one running. Existing sessions move on their next message; idle sessions
+move without a message. Running work finishes on the old version.
+
+### Why is an old version still kept after a session moves?
+
+A session's first run stays on its original version until the session ends,
+so that version is kept. Sessions adopted from Eden `0.9.0` stay on the old
+version until they end and do not move to the new one.
+
+A later deploy removes old versions once their sessions end and their
+queued work and file transfers finish. Inactive Cloudflare instance records
+can remain until destroy. Eden keeps at most 10 versions, including current
+and legacy. If cleanup cannot make room, deploy refuses and lists the
+blocking versions and live session counts. There is no override flag.
 
 ### Can I deploy from CI or another machine?
 
@@ -121,9 +146,11 @@ rather than guess.
 eden destroy --name <target>
 ```
 
-It deletes exactly the Worker, Container application, and registry images
-Eden created for that target, then checks they are gone. Your Postgres
-database, if you use one, is not touched.
+It deletes exactly the Worker, Container application, **every retained
+container instance and image**, and all registry repositories Eden created
+for that target, including legacy deployments, then checks they are gone.
+Destroy also removes sessions still running. Your Postgres database, if you
+use one, is not touched.
 
 ## Compared to other setups
 
@@ -145,10 +172,12 @@ on Eve `0.83.0`, which removed microsandbox.
 It is the same Eve app, built by your own `eve build`. The differences:
 
 - the sandbox is `just-bash`, not Vercel Sandbox
-- runs are not pinned to the deployment that started them, so in-flight runs
-  continue on new code after an update
+- Eve upgrades keep old versions for existing sessions; same-version updates
+  still run in-flight work on new code. Older Worlds without
+  `deploymentAffinity` do not keep old versions
 - a sleeping agent takes 10–15 seconds to wake
-- one container per agent, `workers.dev` URL only, no custom domains yet
+- one instance per kept version, up to 10 versions, `workers.dev` URL only,
+  no custom domains yet
 
 ### Why not just run `eve start` on a server?
 

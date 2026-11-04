@@ -999,6 +999,7 @@ describe("Eve runtime image boundary", () => {
       "utf8",
     );
     expect(dockerfile).toContain("CBOR_NATIVE_ACCELERATION_DISABLED=true");
+    expect(dockerfile).toContain("apt-get install -y --no-install-recommends python3");
     const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
       .trim()
       .split("\n")

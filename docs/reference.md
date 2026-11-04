@@ -76,6 +76,44 @@ secrets, and the registry image, and it changes the project directory by
 writing a generation directory, the deployment record, and the `CURRENT`
 pointer.
 
+#### Eve upgrades and kept versions
+
+The project's installed World package must set
+`eden.capabilities.deploymentAffinity` to boolean `true`. Update both the CLI
+and the World package. With an older World, deploy keeps single-image
+updates and warns that an Eve upgrade ends existing sessions.
+
+The same Eve version updates in place; a new Eve version gets a new image
+and container. Eden also separates versions when its runtime/World protocol
+changes incompatibly (`EDEN_AFFINITY_CONTRACT`).
+
+Existing sessions move to the new version on their next message, keeping
+their ID, history, and sandbox files. Idle sessions move without a message.
+Running work finishes on the old version. Sessions adopted from Eden `0.9.0`
+stay on the legacy `eden-cloudflare` version until they end; they do not move.
+
+A session's first run stays on its original version until the session ends,
+so that version is kept even after the session moves. A later deploy removes
+old versions once their sessions end and their queued work and transfers
+finish. The version replaced by this deploy stays until at least the next
+deploy. Inactive Cloudflare instance records can remain until destroy.
+
+The limit is **10 kept versions**, including current and legacy. If cleanup
+cannot make room, deploy refuses before publication and lists blocking
+deployment IDs and live session counts. There is no override flag.
+
+Deploy rotates the `EDEN_EVE_CONTROL_TOKEN` Worker secret to manage old
+versions. This creates an additional Worker version and can take seconds to
+activate. A read-only cleanup query retries HTTP 401 once per second for up
+to 60 seconds. Other errors, including a cleanup-operation 401, stop deploy.
+The token is not saved locally or included in records, arguments, or logs.
+
+Interrupted sandbox transfers can be retried without overwriting active
+files. Each container sleeps independently, but not during running work or
+file transfers. Old versions start with schedules disabled. If an old version
+is still running work during an upgrade, a scheduled job can fire on both
+versions until that work finishes and Eden stops the old version's schedules.
+
 | Flag | Value | Default | Required |
 | --- | --- | --- | --- |
 | `--project <path>` | Eve project root | current directory | never; must be an existing canonical directory that holds `package.json` |
@@ -87,17 +125,17 @@ pointer.
 
 ### `eden destroy`
 
-Removes the exact target Eden owns. Destroy verifies the immutable ownership
-record, reads the current remote inventory, deletes only that Worker and
-Container application and the registry repositories this target pushed, proves
-the target is absent, and only then clears the target's `CURRENT` pointer. It
-never deletes by prefix or by a broad account search.
+Removes the exact target Eden owns, not just its newest deployment. Destroy
+verifies the immutable ownership record, reads the current remote inventory,
+deletes only that Worker and Container application, every retained container
+instance and image (including legacy), and the registry repositories this
+target pushed. It proves absence before clearing the target's `CURRENT`
+pointer, and never deletes by prefix or a broad account search.
 
 Destroy reads the local deployment records and the Cloudflare account, and
-changes both: it deletes the Worker, the Container application, and the
-registry repositories that the records prove this target pushed, and it
-removes the local `CURRENT` pointer. The local deployment records themselves
-are kept.
+changes both: it deletes the owned resources even when sessions have not
+drained, and removes the local `CURRENT` pointer. Local deployment records
+are kept; an external Postgres database is not touched.
 
 | Flag | Value | Default | Required |
 | --- | --- | --- | --- |
@@ -232,7 +270,7 @@ with `EVE_ENV_RESERVED_VARIABLE`:
 
 `HOST`, `NITRO_HOST`, `PORT`, `NITRO_PORT`, `NODE_ENV`,
 `NODE_EXTRA_CA_CERTS`, `WORKFLOW_LOCAL_BASE_URL`, `EDEN_WORLD_URL`,
-`EDEN_EVE_DEPLOYMENT_ID`, `EDEN_EVE_GENERATION_ID`.
+`EDEN_EVE_DEPLOYMENT_ID`, `EDEN_EVE_GENERATION_ID`, `EDEN_EVE_CONTROL_TOKEN`.
 
 `EDEN_EVE_RUNTIME_REVISION` passes the environment file parser but is
 reserved on the Worker side, so a file that defines it fails the publish step
@@ -285,11 +323,13 @@ The container starts with the project's own runtime values from the
 | `NODE_ENV` | `production` |
 | `WORKFLOW_LOCAL_BASE_URL` | The public `workers.dev` origin |
 | `NODE_EXTRA_CA_CERTS` | The path of the Cloudflare Containers CA certificate |
-| `EDEN_EVE_DEPLOYMENT_ID` | The deployment identity of this publish |
+| `EDEN_EVE_DEPLOYMENT_ID` | The affinity deployment identity |
+| `EDEN_EVE_RELEASE_ID` | The per-publish `eve-deploy-<uuid>` release identity |
 | `EDEN_EVE_GENERATION_ID` | The generation identity of this publish |
 | `EDEN_EVE_RUNTIME_REVISION` | The revision handle of the protected runtime values, when an `--env-file` was supplied |
 | `EDEN_WORLD_URL` | `<public origin>/__eden/world/rpc`, only with the Cloudflare Durable Object World |
 | `CBOR_NATIVE_ACCELERATION_DISABLED` | `true`; the runtime image sets it for every deployment |
+| `EVE_SCHEDULES_DISABLED` | `true` when an old version's container starts; an already-running old version stops its schedules after running work and file transfers finish |
 
 Eve is started as `./node_modules/.bin/eve start --host 0.0.0.0 --port 8080`.
 
@@ -300,8 +340,10 @@ The published Worker carries these plain-text variables:
 | Variable | Value |
 | --- | --- |
 | `EVE_PUBLIC_ORIGIN` | The stable `workers.dev` origin of this Worker |
-| `EVE_CONTAINER_INSTANCE_NAME` | The stable container instance name |
-| `EDEN_EVE_DEPLOYMENT_ID` | The deployment identity |
+| `EVE_CONTAINER_INSTANCE_NAME` | The base container instance name |
+| `EDEN_EVE_DEPLOYMENT_ID` | The newest affinity deployment identity |
+| `EDEN_EVE_RELEASE_ID` | The per-publish release identity |
+| `EDEN_EVE_DEPLOYMENTS` | JSON map of retained affinity IDs to `image`, `generationId`, and optional `runtimeRevisionHandle`, `eveVersion`, `affinityContract`, and `releaseId` |
 | `EDEN_EVE_GENERATION_ID` | The generation identity |
 | `EVE_RUNTIME_VARIABLE_NAMES` | The names of the `--env-file` variables of this run |
 | `EDEN_EVE_RUNTIME_REVISION` | The revision handle, when an `--env-file` was supplied |
@@ -321,6 +363,11 @@ header, and so are incoming `x-eden-*` and `cf-*` headers. The Worker also
 adds `x-eden-eve-*` headers carrying the public origin, deployment identity,
 generation identity, and correlation identity.
 
+`x-eden-eve-deployment-id` identifies the kept version;
+`x-eden-eve-release-id` identifies this publish. The
+`x-eden-eve-started-deployment` health header identifies the running publish,
+so health checks can distinguish same-version updates.
+
 ## What Eden creates
 
 ### In your Cloudflare account
@@ -329,7 +376,7 @@ generation identity, and correlation identity.
 | --- | --- |
 | Worker | Exactly the target name |
 | Container application | `<name>-container`, truncated to 63 characters |
-| Container instance | `<name>-instance`, truncated to 63 characters |
+| Container instance | Base `<name>-instance`, truncated to 63 characters; legacy `eden-cloudflare` uses that unsuffixed base, while new affinity instances use `<base>:<affinity-id>` |
 | Durable Object class | `EveHostDurableContainer`, plus `EdenWorldDurableObject` when the project selects the Cloudflare Durable Object World |
 | Worker secrets | One secret per `--env-file` variable of this run |
 | Cron Trigger | `* * * * *`, only when the project's compiled schedules contain at least one cron expression the trigger can evaluate |
@@ -345,6 +392,11 @@ The Worker is published with `compatibility_date` `2026-04-01`, the
 `enable_ctx_exports` compatibility flag, and `workers_dev` enabled. The
 Container runs on the `standard-1` instance type (1/2 vCPU, 4 GiB) with the
 `durable_object` scheduling policy.
+
+The Container image map holds the current and all kept versions. A
+same-version update replaces its image; an Eve upgrade adds an image and
+instance. Old images and repositories stay until a later deploy removes
+them after their sessions end, or until destroy.
 
 An update republishes the same Worker and the same Container application.
 Durable Object classes are append-only: a new migration tag is added for a
@@ -457,6 +509,11 @@ Human output starts with one header line, `eden <command> — <name>
 ... verifying health at <public origin>
 ... deleting superseded registry repository <repository>   (only on an update)
 ```
+
+The update and registry-cleanup lines above describe the in-place path.
+With affinity, only unneeded images are superseded: a retained image is not
+cleanup residue. Deploy-time retirement removes drained affinity deployments;
+destroy removes all retained deployments and their instances and repositories.
 
 `eden destroy`:
 

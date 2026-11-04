@@ -13,13 +13,14 @@ export async function startWorldServer({ database = ':memory:', deliveryOrigin, 
     }, Math.max(0, at - Date.now()));
   }, delivery: { async deliver(msg) {
     const origin = typeof deliveryOrigin === 'function' ? deliveryOrigin() : deliveryOrigin;
-    if (!origin) return { ok: false, retryAfterMs: 100 };
+    if (!origin) { core.deliverySettled(msg.messageId, msg.attempt); return { ok: false, retryAfterMs: 100 }; }
     const response = await fetch(`${origin}/.well-known/workflow/v1/${msg.path}`, {
       method: 'POST', body: msg.body,
       headers: { ...msg.headers, 'content-type': 'application/json', 'x-vqs-queue-name': msg.queueName,
         'x-vqs-message-id': msg.messageId, 'x-vqs-message-attempt': String(msg.attempt) },
     });
     const text = await response.text();
+    core.deliverySettled(msg.messageId, msg.attempt);
     let result;
     try { result = JSON.parse(text); } catch { result = {}; }
     if (response.ok && typeof result.timeoutSeconds === 'number') return { ok: false, retryAfterMs: result.timeoutSeconds * 1000 };

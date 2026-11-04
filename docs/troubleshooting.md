@@ -640,12 +640,74 @@ last successful deploy generation, or destroy the exact target.
 
 ### `EVE_UPDATE_IN_FLIGHT`
 
-> This update replaces the running Container; durable World runs in flight
-> resume on the new code — Cloudflare has no deployment pinning, so keep step
-> names and payload shapes backward compatible.
+Same-version updates resume durable World runs on new code. Let pending
+approvals and long runs finish first, or keep step names, queue names, and
+serialized payloads backward-compatible. Deployment affinity separates Eve
+versions, not every code release. Worlds without `deploymentAffinity` also
+update in place.
 
-Let pending approvals and long runs settle before updating, or keep step
-names, queue names, and serialized payloads compatible across the change.
+### Old sessions return `session_stranded` after an Eve upgrade
+
+Update both the Eden CLI and the project's World package. The installed
+World must declare `deploymentAffinity`; updating the CLI alone is not
+enough. Older Worlds still warn that an Eve upgrade can end existing
+sessions, even when sandbox files are carried. Start new sessions on that
+path. See the [recorded older-World upgrade](./eve-compatibility.md#eve-0820-to-0830-live-upgrade-2026-10-23).
+
+With the updated Cloudflare World, running work finishes on the old version.
+Existing sessions move to the new version on their next message; idle ones
+move without a message. Sessions adopted from Eden `0.9.0` are different:
+they stay on the old `eden-cloudflare` version until they end.
+
+### Deploy waits for retirement-control authentication
+
+Deploy rotates the reserved `EDEN_EVE_CONTROL_TOKEN` Worker secret, creating
+an additional Worker version. Activation can take seconds. A read-only
+cleanup query retries HTTP 401 once per second for up to 60 seconds. Other
+errors, including authentication failures during cleanup, stop deploy.
+The token is not saved locally or written to logs. This extra Worker version
+does not mean a container restarted.
+
+### Deploy refuses because 10 versions are kept
+
+The limit includes current and legacy versions. A later deploy removes old
+versions once their sessions end and their queued work and transfers finish.
+If adding a version would still exceed 10, deploy refuses before publication
+and lists the blocking deployment IDs and live session counts. There is no
+override flag.
+
+A session's first run stays on its original version until the session ends,
+so that version is kept even after the session moves. Let those sessions
+end, then deploy again. Do not manually delete their images to make room.
+`eden destroy` removes the whole target, including sessions still running;
+it cannot remove just one old version.
+
+### Old images or containers remain after a successful deploy
+
+Old versions stay while sessions, queued work, or file transfers need them.
+Cleanup happens on a later deploy, not immediately after a session moves.
+Cloudflare can keep inactive instance records until destroy removes the
+whole Container application.
+
+Each container sleeps independently when idle, but not during running work
+or file transfers. After an upgrade, a scheduled job can fire on both
+versions until the old version finishes its work. Eden then stops the old
+version's schedules. This window has no fixed timeout.
+
+### Deploying a previously kept version fails its readiness check
+
+Eden may need to restart that version to enable schedules, even if its image
+has not changed. It waits for running work and file transfers to finish
+before restarting. Let that work finish, then retry the same target. Do not
+kill running work to force the restart.
+
+Queued work and transfers continue while the public readiness check fails.
+The wait has no fixed timeout.
+
+### A session's sandbox transfer was interrupted
+
+Interrupted transfers can be retried without overwriting active files on
+the destination. Do not delete the old image while a transfer is unfinished.
 
 ### `EVE_UPDATE_WORLD_SWITCH`
 
@@ -799,8 +861,10 @@ bundles `@workflow/world` `5.0.0-beta.39`, the tested pair is
 
 ## Destroy and cleanup leftovers
 
-`eden destroy` removes exactly one target. It needs the same project,
-environment, and Worker name you deployed with, and it refuses `--env-file`.
+`eden destroy` removes exactly one target, including **all** kept images,
+container instances, and registry repositories, even with sessions still
+running. Use the same project, environment, and Worker name you deployed
+with. Destroy refuses `--env-file`.
 
 Destroy reports one check per step:
 

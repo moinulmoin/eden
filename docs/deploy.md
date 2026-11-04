@@ -10,10 +10,11 @@ Start with [installation and account setup](./install.md).
 ## What Eden deploys
 
 Eden runs the project's own `eve build`, starts the official project-local
-`eve start --host 0.0.0.0 --port 8080` supervisor inside one bounded Cloudflare
-Container (a `standard-1` instance: 1/2 vCPU, 4 GiB) attached to the Worker's
-Durable Object (`scheduling_policy: "durable_object"`), and routes the public
-surface through one generic Worker.
+`eve start --host 0.0.0.0 --port 8080` supervisor inside bounded Cloudflare
+Containers (`standard-1`: 1/2 vCPU, 4 GiB), attached to the Worker's
+Durable Objects (`scheduling_policy: "durable_object"`), and routes the public
+surface through one generic Worker. After an Eve upgrade, older versions
+stay available until their sessions end.
 
 Eden owns build orchestration, packaging, publication, deployment identity, and
 exact cleanup. Eve remains the application and workflow authority.
@@ -197,23 +198,27 @@ update instead of failing with `VAL-CLI-007-TARGET-CONFLICT`:
 
 1. It builds and boot-checks the new image locally, exactly like a first
    deploy.
-2. It pushes the image and republishes the same Worker and Container
-   application. Durable Object classes and their migration history are kept
-   (new migration tags are only appended), so state stored in the Cloudflare
-   World survives.
-3. The running Container restarts on the new image. The image is selected at
-   container start, so Eden compares the running image against the new
-   deployment's and stops the instance itself when it still serves the
-   previous image. Before stopping it, Eden copies Eve's sandbox sessions —
-   every conversation's files under
-   `/workspace/.eve/sandbox-cache/just-bash/sessions` — into the Durable
-   Object's storage (capped at 1 GiB compressed) and restores them into the
-   fresh container before it serves any request. The rest of `/workspace`
-   (including Eve's sandbox templates) resets to the new image, like on
-   Vercel.
-4. It health-checks the public URL, promotes the new generation, then deletes
-   the previous generation's registry repository (every tag, including
-   snapshot tags).
+2. With a Cloudflare World declaring `deploymentAffinity`, the same Eve
+   version updates in place. Eden carries conversation files under
+   `/workspace/.eve/sandbox-cache/just-bash/sessions` through Durable Object
+   storage (up to 1 GiB compressed). The rest of `/workspace` resets to the
+   new image.
+3. A new Eve version gets a new container. The old version stays available
+   for existing sessions and finishes work already running.
+4. A later deploy removes old versions once their sessions end and their
+   queued work and file transfers finish. Their container storage, images,
+   and registry repositories are deleted. Cloudflare can keep inactive
+   instance records until `eden destroy` removes the Container application.
+5. Eden keeps at most **10 versions**, including the current and any legacy
+   version. If adding a version would exceed that limit after cleanup,
+   deploy refuses and lists the blocking versions and live session counts.
+   There is no override flag.
+6. Eden publishes the same public Worker and health-checks the new release.
+   Durable Object state and migration history survive.
+
+Deploy rotates the reserved `EDEN_EVE_CONTROL_TOKEN` Worker secret to manage
+old versions. This creates an additional Worker version and can take seconds
+to activate. The token is not saved locally or written to logs.
 
 A skill change need not break an existing just-bash session. Eve `0.83.0`
 and later stable releases fix Eve's
@@ -225,28 +230,48 @@ builder applies a temporary fix inside its throwaway build image only, and
 only when Eve's file matches a known checksum; on an unknown older version the
 deploy still succeeds and prints an `EVE_SANDBOX_RESUME_PATCH` warning instead.
 
-Eve `0.83.0` still stores just-bash sessions under
-`/workspace/.eve/sandbox-cache/just-bash/sessions`, so Eden carries the same
-directory. Changing the Eve version is different from updating skills or agent
-code: Eve refuses to continue a session on a different Eve version unless the
-World routes each run back to the deployment that started it, which Vercel
-does and Eden's Cloudflare World does not. In a live `0.82.0` → `0.83.0`
-update, deployment succeeded, the old session returned HTTP 409
-`session_stranded` before sandbox access, and new sessions ran bash. Plan to
-start new sessions after any Eve upgrade. See the
-[recorded upgrade result](./eve-compatibility.md#eve-0820-to-0830-live-upgrade-2026-10-23).
+### Eve upgrades and retained sessions
+
+Update both the Eden CLI and the project's Cloudflare World package. With a
+World declaring `deploymentAffinity`, existing sessions move to the new Eve
+version on their next message, keeping their session ID, history, and sandbox
+files. Idle sessions move without a message. Work already running finishes
+on the old version. Interrupted file transfers can be retried without
+overwriting active files on the new version.
+
+A session's first run stays on its original version until the session ends,
+so that version is kept even after the session moves.
+
+Targets deployed with Eden `0.9.0` are different: their existing sessions
+stay on the old version until they end. They do not move to the new version.
+
+Old versions sleep independently when idle, but not during running work or
+file transfers. When an old version finishes its running work, Eden stops
+its schedules. **Until then, a scheduled job can fire on both versions.**
+This window lasts as long as that work, not a fixed timeout.
+
+If you deploy a previously kept Eve version again, Eden may need to restart
+it to enable schedules. If running work prevents the restart, its readiness
+check can fail. Let that work finish, then retry the same target.
+
+**Capability gate:** if the project's installed World does not declare
+`deploymentAffinity`, Eden keeps the previous single-image update behavior
+and warns that changing Eve can strand sessions. That includes older
+Cloudflare World packages; upgrading the CLI alone does not enable affinity.
+The [recorded `0.82.0` → `0.83.0` failure](./eve-compatibility.md#eve-0820-to-0830-live-upgrade-2026-10-23)
+shows what happens with an older World.
 
 The summary prints `✓ updated <name>` (in `--json`, `deployment.operation` is
 `update`). A target that exists but isn't provably Eden's still fails with
 `VAL-CLI-007-TARGET-CONFLICT`; production still requires an explicit `--name`.
 
-**In-flight runs resume on the new code.** On Vercel, Workflow pins each run
-to the deployment that started it. Off Vercel there's no pinning, so sessions,
-pending approvals, and sleeping steps that started before the update continue
-on the new code (`EVE_UPDATE_IN_FLIGHT`). Keep step names and input or state
-shapes backward-compatible until older runs finish, or let them finish before
-a breaking change. Switching Workflow Worlds between deploys is a data
-migration: existing state doesn't move with it (`EVE_UPDATE_WORLD_SWITCH`).
+**Same-version updates resume in-flight runs on new code.** Eden separates
+Eve versions, not every code release. Keep step names and input or state
+shapes backward-compatible until older runs finish, or let them finish
+before a breaking change (`EVE_UPDATE_IN_FLIGHT`). Worlds
+without affinity likewise resume in-flight work on new code. Switching
+Workflow Worlds between deploys is a data migration: existing state doesn't
+move with it (`EVE_UPDATE_WORLD_SWITCH`).
 
 With the Postgres World, state lives in your database, so it survives updates
 and also `destroy`.
@@ -264,11 +289,14 @@ eden destroy \
 
 `destroy` rejects `--env-file`; cleanup does not need application secrets.
 Destroy requires Eden's immutable ownership record, checks the current remote
-identity, removes only that Worker and Container application, verifies bounded
-absence, and only then clears the target's `CURRENT` pointer. It never deletes
-by prefix or broad account search.
+identity, removes only that Worker and Container application and **every
+retained container instance**, verifies bounded absence, and only then clears
+the target's `CURRENT` pointer. It never deletes by prefix or broad account
+search. Destroy is not a drain: it removes retained deployments even if
+sessions still need them.
 
-Destroy also removes the managed-registry image tag
+Destroy also removes every retained image and registry repository, including
+legacy images and the managed-registry image tag
 (`eden-eve-<target>-<generation>:candidate` in `registry.cloudflare.com`) for
 every generation the ownership records prove this exact target pushed,
 including images retained by aborted pushes, then verifies each ref is gone.
@@ -362,8 +390,10 @@ sleeps. When `eve build` reports schedules, Eden adds one every-minute
 Cloudflare Cron Trigger to the generated Worker. Each minute the Worker
 checks whether any schedule's next tick lands within the next four minutes;
 when one does it issues an internal wake request to the Container so Eve's
-own in-process Nitro scheduler fires the tick itself — each schedule runs
-exactly once per cron tick, evaluated in UTC like on Vercel.
+own in-process Nitro scheduler fires the tick itself, evaluated in UTC like
+on Vercel. During an Eve upgrade, a scheduled job can fire on both versions
+until the old version finishes its running work. Eden then stops the old
+version's schedules.
 
 Standard 5-field cron expressions (`minute hour day-of-month month
 day-of-week`) are supported — the same subset Eve documents and Vercel Cron

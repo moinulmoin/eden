@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+Eve upgrades on the Cloudflare World no longer end existing conversations.
+Update both `@moinulmoin/eden` and the project's
+`@moinulmoin/eden-world-cloudflare` to get it.
+
+### Added
+
+- **Sessions survive Eve upgrades.** When `eden deploy` ships a new Eve
+  version, the previous version keeps running next to it. An existing
+  session's next message moves it to the new version with the same session ID,
+  history, and sandbox files. Idle sessions move without a message, and work
+  already running finishes on the old version. Verified live across Eve
+  `0.83.0` → `0.91.0` → `1.0.0-rc.3`. Deploys that keep the same Eve version
+  still update in place, as before.
+- A later `eden deploy` removes an old version once all its sessions have
+  ended. Until then its container runs only while it has work and sleeps
+  otherwise; its image stays in your registry. Eden keeps at most 10 versions
+  and refuses to deploy past that, listing the versions still holding
+  sessions. `eden destroy` removes all of them.
+- Targets deployed with 0.9.0 are adopted on update: their existing sessions
+  keep working on the old version until they end, but don't move to the new
+  one.
+- This needs a World that declares `deploymentAffinity` (this release). With
+  an older World, `eden deploy` keeps the 0.9.0 behavior and still warns that
+  an Eve upgrade ends existing sessions.
+- While an old version finishes work that was running during the upgrade, a
+  scheduled job can fire on both versions. Eden stops the old version's
+  schedules once that work ends.
+
 ### Fixed
 
 - On the Cloudflare World, one long tool call no longer holds up every other
@@ -19,6 +47,9 @@
 - Cloudflare World hook takeover now follows the Workflow contract: a resume
   sent to a run whose hook was taken over is redirected to the new owner even
   after that run finishes or its data expires under the run's retention.
+- Listing the container registry during deploy and destroy may take up to 120
+  seconds instead of 30. An account with many container snapshots took 42
+  seconds, so cleanup failed.
 
 ### Changed
 

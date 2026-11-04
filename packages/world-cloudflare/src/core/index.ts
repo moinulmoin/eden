@@ -10,10 +10,24 @@ export interface SqlExec {
   transactionSync?<T>(callback: () => T): T;
 }
 export interface QueueDelivery {
-  deliver(msg: { queueName: string; messageId: string; attempt: number; body: Uint8Array; path: 'flow' | 'step'; headers?: Record<string, string> }): Promise<{ ok: boolean; retryAfterMs?: number }>;
+  deliver(msg: { queueName: string; messageId: string; attempt: number; body: Uint8Array; path: 'flow' | 'step'; headers?: Record<string, string>; deploymentId?: string; sourceDeploymentId?: string; sandboxSessionId?: string }): Promise<{ ok: boolean; retryAfterMs?: number; sandboxTransferCompleted?: boolean }>;
 }
 type Params = { resolveData?: 'all' | 'none'; pagination?: { limit?: number; cursor?: string | null; sortOrder?: 'asc' | 'desc' }; runId?: string; workflowName?: string; status?: string | string[]; correlationId?: string };
-type EnqueueOptions = {idempotencyKey?:string;delaySeconds?:number;headers?:Record<string,string>};
+type EnqueueOptions = {deploymentId?:string;sourceDeploymentId?:string;idempotencyKey?:string;delaySeconds?:number;headers?:Record<string,string>};
+export type DeploymentDrainState = {liveRuns:number;liveSessions:number;pendingMessages:number;unfinishedTransfers:number;drained:boolean};
+type QueueMessage = {runId?:string;stepId?:string;runInput?:Extract<AnyEventRequest,{eventType:'run_created'}>['eventData'] & {specVersion?:number};specVersion?:number};
+export async function callDeploymentControlRpc(options: {origin:string;token:string;operation:'deployments.drainState'|'deployments.retire';args:unknown[];signal?:AbortSignal}): Promise<unknown> {
+  const response = await fetch(new URL('/__eden/world/rpc',options.origin),{
+    method:'POST',
+    headers:{'content-type':'application/cbor',authorization:`Bearer ${options.token}`},
+    body:new Uint8Array(encode({op:options.operation,args:options.args})),
+    ...(options.signal === undefined ? {} : {signal:options.signal}),
+  });
+  if (!response.ok) throw Object.assign(new Error(`Eden deployment control RPC ${options.operation} failed: HTTP ${response.status}`),{status:response.status});
+  const envelope = decode(new Uint8Array(await response.arrayBuffer())) as {ok:boolean;result?:unknown;error?:{message?:string}};
+  if (!envelope.ok) throw new Error(envelope.error?.message ?? `Eden deployment control RPC ${options.operation} failed`);
+  return envelope.result;
+}
 const ulid = monotonicFactory();
 // Same default as @workflow/world when WORKFLOW_MAX_EVENTS is unset.
 const DEFAULT_MAX_EVENTS_PER_RUN = 25000;
@@ -37,8 +51,10 @@ export class WorldCore {
   private readonly scheduleAlarm: (atMs: number | null) => void | Promise<void>;
   private readonly inFlight = new Set<string>();
   private readonly waitUntil: (promise: Promise<void>) => void;
-  constructor(opts: { sql: SqlExec; delivery: QueueDelivery; now?: () => number; scheduleAlarm: (atMs: number | null) => void | Promise<void>; waitUntil?: (promise: Promise<void>) => void }) {
-    this.sql = opts.sql; this.delivery = opts.delivery; this.now = opts.now ?? Date.now; this.scheduleAlarm = opts.scheduleAlarm; this.waitUntil = opts.waitUntil ?? (() => {});
+  private readonly retireDeployment: ((deploymentId: string) => Promise<void>) | undefined;
+  private readonly currentDeploymentId: string | undefined;
+  constructor(opts: { sql: SqlExec; delivery: QueueDelivery; now?: () => number; scheduleAlarm: (atMs: number | null) => void | Promise<void>; waitUntil?: (promise: Promise<void>) => void; retireDeployment?: (deploymentId: string) => Promise<void>; currentDeploymentId?: string }) {
+    this.sql = opts.sql; this.delivery = opts.delivery; this.now = opts.now ?? Date.now; this.scheduleAlarm = opts.scheduleAlarm; this.waitUntil = opts.waitUntil ?? (() => {}); this.retireDeployment = opts.retireDeployment; this.currentDeploymentId = opts.currentDeploymentId;
   }
   private rows(query: string, ...args: unknown[]) { return this.sql.exec(query, ...args).toArray(); }
   private atomic<T>(fn: () => T): T { return this.sql.transactionSync ? this.sql.transactionSync(fn) : fn(); }
@@ -66,10 +82,174 @@ export class WorldCore {
       'CREATE TABLE IF NOT EXISTS workflow_queue_messages (id TEXT PRIMARY KEY, queue_name TEXT NOT NULL, body BLOB NOT NULL, path TEXT NOT NULL, due_at INTEGER NOT NULL, attempt INTEGER NOT NULL DEFAULT 1, completed INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT)',
       'CREATE UNIQUE INDEX IF NOT EXISTS workflow_queue_idempotency ON workflow_queue_messages(idempotency_key) WHERE idempotency_key IS NOT NULL',
       'CREATE INDEX IF NOT EXISTS workflow_queue_due ON workflow_queue_messages(completed,due_at)',
+      'CREATE TABLE IF NOT EXISTS workflow_sandbox_transfers (message_id TEXT PRIMARY KEY, source_deployment_id TEXT NOT NULL, deployment_id TEXT NOT NULL, session_id TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0)',
+      'CREATE TABLE IF NOT EXISTS workflow_retired_deployments (deployment_id TEXT PRIMARY KEY)',
+      'CREATE TABLE IF NOT EXISTS workflow_delivery_claims (message_id TEXT NOT NULL, attempt INTEGER NOT NULL, deployment_id TEXT NOT NULL, settled INTEGER NOT NULL DEFAULT 0, legacy INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(message_id,attempt))',
+      'CREATE INDEX IF NOT EXISTS workflow_delivery_claims_active ON workflow_delivery_claims(deployment_id,settled)',
     ]) this.sql.exec(statement);
     if (!this.rows('PRAGMA table_info(workflow_queue_messages)').some(row => row.name === 'headers')) this.sql.exec('ALTER TABLE workflow_queue_messages ADD COLUMN headers BLOB');
+    for (const column of ['deployment_id','source_deployment_id']) if (!this.rows('PRAGMA table_info(workflow_queue_messages)').some(row => row.name === column)) this.sql.exec(`ALTER TABLE workflow_queue_messages ADD COLUMN ${column} TEXT`);
+    if (!this.rows('PRAGMA table_info(workflow_queue_messages)').some(row => row.name === 'lease_until')) this.sql.exec('ALTER TABLE workflow_queue_messages ADD COLUMN lease_until INTEGER');
+    if (!this.rows('PRAGMA table_info(workflow_delivery_claims)').some(row => row.name === 'legacy')) this.sql.exec('ALTER TABLE workflow_delivery_claims ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0');
+    this.atomic(()=>{
+      // Pre-protocol outstanding attempts cannot be declared stopped by a
+      // replacement actor. Preserve their exact identity, and reserve a new
+      // attempt number for recovery rather than reusing that old claim.
+      for (const row of this.rows('SELECT * FROM workflow_queue_messages q WHERE completed=0 AND (lease_until IS NULL OR lease_until>0) AND NOT EXISTS (SELECT 1 FROM workflow_delivery_claims c WHERE c.message_id=q.id)')) {
+        const deploymentId = this.queueTarget(this.queueMessage(sqlBytes(row.body)),row.deployment_id == null ? undefined : String(row.deployment_id));
+        this.sql.exec('INSERT INTO workflow_delivery_claims(message_id,attempt,deployment_id,legacy) VALUES(?,?,?,1)',row.id,row.attempt,deploymentId);
+        this.sql.exec('UPDATE workflow_queue_messages SET attempt=attempt+1 WHERE id=?',row.id);
+      }
+    });
+    // A previously drained affinity key can become current again on rollback.
+    // Only Worker publication metadata, never a caller's requested target,
+    // authorizes reopening that key's admission fence.
+    if (this.currentDeploymentId) this.sql.exec('DELETE FROM workflow_retired_deployments WHERE deployment_id=?',this.currentDeploymentId);
   }
   private run(id: string): WorkflowRun { const value = unpack<WorkflowRun>(this.rows('SELECT data FROM workflow_runs WHERE id = ?', id)[0]); if (!value) throw new WorkflowRunNotFoundError(id); return WorkflowRunSchema.parse(value); }
+  private assertDeploymentActive(deploymentId: string): void {
+    if (this.rows('SELECT deployment_id FROM workflow_retired_deployments WHERE deployment_id=?',deploymentId).length) throw new WorkflowWorldError(`Deployment ${deploymentId} has been retired`,{status:409});
+  }
+  deliverySettled(messageId: string, attempt: number): void {
+    // Called by the receiving Container DO through the current World actor.
+    // A different attempt's success never reconciles this execution.
+    this.sql.exec('UPDATE workflow_delivery_claims SET settled=1 WHERE message_id=? AND attempt=?',messageId,attempt);
+  }
+  private reconcileDeliveryClaims(): void {
+    for (const row of this.rows('SELECT c.message_id,c.attempt,c.legacy,q.body FROM workflow_delivery_claims c JOIN workflow_queue_messages q ON q.id=c.message_id WHERE c.settled=0')) {
+      const message = this.queueMessage(sqlBytes(row.body));
+      if (typeof message?.runId !== 'string') continue;
+      if (typeof message.stepId !== 'string' && !Number(row.legacy)) continue;
+      try {
+        // Terminal step evidence proves a tool finished, even when its HTTP
+        // response was lost. Legacy flows additionally use terminal-run
+        // evidence; a running anchor alone never reconciles an unknown flow.
+        const terminal = typeof message.stepId === 'string'
+          ? isTerminalStepStatus(this.step(message.runId,message.stepId).status)
+          : isTerminalWorkflowRunStatus(this.run(message.runId).status);
+        if (terminal) this.deliverySettled(String(row.message_id),Number(row.attempt));
+      } catch (error) {
+        if (!(error instanceof WorkflowRunNotFoundError) && !(error instanceof WorkflowWorldError)) throw error;
+      }
+    }
+  }
+  deploymentActivity(deploymentId: string): {activeDeliveries:number;unfinishedTransfers:number} {
+    this.reconcileDeliveryClaims();
+    const activeDeliveries = Number(this.rows('SELECT COUNT(*) AS count FROM workflow_delivery_claims WHERE deployment_id=? AND settled=0',deploymentId)[0]?.count ?? 0);
+    const unfinishedTransfers = Number(this.rows('SELECT COUNT(*) AS count FROM workflow_sandbox_transfers WHERE completed=0 AND (deployment_id=? OR source_deployment_id=?)',deploymentId,deploymentId)[0]?.count ?? 0);
+    return {activeDeliveries,unfinishedTransfers};
+  }
+  private queueMessage(body: Uint8Array): QueueMessage {
+    return JSON.parse(new TextDecoder().decode(body),(_key,value:unknown)=>{
+      if (value && typeof value === 'object' && '__type' in value && value.__type === 'Uint8Array' && 'data' in value && typeof value.data === 'string') {
+        return Uint8Array.from(atob(value.data),character=>character.charCodeAt(0));
+      }
+      return value;
+    }) as QueueMessage;
+  }
+  private queueTarget(message: QueueMessage | null | undefined, explicit?: string): string {
+    if (explicit) return explicit;
+    if (typeof message?.runId === 'string') {
+      try { return this.run(message.runId).deploymentId; }
+      catch (error) { if (!(error instanceof WorkflowRunNotFoundError)) throw error; }
+    }
+    if (typeof message?.runInput?.deploymentId === 'string') return message.runInput.deploymentId;
+    // Old clients never supplied routing metadata. Their unpinned probes and
+    // pre-affinity messages belong to the original, unsuffixed container.
+    return 'eden-cloudflare';
+  }
+  private sessionId(run: WorkflowRun): string | undefined {
+    const visited = new Set<string>();
+    let current: WorkflowRun | undefined = run;
+    while (current && !visited.has(current.runId)) {
+      visited.add(current.runId);
+      const sessionId = current.attributes?.['$eve.session'];
+      if (typeof sessionId === 'string' && sessionId) return sessionId;
+      if (current.attributes?.['$eve.type'] === 'session') return current.runId;
+      const parentId = current.attributes?.['$parentRunId'];
+      if (typeof parentId !== 'string' || !parentId) return;
+      try { current = this.run(parentId); }
+      catch (error) { if (!(error instanceof WorkflowRunNotFoundError)) throw error; return; }
+    }
+  }
+  private successorSandbox(message: QueueMessage): {sessionId:string;sourceDeploymentId:string} | undefined {
+    if (!message?.runInput || typeof message.runId !== 'string') return;
+    let run: WorkflowRun;
+    try { run = this.run(message.runId); }
+    catch (error) {
+      if (!(error instanceof WorkflowRunNotFoundError)) throw error;
+      // run_created races the initial queue write. Rebuild exactly the same
+      // pending creation state instead of treating a missing row as no import.
+      const now = new Date(this.now());
+      run = WorkflowRunSchema.parse({...message.runInput,runId:message.runId,status:'pending',attributes:message.runInput.attributes ?? {},createdAt:now,updatedAt:now,specVersion:message.runInput.specVersion ?? message.specVersion ?? SPEC_VERSION_CURRENT});
+    }
+    if (run.status !== 'pending' || run.workflowName !== 'workflow//eve//workflowEntry' || run.attributes?.['$eve.session']) return;
+    const parentId = run.attributes?.['$parentRunId'];
+    if (typeof parentId !== 'string' || !parentId) return;
+    // Missing parent metadata is retryable, never permission to start empty.
+    const parent = this.run(parentId);
+    if (parent.workflowName !== 'workflow//eve//workflowEntry') return;
+    const sessionId = this.sessionId(parent);
+    if (!sessionId) throw new WorkflowWorldError(`Cannot resolve sandbox session for successor ${run.runId}`);
+    return {sessionId,sourceDeploymentId:parent.deploymentId};
+  }
+  private reconcileTerminalMessages(runId?: string): void {
+    const terminalRuns = new Set(this.rows(
+      `SELECT id FROM workflow_runs WHERE status IN ('completed','failed','cancelled')${runId === undefined ? '' : ' AND id=?'}`,
+      ...(runId === undefined ? [] : [runId]),
+    ).map(row=>String(row.id)));
+    if (!terminalRuns.size) return;
+    // A terminal run makes undelivered wakes obsolete, not active executions
+    // or sandbox imports. Keep their durable ownership evidence untouched.
+    for (const row of this.rows('SELECT q.id,q.body FROM workflow_queue_messages q WHERE q.completed=0 AND COALESCE(q.lease_until,0)<=? AND NOT EXISTS (SELECT 1 FROM workflow_delivery_claims c WHERE c.message_id=q.id AND c.settled=0) AND NOT EXISTS (SELECT 1 FROM workflow_sandbox_transfers t WHERE t.message_id=q.id AND t.completed=0)',this.now())) {
+      if (this.inFlight.has(String(row.id))) continue;
+      const message = this.queueMessage(sqlBytes(row.body));
+      if (typeof message?.runId !== 'string' || !terminalRuns.has(message.runId)) continue;
+      this.sql.exec('UPDATE workflow_queue_messages SET completed=1,idempotency_key=NULL,lease_until=0 WHERE id=?',row.id);
+    }
+  }
+  private drainState(deploymentIds: string[]): Record<string, DeploymentDrainState> {
+    this.reconcileDeliveryClaims();
+    this.reconcileTerminalMessages();
+    const result: Record<string, DeploymentDrainState> = Object.fromEntries(deploymentIds.map(id=>[id,{liveRuns:0,liveSessions:0,pendingMessages:0,unfinishedTransfers:0,drained:false}]));
+    const sessions = new Map(deploymentIds.map(id=>[id,new Set<string>()]));
+    for (const row of this.rows('SELECT data FROM workflow_runs')) {
+      const run = WorkflowRunSchema.parse(unpack<WorkflowRun>(row));
+      const state = result[run.deploymentId];
+      if (!state || isTerminalWorkflowRunStatus(run.status)) continue;
+      state.liveRuns++;
+      const sessionId = this.sessionId(run);
+      if (sessionId) sessions.get(run.deploymentId)!.add(sessionId);
+    }
+    for (const row of this.rows('SELECT * FROM workflow_queue_messages WHERE completed=0')) {
+      const message = this.queueMessage(sqlBytes(row.body));
+      const target = this.queueTarget(message,row.deployment_id == null ? undefined : String(row.deployment_id));
+      if (result[target]) result[target]!.pendingMessages++;
+      // An admitted successor retains its source even before its first alarm
+      // has persisted a transfer journal entry.
+      const sandbox = this.successorSandbox(message);
+      const source = sandbox?.sourceDeploymentId;
+      if (source && source !== target && !this.rows('SELECT message_id FROM workflow_sandbox_transfers WHERE message_id=?',row.id).length) {
+        for (const id of [source,target]) if (result[id]) result[id]!.unfinishedTransfers++;
+      }
+    }
+    for (const row of this.rows('SELECT source_deployment_id,deployment_id FROM workflow_sandbox_transfers WHERE completed=0')) {
+      for (const id of new Set([String(row.source_deployment_id),String(row.deployment_id)])) if (result[id]) result[id]!.unfinishedTransfers++;
+    }
+    // A later retry completing the queue message does not settle an earlier
+    // container execution whose response was lost. Keep those deliveries in
+    // retirement accounting without double-counting still-pending messages.
+    for (const row of this.rows('SELECT DISTINCT c.message_id,c.deployment_id FROM workflow_delivery_claims c LEFT JOIN workflow_queue_messages q ON q.id=c.message_id WHERE c.settled=0 AND (q.id IS NULL OR q.completed=1)')) {
+      const state = result[String(row.deployment_id)];
+      if (state) state.pendingMessages++;
+    }
+    for (const id of deploymentIds) {
+      const state = result[id]!;
+      state.liveSessions = sessions.get(id)!.size;
+      state.drained = state.liveRuns === 0 && state.pendingMessages === 0 && state.unfinishedTransfers === 0;
+    }
+    return result;
+  }
   private step(runId: string, id: string): Step { const value = unpack<Step>(this.rows('SELECT data FROM workflow_steps WHERE run_id = ? AND step_id = ?', runId, id)[0]); if (!value) throw new WorkflowWorldError(`Step not found: ${id}`); return StepSchema.parse(value); }
   private saveRun(run: WorkflowRun): void { this.sql.exec('INSERT INTO workflow_runs(id,name,status,deployment_id,data) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,deployment_id=excluded.deployment_id,data=excluded.data', run.runId, run.workflowName, run.status, run.deploymentId, encode(compact(run))); }
   private saveStep(step: Step): void { this.sql.exec('INSERT INTO workflow_steps(step_id,run_id,status,data) VALUES(?,?,?,?) ON CONFLICT(step_id) DO UPDATE SET status=excluded.status,data=excluded.data', step.stepId, step.runId, step.status, encode(compact(step))); }
@@ -115,6 +295,7 @@ export class WorldCore {
     if ((data.specVersion ?? SPEC_VERSION_CURRENT) > SPEC_VERSION_CURRENT) throw new RunNotSupportedError(data.specVersion!,SPEC_VERSION_CURRENT);
     if (this.rows('SELECT id FROM workflow_runs WHERE id=?', runId).length) throw new EntityConflictError(`Workflow run "${runId}" already exists`);
     const d = data.eventData; validateAttributeChanges(Object.entries(d.attributes ?? {}).map(([key,value]) => ({key,value})), { allowReservedAttributes: d.allowReservedAttributes === true });
+    this.assertDeploymentActive(d.deploymentId);
     const now = new Date(this.now());
     const run = WorkflowRunSchema.parse(compact({ runId, ...d, status: 'pending', attributes: d.attributes ?? {}, createdAt: now, updatedAt: now, specVersion: data.specVersion ?? SPEC_VERSION_CURRENT }));
     this.saveRun(run); this.sql.exec('INSERT INTO workflow_event_slots(run_id) VALUES(?)', runId); const event = this.insertEvent(runId, data); return { run, event };
@@ -146,7 +327,7 @@ export class WorldCore {
       const validatesRunVersion = type !== 'step_completed' && type !== 'step_retrying';
       if (current && validatesRunVersion && (requiresNewerWorld(current.specVersion) || (current.specVersion ?? SPEC_VERSION_LEGACY) > SPEC_VERSION_CURRENT)) throw new RunNotSupportedError(current.specVersion!, SPEC_VERSION_CURRENT);
       if (current && validatesRunVersion && isLegacySpecVersion(current.specVersion)) {
-        if (type === 'run_cancelled') { run = WorkflowRunSchema.parse({ ...current, status:'cancelled', completedAt:now, updatedAt:now }); this.saveRun(run); this.sql.exec('DELETE FROM workflow_hooks WHERE run_id=?',id); this.sql.exec('DELETE FROM workflow_waits WHERE run_id=?',id); return {run}; }
+        if (type === 'run_cancelled') { run = WorkflowRunSchema.parse({ ...current, status:'cancelled', completedAt:now, updatedAt:now }); this.saveRun(run); this.sql.exec('DELETE FROM workflow_hooks WHERE run_id=?',id); this.sql.exec('DELETE FROM workflow_waits WHERE run_id=?',id); this.reconcileTerminalMessages(id); return {run}; }
         if (!['wait_completed','hook_received'].includes(type)) throw new Error(`Event type '${type}' not supported for legacy runs (specVersion: ${current.specVersion || 'undefined'}). Please upgrade @workflow packages.`);
         if (type === 'hook_received' && isTerminalWorkflowRunStatus(current.status)) throw new RunExpiredError(`Workflow run "${id}" is already in terminal state "${current.status}"`);
         return {event:stripEventDataRefs(this.insertEvent(id,data),params?.resolveData ?? 'all')};
@@ -165,7 +346,7 @@ export class WorldCore {
       const lazy = isChildEntityCreationEvent(data) && type === 'step_started';
       const terminal = current && isTerminalWorkflowRunStatus(current.status);
       if (terminal && current) {
-        if (type === 'run_cancelled' && current.status === 'cancelled') return {event:stripEventDataRefs(this.insertEvent(id,data),params?.resolveData ?? 'all'),run:current};
+        if (type === 'run_cancelled' && current.status === 'cancelled') { this.reconcileTerminalMessages(id); return {event:stripEventDataRefs(this.insertEvent(id,data),params?.resolveData ?? 'all'),run:current}; }
         if (type === 'run_started' || type === 'hook_received') throw new RunExpiredError(`Workflow run "${id}" is already in terminal state "${current.status}"`);
         if (isTerminalRunEventType(type) && !(type === 'run_cancelled' && current.status === 'cancelled')) throw new EntityConflictError(`Cannot transition run from terminal state "${current.status}"`);
         if (isChildEntityCreationEvent(data)) throw new EntityConflictError(`Cannot create new entities on run in terminal state "${current.status}"`);
@@ -183,7 +364,7 @@ export class WorldCore {
         else if (data.eventType === 'run_failed') { const d = data.eventData; run = WorkflowRunSchema.parse({...current,status:'failed',error:d.error,errorCode:d.errorCode,completedAt:now,updatedAt:now}); }
         else if (type === 'run_cancelled') run = WorkflowRunSchema.parse({...current,status:'cancelled',completedAt:current.completedAt ?? now,updatedAt:now});
         if (run) this.saveRun(run);
-        if (isTerminalRunEventType(type)) { for (const row of this.rows('SELECT data FROM workflow_hooks WHERE run_id=?',id)) { const h = unpack<Hook>(row)!; if ((h.tokenRetentionUntil?.getTime() ?? 0) <= this.now()) this.sql.exec('DELETE FROM workflow_hooks WHERE hook_id=?',h.hookId); } this.sql.exec('DELETE FROM workflow_waits WHERE run_id=?',id); }
+        if (isTerminalRunEventType(type)) { for (const row of this.rows('SELECT data FROM workflow_hooks WHERE run_id=?',id)) { const h = unpack<Hook>(row)!; if ((h.tokenRetentionUntil?.getTime() ?? 0) <= this.now()) this.sql.exec('DELETE FROM workflow_hooks WHERE hook_id=?',h.hookId); } this.sql.exec('DELETE FROM workflow_waits WHERE run_id=?',id); this.reconcileTerminalMessages(id); }
       }
       if (data.eventType === 'attr_set') { const d = data.eventData; run = this.attributes(id,d.changes,{allowReservedAttributes:d.allowReservedAttributes === true}); }
       if (type.startsWith('step_')) {
@@ -272,6 +453,7 @@ export class WorldCore {
     }
     for (const row of this.rows('SELECT data FROM workflow_hooks WHERE run_id=?',id)) { const hook = unpack<Hook>(row)!; this.saveHook({...hook,metadata:undefined,resumeContext:undefined}); }
     this.sql.exec('UPDATE workflow_stream_chunks SET data=? WHERE run_id=?',new Uint8Array(),id);
+    this.reconcileTerminalMessages(id);
   }
   private listRuns(params?: Params) {
     const args: unknown[] = []; const where: string[] = [];
@@ -316,7 +498,15 @@ export class WorldCore {
       }
       return value;
     });
-    this.sql.exec('INSERT INTO workflow_queue_messages(id,queue_name,body,path,due_at,idempotency_key,headers) VALUES(?,?,?,?,?,?,?)',id,queueName,new TextEncoder().encode(json),path,this.now()+Math.max(0,opts?.delaySeconds ?? 0)*1000,opts?.idempotencyKey ?? null,opts?.headers ? encode(opts.headers) : null);
+    const deploymentId = this.queueTarget(message as QueueMessage, opts?.deploymentId);
+    this.assertDeploymentActive(deploymentId);
+    const sandbox = this.successorSandbox(message as QueueMessage);
+    const sourceDeploymentId = sandbox?.sourceDeploymentId ?? opts?.sourceDeploymentId;
+    if (sourceDeploymentId && sourceDeploymentId !== deploymentId) this.assertDeploymentActive(sourceDeploymentId);
+    this.atomic(()=>{
+      this.sql.exec('INSERT INTO workflow_queue_messages(id,queue_name,body,path,due_at,idempotency_key,headers,deployment_id,source_deployment_id,lease_until) VALUES(?,?,?,?,?,?,?,?,?,0)',id,queueName,new TextEncoder().encode(json),path,this.now()+Math.max(0,opts?.delaySeconds ?? 0)*1000,opts?.idempotencyKey ?? null,opts?.headers ? encode(opts.headers) : null,deploymentId,sourceDeploymentId ?? null);
+      if (sandbox && sourceDeploymentId && sourceDeploymentId !== deploymentId) this.sql.exec('INSERT INTO workflow_sandbox_transfers(message_id,source_deployment_id,deployment_id,session_id) VALUES(?,?,?,?)',id,sourceDeploymentId,deploymentId,sandbox.sessionId);
+    });
     await this.reschedule();return {messageId:id};
   }
   private async reschedule():Promise<void>{const row=this.rows('SELECT MIN(due_at) AS due FROM workflow_queue_messages WHERE completed=0')[0];const due=row?.due === null || row?.due === undefined ? null:Number(row.due);await this.scheduleAlarm(this.inFlight.size ? Math.min(due ?? Infinity,this.now()+30000):due);}
@@ -328,24 +518,50 @@ export class WorldCore {
     // delivery. The 30 second heartbeat also keeps older compatibility dates
     // active, where pending RPCs/waitUntil alone do not prevent idle eviction.
     const leaseUntil = this.now()+60000;
-    for(const id of this.inFlight)this.sql.exec('UPDATE workflow_queue_messages SET due_at=? WHERE id=? AND completed=0',leaseUntil,id);
+    for(const id of this.inFlight)this.sql.exec('UPDATE workflow_queue_messages SET due_at=?,lease_until=? WHERE id=? AND completed=0',leaseUntil,leaseUntil,id);
     const due=this.rows('SELECT * FROM workflow_queue_messages WHERE completed=0 AND due_at<=? ORDER BY due_at,id LIMIT 50',this.now()).filter(row=>!this.inFlight.has(String(row.id)));
     for(const row of due){
       const id=String(row.id);
-      this.sql.exec('UPDATE workflow_queue_messages SET due_at=? WHERE id=?',leaseUntil,id);
+      const deploymentId = this.queueTarget(this.queueMessage(sqlBytes(row.body)),row.deployment_id == null ? undefined : String(row.deployment_id));
+      this.atomic(()=>{
+        this.sql.exec('INSERT INTO workflow_delivery_claims(message_id,attempt,deployment_id) VALUES(?,?,?)',id,row.attempt,deploymentId);
+        this.sql.exec('UPDATE workflow_queue_messages SET due_at=?,lease_until=?,attempt=attempt+1,deployment_id=? WHERE id=?',leaseUntil,leaseUntil,deploymentId,id);
+      });
       this.inFlight.add(id);
     }
     // Persist recovery before making external effects. A crash here leaves
     // every claimed message eligible again after its lease expires.
-    try{await this.reschedule();}catch(error){for(const row of due)this.inFlight.delete(String(row.id));throw error;}
+    try{await this.reschedule();}catch(error){for(const row of due){this.inFlight.delete(String(row.id));this.deliverySettled(String(row.id),Number(row.attempt));}throw error;}
     for(const row of due){
       const id=String(row.id);const attempt=Number(row.attempt);
       this.waitUntil((async()=>{
         try{
-          let result:{ok:boolean;retryAfterMs?:number};try{result=await this.delivery.deliver({queueName:String(row.queue_name),messageId:id,attempt,body:sqlBytes(row.body),path:row.path as 'flow'|'step',...(row.headers ? {headers:decode(sqlBytes(row.headers)) as Record<string,string>} : {})});}catch{result={ok:false};}
+          let dispatched = false;
+          let result:{ok:boolean;retryAfterMs?:number;sandboxTransferCompleted?:boolean};try{
+            const body = sqlBytes(row.body); const message = this.queueMessage(body);
+            const deploymentId = this.queueTarget(message,row.deployment_id == null ? undefined : String(row.deployment_id));
+            this.assertDeploymentActive(deploymentId);
+            this.sql.exec('UPDATE workflow_queue_messages SET deployment_id=? WHERE id=?',deploymentId,id);
+            let transfer = this.rows('SELECT * FROM workflow_sandbox_transfers WHERE message_id=?',id)[0];
+            const sandbox = transfer ? undefined : this.successorSandbox(message);
+            const sourceDeploymentId = transfer ? String(transfer.source_deployment_id) : sandbox?.sourceDeploymentId ?? (row.source_deployment_id == null ? undefined : String(row.source_deployment_id));
+            if (sandbox && sourceDeploymentId && sourceDeploymentId !== deploymentId) {
+              this.assertDeploymentActive(sourceDeploymentId);
+              this.sql.exec('UPDATE workflow_queue_messages SET source_deployment_id=? WHERE id=?',sourceDeploymentId,id);
+              this.sql.exec('INSERT INTO workflow_sandbox_transfers(message_id,source_deployment_id,deployment_id,session_id) VALUES(?,?,?,?)',id,sourceDeploymentId,deploymentId,sandbox.sessionId);
+              transfer = this.rows('SELECT * FROM workflow_sandbox_transfers WHERE message_id=?',id)[0];
+            }
+            const sandboxSessionId = transfer && !Number(transfer.completed) ? String(transfer.session_id) : undefined;
+            dispatched = true;
+            result=await this.delivery.deliver({queueName:String(row.queue_name),messageId:id,attempt,body,path:row.path as 'flow'|'step',...(row.headers ? {headers:decode(sqlBytes(row.headers)) as Record<string,string>} : {}),deploymentId,...(sourceDeploymentId === undefined ? {} : {sourceDeploymentId}),...(sandboxSessionId === undefined ? {} : {sandboxSessionId})});
+            if (sandboxSessionId) {
+              if (result.sandboxTransferCompleted) this.sql.exec('UPDATE workflow_sandbox_transfers SET completed=1 WHERE message_id=?',id);
+              else result={ok:false,...(result.retryAfterMs === undefined ? {} : {retryAfterMs:result.retryAfterMs})};
+            }
+          }catch{if(!dispatched)this.deliverySettled(id,attempt);result={ok:false};}
           // Like world-local, deduplicate outstanding deliveries, not future wakes.
-          if(result.ok && result.retryAfterMs === undefined)this.sql.exec('UPDATE workflow_queue_messages SET completed=1,idempotency_key=NULL WHERE id=?',id);
-          else this.sql.exec('UPDATE workflow_queue_messages SET attempt=?,due_at=? WHERE id=?',attempt+1,this.now()+Math.max(1,result.retryAfterMs ?? Math.min(60000,1000*2**Math.min(attempt-1,6))),id);
+          if(result.ok && result.retryAfterMs === undefined)this.sql.exec('UPDATE workflow_queue_messages SET completed=1,idempotency_key=NULL,lease_until=0 WHERE id=?',id);
+          else this.sql.exec('UPDATE workflow_queue_messages SET due_at=? WHERE id=?',this.now()+Math.max(1,result.retryAfterMs ?? Math.min(60000,1000*2**Math.min(attempt-1,6))),id);
         }finally{this.inFlight.delete(id);await this.reschedule();}
       })());
     }
@@ -354,8 +570,35 @@ export class WorldCore {
     try{const {op,args}=decode(body) as {op:string;args:unknown[]};const result=await this.dispatch(op,args);return encode({ok:true,result});}
     catch(error){const e=error instanceof Error ? error : new Error(String(error));return encode({ok:false,error:{...Object.fromEntries(Object.entries(e)),name:e.name,message:e.message}});}
   }
+  async handleControlRpc(body:Uint8Array):Promise<Uint8Array>{
+    try {
+      const request = decode(body) as {op:string;args:unknown[]};
+      if (request.op !== 'deployments.drainState' && request.op !== 'deployments.retire') throw new WorkflowWorldError('Operation is not available through deployment control RPC',{status:403});
+      return encode({ok:true,result:await this.dispatch(request.op,request.args)});
+    } catch (error) {
+      const e = error instanceof Error ? error : new Error(String(error));
+      return encode({ok:false,error:{...Object.fromEntries(Object.entries(e)),name:e.name,message:e.message}});
+    }
+  }
   private async dispatch(op:string,args:unknown[]):Promise<unknown>{
     switch(op){
+      case 'deployments.drainState': {
+        const request = args[0] as {deploymentIds:string[]};
+        return this.drainState(request.deploymentIds);
+      }
+      case 'deployments.retire': {
+        const request = args[0] as {deploymentIds:string[]};
+        const ids = request.deploymentIds;
+        if (this.currentDeploymentId && ids.includes(this.currentDeploymentId)) throw new WorkflowWorldError('Cannot retire the current deployment',{status:409});
+        const states = this.drainState(ids);
+        if (ids.some(id=>!states[id]!.drained)) throw new WorkflowWorldError('Cannot retire a deployment with live runs, queued messages, or unfinished transfers',{status:409});
+        if (!this.retireDeployment) throw new WorkflowWorldError('Deployment retirement is unavailable',{status:501});
+        // Drain and admission fencing are synchronous in the same DO turn.
+        // Keep fences durable even if external deletion must be retried.
+        this.atomic(()=>{for (const id of ids) this.sql.exec('INSERT OR IGNORE INTO workflow_retired_deployments(deployment_id) VALUES(?)',id);});
+        for (const id of ids) await this.retireDeployment(id);
+        return {retired:ids};
+      }
       case 'runs.get':return filterData(this.run(args[0] as string),args[1] as Params);
       case 'runs.getMany':return (args[0] as string[]).map(id=>{try{return filterData(this.run(id),args[1] as Params);}catch(e){if(e instanceof WorkflowRunNotFoundError)return null;throw e;}});
       case 'runs.list':return this.listRuns(args[0] as Params);
@@ -377,6 +620,7 @@ export class WorldCore {
       case 'streams.getChunks':return this.getChunks(args[1] as string,args[2] as {cursor?:string;limit?:number});
       case 'streams.getInfo':return {tailIndex:this.streamCount(args[1] as string)-1,done:this.streamDone(args[1] as string)};
       case 'queue.enqueue':return this.enqueue(args[0] as string,args[1],args[2] as EnqueueOptions);
+      case 'queue.deliverySettled':return this.deliverySettled(args[0] as string,args[1] as number);
       case 'queue.enqueueBatch':return Promise.all((args[1] as {message:unknown;opts?:EnqueueOptions}[]).map(async item=>{try{return await this.enqueue(args[0] as string,item.message,item.opts);}catch(e){return {messageId:null,error:String(e),retryable:true};}}));
       default:throw new WorkflowWorldError(`Unknown Eden World RPC operation: ${op}`,{status:400});
     }

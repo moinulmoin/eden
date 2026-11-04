@@ -1932,6 +1932,7 @@ describe("eden destroy", () => {
             }),
             deleteWorker: async () => "deleted",
             deleteContainer: async () => "deleted",
+            deleteRegistryRepository: async () => "deleted",
           },
         },
       ),
@@ -2994,11 +2995,13 @@ describe("eden deploy in-place update", () => {
     ]);
     expect(workerSource).toContain("export { EdenWorldDurableObject }");
     const result = JSON.parse(output[0] as string) as {
-      readonly warnings: readonly { readonly id: string }[];
+      readonly warnings: readonly { readonly id: string; readonly message: string }[];
     };
     expect(result.warnings.map((value) => value.id)).toEqual(
       expect.arrayContaining(["EVE_UPDATE_IN_FLIGHT", "EVE_UPDATE_WORLD_SWITCH"]),
     );
+    expect(result.warnings.find((value) => value.id === "EVE_UPDATE_IN_FLIGHT")?.message)
+      .toContain("can strand existing sessions");
   });
 
   test("keeps the World class binding and migration when the update switches away from the Durable Object World", async () => {

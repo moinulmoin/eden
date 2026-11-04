@@ -1,4 +1,6 @@
 export {
+  EDEN_AFFINITY_CONTRACT,
+  callDeploymentControlRpc,
   createEveHostConfig,
   generateEveHostWorkerSource,
   parseEveScheduleCron,
@@ -8,5 +10,7 @@ export type {
   EveDurableBinding,
   EveDurableMigration,
   EveHostConfig,
+  EveRetainedDeployment,
+  EveDeploymentRoute,
   EveScheduleCronEntry,
 } from "./eve-host.js";

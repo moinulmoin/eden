@@ -226,9 +226,12 @@ Eden deploys; your Eve project still owns its:
   microsandbox applies only to older Eve releases; Eve `0.83.0` removed it.
 - **State:** container disk survives sleep, and updates carry every
   conversation's files (up to 1 GiB compressed) through Durable Object storage.
-  **Changing the Eve version ends existing sessions:** Eve refuses to continue
-  a session on a different Eve version, so after an Eve upgrade old sessions
-  return HTTP 409 `session_stranded` (observed live on `0.82.0` → `0.83.0`)
+  **Eve upgrades keep sessions on the Cloudflare World:** when a deploy changes
+  the Eve version, the old version keeps running and each session moves to the
+  new one on its next message, with its history and files (verified live on
+  `0.83.0` → `0.91.0` → `1.0.0-rc.3`). This needs the current
+  `@moinulmoin/eden-world-cloudflare`; with an older World or the Postgres
+  World, old sessions return HTTP 409 `session_stranded` after an Eve upgrade
   and users start new ones. Skill and code updates on the same Eve version
   keep sessions.
   Local Workflow World state resets on update, and Eden warns about it. To keep
@@ -238,7 +241,9 @@ Eden deploys; your Eve project still owns its:
   (a Cloudflare Cron Trigger wakes it); others only run while it is awake. See
   [docs/deploy.md](docs/deploy.md#schedules).
 - **Scale:** one Container instance per agent (`standard-1`: 1/2 vCPU, 4 GiB),
-  `workers.dev` URL only. No horizontal scaling or custom domains yet.
+  plus one per older Eve version still holding sessions after an upgrade
+  (they sleep when idle; at most 10 versions). `workers.dev` URL only. No
+  horizontal scaling or custom domains yet.
 
 ## What we found running Eve on Cloudflare
 

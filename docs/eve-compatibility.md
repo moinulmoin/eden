@@ -94,18 +94,47 @@ Eden deployed the update successfully. A POST to the same session returned:
 {"code":"session_stranded","error":"This session is no longer available.","ok":false,"eveVersion":"0.82.0"}
 ```
 
-The response was HTTP 409 and occurred before sandbox access. Eve's
-`execution/session-inbox/runnable-owner.js` (`isRunnableOwnerRun`, present in
-both `0.82.0` and `0.83.0`) only runs a session whose recorded Eve version
-equals the installed one, unless the World reports `deploymentAffinity`, which
-Eden's Cloudflare World does not. So any Eve version change ends existing
-sessions; carrying sandbox files does not change that. Start new sessions
-after an Eve upgrade.
+The response was HTTP 409, before sandbox access. Eve only continues a
+session on the Eve version that started it unless its World declares
+`deploymentAffinity`. The World in this run did not. Carrying sandbox files
+alone did not keep these sessions working. With an older World, start new
+sessions after an Eve upgrade.
 
 A new `0.83.0` Cloudflare World session ran bash successfully. A separate live
 local World `0.83.0` run passed multi-step queue execution with two bash tools.
-The same-version carry and queued-task proof below passed separately; it does
-not change the cross-version session limitation.
+The same-version update below separately proved that sandbox files and a
+queued task survived. It did not test an Eve upgrade.
+
+## Session behavior across Eve upgrades
+
+Update both the Eden CLI and the project's Cloudflare World package. The
+installed World must declare `deploymentAffinity`; updating the CLI alone
+keeps the older behavior and the warning that an Eve upgrade ends sessions.
+
+The same Eve version updates in place. Running work then uses the new code,
+so keep code and state backward-compatible. A new Eve version gets a new
+container. Existing sessions move on their next message with the same ID,
+history, and sandbox files. Idle sessions move without a message. Work
+already running finishes on the old version.
+
+Sessions adopted from Eden `0.9.0` stay on the old version until they end;
+they do not move to the new version. A session's first run also stays on
+its original version until the session ends, so that version is kept even
+after the session moves.
+
+Interrupted sandbox transfers can be retried without overwriting active
+files. Each container sleeps independently, but not during running work or
+file transfers. A scheduled job can fire on both versions until the old
+version finishes its work and Eden stops its schedules.
+
+A later deploy removes old versions once their sessions end and their queued
+work and transfers finish. Inactive instance records can remain until destroy.
+Eden keeps at most 10 versions, including current and legacy. If cleanup
+cannot make room, deploy refuses and lists the blocking versions and live
+session counts. There is no override. Destroy removes every version,
+including sessions still running. See
+[Updating an agent](./deploy.md#updating-an-agent).
+
 
 ## Eve 0.83.0 skill-update carry and queued task (2026-10-23)
 
@@ -172,7 +201,8 @@ The session ID (`wrun_01M6K7JEFSB77SZFHTN570S5ZP`), its stream, and its
 channel address stayed the same, and the stream kept the earlier history. A
 local `eve build` + `eve start` run on Eve `0.91.0` and `1.0.0-rc.3` against the
 updated World also ran bash. Eve `0.68.0`–`0.82.0` were not run against it.
-This does not change the Eve-upgrade limitation above.
+This run proved compaction handoff on one Eve version, not a move between
+Eve versions. See [session behavior across Eve upgrades](#session-behavior-across-eve-upgrades).
 
 ## Sandbox resume compatibility
 
