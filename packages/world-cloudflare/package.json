@@ -4,7 +4,8 @@
   "description": "Cloudflare Durable Object SQLite World for Eve workflows.",
   "eden": {
     "capabilities": {
-      "deploymentAffinity": true
+      "deploymentAffinity": true,
+      "worldRpcAuth": true
     }
   },
   "type": "module",

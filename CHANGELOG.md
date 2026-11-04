@@ -2,9 +2,21 @@
 
 ## Unreleased
 
-Eve upgrades on the Cloudflare World no longer end existing conversations.
-Update both `@moinulmoin/eden` and the project's
-`@moinulmoin/eden-world-cloudflare` to get it.
+Eve upgrades on the Cloudflare World no longer end existing conversations, and
+the agent's sandbox can no longer reach the World's internal API. Update both
+`@moinulmoin/eden` and the project's `@moinulmoin/eden-world-cloudflare` to get
+both.
+
+### Security
+
+- In 0.9.0 and earlier, code run in the agent's bash sandbox could call the
+  Cloudflare World's internal API through the container's own URL, and read or
+  change any session's workflow state: run inputs and outputs, events, and hook
+  tokens, or start workflow steps. The World now requires a secret that Eden
+  gives only to Eve's World client at each container start, and refuses
+  workflow step requests from inside the container; the sandbox can't read the
+  secret, and its requests get HTTP 403. Versions kept running from before the
+  update stay exposed until their sessions end.
 
 ### Added
 
@@ -19,7 +31,9 @@ Update both `@moinulmoin/eden` and the project's
   ended. Until then its container runs only while it has work and sleeps
   otherwise; its image stays in your registry. Eden keeps at most 10 versions
   and refuses to deploy past that, listing the versions still holding
-  sessions. `eden destroy` removes all of them.
+  sessions. `eden destroy` removes all of them. To check old versions, deploy
+  rotates a control secret, which creates a Worker version with unchanged
+  code, even when the deploy is then refused.
 - Targets deployed with 0.9.0 are adopted on update: their existing sessions
   keep working on the old version until they end, but don't move to the new
   one.

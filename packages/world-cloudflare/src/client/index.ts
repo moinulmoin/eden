@@ -36,7 +36,10 @@ export function createWorld(options: CloudflareWorldOptions = {}): World {
     const body = new Uint8Array(encode({ op, args }));
     const response = await fetch(endpoint, {
       method: "POST",
-      headers: { "content-type": "application/cbor" },
+      headers: {
+        "content-type": "application/cbor",
+        "x-eden-world-token": process.env.EDEN_WORLD_TOKEN ?? "",
+      },
       body,
     });
     if (!response.ok) throw new Error(`Eden World RPC ${op} failed: HTTP ${response.status}`);

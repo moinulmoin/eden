@@ -474,6 +474,9 @@ describe("generic Eve Cloudflare host", () => {
           "x-eden-eve-deployment-id": "attacker-deployment",
           "x-eden-eve-generation-id": "attacker-generation",
           "x-eden-eve-public-origin": "https://evil.invalid",
+          "x-vqs-message-id": "attacker-message",
+          "x-vqs-message-attempt": "1",
+          "x-vqs-queue-name": "attacker-queue",
         },
       },
     );
@@ -498,6 +501,9 @@ describe("generic Eve Cloudflare host", () => {
     expect(upstream.headers.get("x-forwarded-proto")).toBe("https");
     expect(upstream.headers.get("x-real-ip")).toBeNull();
     expect(upstream.headers.get("cf-container-target-port")).toBeNull();
+    expect(upstream.headers.get("x-vqs-message-id")).toBeNull();
+    expect(upstream.headers.get("x-vqs-message-attempt")).toBeNull();
+    expect(upstream.headers.get("x-vqs-queue-name")).toBeNull();
     expect(upstream.headers.get("x-eden-eve-deployment-id")).toBe(
       IDENTITY.deploymentId,
     );

@@ -16,7 +16,8 @@ function setup(arrayBuffers: boolean) {
   };
   const core: WorldCore = new WorldCore({sql:storage,now:()=>now,scheduleAlarm:at=>{alarms.push(at);},delivery:{async deliver(msg){deliveries.push(msg);if(!fail)core.deliverySettled(msg.messageId,msg.attempt);return {ok:!fail};}}}); core.migrate();
   async function rpc(op:string,...args:unknown[]) { const response = decode(await core.handleRpc(encode({op,args}))); if(!response.ok) throw Object.assign(new Error(response.error.message),response.error);return response.result; }
-  return {sql,core,rpc,alarms,deliveries,advance(ms:number){now+=ms;},setFailure(value:boolean){fail=value;}};
+  async function controlRpc(op:string,...args:unknown[]) { const response = decode(await core.handleControlRpc(encode({op,args}))); if(!response.ok) throw Object.assign(new Error(response.error.message),response.error);return response.result; }
+  return {sql,core,rpc,controlRpc,alarms,deliveries,advance(ms:number){now+=ms;},setFailure(value:boolean){fail=value;}};
 }
 describe.each([false,true])('WorldCore (ArrayBuffer BLOBs: %s)',(arrayBuffers)=>{
   it('allocates dense slots, reports intervening events, and does not burn slots on dedup',async()=>{
@@ -43,7 +44,7 @@ describe.each([false,true])('WorldCore (ArrayBuffer BLOBs: %s)',(arrayBuffers)=>
     const s=setup(arrayBuffers);try{
       const run=(await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'old',workflowName:'test',input:[]}})).run;
       const first=await s.rpc('queue.enqueue','__wkf_workflow_test',{runId:run.runId},{idempotencyKey:'key',sourceDeploymentId:'new'});const duplicate=await s.rpc('queue.enqueue','__wkf_workflow_test',{runId:run.runId},{idempotencyKey:'key',deploymentId:'wrong'});expect(duplicate).toEqual(first);
-      expect(await s.rpc('deployments.drainState',{deploymentIds:['old','new']})).toMatchObject({old:{liveRuns:1,pendingMessages:1,drained:false},new:{liveRuns:0,pendingMessages:0,drained:true}});
+      expect(await s.controlRpc('deployments.drainState',{deploymentIds:['old','new']})).toMatchObject({old:{liveRuns:1,pendingMessages:1,drained:false},new:{liveRuns:0,pendingMessages:0,drained:true}});
       s.setFailure(true);await s.core.runAlarm();expect(s.deliveries).toMatchObject([{messageId:first.messageId,attempt:1,deploymentId:'old',sourceDeploymentId:'new'}]);
       await s.core.runAlarm();expect(s.deliveries).toHaveLength(1);s.advance(1000);s.setFailure(false);await s.core.runAlarm();expect(s.deliveries).toMatchObject([{attempt:1},{attempt:2,messageId:first.messageId,deploymentId:'old',sourceDeploymentId:'new'}]);
       expect(s.alarms.at(-1)).toBeNull();await s.core.runAlarm();expect(s.deliveries).toHaveLength(2);
@@ -51,9 +52,9 @@ describe.each([false,true])('WorldCore (ArrayBuffer BLOBs: %s)',(arrayBuffers)=>
       expect(wake.messageId).not.toBe(first.messageId);await s.core.runAlarm();
       expect(s.deliveries[2]).toMatchObject({messageId:wake.messageId,attempt:1,deploymentId:'old'});
       await s.rpc('events.create',run.runId,{eventType:'run_completed',eventData:{output:[]}});
-      expect(await s.rpc('deployments.drainState',{deploymentIds:['old']})).toMatchObject({old:{pendingMessages:1,drained:false}});
+      expect(await s.controlRpc('deployments.drainState',{deploymentIds:['old']})).toMatchObject({old:{pendingMessages:1,drained:false}});
       s.core.deliverySettled(first.messageId,1);
-      expect(await s.rpc('deployments.drainState',{deploymentIds:['old']})).toEqual({old:{liveRuns:0,liveSessions:0,pendingMessages:0,unfinishedTransfers:0,drained:true}});
+      expect(await s.controlRpc('deployments.drainState',{deploymentIds:['old']})).toEqual({old:{liveRuns:0,liveSessions:0,pendingMessages:0,unfinishedTransfers:0,drained:true}});
     }finally{s.sql.close();}
   });
   it('bounds streams at the first EOF and closes readers past the tail',async()=>{

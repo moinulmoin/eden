@@ -344,6 +344,7 @@ export interface EveRetainedDeployment {
   readonly releaseId?: string;
   readonly eveVersion?: string;
   readonly affinityContract?: number;
+  readonly worldRpcAuth?: boolean;
 }
 
 export interface EveDeploymentRoute {
@@ -353,6 +354,7 @@ export interface EveDeploymentRoute {
   readonly releaseId?: string;
   readonly eveVersion?: string;
   readonly affinityContract?: number;
+  readonly worldRpcAuth?: boolean;
 }
 
 export interface EveHostConfigRequest extends EveHostIdentity {
@@ -371,6 +373,7 @@ export interface EveHostConfigRequest extends EveHostIdentity {
   /** Overrides the Container `sleepAfter` (e.g. "30s") for testing. */
   readonly containerSleepAfter?: string;
   readonly workflowWorld?: string;
+  readonly worldRpcAuth?: boolean;
   /**
    * Durable Object state already published for this exact target. In-place
    * updates carry the recorded binding and migration history forward
@@ -417,6 +420,7 @@ export interface EveHostWranglerConfig {
     readonly EDEN_EVE_RUNTIME_REVISION?: string;
     readonly EDEN_EVE_CONTAINER_SLEEP_AFTER?: string;
     readonly EDEN_EVE_WORLD_CLOUDFLARE?: true;
+    readonly EDEN_EVE_WORLD_RPC_AUTH?: true;
   };
   readonly triggers?: { readonly crons: readonly string[] };
   readonly containers: readonly [
@@ -575,6 +579,7 @@ export function createEveHostConfig(
       releaseId: request.releaseId ?? request.deploymentId,
       ...(request.eveVersion === undefined ? {} : { eveVersion: request.eveVersion }),
       affinityContract: request.affinityContract ?? EDEN_AFFINITY_CONTRACT,
+      ...(request.worldRpcAuth === true ? { worldRpcAuth: true } : {}),
       generationId: request.generationId,
       ...(request.runtimeRevisionHandle === undefined
         ? {}
@@ -595,6 +600,7 @@ export function createEveHostConfig(
       ...(retained.releaseId === undefined ? {} : { releaseId: retained.releaseId }),
       ...(retained.eveVersion === undefined ? {} : { eveVersion: retained.eveVersion }),
       ...(retained.affinityContract === undefined ? {} : { affinityContract: retained.affinityContract }),
+      ...(retained.worldRpcAuth === undefined ? {} : { worldRpcAuth: retained.worldRpcAuth }),
       ...(retained.runtimeRevisionHandle === undefined
         ? {}
         : { runtimeRevisionHandle: retained.runtimeRevisionHandle }),
@@ -714,6 +720,7 @@ export function createEveHostConfig(
         ...(request.workflowWorld === "@moinulmoin/eden-world-cloudflare"
           ? { EDEN_EVE_WORLD_CLOUDFLARE: true as const }
           : {}),
+        ...(request.worldRpcAuth === true ? { EDEN_EVE_WORLD_RPC_AUTH: true as const } : {}),
       },
       ...(schedules.length === 0
         ? {}
@@ -732,7 +739,6 @@ export function createEveHostConfig(
       deploymentId: request.deploymentId,
       releaseId: request.releaseId ?? request.deploymentId,
       generationId: request.generationId,
-      ...(request.retainedDeployments === undefined ? {} : { deployments }),
       ...(request.runtimeRevisionHandle === undefined
         ? {}
         : { runtimeRevisionHandle: request.runtimeRevisionHandle }),
@@ -751,7 +757,6 @@ export function generateEveHostWorkerSource(
     deploymentId: request.config.container.deploymentId,
     releaseId: request.config.container.releaseId ?? request.config.container.deploymentId,
     generationId: request.config.container.generationId,
-    ...(request.config.container.deployments === undefined ? {} : { deployments: request.config.container.deployments }),
     stableContainerInstanceName: request.config.container.instanceName,
     ...(request.config.container.runtimeRevisionHandle === undefined
       ? {}
@@ -824,7 +829,7 @@ export function createTrustedEveRequest(
   const headers = new Headers(request.headers);
   const headersToStrip: string[] = [];
   headers.forEach((_value, header) => {
-    if (isHostOwnedHeader(header)) {
+    if (isHostOwnedHeader(header) || header.startsWith("x-vqs-")) {
       headersToStrip.push(header);
     }
   });
@@ -894,6 +899,7 @@ export interface EveHostContainerEnvironment {
   readonly EDEN_EVE_RUNTIME_REVISION?: string;
   readonly EDEN_EVE_CONTAINER_SLEEP_AFTER?: string;
   readonly EDEN_EVE_WORLD_CLOUDFLARE?: boolean;
+  readonly EDEN_EVE_WORLD_RPC_AUTH?: boolean;
 }
 
 export interface EveHostReadinessEvidence {
@@ -947,6 +953,7 @@ const RESERVED_EVE_HOST_VARIABLES = new Set([
   "NODE_EXTRA_CA_CERTS",
   "WORKFLOW_LOCAL_BASE_URL",
   "EDEN_WORLD_URL",
+  "EDEN_WORLD_TOKEN",
   "EDEN_EVE_DEPLOYMENT_ID",
   "EDEN_EVE_GENERATION_ID",
   "EDEN_EVE_DEPLOYMENTS",

@@ -301,6 +301,7 @@ export interface EveAffinityDeployment {
   readonly eveVersion?: string;
   readonly affinityContract?: number;
   readonly releaseId?: string;
+  readonly worldRpcAuth?: boolean;
 }
 
 export interface EveDeploymentDrainState {
@@ -315,7 +316,6 @@ export type EveDeploymentRpcRunner = (request: {
   readonly origin: string;
   readonly operation: "deployments.drainState" | "deployments.retire";
   readonly deploymentIds: readonly string[];
-  readonly runtimeConfig?: EveRuntimeConfig;
   readonly controlToken: string;
 }) => Promise<unknown>;
 
@@ -745,7 +745,7 @@ async function readInstalledManifest(
 ): Promise<
   | {
     readonly version?: string;
-    readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean } };
+    readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean; readonly worldRpcAuth?: boolean } };
     readonly devDependencies?: Readonly<Record<string, string>>;
     readonly dependencies?: Readonly<Record<string, string>>;
     readonly peerDependencies?: Readonly<Record<string, string>>;
@@ -760,7 +760,7 @@ async function readInstalledManifest(
       ),
     ) as {
       readonly version?: string;
-      readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean } };
+      readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean; readonly worldRpcAuth?: boolean } };
       readonly devDependencies?: Readonly<Record<string, string>>;
       readonly dependencies?: Readonly<Record<string, string>>;
       readonly peerDependencies?: Readonly<Record<string, string>>;
@@ -2657,6 +2657,7 @@ async function runEveDeployment(
     ? await readInstalledManifest(candidate.snapshotRoot, collected.workflowWorld)
     : undefined;
   const affinityEnabled = worldManifest?.eden?.capabilities?.deploymentAffinity === true;
+  const worldRpcAuth = worldManifest?.eden?.capabilities?.worldRpcAuth === true;
   if (!affinityEnabled && priorIdentity?.retainedDeployments !== undefined) {
     throw deploymentFailure("EVE_AFFINITY_REQUIRED", "This target retains affinity deployments; install a World package declaring deploymentAffinity before updating it.");
   }
@@ -2779,8 +2780,10 @@ async function runEveDeployment(
   delete retiringDeployments[deploymentId];
   if (priorIdentity?.deploymentId !== undefined) delete retiringDeployments[priorIdentity.deploymentId];
   for (const id of prior?.protectedDeploymentIds ?? []) delete retiringDeployments[id];
+  const hasRetainedNoncurrentDeployments = priorIdentity?.retainedDeployments !== undefined &&
+    Object.keys(retainedDeployments).some((id) => id !== priorIdentity.deploymentId);
   const controlToken = `${randomUUID()}${randomUUID()}`;
-  if (affinityEnabled) {
+  if (affinityEnabled && (hasRetainedNoncurrentDeployments || Object.keys(retiringDeployments).length > 0)) {
     await (options.protectedStore ?? defaultProtectedStore(request.name)).put({
       targetId: targetKey, revision: `eve-affinity-control-${randomUUID()}`,
       inputIdentity: {
@@ -2791,12 +2794,11 @@ async function runEveDeployment(
       variableNames: ["EDEN_EVE_CONTROL_TOKEN"], values: { EDEN_EVE_CONTROL_TOKEN: controlToken },
     });
   }
-  if (affinityEnabled && priorIdentity?.retainedDeployments !== undefined) {
+  if (affinityEnabled && hasRetainedNoncurrentDeployments) {
     const ids = Object.keys(retainedDeployments);
     const raw = await (options.deploymentRpc ?? defaultDeploymentRpc)({
       origin: stableWorkersDevOrigin, operation: "deployments.drainState", deploymentIds: ids,
       controlToken,
-      ...(collected.runtimeConfig === undefined ? {} : { runtimeConfig: collected.runtimeConfig }),
     });
     const states = validateDeploymentDrainStates(raw, ids);
     const eligible = ids.filter((id) =>
@@ -2810,7 +2812,6 @@ async function runEveDeployment(
       const retired = await (options.deploymentRpc ?? defaultDeploymentRpc)({
         origin: stableWorkersDevOrigin, operation: "deployments.retire",
         deploymentIds: eligible, controlToken,
-        ...(collected.runtimeConfig === undefined ? {} : { runtimeConfig: collected.runtimeConfig }),
       });
       if (typeof retired !== "object" || retired === null || !("retired" in retired) ||
           !Array.isArray(retired.retired) ||
@@ -2825,7 +2826,7 @@ async function runEveDeployment(
     if (Object.keys(retainedDeployments).length + (deploymentId in retainedDeployments ? 0 : 1) > 10) {
       const blockers = Object.entries(states).filter(([id]) => id in retainedDeployments)
         .map(([id, state]) => `${id}: ${state.liveSessions} live sessions, ${state.liveRuns} live runs, ${state.pendingMessages} pending messages, ${state.unfinishedTransfers} unfinished transfers`);
-      throw deploymentFailure("EVE_AFFINITY_LIMIT", `Deployment refused before publication: at most 10 affinity deployments may be retained. Blocking deployments: ${blockers.join("; ")}`);
+      throw deploymentFailure("EVE_AFFINITY_LIMIT", `Deployment refused before image/code publication: at most 10 affinity deployments may be retained. Blocking deployments: ${blockers.join("; ")}`);
     }
   }
   let imageReference = options.containerImageReference;
@@ -2950,6 +2951,7 @@ async function runEveDeployment(
           eveVersion: candidate.eveVersion,
           affinityContract: EDEN_AFFINITY_CONTRACT,
           releaseId,
+          worldRpcAuth,
           ...(runtimeInjection?.protectedHandle === undefined ? {} : { runtimeRevisionHandle: runtimeInjection.protectedHandle }),
         },
       },
@@ -2975,6 +2977,7 @@ async function runEveDeployment(
     containerApplicationName: identity.containerApplicationName,
     stableContainerInstanceName: identity.stableContainerInstanceName,
     deploymentId: identity.deploymentId,
+    worldRpcAuth,
     ...(identity.releaseId === undefined ? {} : { releaseId: identity.releaseId }),
     ...(identity.eveVersion === undefined ? {} : { eveVersion: identity.eveVersion }),
     ...(identity.affinityContract === undefined ? {} : { affinityContract: identity.affinityContract }),
@@ -3357,11 +3360,11 @@ async function runEveDeployment(
   let supersededImageCleanup: EvePreflightCheck | undefined;
   if (affinityEnabled && Object.keys(retiringDeployments).length > 0) {
     const ids = Object.keys(retiringDeployments);
+    const completedRetirements: string[] = [];
     try {
       const result = await (options.deploymentRpc ?? defaultDeploymentRpc)({
         origin: stableWorkersDevOrigin, operation: "deployments.retire", deploymentIds: ids,
         controlToken,
-        ...(collected.runtimeConfig === undefined ? {} : { runtimeConfig: collected.runtimeConfig }),
       });
       if (typeof result !== "object" || result === null ||
           !("retired" in result) || !Array.isArray(result.retired) ||
@@ -3374,10 +3377,17 @@ async function runEveDeployment(
             defaultRegistryRepositoryDelete)({ repository }) === "indeterminate") {
           throw new Error(`Repository deletion was not proven: ${repository}`);
         }
+        completedRetirements.push(id);
       }
       supersededImageCleanup = check("VAL-LIFE-007", "passed", "Drained deployment instances and their owned registry repositories were retired.");
     } catch {
       supersededImageCleanup = check("VAL-LIFE-007", "failed", "The deployment is healthy, but drained resource retirement was not proven; exact pending retirement records were retained for retry.", "Retry deploy to finish only recorded drained resource cleanup.");
+    }
+    if (completedRetirements.length > 0) {
+      // Keep the immutable deployment record as evidence, but exclude proven
+      // cleanup from the next deploy's active retry set.
+      await writeFile(join(candidate.generationRoot, "completed-retirements.json"),
+        `${JSON.stringify(completedRetirements)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
     }
   }
   if (isUpdate && !affinityEnabled) {
@@ -4424,6 +4434,7 @@ async function parseEveDestroyRecord(
           (deployment.eveVersion !== undefined && typeof deployment.eveVersion !== "string") ||
           (deployment.affinityContract !== undefined && typeof deployment.affinityContract !== "number") ||
           (deployment.releaseId !== undefined && typeof deployment.releaseId !== "string") ||
+          (deployment.worldRpcAuth !== undefined && typeof deployment.worldRpcAuth !== "boolean") ||
           (deployment.runtimeRevisionHandle !== undefined && typeof deployment.runtimeRevisionHandle !== "string")) return undefined;
     }
     Object.assign(metadata, { [key]: value });
@@ -4637,6 +4648,17 @@ async function parseEveDeploymentRecord(
 > & { readonly deploymentId?: string | undefined }) | undefined> {
   const base = await parseEveDestroyRecord(recordPath, environment, name);
   if (base === undefined) return undefined;
+  let identity = base.identity;
+  try {
+    const completed: unknown = JSON.parse(await readFile(join(dirname(recordPath), "completed-retirements.json"), "utf8"));
+    if (Array.isArray(completed) && completed.every((id) => typeof id === "string")) {
+      const pendingRetirements = { ...identity.pendingRetirements };
+      for (const id of completed) delete pendingRetirements[id];
+      identity = { ...identity, pendingRetirements };
+    }
+  } catch {
+    // Missing or unreadable cleanup evidence must not suppress a retry.
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(await readFile(recordPath, "utf8")) as unknown;
@@ -4681,7 +4703,7 @@ async function parseEveDeploymentRecord(
     Array.isArray(rawMigrations);
   const invalidHistory = () => ({
     recordPath,
-    identity: base.identity,
+    identity,
     status,
     deploymentId,
     worldCloudflare: rawVars?.EDEN_EVE_WORLD_CLOUDFLARE === true,
@@ -4716,7 +4738,7 @@ async function parseEveDeploymentRecord(
   }
   return {
     recordPath,
-    identity: base.identity,
+    identity,
     status,
     deploymentId,
     worldCloudflare: rawVars?.EDEN_EVE_WORLD_CLOUDFLARE === true,

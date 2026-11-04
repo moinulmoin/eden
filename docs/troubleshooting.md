@@ -661,20 +661,23 @@ they stay on the old `eden-cloudflare` version until they end.
 
 ### Deploy waits for retirement-control authentication
 
-Deploy rotates the reserved `EDEN_EVE_CONTROL_TOKEN` Worker secret, creating
-an additional Worker version. Activation can take seconds. A read-only
-cleanup query retries HTTP 401 once per second for up to 60 seconds. Other
-errors, including authentication failures during cleanup, stop deploy.
-The token is not saved locally or written to logs. This extra Worker version
-does not mean a container restarted.
+Deploy rotates the reserved `EDEN_EVE_CONTROL_TOKEN` Worker secret only when
+local records contain old versions to query or pending retirement cleanup to
+retry. Fresh targets and current-only targets without pending cleanup skip it.
+Rotation creates an additional Worker version with unchanged code. Activation
+can take seconds. A read-only cleanup query retries HTTP 401 once per second
+for up to 60 seconds. Other errors, including authentication failures during
+cleanup, stop deploy. The token is not saved locally or written to logs. This
+extra Worker version does not mean a container restarted.
 
 ### Deploy refuses because 10 versions are kept
 
 The limit includes current and legacy versions. A later deploy removes old
 versions once their sessions end and their queued work and transfers finish.
-If adding a version would still exceed 10, deploy refuses before publication
-and lists the blocking deployment IDs and live session counts. There is no
-override flag.
+If adding a version would still exceed 10, deploy refuses before image/code
+publication and lists the blocking deployment IDs and live session counts.
+The cleanup credential rotation may already have created a Worker version
+with unchanged code. There is no override flag.
 
 A session's first run stays on its original version until the session ends,
 so that version is kept even after the session moves. Let those sessions

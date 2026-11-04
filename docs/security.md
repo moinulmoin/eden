@@ -71,6 +71,16 @@ What the Worker does for you:
   deployment and generation IDs, and container instance name. They identify
   the deployment; they contain no secrets.
 
+For Cloudflare World packages declaring `worldRpcAuth`, the container's World
+RPC endpoint requires a per-start secret supplied only to that container's
+World client. This protects workflow state across sessions; the RPC endpoint
+is not protected by the agent's Eve authenticator. Update both the CLI and
+the project's Cloudflare World package to enable it. Older World packages,
+including retained versions built without this capability, remain
+unauthenticated for compatibility and can expose cross-session workflow state.
+End sessions on those versions so they can retire. `EDEN_WORLD_TOKEN` is
+reserved and cannot be supplied through `--env-file`.
+
 ## The sandbox
 
 Eden agents use Eve's `just-bash` sandbox: a simulated shell that runs inside

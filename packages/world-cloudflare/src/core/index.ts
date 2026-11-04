@@ -10,7 +10,7 @@ export interface SqlExec {
   transactionSync?<T>(callback: () => T): T;
 }
 export interface QueueDelivery {
-  deliver(msg: { queueName: string; messageId: string; attempt: number; body: Uint8Array; path: 'flow' | 'step'; headers?: Record<string, string>; deploymentId?: string; sourceDeploymentId?: string; sandboxSessionId?: string }): Promise<{ ok: boolean; retryAfterMs?: number; sandboxTransferCompleted?: boolean }>;
+  deliver(msg: { queueName: string; messageId: string; attempt: number; body: Uint8Array; path: 'flow' | 'step'; headers?: Record<string, string>; deploymentId?: string; sourceDeploymentId?: string; sandboxSessionId?: string }): Promise<{ ok: boolean; retryAfterMs?: number; sandboxTransferCompleted?: boolean; sandboxTransferFailed?: boolean }>;
 }
 type Params = { resolveData?: 'all' | 'none'; pagination?: { limit?: number; cursor?: string | null; sortOrder?: 'asc' | 'desc' }; runId?: string; workflowName?: string; status?: string | string[]; correlationId?: string };
 type EnqueueOptions = {deploymentId?:string;sourceDeploymentId?:string;idempotencyKey?:string;delaySeconds?:number;headers?:Record<string,string>};
@@ -82,6 +82,7 @@ export class WorldCore {
       'CREATE TABLE IF NOT EXISTS workflow_queue_messages (id TEXT PRIMARY KEY, queue_name TEXT NOT NULL, body BLOB NOT NULL, path TEXT NOT NULL, due_at INTEGER NOT NULL, attempt INTEGER NOT NULL DEFAULT 1, completed INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT)',
       'CREATE UNIQUE INDEX IF NOT EXISTS workflow_queue_idempotency ON workflow_queue_messages(idempotency_key) WHERE idempotency_key IS NOT NULL',
       'CREATE INDEX IF NOT EXISTS workflow_queue_due ON workflow_queue_messages(completed,due_at)',
+      // completed: 0 = pending, 1 = imported, -1 = FAILED (never an import acknowledgement).
       'CREATE TABLE IF NOT EXISTS workflow_sandbox_transfers (message_id TEXT PRIMARY KEY, source_deployment_id TEXT NOT NULL, deployment_id TEXT NOT NULL, session_id TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0)',
       'CREATE TABLE IF NOT EXISTS workflow_retired_deployments (deployment_id TEXT PRIMARY KEY)',
       'CREATE TABLE IF NOT EXISTS workflow_delivery_claims (message_id TEXT NOT NULL, attempt INTEGER NOT NULL, deployment_id TEXT NOT NULL, settled INTEGER NOT NULL DEFAULT 0, legacy INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(message_id,attempt))',
@@ -509,6 +510,24 @@ export class WorldCore {
     });
     await this.reschedule();return {messageId:id};
   }
+  private failSandboxTransfer(id:string,attempt:number,message:QueueMessage):void {
+    this.atomic(()=>{
+      if (typeof message.runId === 'string') {
+        let run:WorkflowRun;
+        try { run=this.run(message.runId); }
+        catch(error) {
+          if (!(error instanceof WorkflowRunNotFoundError) || !message.runInput) throw error;
+          run=this.createSync(message.runId,{eventType:'run_created',eventData:message.runInput,specVersion:message.runInput.specVersion ?? message.specVersion ?? SPEC_VERSION_CURRENT}).run!;
+        }
+        // Import precedes workflow dispatch: fail only the unstarted successor,
+        // never its source session or a successor that already took ownership.
+        if (run.status === 'pending') this.createSync(message.runId,{eventType:'run_failed',specVersion:run.specVersion,eventData:{error:new TextEncoder().encode(JSON.stringify(['Sandbox export failed; session remains on its current deployment.'])),errorCode:'SANDBOX_EXPORT_FAILED'}});
+      }
+      this.sql.exec('UPDATE workflow_sandbox_transfers SET completed=-1 WHERE message_id=? AND completed=0',id);
+      this.deliverySettled(id,attempt);
+      this.sql.exec('UPDATE workflow_queue_messages SET completed=1,idempotency_key=NULL,lease_until=0 WHERE id=?',id);
+    });
+  }
   private async reschedule():Promise<void>{const row=this.rows('SELECT MIN(due_at) AS due FROM workflow_queue_messages WHERE completed=0')[0];const due=row?.due === null || row?.due === undefined ? null:Number(row.due);await this.scheduleAlarm(this.inFlight.size ? Math.min(due ?? Infinity,this.now()+30000):due);}
   async runAlarm():Promise<void>{
     // Alarms cannot overlap on Cloudflare. Never keep one open on a delivery:
@@ -537,7 +556,7 @@ export class WorldCore {
       this.waitUntil((async()=>{
         try{
           let dispatched = false;
-          let result:{ok:boolean;retryAfterMs?:number;sandboxTransferCompleted?:boolean};try{
+          let result:{ok:boolean;retryAfterMs?:number;sandboxTransferCompleted?:boolean;sandboxTransferFailed?:boolean};try{
             const body = sqlBytes(row.body); const message = this.queueMessage(body);
             const deploymentId = this.queueTarget(message,row.deployment_id == null ? undefined : String(row.deployment_id));
             this.assertDeploymentActive(deploymentId);
@@ -555,6 +574,7 @@ export class WorldCore {
             dispatched = true;
             result=await this.delivery.deliver({queueName:String(row.queue_name),messageId:id,attempt,body,path:row.path as 'flow'|'step',...(row.headers ? {headers:decode(sqlBytes(row.headers)) as Record<string,string>} : {}),deploymentId,...(sourceDeploymentId === undefined ? {} : {sourceDeploymentId}),...(sandboxSessionId === undefined ? {} : {sandboxSessionId})});
             if (sandboxSessionId) {
+              if (result.sandboxTransferFailed) { this.failSandboxTransfer(id,attempt,message); return; }
               if (result.sandboxTransferCompleted) this.sql.exec('UPDATE workflow_sandbox_transfers SET completed=1 WHERE message_id=?',id);
               else result={ok:false,...(result.retryAfterMs === undefined ? {} : {retryAfterMs:result.retryAfterMs})};
             }
@@ -567,7 +587,12 @@ export class WorldCore {
     }
   }
   async handleRpc(body:Uint8Array):Promise<Uint8Array>{
-    try{const {op,args}=decode(body) as {op:string;args:unknown[]};const result=await this.dispatch(op,args);return encode({ok:true,result});}
+    try {
+      const {op,args}=decode(body) as {op:string;args:unknown[]};
+      if (op.startsWith('deployments.')) throw new WorkflowWorldError('Deployment operations require deployment control RPC',{status:403});
+      const result=await this.dispatch(op,args);
+      return encode({ok:true,result});
+    }
     catch(error){const e=error instanceof Error ? error : new Error(String(error));return encode({ok:false,error:{...Object.fromEntries(Object.entries(e)),name:e.name,message:e.message}});}
   }
   async handleControlRpc(body:Uint8Array):Promise<Uint8Array>{
