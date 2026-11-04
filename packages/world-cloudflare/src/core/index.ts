@@ -35,9 +35,10 @@ export class WorldCore {
   private readonly delivery: QueueDelivery;
   private readonly now: () => number;
   private readonly scheduleAlarm: (atMs: number | null) => void | Promise<void>;
-  private alarmRunning = false;
-  constructor(opts: { sql: SqlExec; delivery: QueueDelivery; now?: () => number; scheduleAlarm: (atMs: number | null) => void | Promise<void> }) {
-    this.sql = opts.sql; this.delivery = opts.delivery; this.now = opts.now ?? Date.now; this.scheduleAlarm = opts.scheduleAlarm;
+  private readonly inFlight = new Set<string>();
+  private readonly waitUntil: (promise: Promise<void>) => void;
+  constructor(opts: { sql: SqlExec; delivery: QueueDelivery; now?: () => number; scheduleAlarm: (atMs: number | null) => void | Promise<void>; waitUntil?: (promise: Promise<void>) => void }) {
+    this.sql = opts.sql; this.delivery = opts.delivery; this.now = opts.now ?? Date.now; this.scheduleAlarm = opts.scheduleAlarm; this.waitUntil = opts.waitUntil ?? (() => {});
   }
   private rows(query: string, ...args: unknown[]) { return this.sql.exec(query, ...args).toArray(); }
   private atomic<T>(fn: () => T): T { return this.sql.transactionSync ? this.sql.transactionSync(fn) : fn(); }
@@ -318,21 +319,36 @@ export class WorldCore {
     this.sql.exec('INSERT INTO workflow_queue_messages(id,queue_name,body,path,due_at,idempotency_key,headers) VALUES(?,?,?,?,?,?,?)',id,queueName,new TextEncoder().encode(json),path,this.now()+Math.max(0,opts?.delaySeconds ?? 0)*1000,opts?.idempotencyKey ?? null,opts?.headers ? encode(opts.headers) : null);
     await this.reschedule();return {messageId:id};
   }
-  private async reschedule():Promise<void>{const row=this.rows('SELECT MIN(due_at) AS due FROM workflow_queue_messages WHERE completed=0')[0];await this.scheduleAlarm(row?.due === null || row?.due === undefined ? null:Number(row.due));}
+  private async reschedule():Promise<void>{const row=this.rows('SELECT MIN(due_at) AS due FROM workflow_queue_messages WHERE completed=0')[0];const due=row?.due === null || row?.due === undefined ? null:Number(row.due);await this.scheduleAlarm(this.inFlight.size ? Math.min(due ?? Infinity,this.now()+30000):due);}
   async runAlarm():Promise<void>{
-    if(this.alarmRunning)return;this.alarmRunning=true;
-    try{
-      const due=this.rows('SELECT * FROM workflow_queue_messages WHERE completed=0 AND due_at<=? ORDER BY due_at,id LIMIT 50',this.now());
-      await Promise.all(due.map(async row=>{
-        const id=String(row.id);const attempt=Number(row.attempt);
-        // Persist a lease before the external effect: a crashed delivery retries.
-        this.sql.exec('UPDATE workflow_queue_messages SET due_at=? WHERE id=?',this.now()+60000,id);
-        let result:{ok:boolean;retryAfterMs?:number};try{result=await this.delivery.deliver({queueName:String(row.queue_name),messageId:id,attempt,body:sqlBytes(row.body),path:row.path as 'flow'|'step',...(row.headers ? {headers:decode(sqlBytes(row.headers)) as Record<string,string>} : {})});}catch{result={ok:false};}
-        // Like world-local, deduplicate outstanding deliveries, not future wakes.
-        if(result.ok && result.retryAfterMs === undefined)this.sql.exec('UPDATE workflow_queue_messages SET completed=1,idempotency_key=NULL WHERE id=?',id);
-        else this.sql.exec('UPDATE workflow_queue_messages SET attempt=?,due_at=? WHERE id=?',attempt+1,this.now()+Math.max(1,result.retryAfterMs ?? Math.min(60000,1000*2**Math.min(attempt-1,6))),id);
-      }));
-    }finally{this.alarmRunning=false;await this.reschedule();}
+    // Alarms cannot overlap on Cloudflare. Never keep one open on a delivery:
+    // it would block every subsequent wake, and has a 15 minute wall-time limit.
+    // Renew live deliveries before selecting due work. Their durable leases
+    // recover a lost instance; the in-memory set, not elapsed time, owns a live
+    // delivery. The 30 second heartbeat also keeps older compatibility dates
+    // active, where pending RPCs/waitUntil alone do not prevent idle eviction.
+    const leaseUntil = this.now()+60000;
+    for(const id of this.inFlight)this.sql.exec('UPDATE workflow_queue_messages SET due_at=? WHERE id=? AND completed=0',leaseUntil,id);
+    const due=this.rows('SELECT * FROM workflow_queue_messages WHERE completed=0 AND due_at<=? ORDER BY due_at,id LIMIT 50',this.now()).filter(row=>!this.inFlight.has(String(row.id)));
+    for(const row of due){
+      const id=String(row.id);
+      this.sql.exec('UPDATE workflow_queue_messages SET due_at=? WHERE id=?',leaseUntil,id);
+      this.inFlight.add(id);
+    }
+    // Persist recovery before making external effects. A crash here leaves
+    // every claimed message eligible again after its lease expires.
+    try{await this.reschedule();}catch(error){for(const row of due)this.inFlight.delete(String(row.id));throw error;}
+    for(const row of due){
+      const id=String(row.id);const attempt=Number(row.attempt);
+      this.waitUntil((async()=>{
+        try{
+          let result:{ok:boolean;retryAfterMs?:number};try{result=await this.delivery.deliver({queueName:String(row.queue_name),messageId:id,attempt,body:sqlBytes(row.body),path:row.path as 'flow'|'step',...(row.headers ? {headers:decode(sqlBytes(row.headers)) as Record<string,string>} : {})});}catch{result={ok:false};}
+          // Like world-local, deduplicate outstanding deliveries, not future wakes.
+          if(result.ok && result.retryAfterMs === undefined)this.sql.exec('UPDATE workflow_queue_messages SET completed=1,idempotency_key=NULL WHERE id=?',id);
+          else this.sql.exec('UPDATE workflow_queue_messages SET attempt=?,due_at=? WHERE id=?',attempt+1,this.now()+Math.max(1,result.retryAfterMs ?? Math.min(60000,1000*2**Math.min(attempt-1,6))),id);
+        }finally{this.inFlight.delete(id);await this.reschedule();}
+      })());
+    }
   }
   async handleRpc(body:Uint8Array):Promise<Uint8Array>{
     try{const {op,args}=decode(body) as {op:string;args:unknown[]};const result=await this.dispatch(op,args);return encode({ok:true,result});}

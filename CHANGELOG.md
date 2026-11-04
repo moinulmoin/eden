@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- On the Cloudflare World, one long tool call no longer holds up every other
+  session of the agent. The World delivered queued work in batches and waited
+  for the whole batch, so while one session ran a 5-minute bash command, a
+  quick message in another session waited about 305 seconds; it now finishes
+  in about 5 seconds. Each queued delivery now runs on its own and is not sent
+  again while it is still running; if Cloudflare restarts the World's Durable
+  Object, unfinished deliveries are retried, as before.
 - Long sessions on the Cloudflare World no longer keep one ever-growing
   workflow run. The World now supports Eve's compaction handoff (it declares
   `hookForceClaim` and `hookRetention`): after a compaction, Eve moves the

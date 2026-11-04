@@ -174,6 +174,7 @@ export class EdenWorldDurableObject {
         exec: ctx.storage.sql.exec.bind(ctx.storage.sql),
         transactionSync: ctx.storage.transactionSync.bind(ctx.storage),
       },
+      waitUntil: (promise) => ctx.waitUntil(promise),
       scheduleAlarm: async (atMs) => {
         if (atMs === null) await ctx.storage.deleteAlarm();
         else await ctx.storage.setAlarm(atMs);

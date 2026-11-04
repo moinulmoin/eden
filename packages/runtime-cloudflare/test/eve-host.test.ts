@@ -314,6 +314,7 @@ describe("durable World queue acknowledgements", () => {
         import.meta.resolve("@moinulmoin/eden-world-cloudflare"),
       )("cbor-x") as { encode(value: unknown): Uint8Array };
       let alarm: number | null = null;
+      const background: Promise<void>[] = [];
       const object = new EdenWorldDurableObject({
         storage: {
           sql,
@@ -322,6 +323,7 @@ describe("durable World queue acknowledgements", () => {
           deleteAlarm: async () => { alarm = null; },
         },
         blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(),
+        waitUntil: (promise: Promise<void>) => { background.push(promise); },
       } as never, {
         EVE_PUBLIC_ORIGIN: "https://eden-eve-preview.account.workers.dev",
         EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
@@ -341,6 +343,7 @@ describe("durable World queue acknowledgements", () => {
           body: encode({ op: "queue.enqueue", args: ["workflow", { runId: "proof" }] }) as Uint8Array<ArrayBuffer>,
         }));
         await object.alarm();
+        await Promise.all(background);
         const row = sql.exec(
           "SELECT completed,attempt,due_at FROM workflow_queue_messages",
         ).toArray()[0];
