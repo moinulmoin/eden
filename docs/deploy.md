@@ -415,6 +415,11 @@ updates it in place (see [Updating an agent](#updating-an-agent)): the same
 Worker and Durable Object, so stored sessions and pending approvals survive.
 Only `eden destroy` deletes them.
 
+**Long sessions stay bounded.** When Eve compacts a session's history, it moves
+the session to a fresh workflow run with the same session ID, stream, and
+channel address. Cloudflare World `0.9.0` and earlier don't support this: Eve
+logs `session handoff unavailable` and the session's run history keeps growing.
+
 **Sleep is snapshot-based.** With this World the container's idle sleep is
 driven by a Durable Object alarm: after the sleep window, Eden snapshots the
 container's filesystem, stops the instance, and restores the snapshot on the

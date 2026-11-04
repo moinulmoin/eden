@@ -74,4 +74,101 @@ describe.each([false,true])('WorldCore (ArrayBuffer BLOBs: %s)',(arrayBuffers)=>
       expect(await s.rpc('streams.list',id)).toEqual(['retained-stream']);const chunks=await s.rpc('streams.readChunks','retained-stream',0,100);expect(chunks.done).toBe(true);expect(chunks.chunks[0]).toEqual(new Uint8Array());
     }finally{s.sql.close();}
   });
+  it('force-claims a live token and redirects an in-flight resume with the same identity',async()=>{
+    const s=setup(arrayBuffers);try{
+      const create=async()=> (await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'local',workflowName:'test',input:[]}})).run.runId;
+      const old=await create();const next=await create();
+      await s.rpc('events.create',old,{eventType:'hook_created',correlationId:'old-hook',eventData:{token:'handoff'}});
+      const acceptedRequest={eventType:'hook_received',correlationId:'old-hook',eventData:{token:'handoff',payload:[0]}};
+      const accepted=await s.rpc('events.create',old,acceptedRequest,{resumeId:'accepted'});
+      const claimed=await s.rpc('events.create',next,{eventType:'hook_created',correlationId:'next-hook',eventData:{token:'handoff',force:true}});
+      expect(claimed.hook.claimedFrom).toMatchObject({runId:old,hookId:'old-hook',workflowName:'test',deploymentId:'local'});
+      expect(claimed.event.eventData.forceClaimedFrom).toEqual(claimed.hook.claimedFrom);
+      expect((await s.rpc('hooks.getByToken','handoff')).runId).toBe(next);
+      expect((await s.rpc('events.create',old,acceptedRequest,{resumeId:'accepted'})).event.eventId).toBe(accepted.event.eventId);
+      await expect(s.rpc('events.create',old,{eventType:'hook_received',correlationId:'old-hook',eventData:{token:'handoff',payload:[1]}},{resumeId:'delivery'})).rejects.toMatchObject({name:'HookForceClaimedError',claimedByRunId:next,claimedByHookId:'next-hook'});
+      const request={eventType:'hook_received',correlationId:'next-hook',eventData:{token:'handoff',payload:[1]}};
+      const delivered=await s.rpc('events.create',next,request,{resumeId:'delivery'});
+      expect((await s.rpc('events.create',next,request,{resumeId:'delivery'})).event.eventId).toBe(delivered.event.eventId);
+      const log=await s.rpc('events.list',{runId:old});expect(log.data.at(-1)).toMatchObject({eventType:'hook_disposed',eventData:{forceClaimedBy:{runId:next,hookId:'next-hook'}}});
+    }finally{s.sql.close();}
+  });
+  it.each([false,true])('redirects a taken-over owner after terminal cleanup (zero retention: %s)',async(zeroRetention)=>{
+    const s=setup(arrayBuffers);try{
+      const create=async()=> (await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'local',workflowName:'test',input:[],...(zeroRetention?{attributes:{'$retention':'0'},allowReservedAttributes:true}:{})}})).run.runId;
+      const old=await create();const next=await create();const latest=await create();
+      await s.rpc('events.create',old,{eventType:'hook_created',correlationId:'old-hook',eventData:{token:'chain'}});
+      await s.rpc('events.create',next,{eventType:'hook_created',correlationId:'next-hook',eventData:{token:'chain',force:true}});
+      await s.rpc('events.create',old,{eventType:'run_completed',eventData:{output:[]}});
+      await s.rpc('events.create',latest,{eventType:'hook_created',correlationId:'latest-hook',eventData:{token:'chain',force:true}});
+      await expect(s.rpc('events.create',old,{eventType:'hook_received',correlationId:'old-hook',eventData:{token:'chain',payload:[1]}},{resumeId:'late'})).rejects.toMatchObject({name:'HookForceClaimedError',claimedByRunId:latest,claimedByHookId:'latest-hook'});
+    }finally{s.sql.close();}
+  });
+  it('refuses competing non-forced and stale forced claims without moving the token',async()=>{
+    const s=setup(arrayBuffers);try{
+      const create=async()=> (await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'local',workflowName:'test',input:[]}})).run.runId;
+      const old=await create();const next=await create();const rival=await create();
+      const claim={eventType:'hook_created',correlationId:'old-hook',eventData:{token:'race',force:true}};
+      await s.rpc('events.create',old,claim);
+      expect((await s.rpc('events.create',rival,{eventType:'hook_created',correlationId:'rival-hook',eventData:{token:'race'}})).event.eventType).toBe('hook_conflict');
+      await s.rpc('events.create',next,{eventType:'hook_created',correlationId:'next-hook',eventData:{token:'race',force:true}});
+      await expect(s.rpc('events.create',old,claim)).rejects.toMatchObject({name:'EntityConflictError'});
+      expect((await s.rpc('hooks.getByToken','race')).runId).toBe(next);
+    }finally{s.sql.close();}
+  });
+  it('retains terminal hooks until expiry and redirects a terminal retained token takeover',async()=>{
+    const s=setup(arrayBuffers);try{
+      const create=async()=> (await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'local',workflowName:'test',input:[]}})).run.runId;
+      const old=await create();const next=await create();const expires=new Date(Date.now()+10000);
+      await s.rpc('events.create',old,{eventType:'hook_created',correlationId:'retained-hook',eventData:{token:'retained',tokenRetentionUntil:expires}});
+      await s.rpc('events.create',old,{eventType:'hook_created',correlationId:'expires-hook',eventData:{token:'expires',tokenRetentionUntil:expires}});
+      await s.rpc('events.create',old,{eventType:'run_completed',eventData:{output:[]}});
+      expect((await s.rpc('hooks.getByToken','retained')).runId).toBe(old);
+      await expect(s.rpc('events.create',old,{eventType:'hook_received',correlationId:'retained-hook',eventData:{token:'retained',payload:[]}})).rejects.toMatchObject({name:'RunExpiredError'});
+      const claim=await s.rpc('events.create',next,{eventType:'hook_created',correlationId:'next-hook',eventData:{token:'retained',force:true}});
+      expect(claim.hook.claimedFrom).toEqual({runId:old,hookId:'retained-hook'});
+      await expect(s.rpc('events.create',old,{eventType:'hook_received',correlationId:'retained-hook',eventData:{token:'retained',payload:[]}},{resumeId:'late'})).rejects.toMatchObject({name:'HookForceClaimedError',claimedByRunId:next});
+      s.advance(10001);await expect(s.rpc('hooks.getByToken','expires')).rejects.toMatchObject({name:'HookNotFoundError'});
+    }finally{s.sql.close();}
+  });
+  it('refuses forced takeover of a live pre-force-claim reader but allows it once terminal',async()=>{
+    const s=setup(arrayBuffers);try{
+      const old=(await s.rpc('events.create',null,{eventType:'run_created',specVersion:6,eventData:{deploymentId:'local',workflowName:'test',input:[]}})).run.runId;
+      const next=(await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'local',workflowName:'test',input:[]}})).run.runId;
+      await s.rpc('events.create',old,{eventType:'hook_created',specVersion:6,correlationId:'old-hook',eventData:{token:'legacy',tokenRetentionUntil:new Date(Date.now()+10000)}});
+      const refused=await s.rpc('events.create',next,{eventType:'hook_created',correlationId:'refused-hook',eventData:{token:'legacy',force:true}});
+      expect(refused.event).toMatchObject({eventType:'hook_conflict',eventData:{conflictingRunId:old,forceRefusedReason:'victim-spec-version'}});
+      expect((await s.rpc('hooks.getByToken','legacy')).runId).toBe(old);
+      expect((await s.rpc('events.list',{runId:old})).data).toHaveLength(2);
+      await s.rpc('events.create',old,{eventType:'run_completed',specVersion:6,eventData:{output:[]}});
+      expect((await s.rpc('events.create',next,{eventType:'hook_created',correlationId:'allowed-hook',eventData:{token:'legacy',force:true}})).hook.runId).toBe(next);
+    }finally{s.sql.close();}
+  });
+  it('rejects a resume addressed to a different run even without resumeId',async()=>{
+    const s=setup(arrayBuffers);try{
+      const create=async()=> (await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'local',workflowName:'test',input:[]}})).run.runId;
+      const owner=await create();const other=await create();
+      await s.rpc('events.create',owner,{eventType:'hook_created',correlationId:'owned-hook',eventData:{token:'owned'}});
+      await expect(s.rpc('events.create',other,{eventType:'hook_received',correlationId:'owned-hook',eventData:{token:'owned',payload:[]}})).rejects.toMatchObject({name:'HookNotFoundError'});
+      await expect(s.rpc('events.create',owner,{eventType:'hook_received',correlationId:'owned-hook',eventData:{token:'wrong',payload:[]}})).rejects.toMatchObject({name:'HookNotFoundError'});
+    }finally{s.sql.close();}
+  });
+  it('does not create spec 9 runs without the in-band fence',async()=>{
+    const s=setup(arrayBuffers);try{
+      await expect(s.rpc('events.create',null,{eventType:'run_created',specVersion:9,eventData:{deploymentId:'local',workflowName:'test',input:[]}})).rejects.toMatchObject({name:'RunNotSupportedError'});
+      expect((await s.rpc('runs.list')).data).toEqual([]);
+    }finally{s.sql.close();}
+  });
+  it('preserves pre-upgrade takeover routing when zero-retention data expires',async()=>{
+    const s=setup(arrayBuffers);try{
+      const old=(await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'local',workflowName:'test',input:[],attributes:{'$retention':'0'},allowReservedAttributes:true}})).run.runId;
+      const next=(await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'local',workflowName:'test',input:[]}})).run.runId;
+      await s.rpc('events.create',old,{eventType:'hook_created',correlationId:'old-hook',eventData:{token:'upgrade'}});
+      await s.rpc('events.create',next,{eventType:'hook_created',correlationId:'next-hook',eventData:{token:'upgrade',force:true}});
+      // Persisted 0.9.0 storage has the disposal event, but no routing table.
+      s.sql.exec('DROP TABLE workflow_hook_disposals');s.core.migrate();
+      await s.rpc('events.create',old,{eventType:'run_completed',eventData:{output:[]}});
+      await expect(s.rpc('events.create',old,{eventType:'hook_received',correlationId:'old-hook',eventData:{token:'upgrade',payload:[]}},{resumeId:'after-upgrade'})).rejects.toMatchObject({name:'HookForceClaimedError',claimedByRunId:next,claimedByHookId:'next-hook'});
+    }finally{s.sql.close();}
+  });
 });

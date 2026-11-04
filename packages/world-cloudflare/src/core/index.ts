@@ -56,6 +56,8 @@ export class WorldCore {
       'CREATE TABLE IF NOT EXISTS workflow_hooks (hook_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, token TEXT NOT NULL, data BLOB NOT NULL)',
       'CREATE INDEX IF NOT EXISTS workflow_hooks_run ON workflow_hooks(run_id)',
       'CREATE INDEX IF NOT EXISTS workflow_hooks_token ON workflow_hooks(token)',
+      // Routing tombstones outlive invocation-data retention; never store payloads here.
+      'CREATE TABLE IF NOT EXISTS workflow_hook_disposals (run_id TEXT NOT NULL, hook_id TEXT NOT NULL, token TEXT NOT NULL, claimed_run_id TEXT NOT NULL, claimed_hook_id TEXT NOT NULL, PRIMARY KEY(run_id,hook_id))',
       'CREATE TABLE IF NOT EXISTS workflow_waits (wait_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, data BLOB NOT NULL)',
       'CREATE TABLE IF NOT EXISTS workflow_stream_chunks (sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL, stream_id TEXT NOT NULL, run_id TEXT NOT NULL, data BLOB NOT NULL, eof INTEGER NOT NULL, created_at INTEGER NOT NULL, UNIQUE(stream_id,id))',
       'CREATE INDEX IF NOT EXISTS workflow_stream_chunks_name ON workflow_stream_chunks(stream_id,sequence)',
@@ -101,11 +103,15 @@ export class WorldCore {
     const updated = { ...run, attributes, updatedAt: new Date(this.now()) }; this.saveRun(updated); return updated;
   }
   private forceRefusal(runId: string, hookId: string, token?: string): void {
-    const disposal = this.prior(runId, hookId, 'hook_disposed'); const data = disposal?.eventType === 'hook_disposed' ? disposal.eventData : undefined;
-    if (data?.forceClaimedBy) { const successor = this.findHook(token ?? data.token ?? '', true); throw new HookForceClaimedError(token ?? data.token ?? '', successor?.runId ?? data.forceClaimedBy.runId, successor?.hookId ?? data.forceClaimedBy.hookId); }
+    const marker = this.rows('SELECT token,claimed_run_id,claimed_hook_id FROM workflow_hook_disposals WHERE run_id=? AND hook_id=?',runId,hookId)[0];
+    // Older deployments journaled the routing evidence only in the event log.
+    const disposal = marker ? undefined : this.prior(runId, hookId, 'hook_disposed'); const data = disposal?.eventType === 'hook_disposed' ? disposal.eventData : undefined;
+    const claimedBy = marker ? {runId:String(marker.claimed_run_id),hookId:String(marker.claimed_hook_id)} : data?.forceClaimedBy;
+    if (claimedBy) { const routeToken = token ?? (marker ? String(marker.token) : data?.token) ?? ''; const successor = this.findHook(routeToken,true); throw new HookForceClaimedError(routeToken,successor?.runId ?? claimedBy.runId,successor?.hookId ?? claimedBy.hookId); }
     throw new HookNotFoundError(hookId);
   }
   private createRun(runId: string, data: Extract<AnyEventRequest, { eventType: 'run_created' }>): { run: WorkflowRun; event: Event } {
+    if ((data.specVersion ?? SPEC_VERSION_CURRENT) > SPEC_VERSION_CURRENT) throw new RunNotSupportedError(data.specVersion!,SPEC_VERSION_CURRENT);
     if (this.rows('SELECT id FROM workflow_runs WHERE id=?', runId).length) throw new EntityConflictError(`Workflow run "${runId}" already exists`);
     const d = data.eventData; validateAttributeChanges(Object.entries(d.attributes ?? {}).map(([key,value]) => ({key,value})), { allowReservedAttributes: d.allowReservedAttributes === true });
     const now = new Date(this.now());
@@ -137,12 +143,18 @@ export class WorldCore {
       }
       if (!current && ['run_started','attr_set','hook_received'].includes(type)) throw new WorkflowRunNotFoundError(id);
       const validatesRunVersion = type !== 'step_completed' && type !== 'step_retrying';
-      if (current && validatesRunVersion && requiresNewerWorld(current.specVersion)) throw new RunNotSupportedError(current.specVersion!, SPEC_VERSION_CURRENT);
+      if (current && validatesRunVersion && (requiresNewerWorld(current.specVersion) || (current.specVersion ?? SPEC_VERSION_LEGACY) > SPEC_VERSION_CURRENT)) throw new RunNotSupportedError(current.specVersion!, SPEC_VERSION_CURRENT);
       if (current && validatesRunVersion && isLegacySpecVersion(current.specVersion)) {
         if (type === 'run_cancelled') { run = WorkflowRunSchema.parse({ ...current, status:'cancelled', completedAt:now, updatedAt:now }); this.saveRun(run); this.sql.exec('DELETE FROM workflow_hooks WHERE run_id=?',id); this.sql.exec('DELETE FROM workflow_waits WHERE run_id=?',id); return {run}; }
         if (!['wait_completed','hook_received'].includes(type)) throw new Error(`Event type '${type}' not supported for legacy runs (specVersion: ${current.specVersion || 'undefined'}). Please upgrade @workflow packages.`);
         if (type === 'hook_received' && isTerminalWorkflowRunStatus(current.status)) throw new RunExpiredError(`Workflow run "${id}" is already in terminal state "${current.status}"`);
         return {event:stripEventDataRefs(this.insertEvent(id,data),params?.resolveData ?? 'all')};
+      }
+      // A stale resolved delivery must follow a takeover even after the victim
+      // finishes or purges its invocation data. Successful resumes still dedup below.
+      if (type === 'hook_received' && !this.findHook(correlationId!) && !(params?.resumeId && this.rows("SELECT id FROM workflow_events WHERE run_id=? AND resume_id=? AND type='hook_received'",id,params.resumeId).length)) {
+        try { this.forceRefusal(id,correlationId!,(data as Extract<AnyEventRequest,{eventType:'hook_received'}>).eventData.token); }
+        catch (error) { if (error instanceof HookForceClaimedError) throw error; if (!(error instanceof HookNotFoundError)) throw error; }
       }
       if (type === 'hook_received' && params?.resumeId) {
         if (current?.expiredAt || (current && isTerminalWorkflowRunStatus(current.status) && current.attributes['$retention'] === '0')) throw new WorkflowWorldError('Invocation data has expired under the run retention policy',{status:410,code:'INVOCATION_DATA_EXPIRED'});
@@ -205,6 +217,7 @@ export class WorldCore {
           if (d.force !== true || refused) { const conflict = { eventType:'hook_conflict' as const, correlationId:correlationId!,eventData:{token:d.token,conflictingRunId:existing.runId,...(refused ? {forceRefusedReason:'victim-spec-version' as const}: {})},specVersion }; return {event:stripEventDataRefs(this.insertEvent(id,conflict),params?.resolveData ?? 'all')}; }
           claimedFrom = {runId:existing.runId,hookId:existing.hookId,...(victimRunning ? {workflowName:victim.workflowName,deploymentId:victim.deploymentId,runSpecVersion:victim.specVersion}: {})};
           if (victimRunning) this.insertEvent(existing.runId,{eventType:'hook_disposed',correlationId:existing.hookId,eventData:{token:d.token,forceClaimedBy:{runId:id,hookId:correlationId!}},specVersion:victim.specVersion ?? specVersion});
+          this.sql.exec('INSERT INTO workflow_hook_disposals(run_id,hook_id,token,claimed_run_id,claimed_hook_id) VALUES(?,?,?,?,?)',existing.runId,existing.hookId,d.token,id,correlationId!);
           this.sql.exec('DELETE FROM workflow_hooks WHERE hook_id=?',existing.hookId);
           data = {...data,eventData:{...d,forceClaimedFrom:claimedFrom}} as AnyEventRequest;
         }
@@ -214,7 +227,7 @@ export class WorldCore {
       if (type === 'hook_disposed' || type === 'hook_received') {
         hook = this.findHook(correlationId!);
         if (!hook) this.forceRefusal(id,correlationId!,type === 'hook_received' ? (data as Extract<AnyEventRequest,{eventType:'hook_received'}>).eventData.token : undefined);
-        if (type === 'hook_received' && params?.resumeId) { const token = (data as Extract<AnyEventRequest,{eventType:'hook_received'}>).eventData.token; if (hook!.runId !== id || (token !== undefined && token !== hook!.token)) throw new HookNotFoundError(correlationId!); }
+        if (type === 'hook_received') { const token = (data as Extract<AnyEventRequest,{eventType:'hook_received'}>).eventData.token; if (hook!.runId !== id || (token !== undefined && token !== hook!.token)) throw new HookNotFoundError(correlationId!); }
         if (type === 'hook_disposed') this.sql.exec('DELETE FROM workflow_hooks WHERE hook_id=?',correlationId!);
         hook = undefined;
       }
@@ -247,7 +260,15 @@ export class WorldCore {
   private purge(id: string, at: Date): void {
     const run = this.run(id); this.saveRun({...run,input:undefined,output:undefined,error:undefined,expiredAt:at});
     for (const row of this.rows('SELECT data FROM workflow_steps WHERE run_id=?',id)) { const step = unpack<Step>(row)!; this.saveStep({...step,input:undefined,output:undefined,error:undefined}); }
-    for (const row of this.rows('SELECT data FROM workflow_events WHERE run_id=?',id)) { const event = unpack<Event>(row)!; this.sql.exec('UPDATE workflow_events SET data=?,resume_payload_digest=NULL WHERE run_id=? AND id=?',encode({...event,eventData:undefined}),id,event.eventId); }
+    for (const row of this.rows('SELECT data FROM workflow_events WHERE run_id=?',id)) {
+      const event = unpack<Event>(row)!;
+      // Promote pre-upgrade routing evidence before erasing event payloads.
+      if (event.eventType === 'hook_disposed' && event.eventData?.forceClaimedBy) {
+        const {token,forceClaimedBy} = event.eventData;
+        this.sql.exec('INSERT OR IGNORE INTO workflow_hook_disposals(run_id,hook_id,token,claimed_run_id,claimed_hook_id) VALUES(?,?,?,?,?)',id,event.correlationId,token ?? '',forceClaimedBy.runId,forceClaimedBy.hookId);
+      }
+      this.sql.exec('UPDATE workflow_events SET data=?,resume_payload_digest=NULL WHERE run_id=? AND id=?',encode({...event,eventData:undefined}),id,event.eventId);
+    }
     for (const row of this.rows('SELECT data FROM workflow_hooks WHERE run_id=?',id)) { const hook = unpack<Hook>(row)!; this.saveHook({...hook,metadata:undefined,resumeContext:undefined}); }
     this.sql.exec('UPDATE workflow_stream_chunks SET data=? WHERE run_id=?',new Uint8Array(),id);
   }

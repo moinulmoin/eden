@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Long sessions on the Cloudflare World no longer keep one ever-growing
+  workflow run. The World now supports Eve's compaction handoff (it declares
+  `hookForceClaim` and `hookRetention`): after a compaction, Eve moves the
+  session to a fresh run with the same session ID, stream, and channel address.
+  World `0.9.0` and earlier logged `session handoff unavailable` instead.
+- Cloudflare World hook takeover now follows the Workflow contract: a resume
+  sent to a run whose hook was taken over is redirected to the new owner even
+  after that run finishes or its data expires under the run's retention.
+
+### Changed
+
+- The Cloudflare World is built on `@workflow/world` `5.1.0` and
+  `@workflow/world-local` `5.2.0` (from `5.0.0` betas), the versions Eve
+  `1.0.0-rc.3` bundles. It still creates spec 8 runs and rejects spec 9 runs
+  instead of storing them.
+
 ## 0.9.0 — 2026-11-04
 
 Eden 0.8.0 does not work with a fresh project on Eve `0.83.0` or later,

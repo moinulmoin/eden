@@ -151,6 +151,29 @@ principals; Eden does not call it. Without a sandbox module, released Eden 0.8.0
 deployed a `1.0.0-rc.3` project whose bash call then failed with
 `DefaultSandbox has no sandbox provider for this build`.
 
+## Compaction handoff on the Cloudflare World (2026-11-04)
+
+After a compaction, Eve moves a session to a fresh workflow run so a long
+session's run history stays bounded. Eve does this only when the World declares
+`hookForceClaim` and `hookRetention`; Cloudflare World `0.9.0` and earlier
+declare neither, so Eve logs `session handoff unavailable` and keeps one
+growing run. The next Cloudflare World release declares both. It is built on
+`@workflow/world` `5.1.0` and still creates spec 8 runs.
+
+Live on Eve `1.0.0-rc.3`, both Worlds deployed, ran bash, compacted (HTTP 202),
+and ran bash again (exit code 0):
+
+| World | Owner run after compaction | Container log |
+| --- | --- | --- |
+| `0.9.0` | Unchanged (`wrun_01M6K7B2J727T8E8WAKFD854K3`) | `session handoff unavailable` |
+| Next release | `wrun_01M6K7K2DTM3WT6JBDGM5M1DRF` → `wrun_01M6K7MAFH9E2274AGBN7F12MP` | No handoff warning |
+
+The session ID (`wrun_01M6K7JEFSB77SZFHTN570S5ZP`), its stream, and its
+channel address stayed the same, and the stream kept the earlier history. A
+local `eve build` + `eve start` run on Eve `0.91.0` and `1.0.0-rc.3` against the
+updated World also ran bash. Eve `0.68.0`–`0.82.0` were not run against it.
+This does not change the Eve-upgrade limitation above.
+
 ## Sandbox resume compatibility
 
 Eden's temporary [eve#4440](https://github.com/vercel/eve/issues/4440) patch

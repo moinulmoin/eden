@@ -23,15 +23,15 @@
     "NOTICE"
   ],
   "dependencies": {
-    "@workflow/errors": "5.0.0-beta.24",
-    "@workflow/world": "5.0.0-beta.39",
-    "@workflow/world-local": "5.0.0-beta.48",
+    "@workflow/errors": "5.1.0",
+    "@workflow/world": "5.1.0",
+    "@workflow/world-local": "5.2.0",
     "cbor-x": "1.6.4",
     "ulid": "3.0.2"
   },
   "devDependencies": {
     "@types/node": "24.0.0",
-    "@workflow/world-testing": "5.0.0-beta.57"
+    "@workflow/world-testing": "5.0.7"
   },
   "scripts": {
     "build": "tsc -b",
