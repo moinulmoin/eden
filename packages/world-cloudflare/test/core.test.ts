@@ -17,7 +17,7 @@ function setup(arrayBuffers: boolean) {
   const core: WorldCore = new WorldCore({sql:storage,now:()=>now,scheduleAlarm:at=>{alarms.push(at);},delivery:{async deliver(msg){deliveries.push(msg);if(!fail)core.deliverySettled(msg.messageId,msg.attempt);return {ok:!fail};}}}); core.migrate();
   async function rpc(op:string,...args:unknown[]) { const response = decode(await core.handleRpc(encode({op,args}))); if(!response.ok) throw Object.assign(new Error(response.error.message),response.error);return response.result; }
   async function controlRpc(op:string,...args:unknown[]) { const response = decode(await core.handleControlRpc(encode({op,args}))); if(!response.ok) throw Object.assign(new Error(response.error.message),response.error);return response.result; }
-  return {sql,core,rpc,controlRpc,alarms,deliveries,advance(ms:number){now+=ms;},setFailure(value:boolean){fail=value;}};
+  return {sql,core,rpc,controlRpc,alarms,deliveries,now:()=>now,advance(ms:number){now+=ms;},setFailure(value:boolean){fail=value;}};
 }
 describe.each([false,true])('WorldCore (ArrayBuffer BLOBs: %s)',(arrayBuffers)=>{
   it('allocates dense slots, reports intervening events, and does not burn slots on dedup',async()=>{
@@ -126,7 +126,7 @@ describe.each([false,true])('WorldCore (ArrayBuffer BLOBs: %s)',(arrayBuffers)=>
   it('retains terminal hooks until expiry and redirects a terminal retained token takeover',async()=>{
     const s=setup(arrayBuffers);try{
       const create=async()=> (await s.rpc('events.create',null,{eventType:'run_created',eventData:{deploymentId:'local',workflowName:'test',input:[]}})).run.runId;
-      const old=await create();const next=await create();const expires=new Date(Date.now()+10000);
+      const old=await create();const next=await create();const expires=new Date(s.now()+10000);
       await s.rpc('events.create',old,{eventType:'hook_created',correlationId:'retained-hook',eventData:{token:'retained',tokenRetentionUntil:expires}});
       await s.rpc('events.create',old,{eventType:'hook_created',correlationId:'expires-hook',eventData:{token:'expires',tokenRetentionUntil:expires}});
       await s.rpc('events.create',old,{eventType:'run_completed',eventData:{output:[]}});
