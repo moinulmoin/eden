@@ -8,7 +8,9 @@ import { clearTimeout, setTimeout } from "node:timers";
 const DEFAULT_MAX_BUFFER = 1024 * 1024;
 const TERMINATION_GRACE_MS = 1_000;
 const KILL_GRACE_MS = 2_000;
-const PROCESS_SNAPSHOT_TIMEOUT_MS = 250;
+// `ps` takes ~45 ms on an idle Mac and up to 200 ms under process churn;
+// 1 s leaves headroom for the full suite's load.
+const PROCESS_SNAPSHOT_TIMEOUT_MS = 1_000;
 // A process can be visible to `ps` only after spawn has returned and can be
 // briefly absent while the kernel is reaping it. Four snapshot budgets plus
 // one termination-sized margin make startup evidence bounded without making a
