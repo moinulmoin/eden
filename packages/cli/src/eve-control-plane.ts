@@ -863,6 +863,66 @@ function pooledPostgresReason(
   return undefined;
 }
 
+const EVE_WORLD_LOCAL_REMEDIATION =
+  'For durable state without a database, add @moinulmoin/eden-world-cloudflare and set experimental: { workflow: { world: "@moinulmoin/eden-world-cloudflare" } } in agent.ts; sessions survive Eve upgrades. Alternatively, add @workflow/world-postgres, select it as the workflow world, and put WORKFLOW_POSTGRES_URL with a direct, unpooled Postgres URL in --env-file.';
+
+/** Static, dynamic, side-effect, or require imports of @vercel/connect or a subpath. */
+function importsVercelConnect(source: string): boolean {
+  return /\b(?:from|import|require)\s*\(?\s*["']@vercel\/connect(?:\/[^"']*)?["']/u
+    .test(source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/gu, ""));
+}
+
+async function vercelConnectSourcePaths(projectRoot: string): Promise<string[]> {
+  const paths: string[] = [];
+  const visit = async (path: string): Promise<void> => {
+    const entries = await readdir(join(projectRoot, path), { withFileTypes: true })
+      .catch(() => []);
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.isSymbolicLink()) continue;
+      const child = `${path}/${entry.name}`;
+      if (entry.isDirectory()) await visit(child);
+      else if (entry.isFile() && /\.[cm]?[jt]sx?$/u.test(entry.name)) {
+        const source = await readFile(join(projectRoot, child), "utf8").catch(() => "");
+        if (importsVercelConnect(source)) paths.push(child);
+      }
+    }
+  };
+  await visit("agent");
+  await visit("agents");
+  return paths.sort();
+}
+
+/** Eve persists its compile-time routing decision, including its default model. */
+async function collectEveGatewayWarnings(
+  candidate: EveProjectBuildCandidate,
+  runtimeConfig: EveRuntimeConfig | undefined,
+): Promise<EvePreflightWarning[]> {
+  if (runtimeConfig?.withProtectedValues((values) =>
+    (values.AI_GATEWAY_API_KEY?.trim().length ?? 0) > 0) === true) return [];
+  try {
+    const manifest = JSON.parse(await readFile(
+      join(candidate.snapshotRoot, EVE_COMPILED_MANIFEST_PATH), "utf8",
+    )) as {
+      config?: {
+        model?: { routing?: { kind?: unknown } };
+        source?: { logicalPath?: unknown };
+      };
+    } | null;
+    if (manifest?.config?.model?.routing?.kind !== "gateway") return [];
+    const source = typeof manifest.config.source?.logicalPath === "string"
+      ? manifest.config.source.logicalPath
+      : "agent/agent.ts";
+    return [{
+      id: "EVE_AI_GATEWAY_KEY_MISSING",
+      message: `The model in ${source} routes through Vercel AI Gateway, but --env-file has no non-blank AI_GATEWAY_API_KEY. Cloudflare has no Vercel OIDC project identity, so model calls fail.`,
+      remediation: 'Add AI_GATEWAY_API_KEY from https://vercel.com/dashboard/ai/api-keys to your --env-file, or use a direct provider such as openai("gpt-5") from @ai-sdk/openai with OPENAI_API_KEY in that file.',
+    }];
+  } catch {
+    // Unknown or older compiled formats are not evidence of Gateway routing.
+    return [];
+  }
+}
+
 /**
  * Recognizes the generated channel, not arbitrary user authentication policies.
  * The calls below match the Eve 0.82 initializer's agent/channels/eve.ts.
@@ -878,6 +938,14 @@ async function collectEveSetupWarnings(
       return "";
     }
   };
+  const connectPaths = await vercelConnectSourcePaths(projectRoot);
+  if (connectPaths.length > 0) {
+    warnings.push({
+      id: "EVE_VERCEL_CONNECT",
+      message: `Vercel Connect imports in ${connectPaths.join(", ")} get credentials using a Vercel project identity (OIDC) that only Vercel injects; these connections fail on Cloudflare.`,
+      remediation: "Put each service's own API key or bot token in --env-file and replace connect(...) in the connection with auth: { getToken: async () => ({ token: process.env.SERVICE_TOKEN! }) }. For per-user sign-in, use defineInteractiveAuthorization from eve/connections with your own OAuth app.",
+    });
+  }
   const channel = (await source("agent/channels/eve.ts"))
     .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/gu, "")
     .replace(/\s+/gu, "");
@@ -901,7 +969,7 @@ async function collectEveSetupWarnings(
       warnings.push({
         id: "EVE_WORLD_LOCAL",
         message: "Local World stores memory on container disk; updates or a lost sleep snapshot reset sessions and approvals.",
-        remediation: "Configure @workflow/world-postgres; see docs/deploy.md#durable-state-postgres-world.",
+        remediation: EVE_WORLD_LOCAL_REMEDIATION,
       });
     }
     if (
@@ -973,8 +1041,7 @@ async function collectEveWorldWarnings(
         id: "EVE_WORLD_LOCAL",
         message:
           "Local World stores memory on container disk; updates or a lost sleep snapshot reset sessions and approvals.",
-        remediation:
-          "Configure a durable Workflow World such as @workflow/world-postgres; see docs/deploy.md#durable-state-postgres-world.",
+        remediation: EVE_WORLD_LOCAL_REMEDIATION,
       });
     }
   }
@@ -3748,6 +3815,7 @@ async function collectEvePreflight(
   warnings.push(
     ...(await collectEveWorldWarnings(candidate, undefined)),
   );
+  warnings.push(...await collectEveGatewayWarnings(candidate, runtimeConfig));
   const schedules = await readCompiledSchedules(candidate);
   const expressible = schedules.filter(
     (schedule) => parseEveScheduleCron(schedule.cron) !== undefined,

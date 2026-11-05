@@ -191,6 +191,7 @@ Commands:
   preflight  Build and inspect a local Eve candidate without remote mutation
   deploy     Deploy the selected Eve project to the exact named target
   destroy    Remove the exact owned Eve target
+  skill      Print the bundled Eden skill for coding agents
 
 preflight and deploy default to the current directory, the preview
 environment, and a target name derived from package.json. destroy and
@@ -383,6 +384,22 @@ export async function runEdenCli(
     }
     if (args[0] === "--version" || args[0] === "-v") {
       stdout(edenVersion());
+      return 0;
+    }
+    if (args[0] === "skill") {
+      if (args.length === 2 && (args[1] === "--help" || args[1] === "-h")) {
+        stdout("Usage: eden skill");
+        return 0;
+      }
+      if (args.length !== 1) {
+        throw new EveCliError({
+          code: "EVE_ARGUMENT_UNKNOWN",
+          message: "eden skill takes no arguments or options.",
+        });
+      }
+      const skill = readFileSync(new URL("./SKILL.md", import.meta.url), "utf8");
+      if (options.stdout === undefined) process.stdout.write(skill);
+      else options.stdout(skill);
       return 0;
     }
     if (!(EVE_CLI_COMMANDS as readonly string[]).includes(args[0] ?? "")) {

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.11.0 — 2026-11-05
+
+Coding agents can now get an Eve project ready for Cloudflare on their own.
+Eden ships a skill they can read, and preflight names two Vercel-only setups
+that deploy fine but then fail on Cloudflare.
+
+### Added
+
+- `eden skill` prints the coding-agent skill for the installed CLI version:
+  how to get a project ready, deploy, check it works, update, and remove it.
+  `npx skills add moinulmoin/eden` installs the same skill.
+- Preflight warns with `EVE_VERCEL_CONNECT` when project code imports
+  `@vercel/connect`. Vercel Connect needs a Vercel project identity, so those
+  connections fail on Cloudflare. The fix shows how to read the service's own
+  key from the env file instead.
+- Preflight warns with `EVE_AI_GATEWAY_KEY_MISSING` when the model goes
+  through Vercel AI Gateway and the env file has no `AI_GATEWAY_API_KEY`.
+  Without it, every model call fails on Cloudflare.
+
+### Changed
+
+- `EVE_WORLD_LOCAL` now names both ways to keep sessions across updates: the
+  Cloudflare World (no database, one setting in `agent.ts`) or Postgres.
+
 ## 0.10.0 — 2026-11-04
 
 Eve upgrades on the Cloudflare World no longer end existing conversations, and

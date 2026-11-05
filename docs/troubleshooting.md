@@ -34,10 +34,10 @@ Warnings do not stop a run. They print with an `!` and a remediation arrow:
 When the command itself fails, the error goes to stderr in the form
 `CODE [source]: message`, and the process exits with status `1`.
 
-Every command accepts `--json`, which prints the machine-readable result
-object instead of the human summary. The object holds `command`, `ok`,
-`environment`, `name`, `checks`, `warnings`, `candidate`, and, for a deploy,
-`deployment`.
+`preflight`, `deploy`, and `destroy` accept `--json`, which prints the
+machine-readable result object instead of the human summary. The object
+holds `command`, `ok`, `environment`, `name`, `checks`, `warnings`,
+`candidate`, and, for a deploy, `deployment`.
 
 The codes come from three places:
 
@@ -84,7 +84,7 @@ Bun can install the package, but Eden always runs on Node. Do not run it with
 ### `COMMAND_UNKNOWN`
 
 `Unknown Eden command "…".` You typed a command that does not exist. The
-three commands are `preflight`, `deploy`, and `destroy`.
+four commands are `preflight`, `deploy`, `destroy`, and `skill`.
 
 ### `EVE_COMMAND_UNKNOWN`
 
@@ -841,7 +841,36 @@ isolated builder extracts a regular .eve/sandbox-cache directory.`
 | --- | --- | --- |
 | `EVE_JUST_BASH_MISSING` | Eve's default sandbox needs a missing production dependency inside the isolated builder. | Run `npm add just-bash` for npm, or `pnpm add just-bash` for pnpm, and retain the updated matching lockfile. |
 | `EVE_AUTH_SCAFFOLD` | The project still uses generated authentication that does not grant production access on Cloudflare. | Replace the generated Vercel/localhost placeholder with your real [Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection), and supply its secrets through your external env file. |
+| `EVE_VERCEL_CONNECT` | Project source imports or requires `@vercel/connect` or a subpath, but Vercel OIDC is unavailable on Cloudflare. | Supply your own API keys or bot tokens through `--env-file` and read them directly instead of calling `connect()`; see below. |
+| `EVE_AI_GATEWAY_KEY_MISSING` | The project routes models through Vercel AI Gateway without a nonblank `AI_GATEWAY_API_KEY`. | Supply a gateway key through `--env-file`, or switch to a direct provider with its own API key; see below. |
 | `EVE_WORLD_LOCAL` | Default local Workflow World state lives on container disk and resets on image updates. | Configure a durable Workflow World before relying on workflow state across updates; see below. |
+
+### `EVE_VERCEL_CONNECT`
+
+Project source imports or requires `@vercel/connect` or one of its subpaths.
+Vercel OIDC is unavailable on Cloudflare, so `connect()` cannot obtain the
+project's provider credentials there.
+
+Put each service's own API key or bot token in the `--env-file`, and replace
+`connect(...)` in the connection with a token read from the environment:
+
+```ts
+auth: { getToken: async () => ({ token: process.env.SERVICE_TOKEN! }) },
+```
+
+Connections where each end-user signs in need your own OAuth app through
+`defineInteractiveAuthorization` from `eve/connections` instead.
+
+### `EVE_AI_GATEWAY_KEY_MISSING`
+
+The project routes models through Vercel AI Gateway, but its environment
+does not supply a nonblank `AI_GATEWAY_API_KEY`.
+
+Create a key at [Vercel AI Gateway API keys](https://vercel.com/dashboard/ai/api-keys)
+and supply `AI_GATEWAY_API_KEY` through `--env-file`. Alternatively, switch
+to a direct provider: for example, import `openai` from `@ai-sdk/openai`,
+use `openai("…")` instead of gateway routing, and supply `OPENAI_API_KEY`
+through `--env-file`.
 
 ### `EVE_WORLD_LOCAL`
 
@@ -849,8 +878,23 @@ isolated builder extracts a regular .eve/sandbox-cache directory.`
 > on the container disk, survives sleep, and resets when you update the
 > agent.
 
-Configure a durable Workflow World such as `@workflow/world-postgres`, or
-`@moinulmoin/eden-world-cloudflare`, if you need state to survive an update.
+For durable state without a database, add `@moinulmoin/eden-world-cloudflare`
+to the project's production dependencies and select it in `agent.ts`:
+
+```ts
+experimental: {
+  workflow: { world: "@moinulmoin/eden-world-cloudflare" },
+},
+```
+
+This experimental Cloudflare World stores state in a Durable Object, not on
+container disk; sessions survive Eve upgrades with an updated CLI and World
+package. See [Durable state on Cloudflare (no database)](./deploy.md#durable-state-on-cloudflare-no-database).
+
+Alternatively, configure `@workflow/world-postgres` with a direct, unpooled
+Postgres URL that supports `LISTEN`/`NOTIFY`; see the
+[Postgres World setup](./deploy.md#durable-state-postgres-world). A
+transaction-mode pooled URL breaks live session streaming.
 
 ### `EVE_WORLD_PAIRING` — the World version does not pair with Eve
 

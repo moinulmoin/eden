@@ -7,24 +7,26 @@ variable, and resource name. The deployment walkthrough is in
 
 ## Commands
 
-Eden has three commands and two top-level switches.
+Eden has four commands and two top-level switches.
 
 | Command | Purpose |
 | --- | --- |
 | `eden preflight` | Build and inspect a local Eve candidate without remote mutation |
 | `eden deploy` | Deploy the selected Eve project to the exact named target |
 | `eden destroy` | Remove the exact owned Eve target |
+| `eden skill` | Print the bundled Eden skill verbatim for coding agents |
 
 `eden --help` (or `-h`) prints the top-level usage. `eden --version` (or `-v`)
-prints the installed version, for example `0.10.0`. Running `eden` with no
+prints the installed version, for example `0.11.0`. Running `eden` with no
 arguments prints the same usage. An unknown command fails with
 `COMMAND_UNKNOWN`.
 
 `eden <command> --help` prints the options of that command.
 
-Every option that takes a value accepts both `--option value` and
-`--option=value`, may be given only once, and takes a value that is neither
-empty nor starting with `-`. `--json` and `--help` are switches and take no
+For `preflight`, `deploy`, and `destroy`, every option that takes a value
+accepts both `--option value` and `--option=value`, may be given only once,
+and takes a value that is neither empty nor starting with `-`.
+`--json` and `--help` are switches and take no
 value. A repeated option fails with a `..._REPEATED` code, an unknown option
 with `EVE_OPTION_UNKNOWN`, and a positional argument with
 `EVE_ARGUMENT_UNKNOWN`.
@@ -151,6 +153,24 @@ are kept; an external Postgres database is not touched.
 
 `destroy` rejects `--env-file` with `EVE_ENV_FILE_UNSUPPORTED`; cleanup does
 not need application secrets.
+
+### `eden skill`
+
+Prints the bundled Eden skill verbatim to standard output, so coding agents
+can read the deployment instructions shipped with the installed CLI.
+It does not read an Eve project or access Cloudflare.
+
+```sh
+eden skill
+```
+
+This command takes no arguments or deployment flags, including `--json`.
+`eden skill --help` (or `eden skill -h`) prints `Usage: eden skill` instead
+of the skill text.
+
+| Flag | Value | Default | Required |
+| --- | --- | --- | --- |
+| `--help`, `-h` | print the command usage | — | never |
 
 ### Exit codes
 

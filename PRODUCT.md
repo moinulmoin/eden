@@ -80,7 +80,7 @@ eden destroy --name my-eve-agent-9e510242
 
 Eden checks its own ownership record, then removes that deployment's Worker, Container application and registry images. It never matches by prefix and never touches look-alike resources. In our tests it took 15–25 seconds.
 
-### Three commands. That's the whole CLI.
+### Three commands to ship.
 
 | Command | What it does |
 |---|---|
@@ -88,7 +88,9 @@ Eden checks its own ownership record, then removes that deployment's Worker, Con
 | `eden deploy` | Builds, publishes and health-checks one exact target |
 | `eden destroy --name <name>` | Removes one exact Eden-owned deployment |
 
-Every command accepts `--json` for scripts and CI.
+Every command accepts `--json` for scripts and CI. Using a coding agent?
+`eden skill` prints a guide that teaches it to get a project ready, deploy, and
+clean up.
 
 ### Safe defaults
 - `deploy` and `preflight` default to `preview`.

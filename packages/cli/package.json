@@ -1,6 +1,6 @@
 {
   "name": "@moinulmoin/eden",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Deploy existing Eve projects to your own Cloudflare account.",
   "keywords": [
     "ai",
@@ -27,16 +27,17 @@
     "dist/**/*.js",
     "dist/**/*.mjs",
     "dist/**/*.d.ts",
+    "dist/SKILL.md",
     "LICENSE",
     "NOTICE"
   ],
   "dependencies": {
-    "@moinulmoin/eden-runtime-cloudflare": "0.10.0",
+    "@moinulmoin/eden-runtime-cloudflare": "0.11.0",
     "wrangler": "4.147.0"
   },
   "scripts": {
     "build": "tsc -b",
-    "postbuild": "chmod 755 dist/index.js",
+    "postbuild": "chmod 755 dist/index.js && cp ../../skills/eden/SKILL.md dist/SKILL.md",
     "prepack": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && pnpm run build",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src --max-warnings 0",

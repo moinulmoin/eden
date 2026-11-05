@@ -44,19 +44,19 @@ change. New to Eve, or starting from `eve init`? Check
 `npx @moinulmoin/eden` needs no install. For a global `eden` command, use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.10.0
+npm install --global @moinulmoin/eden@0.11.0
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.10.0
+pnpm add --global @moinulmoin/eden@0.11.0
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.10.0
+bun add --global @moinulmoin/eden@0.11.0
 ```
 
 Confirm the installation:
@@ -69,12 +69,25 @@ Users install only `@moinulmoin/eden`; its companion packages are resolved
 automatically. Bun is supported as an installer only. Node `>=24.17.0` remains
 the Eden runtime, so do not force the CLI through `bunx --bun`.
 
-Using a coding agent (Claude Code, Codex, Cursor, and others)? Install Eden's
-skill so it knows how to deploy, update, and remove Eve agents with Eden:
+### With a coding agent
+
+Eden ships a skill for coding agents (Claude Code, Codex, Cursor, and others):
+how to get an Eve project ready for Cloudflare, then deploy, update, and remove
+it. Point the agent at the copy that matches your installed CLI:
+
+```sh
+npx @moinulmoin/eden skill
+```
+
+Or install it into the agent's skills folder:
 
 ```sh
 npx skills add moinulmoin/eden
 ```
+
+The skill's core loop is `eden preflight --json`: fix each check and warning
+by its `remediation`, repeat until clean, then deploy. Preflight changes
+nothing on Cloudflare.
 
 ## Requirements
 
@@ -277,6 +290,7 @@ Things that differ from Vercel, and what Eden does about each:
 | `eden deploy` | Deploy an Eve project to one exact target, or update a target Eden owns in place |
 | `eden destroy` | Remove one exact Eden-owned Eve deployment |
 | `eden preflight` | Build and check an Eve project locally without changing anything on Cloudflare |
+| `eden skill` | Print the coding-agent skill for this CLI version |
 
 Run `eden <command> --help` for options and `eden --version` for the installed
 version.

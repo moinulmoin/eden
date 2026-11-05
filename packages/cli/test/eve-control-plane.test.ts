@@ -2203,7 +2203,7 @@ export default eveChannel({
 
     const text = output.join("\n");
     expect(text).toContain("! EVE_WORLD_LOCAL");
-    expect(text).toContain("durable-state-postgres-world");
+    expect(text).toContain("@moinulmoin/eden-world-cloudflare");
     expect(text).toContain("preflight passed");
   });
 
