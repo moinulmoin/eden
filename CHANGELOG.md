@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.11.1 — 2026-11-06
+
+Eve `1.0.0-rc.6`, which `npx eve init` installs today, couldn't start a session
+on the Cloudflare World. Update both `@moinulmoin/eden` and the project's
+`@moinulmoin/eden-world-cloudflare`.
+
+### Added
+
+- Preflight and deploy fail with `EVE_WORLD_PAIRING` when the project runs Eve
+  `1.0.0-rc.6` or later on a Cloudflare World without atomic start hooks
+  (`0.11.0` and earlier), instead of deploying an agent whose sessions all
+  fail.
+
+### Fixed
+
+- On Eve `1.0.0-rc.6` and later with the Cloudflare World, every new session
+  failed with HTTP 500 after a successful deploy and a clean preflight. The
+  container log said "The configured Workflow world does not support atomic
+  start hooks, which eve needs to start a session." Eve now claims a session's
+  channel address in the same step that creates its run, and requires the
+  World to do both atomically. The Cloudflare World now does, and declares
+  `atomicStartHook`. It passes the 27 applicable cases of `@workflow/world`'s
+  atomic start hook conformance suite; the other 5 need a half-finished
+  admission, which this World can't produce because it admits a session in one
+  transaction. Verified live on `1.0.0-rc.6`: a new session, bash, the new
+  `edit_file` tool, an in-place update that kept the session and its files,
+  and a fresh session after it. No migration step: the World creates its new
+  table on its own, and runs and hooks from 0.11.0 stay as they are.
+
 ## 0.11.0 — 2026-11-05
 
 Coding agents can now get an Eve project ready for Cloudflare on their own.

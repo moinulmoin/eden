@@ -906,6 +906,16 @@ Eve-bundled line. The pairing is version-specific: for Eve `0.68.0`, which
 bundles `@workflow/world` `5.0.0-beta.39`, the tested pair is
 `@workflow/world-postgres@5.0.0-beta.47`.
 
+On Eve `1.0.0-rc.6` and later with the Cloudflare World, the check also fails
+with:
+
+> Eve <version> needs a World with atomic start hooks, and the installed
+> `@moinulmoin/eden-world-cloudflare` <version> does not have them; every new
+> session would fail with HTTP 500.
+
+Eve now refuses to start a session on a World without them. Update the
+project's `@moinulmoin/eden-world-cloudflare` to `0.11.1` or later.
+
 ## Destroy and cleanup leftovers
 
 `eden destroy` removes exactly one target, including **all** kept images,

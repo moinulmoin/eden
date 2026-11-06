@@ -44,19 +44,19 @@ change. New to Eve, or starting from `eve init`? Check
 `npx @moinulmoin/eden` needs no install. For a global `eden` command, use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.11.0
+npm install --global @moinulmoin/eden@0.11.1
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.11.0
+pnpm add --global @moinulmoin/eden@0.11.1
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.11.0
+bun add --global @moinulmoin/eden@0.11.1
 ```
 
 Confirm the installation:
@@ -125,9 +125,9 @@ installs that require project `.npmrc` configuration are not supported.
 ### Starting from a fresh Eve project
 
 Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, `0.82.0`,
-`0.83.0`, `0.91.0`, and `1.0.0-rc.3`, including a fresh npm project on `0.82.0`
-and sandbox-file carry plus a queued task across a same-version skill update on
-`0.83.0`. These recorded live runs
+`0.83.0`, `0.91.0`, `1.0.0-rc.3`, and `1.0.0-rc.6`, including a fresh npm
+project on `0.82.0` and sandbox-file carry plus a queued task across a
+same-version skill update on `0.83.0`. These recorded live runs
 are listed in [Eve compatibility](./docs/eve-compatibility.md). To start a new
 project on Eve `0.91.0`, the latest stable release:
 

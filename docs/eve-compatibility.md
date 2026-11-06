@@ -17,9 +17,9 @@ tested Eve line. Do not replace the exact Eve pin with `latest` in a release
 gate.
 
 Recorded Cloudflare launch gates also use separate fresh initializer projects,
-including Eve `0.81.0`, `0.82.0`, `0.83.0`, `0.91.0`, and `1.0.0-rc.3` below.
-The current fresh-project instructions pin `0.91.0`. Keep the older fixture
-pin: it exercises the original
+including Eve `0.81.0`, `0.82.0`, `0.83.0`, `0.91.0`, `1.0.0-rc.3`, and
+`1.0.0-rc.6` below. The current fresh-project instructions pin `0.91.0`. Keep
+the older fixture pin: it exercises the original
 prepared-artifact shape, while Eve
 `0.79.1` and later use the newer `templateKey` shape. See the
 [fresh-project setup](../README.md#starting-from-a-fresh-eve-project) for the
@@ -203,6 +203,40 @@ local `eve build` + `eve start` run on Eve `0.91.0` and `1.0.0-rc.3` against the
 updated World also ran bash. Eve `0.68.0`–`0.82.0` were not run against it.
 This run proved compaction handoff on one Eve version, not a move between
 Eve versions. See [session behavior across Eve upgrades](#session-behavior-across-eve-upgrades).
+
+## Eve 1.0.0-rc.6 atomic start Hooks (2026-11-06)
+
+Eve `1.0.0-rc.6` claims a new session's channel address in the same step that
+creates its workflow run, and refuses to start a session unless the World
+declares `atomicStartHook`. Released Eden `0.11.0` with Cloudflare World
+`0.11.0` passed preflight with no warnings and deployed a fresh `rc.6` project,
+but `POST /eve/v1/session` returned HTTP 500 and the container logged:
+
+```text
+Error: The configured Workflow world does not support atomic start hooks, which eve needs to start a session. Use the local world, Vercel Workflow, or @workflow/world-postgres 5.1.1 or later.
+```
+
+The same release with the local World ran a session on `rc.6`: bash, Eve's new
+default `edit_file` tool, and a non-zero exit reported to the model as
+`[exit code: 7]`. After an in-place update the old session returned HTTP 409
+`session_not_active` (the local World resets on update) and a new session ran
+bash.
+
+The updated Cloudflare World admits a session's run and its start Hook in one
+Durable Object transaction and declares `atomicStartHook`. Through the client
+RPC path it passes 27 cases of `@workflow/world` `5.1.0`'s atomic start hook
+conformance suite; the 5 orphan-bound cases are skipped because they need a
+candidate admitted without its run, which one transaction cannot leave behind.
+Live on a fresh `rc.6` project with that World, a new session returned HTTP
+202 and ran bash and `edit_file`; after a same-version update the session
+continued (HTTP 202, same session ID, file intact) and a new session ran bash.
+The container log had no atomic start hook error. Racing first messages to one
+channel address were not tested: Eve's HTTP channel only addresses sessions by
+ID.
+
+Eve also says sessions from Eve before `0.83.0` can't move to `rc.6`, and
+the Postgres World needs `@workflow/world-postgres` `5.1.1` or later. Postgres
+was not checked.
 
 ## Sandbox resume compatibility
 

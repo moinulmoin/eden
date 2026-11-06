@@ -91,7 +91,7 @@ export function createWorld(options: CloudflareWorldOptions = {}): World {
   };
   return {
     specVersion: SPEC_VERSION_CURRENT,
-    capabilities: { deploymentAffinity: true, hookForceClaim: true, hookRetention: { active: true } },
+    capabilities: { deploymentAffinity: true, hookForceClaim: true, hookRetention: { active: true }, atomicStartHook: { active: true } },
     runs: methods<World["runs"]>("runs", ["get", "getMany", "list", "experimentalSetAttributes"]),
     steps: methods<World["steps"]>("steps", ["get", "list"]),
     events: methods<World["events"]>("events", ["create", "get", "list", "listByCorrelationId"]),

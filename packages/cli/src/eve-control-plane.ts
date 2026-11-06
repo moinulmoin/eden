@@ -745,7 +745,7 @@ async function readInstalledManifest(
 ): Promise<
   | {
     readonly version?: string;
-    readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean; readonly worldRpcAuth?: boolean } };
+    readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean; readonly worldRpcAuth?: boolean; readonly atomicStartHook?: boolean } };
     readonly devDependencies?: Readonly<Record<string, string>>;
     readonly dependencies?: Readonly<Record<string, string>>;
     readonly peerDependencies?: Readonly<Record<string, string>>;
@@ -760,7 +760,7 @@ async function readInstalledManifest(
       ),
     ) as {
       readonly version?: string;
-      readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean; readonly worldRpcAuth?: boolean } };
+      readonly eden?: { readonly capabilities?: { readonly deploymentAffinity?: boolean; readonly worldRpcAuth?: boolean; readonly atomicStartHook?: boolean } };
       readonly devDependencies?: Readonly<Record<string, string>>;
       readonly dependencies?: Readonly<Record<string, string>>;
       readonly peerDependencies?: Readonly<Record<string, string>>;
@@ -768,6 +768,22 @@ async function readInstalledManifest(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Eve `1.0.0-rc.6` and later refuse to start a session unless the World
+ * admits start Hooks atomically; earlier prereleases of 1.0.0 do not ask.
+ */
+function eveRequiresAtomicStartHook(version: unknown): boolean {
+  const match = typeof version === "string"
+    ? /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/u.exec(version)
+    : null;
+  if (match === null) return false;
+  const [major, minor, patch] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  if (major !== 1 || minor !== 0 || patch !== 0) return major >= 1;
+  if (match[4] === undefined) return true;
+  const rc = /^rc\.(\d+)$/u.exec(match[4]);
+  return rc !== null && Number(rc[1]) >= 6;
 }
 
 /**
@@ -785,6 +801,23 @@ async function checkEveWorldPairing(
     candidate.snapshotRoot,
     "eve",
   );
+  const worldManifest = await readInstalledManifest(
+    candidate.snapshotRoot,
+    world,
+  );
+  if (
+    world === "@moinulmoin/eden-world-cloudflare" &&
+    worldManifest !== undefined &&
+    eveRequiresAtomicStartHook(eveManifest?.version) &&
+    worldManifest.eden?.capabilities?.atomicStartHook !== true
+  ) {
+    return check(
+      "EVE_WORLD_PAIRING",
+      "failed",
+      `Eve ${eveManifest?.version} needs a World with atomic start hooks, and the installed ${world} ${worldManifest.version ?? "(unknown version)"} does not have them; every new session would fail with HTTP 500.`,
+      `Install ${world}@0.11.1 or later; see docs/troubleshooting.md.`,
+    );
+  }
   const expectedRange = eveManifest === undefined
     ? undefined
     : [
@@ -797,10 +830,6 @@ async function checkEveWorldPairing(
         typeof value === "string" && value.trim().length > 0
       );
   if (expectedRange === undefined) return undefined;
-  const worldManifest = await readInstalledManifest(
-    candidate.snapshotRoot,
-    world,
-  );
   const declared = worldManifest === undefined
     ? undefined
     : ["@workflow/core", "@workflow/world"]

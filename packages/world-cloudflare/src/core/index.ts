@@ -1,9 +1,9 @@
 // Storage semantics ported from @workflow/world-postgres (Apache-2.0).
 import { decode, encode } from 'cbor-x';
 import { monotonicFactory } from 'ulid';
-import { EntityConflictError, HookForceClaimedError, HookNotFoundError, RunExpiredError, RunNotSupportedError, TooEarlyError, WorkflowRunNotFoundError, WorkflowWorldError } from '@workflow/errors';
-import { EventSchema, HookSchema, StepSchema, WorkflowRunSchema, SPEC_VERSION_CURRENT, SPEC_VERSION_LEGACY, SPEC_VERSION_SUPPORTS_HOOK_FORCE_CLAIM, slotToEventId, eventIdToSlot, stripEventDataRefs, validateAttributeChanges, validateUlidTimestamp, isTerminalWorkflowRunStatus, isTerminalStepStatus, isChildEntityCreationEvent, isTerminalRunEventType, requiresNewerWorld, isLegacySpecVersion } from '@workflow/world';
-import type { AnyEventRequest, CreateEventParams, Event, EventResult, Hook, Step, Wait, WorkflowRun, AttributeChange, EventsResolveData } from '@workflow/world';
+import { EntityConflictError, HookConflictError, HookForceClaimedError, HookNotFoundError, RunExpiredError, RunNotSupportedError, TooEarlyError, WorkflowRunNotFoundError, WorkflowWorldError } from '@workflow/errors';
+import { EventSchema, HookSchema, StepSchema, WorkflowRunSchema, StartHookSchema, START_HOOK_CANDIDATE_MAX_AGE_MS, startHookId, isStartHookId, ulidToDate, SPEC_VERSION_CURRENT, SPEC_VERSION_LEGACY, SPEC_VERSION_SUPPORTS_HOOK_FORCE_CLAIM, slotToEventId, eventIdToSlot, stripEventDataRefs, validateAttributeChanges, validateUlidTimestamp, isTerminalWorkflowRunStatus, isTerminalStepStatus, isChildEntityCreationEvent, isTerminalRunEventType, requiresNewerWorld, isLegacySpecVersion } from '@workflow/world';
+import type { AnyEventRequest, CreateEventParams, Event, EventResult, Hook, Step, Wait, WorkflowRun, AttributeChange, EventsResolveData, StartHook } from '@workflow/world';
 
 export interface SqlExec {
   exec(query: string, ...bindings: unknown[]): { toArray(): Record<string, unknown>[] };
@@ -73,6 +73,9 @@ export class WorldCore {
       'CREATE TABLE IF NOT EXISTS workflow_hooks (hook_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, token TEXT NOT NULL, data BLOB NOT NULL)',
       'CREATE INDEX IF NOT EXISTS workflow_hooks_run ON workflow_hooks(run_id)',
       'CREATE INDEX IF NOT EXISTS workflow_hooks_token ON workflow_hooks(token)',
+      // Decisions outlive Hook disposal and token takeover; retries must never
+      // turn a refused candidate into a second run.
+      'CREATE TABLE IF NOT EXISTS workflow_start_hook_admissions (run_id TEXT PRIMARY KEY, token TEXT NOT NULL, conflicting_run_id TEXT, cancelled INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)',
       // Routing tombstones outlive invocation-data retention; never store payloads here.
       'CREATE TABLE IF NOT EXISTS workflow_hook_disposals (run_id TEXT NOT NULL, hook_id TEXT NOT NULL, token TEXT NOT NULL, claimed_run_id TEXT NOT NULL, claimed_hook_id TEXT NOT NULL, PRIMARY KEY(run_id,hook_id))',
       'CREATE TABLE IF NOT EXISTS workflow_waits (wait_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, data BLOB NOT NULL)',
@@ -292,6 +295,36 @@ export class WorldCore {
     if (claimedBy) { const routeToken = token ?? (marker ? String(marker.token) : data?.token) ?? ''; const successor = this.findHook(routeToken,true); throw new HookForceClaimedError(routeToken,successor?.runId ?? claimedBy.runId,successor?.hookId ?? claimedBy.hookId); }
     throw new HookNotFoundError(hookId);
   }
+  private rejectStartHook(reason: 'invalid' | 'expired' | 'token_mismatch' | 'ordinary_run'): never {
+    throw new WorkflowWorldError(`Start Hook admission rejected: ${reason}`,{status:400,code:'START_HOOK_ADMISSION_REJECTED',reason});
+  }
+  private admitStartHook(id: string, request: AnyEventRequest): { request: AnyEventRequest; error?: HookConflictError } {
+    if (request.eventType !== 'run_created' && request.eventType !== 'run_started') return {request};
+    const input = request.eventData;
+    const recorded = this.rows('SELECT * FROM workflow_start_hook_admissions WHERE run_id=?',id)[0];
+    if (recorded?.cancelled) this.rejectStartHook('expired');
+    if (input?.startHook === undefined) {
+      if (recorded && !this.rows('SELECT id FROM workflow_runs WHERE id=?',id).length) return {request,error:new HookConflictError(String(recorded.token),String(recorded.conflicting_run_id))};
+      return {request};
+    }
+    const parsed = StartHookSchema.safeParse(input.startHook);
+    if (!parsed.success) this.rejectStartHook('invalid');
+    const startHook: StartHook = {...parsed.data,hookId:startHookId(id)};
+    if (parsed.data.hookId && parsed.data.hookId !== startHook.hookId) this.rejectStartHook('invalid');
+    if (startHook.tokenRetentionUntil && startHook.tokenRetentionUntil.getTime() > this.now()+30*86400000) this.rejectStartHook('invalid');
+    const candidateTime = ulidToDate(id.replace(/^wrun_/,''))?.getTime();
+    if (candidateTime === undefined || (this.now()-candidateTime > START_HOOK_CANDIDATE_MAX_AGE_MS && (request.eventType === 'run_created' || !this.rows('SELECT id FROM workflow_runs WHERE id=?',id).length))) this.rejectStartHook('expired');
+    if (recorded) {
+      if (recorded.token !== startHook.token) this.rejectStartHook('token_mismatch');
+      if (recorded.conflicting_run_id) return {request,error:new HookConflictError(startHook.token,String(recorded.conflicting_run_id))};
+    } else {
+      if (this.rows('SELECT id FROM workflow_runs WHERE id=?',id).length) this.rejectStartHook('ordinary_run');
+      const owner = this.findHook(startHook.token,true);
+      this.sql.exec('INSERT INTO workflow_start_hook_admissions(run_id,token,conflicting_run_id,created_at) VALUES(?,?,?,?)',id,startHook.token,owner?.runId ?? null,this.now());
+      if (owner) return {request,error:new HookConflictError(startHook.token,owner.runId)};
+    }
+    return {request:{...request,eventData:{...input,startHook}} as AnyEventRequest};
+  }
   private createRun(runId: string, data: Extract<AnyEventRequest, { eventType: 'run_created' }>): { run: WorkflowRun; event: Event } {
     if ((data.specVersion ?? SPEC_VERSION_CURRENT) > SPEC_VERSION_CURRENT) throw new RunNotSupportedError(data.specVersion!,SPEC_VERSION_CURRENT);
     if (this.rows('SELECT id FROM workflow_runs WHERE id=?', runId).length) throw new EntityConflictError(`Workflow run "${runId}" already exists`);
@@ -299,23 +332,39 @@ export class WorldCore {
     this.assertDeploymentActive(d.deploymentId);
     const now = new Date(this.now());
     const run = WorkflowRunSchema.parse(compact({ runId, ...d, status: 'pending', attributes: d.attributes ?? {}, createdAt: now, updatedAt: now, specVersion: data.specVersion ?? SPEC_VERSION_CURRENT }));
-    this.saveRun(run); this.sql.exec('INSERT INTO workflow_event_slots(run_id) VALUES(?)', runId); const event = this.insertEvent(runId, data); return { run, event };
+    this.saveRun(run);
+    if (d.startHook) this.saveHook(HookSchema.parse(compact({...d.startHook,runId,hookId:startHookId(runId),ownerId:'',projectId:'',environment:'',createdAt:now,specVersion:run.specVersion,isWebhook:false,isSystem:false})));
+    this.sql.exec('INSERT INTO workflow_event_slots(run_id) VALUES(?)', runId); const event = this.insertEvent(runId, data); return { run, event };
   }
   private async create(runId: string | null, request: AnyEventRequest, params?: CreateEventParams): Promise<EventResult> {
     const id = runId || (request.eventType === 'run_created' ? `wrun_${ulid(this.now())}` : ''); if (!id) throw new Error('runId is required for non-run_created events');
-    if (request.eventType === 'run_created' && runId) { const error = validateUlidTimestamp(id, 'wrun_'); if (error) throw new WorkflowWorldError(error); }
+    const hasStartHook = (request.eventType === 'run_created' || request.eventType === 'run_started') && request.eventData?.startHook !== undefined;
+    if (request.eventType === 'run_created' && runId) { const error = validateUlidTimestamp(id, 'wrun_'); if (error) { if (hasStartHook) this.rejectStartHook('expired'); throw new WorkflowWorldError(error); } }
     let digest: string | undefined;
     if (request.eventType === 'hook_received' && params?.resumeId) {
       const payload = request.eventData.payload; const input = payload instanceof Uint8Array ? payload : encode(payload);
       digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(input))), b => b.toString(16).padStart(2, '0')).join('');
       if (params.resumePayloadDigest && params.resumePayloadDigest !== digest) throw new WorkflowWorldError('Hook resume digest does not match its payload', { status: 422 });
     }
-    return this.atomic(() => this.createSync(id, request, params, digest));
+    const result = this.atomic(() => {
+      const admission = this.admitStartHook(id,request);
+      // A refusal is a durable decision. Throw only after its transaction commits.
+      if (admission.error) return admission.error;
+      if (request.eventType === 'run_cancelled' && !this.rows('SELECT id FROM workflow_runs WHERE id=?',id).length && this.rows('SELECT run_id FROM workflow_start_hook_admissions WHERE run_id=?',id).length) {
+        this.sql.exec('UPDATE workflow_start_hook_admissions SET cancelled=1 WHERE run_id=?',id);
+        return new WorkflowWorldError('Start Hook candidate cancelled',{status:409,code:'START_HOOK_CANDIDATE_CANCELLED'});
+      }
+      if (hasStartHook && request.eventType === 'run_created' && this.rows('SELECT id FROM workflow_runs WHERE id=?',id).length) return this.eventResult(id,{run:this.run(id)},params);
+      return this.createSync(id,admission.request,params,digest);
+    });
+    if (result instanceof Error) throw result;
+    return result;
   }
   private createSync(id: string, request: AnyEventRequest, params?: CreateEventParams, digest?: string): EventResult {
     const now = new Date(this.now()); const specVersion = request.specVersion ?? SPEC_VERSION_CURRENT;
     let data = { ...request } as AnyEventRequest; let run: WorkflowRun | undefined; let step: Step | undefined; let hook: Hook | undefined; let wait: Wait | undefined; let event: Event | undefined; let stepCreated = false;
     const type = data.eventType; const correlationId = data.correlationId;
+    if (type === 'hook_created' && correlationId && isStartHookId(id,correlationId)) throw new WorkflowWorldError('The start Hook id is reserved for atomic admission',{status:400});
     if (type === 'run_created') { ({ run, event } = this.createRun(id, data as Extract<AnyEventRequest,{eventType:'run_created'}>)); }
     else {
       let current: WorkflowRun | undefined;
