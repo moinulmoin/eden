@@ -120,7 +120,7 @@ async function publish(from, to) {
 const EVE_HOST_ENTRYPOINT = Object.freeze([
   "/bin/sh",
   "-c",
-  "rm -f /dev/kvm; cd /workspace && exec ./node_modules/.bin/eve start --host 0.0.0.0 --port 8080",
+  "unset EVE_DEV VERCEL VERCEL_ENV VERCEL_TARGET_ENV; rm -f /dev/kvm; cd /workspace && exec ./node_modules/.bin/eve start --host 0.0.0.0 --port 8080",
 ]);
 
 /**
@@ -267,6 +267,10 @@ export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnviro
     super(ctx, env);
     this.core = new WorldCore({
       ...(env.EDEN_EVE_DEPLOYMENT_ID === undefined ? {} : { currentDeploymentId: env.EDEN_EVE_DEPLOYMENT_ID }),
+      // The published route table is authoritative, including before cleanup
+      // has finished fencing and deleting an insecure legacy container.
+      isDeploymentRemoved: (id) => env.EDEN_EVE_DEPLOYMENTS !== undefined &&
+        id !== env.EDEN_EVE_DEPLOYMENT_ID && deploymentImages(env)[id] === undefined,
       sql: {
         exec: ctx.storage.sql.exec.bind(ctx.storage.sql),
         transactionSync: ctx.storage.transactionSync.bind(ctx.storage),
@@ -420,6 +424,9 @@ export async function routeEveOutboundRequest(
   }
   if (new URL(request.url).pathname === "/__eden/world/rpc") {
     const route = deploymentImages(env)[deploymentId];
+    if (env.EDEN_EVE_DEPLOYMENTS !== undefined && route === undefined) {
+      return new Response("Deployment retired; its sessions ended.", { status: 403 });
+    }
     const authRequired = route?.worldRpcAuth === true ||
       (env.EDEN_EVE_DEPLOYMENTS === undefined && env.EDEN_EVE_WORLD_RPC_AUTH === true);
     if (authRequired) {
@@ -533,6 +540,9 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       throw new Error("The Container deployment identity does not match its persisted owner.");
     }
     const record = deploymentImages(this.env)[id];
+    if (affinity && record === undefined) {
+      throw new Error(`Deployment ${id} has been retired; its sessions ended. Start a new session.`);
+    }
     if (stored === undefined) await this.ctx.storage.put("eden.eve.host.deployment-id", id);
     this.deploymentId = id;
     this.envVars.EDEN_EVE_DEPLOYMENT_ID = id;
@@ -619,7 +629,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     const id = this.deploymentId;
     if (id === undefined) throw new Error("Container deployment identity has not been resolved.");
     const record = deploymentImages(this.env)[id];
-    if (this.env.EDEN_EVE_DEPLOYMENTS !== undefined && record === undefined && id !== "eden-cloudflare") throw new Error(`Deployment ${id} has no retained Container image.`);
+    if (this.env.EDEN_EVE_DEPLOYMENTS !== undefined && record === undefined) throw new Error(`Deployment ${id} has no retained Container image.`);
     return runtime.images[record?.image ?? "eve"];
   }
 
@@ -696,6 +706,17 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       // container generation is also gone, so both are re-attached here.
       this.ctx.blockConcurrencyWhile(async () => {
         if (env.EDEN_EVE_DEPLOYMENTS !== undefined) {
+          const stored = await this.ctx.storage.get<string>("eden.eve.host.deployment-id");
+          const namespace = env.EVE_CONTAINER as DurableObjectNamespace;
+          const owner = stored ?? (this.ctx.id.equals(namespace.idFromName(env.EVE_CONTAINER_INSTANCE_NAME!)) ? "eden-cloudflare" : undefined);
+          if (owner !== undefined && deploymentImages(env)[owner] === undefined) {
+            // Removed routes must not make the constructor fail before the
+            // retirement RPC can destroy a still-running legacy container.
+            await runtime.destroy(new Error("deployment-retired"));
+            this.recordContainerStopped();
+            await this.ctx.storage.deleteAlarm();
+            return;
+          }
           await this.identifyDeployment();
           await this.registerLoopbackIntercept(runtime);
         }
@@ -1226,7 +1247,13 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   async retire(deploymentId: string): Promise<void> {
     // World routes the fenced target to its named DO. Retirement must not
     // restore or trust a stored owner left by an earlier retirement attempt.
-    if (await this.deploymentBusy(deploymentId)) {
+    const removed = this.env.EDEN_EVE_DEPLOYMENTS !== undefined &&
+      deploymentId !== this.env.EDEN_EVE_DEPLOYMENT_ID && deploymentImages(this.env)[deploymentId] === undefined;
+    const namespace = this.env.EVE_CONTAINER as DurableObjectNamespace;
+    if (!this.ctx.id.equals(namespace.idFromName(deploymentInstance(this.env, deploymentId)))) {
+      throw new Error("The retirement target does not match its Container instance.");
+    }
+    if (!removed && await this.deploymentBusy(deploymentId)) {
       throw new Error("Cannot retire a deployment with active deliveries or transfers.");
     }
     const runtime = this.containerRuntime();

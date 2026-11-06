@@ -474,7 +474,7 @@ describe("Eve runtime image boundary", () => {
       expect.arrayContaining(["--platform=linux/amd64", "--iidfile"]),
     );
     expect(dockerArgs.find((args) => args[0] === "run")).toEqual(
-      expect.arrayContaining(["--publish", "4310:8080"]),
+      expect.arrayContaining(["--publish", "127.0.0.1:4310:8080"]),
     );
     expect(dockerArgs).toContainEqual(
       expect.arrayContaining(["top", "boot-container-1"]),

@@ -242,8 +242,15 @@ overwriting active files on the new version.
 A session's first run stays on its original version until the session ends,
 so that version is kept even after the session moves.
 
-Targets deployed with Eden `0.9.0` are different: their existing sessions
-stay on the old version until they end. They do not move to the new version.
+Targets deployed with Eden ≤`0.9.0` are different: on the next deploy their
+legacy version is retired because its World RPC was unauthenticated. The
+same applies to any kept version built without World RPC authentication.
+Their sessions end even if work is running; their next message fails, sometimes
+with Eve's generic "Failed to send the session message" error. Users must start
+new sessions.
+Deploy warns how many versions were retired, removes their routes immediately,
+and cleans up their containers and images after the new deployment is healthy.
+If cleanup fails, its recorded resources are retried on the next deploy.
 
 Old versions sleep independently when idle, but not during running work or
 file transfers. When an old version finishes its running work, Eden stops
@@ -294,6 +301,14 @@ retained container instance**, verifies bounded absence, and only then clears
 the target's `CURRENT` pointer. It never deletes by prefix or broad account
 search. Destroy is not a drain: it removes retained deployments even if
 sessions still need them.
+
+The record's Container name must match Eden's exact derived name. A live
+Worker must also match the recorded identities through authenticated
+provider settings, with the Container namespace matching its Worker binding.
+If the Worker is already absent, cleanup of its recorded, exact-name
+Container and images is still supported. A failed inventory read stops
+cleanup as indeterminate; it never counts as absence. These checks do not
+make untrusted `.eden` records safe: deployment IDs are public.
 
 Destroy also removes every retained image and registry repository, including
 legacy images and the managed-registry image tag

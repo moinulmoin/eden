@@ -713,6 +713,14 @@ const EVE_EXCLUDED_FILE_NAMES = new Set([
   ".bunfig.toml",
   ".yarnrc",
   ".yarnrc.yml",
+  ".dev.vars",
+  ".netrc",
+  ".git-credentials",
+  "id_rsa",
+  "id_ecdsa",
+  "id_ed25519",
+  "id_dsa",
+  "secrets.json",
   "credentials.json",
   "service-account.json",
 ]);
@@ -807,6 +815,19 @@ function isAllowedSystemAlias(path: string): boolean {
   return normalized === "/var" || normalized === "/tmp";
 }
 
+function isCredentialPath(relativePath: string): boolean {
+  const parts = relativePath.split("/");
+  const name = parts[parts.length - 1];
+  return name !== undefined && (
+    EVE_EXCLUDED_FILE_NAMES.has(name) ||
+    name.startsWith(".dev.vars.") ||
+    name.endsWith(".pem") || name.endsWith(".key") ||
+    name.endsWith(".p12") || name.endsWith(".pfx") ||
+    name.endsWith(".tfvars") ||
+    (name === "credentials" && parts[parts.length - 2] === ".aws")
+  );
+}
+
 function isPathExcluded(
   relativePath: string,
   runtimeEnvRelativePath: string | undefined,
@@ -833,10 +854,7 @@ function isPathExcluded(
   if (name !== undefined && name.startsWith(".env")) {
     return { excluded: true, category: "runtime-env" };
   }
-  if (
-    (name !== undefined && EVE_EXCLUDED_FILE_NAMES.has(name)) ||
-    (name !== undefined && (name.endsWith(".pem") || name.endsWith(".key")))
-  ) {
+  if (isCredentialPath(relativePath)) {
     return { excluded: true, category: "credentials" };
   }
   if (
@@ -2275,9 +2293,7 @@ async function assertGeneratedTreesExcludeSecrets(
       const candidate = join(directory, entry.name);
       if (
         entry.name.startsWith(".env") ||
-        EVE_EXCLUDED_FILE_NAMES.has(entry.name) ||
-        entry.name.endsWith(".pem") ||
-        entry.name.endsWith(".key")
+        isCredentialPath(relativePath)
       ) {
         throw new EvePackagingError({
           code: "SECRET_EXCLUSION_FAILED",

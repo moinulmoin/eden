@@ -17,7 +17,7 @@ Eden has four commands and two top-level switches.
 | `eden skill` | Print the bundled Eden skill verbatim for coding agents |
 
 `eden --help` (or `-h`) prints the top-level usage. `eden --version` (or `-v`)
-prints the installed version, for example `0.11.1`. Running `eden` with no
+prints the installed version, for example `0.11.2`. Running `eden` with no
 arguments prints the same usage. An unknown command fails with
 `COMMAND_UNKNOWN`.
 
@@ -91,8 +91,15 @@ changes incompatibly (`EDEN_AFFINITY_CONTRACT`).
 
 Existing sessions move to the new version on their next message, keeping
 their ID, history, and sandbox files. Idle sessions move without a message.
-Running work finishes on the old version. Sessions adopted from Eden `0.9.0`
-stay on the legacy `eden-cloudflare` version until they end; they do not move.
+Running work finishes on authenticated old versions. The next deploy retires
+any kept version whose World RPC was unauthenticated, including the legacy
+`eden-cloudflare` version from Eden ≤`0.9.0`, regardless of live sessions or
+queued work. Their sessions end; their next message fails, sometimes with Eve's
+generic "Failed to send the session message" error. Users must start new
+sessions. Deploy warns
+with the number of versions retired. Their routes disappear immediately;
+queued deliveries stop terminally, and image/container cleanup runs after
+the new deployment is healthy. Failed cleanup remains recorded for retry.
 
 A session's first run stays on its original version until the session ends,
 so that version is kept even after the session moves. A later deploy removes
@@ -279,7 +286,10 @@ snapshot, and it never reaches the image, the build environment, the generated
 manifests, or the logs. Eden excludes the same way any other file whose name
 starts with `.env`, and any `credentials.json`, `service-account.json`,
 `.npmrc`, `.pnpmrc`, `.pypirc`, `.bunfig.toml`, `.yarnrc`, `.yarnrc.yml`,
-`*.pem`, and `*.key` file.
+`.dev.vars`, `.dev.vars.*`, `.netrc`, `.git-credentials`, `id_rsa`,
+`id_ecdsa`, `id_ed25519`, `id_dsa`, `*.p12`, `*.pfx`, `.aws/credentials`,
+`*.tfvars`, `secrets.json`, `*.pem`, and `*.key` file. Public SSH keys
+(`*.pub`) are not excluded.
 
 `SECRET_EXCLUSION_FAILED` is a different failure: it is raised when the
 generated runtime closure (installed dependencies and the `eve build` output)
@@ -295,7 +305,14 @@ with `EVE_ENV_RESERVED_VARIABLE`:
 `HOST`, `NITRO_HOST`, `PORT`, `NITRO_PORT`, `NODE_ENV`,
 `NODE_EXTRA_CA_CERTS`, `WORKFLOW_LOCAL_BASE_URL`, `EDEN_WORLD_URL`,
 `EDEN_WORLD_TOKEN`, `EDEN_EVE_WORLD_RPC_AUTH`, `EDEN_EVE_DEPLOYMENT_ID`,
-`EDEN_EVE_GENERATION_ID`, `EDEN_EVE_CONTROL_TOKEN`.
+`EDEN_EVE_GENERATION_ID`, `EDEN_EVE_RELEASE_ID`, `EDEN_EVE_DEPLOYMENTS`,
+`EDEN_AFFINITY_CONTRACT`, `EVE_SCHEDULES_DISABLED`, `EDEN_EVE_CONTROL_TOKEN`,
+`EVE_DEV`, `VERCEL`, `VERCEL_ENV`, `VERCEL_TARGET_ENV`.
+
+Remove the four development-mode variables rather than setting production
+values: they switch Eve into development mode, which can let unauthenticated
+callers in. The Worker rejects them too, and its container entrypoint unsets
+them before starting Eve.
 
 `EDEN_EVE_RUNTIME_REVISION` passes the environment file parser but is
 reserved on the Worker side, so a file that defines it fails the publish step
@@ -422,7 +439,8 @@ Container runs on the `standard-1` instance type (1/2 vCPU, 4 GiB) with the
 The Container image map holds the current and all kept versions. A
 same-version update replaces its image; an Eve upgrade adds an image and
 instance. Old images and repositories stay until a later deploy removes
-them after their sessions end, or until destroy.
+them after their sessions end, or until destroy. Unauthenticated kept versions
+are the security exception above: their sessions end on the next deploy.
 
 An update republishes the same Worker and the same Container application.
 Durable Object classes are append-only: a new migration tag is added for a

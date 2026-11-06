@@ -14,6 +14,7 @@ import {
 import {
   lstat,
   mkdir,
+  mkdtemp,
   readFile,
   readdir,
   realpath,
@@ -24,6 +25,7 @@ import {
 } from "node:fs/promises";
 import {
   homedir,
+  tmpdir,
 } from "node:os";
 import {
   createServer,
@@ -104,7 +106,6 @@ export const DEFAULT_EVE_HOST_REQUIREMENTS: EveHostRequirements = Object.freeze(
   network: "supported",
   durableLocalFilesystem: false,
 });
-const wranglerCwd = dirname(wranglerEntrypoint);
 
 export const DEFAULT_EVE_NODE_IMAGE: EveNodeImage = Object.freeze({
   reference: "node:24.17.0-bookworm-slim",
@@ -219,16 +220,17 @@ export interface EveCloudflareReadResult {
      * Provider-backed facts about the live target, read through the
      * Cloudflare API (not self-asserted response headers, which any Worker
      * can forge): the Container application's Durable Object namespace and
-     * the `EDEN_EVE_DEPLOYMENT_ID` plain-text var Eden stamps into every
-     * Worker it publishes. `settingsReadable` tells the ownership resolver
-     * whether a missing var is evidence of a foreign Worker or just an
-     * unreadable settings call.
+     * the `EDEN_EVE_DEPLOYMENT_ID` and `EDEN_EVE_RELEASE_ID` plain-text vars
+     * Eden stamps into every Worker it publishes. `settingsReadable` tells
+     * the ownership resolver whether a missing var is evidence of a foreign
+     * Worker or just an unreadable settings call.
      */
     readonly providerEvidence?: {
       readonly containerApplicationId?: string;
       readonly containerSchedulingPolicy?: string;
       readonly containerNamespaceId?: string;
       readonly workerDeploymentId?: string;
+      readonly workerReleaseId?: string;
       readonly workerContainerNamespaceId?: string;
       readonly settingsReadable?: boolean;
     };
@@ -518,6 +520,8 @@ export interface EvePreflightOptions {
 
 export interface EveDestroyTargetRead {
   readonly workerExists: boolean;
+  readonly inventoryComplete?: boolean;
+  readonly providerEvidence?: EveCloudflareReadResult["target"]["providerEvidence"];
   readonly containerApplicationId?: string;
   readonly accountId?: string;
   /**
@@ -807,6 +811,17 @@ async function checkEveWorldPairing(
   );
   if (
     world === "@moinulmoin/eden-world-cloudflare" &&
+    worldManifest?.eden?.capabilities?.worldRpcAuth !== true
+  ) {
+    return check(
+      "EVE_WORLD_PAIRING",
+      "failed",
+      "The installed Cloudflare World lets the agent's sandbox read and change every session's workflow state.",
+      "Install @moinulmoin/eden-world-cloudflare@0.11.2 or later; see docs/troubleshooting.md.",
+    );
+  }
+  if (
+    world === "@moinulmoin/eden-world-cloudflare" &&
     worldManifest !== undefined &&
     eveRequiresAtomicStartHook(eveManifest?.version) &&
     worldManifest.eden?.capabilities?.atomicStartHook !== true
@@ -815,7 +830,7 @@ async function checkEveWorldPairing(
       "EVE_WORLD_PAIRING",
       "failed",
       `Eve ${eveManifest?.version} needs a World with atomic start hooks, and the installed ${world} ${worldManifest.version ?? "(unknown version)"} does not have them; every new session would fail with HTTP 500.`,
-      `Install ${world}@0.11.1 or later; see docs/troubleshooting.md.`,
+      `Install ${world}@0.11.2 or later; see docs/troubleshooting.md.`,
     );
   }
   const expectedRange = eveManifest === undefined
@@ -1291,6 +1306,7 @@ function safeWranglerEnvironment(): NodeJS.ProcessEnv {
     LANG: process.env.LANG,
     LC_ALL: process.env.LC_ALL,
     CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
+    CLOUDFLARE_API_BASE_URL: "https://api.cloudflare.com/client/v4",
     NODE_OPTIONS: undefined,
   };
 }
@@ -1313,21 +1329,32 @@ interface WranglerJsonResult {
   readonly stderr?: string;
 }
 
+async function withWranglerDirectory<T>(
+  operation: (cwd: string) => Promise<T>,
+): Promise<T> {
+  const cwd = await mkdtemp(join(tmpdir(), "eden-wrangler-"));
+  try {
+    return await operation(cwd);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+}
+
 async function readWranglerJson(
   args: readonly string[],
   timeoutMs: number = 30_000,
 ): Promise<WranglerJsonResult> {
   try {
-    const result = await execFileAsync(
+    const result = await withWranglerDirectory((cwd) => execFileAsync(
       process.execPath,
       [wranglerEntrypoint, ...args],
       {
         env: safeWranglerEnvironment(),
-        cwd: wranglerCwd,
+        cwd,
         maxBuffer: 2 * 1024 * 1024,
         timeout: timeoutMs,
       },
-    );
+    ));
     const parsed = JSON.parse(result.stdout.trim()) as unknown;
     return { value: parsed, failed: false };
   } catch (error: unknown) {
@@ -1486,6 +1513,8 @@ export function exactTargetContainerEntries(
 }
 
 async function readExactTargetInventory(workerName: string, containerApp: string) {
+  // Wrangler's JSON output does not expose a pagination cursor. A full page
+  // without the exact name remains indeterminate in exactContainerEntries.
   const containers = await readWranglerJson([
     "containers", "list", "--json", "--per-page", "100",
   ]);
@@ -1495,7 +1524,7 @@ async function readExactTargetInventory(workerName: string, containerApp: string
   return {
     containers,
     deployments,
-    containerEntries: exactContainerEntries(containers.value, containerApp),
+    containerEntries: containers.failed ? undefined : exactContainerEntries(containers.value, containerApp),
     deploymentEntries: exactDeploymentEntries(deployments.value),
   };
 }
@@ -1614,6 +1643,7 @@ async function readProviderEvidence(
     containerSchedulingPolicy?: string;
     containerNamespaceId?: string;
     workerDeploymentId?: string;
+    workerReleaseId?: string;
     workerContainerNamespaceId?: string;
     settingsReadable?: boolean;
   } = {
@@ -1677,6 +1707,14 @@ async function readProviderEvidence(
           if (typeof deploymentBinding?.text === "string") {
             evidence.workerDeploymentId = deploymentBinding.text;
           }
+          const releaseBinding = bindings.find(
+            (value) =>
+              value.type === "plain_text" &&
+              value.name === "EDEN_EVE_RELEASE_ID",
+          );
+          if (typeof releaseBinding?.text === "string") {
+            evidence.workerReleaseId = releaseBinding.text;
+          }
           const containerBinding = bindings.find(
             (value) =>
               value.type === "durable_object_namespace" &&
@@ -1698,12 +1736,9 @@ async function readProviderEvidence(
 
 
 /**
- * Resolves `unowned` reads against Eden's immutable deployment records AND
- * the live remote target. The local record proves Eden once created the
- * target; the remote Worker's stamped identity proves it is still the one
- * Eden deployed — a same-name Worker recreated by something else after the
- * target was destroyed (or a forged local record) must never be upgraded to
- * `owned`.
+ * Resolves local deployment history against authenticated provider state.
+ * This detects name reuse and stale records, but deployment IDs are public:
+ * a malicious forged local record is not an independent ownership proof.
  */
 async function resolveEveTargetOwnership(
   request: EveCloudflareReadRequest,
@@ -1741,11 +1776,19 @@ async function resolveEveTargetOwnership(
   // its own settings: unreadable settings fail closed.
   const evidence = result.target.providerEvidence;
   const recordedDeploymentIds = new Set(record.deploymentIds);
+  // Every Eden project on the same Eve version publishes the same affinity
+  // deployment ID, so the per-publish release ID is what tells a same-name
+  // Worker from another project apart. Workers from before release IDs
+  // existed used the release ID as their deployment ID.
+  const recordedReleaseIds = new Set(record.releaseIds);
+  const workerReleaseId = evidence?.workerReleaseId ?? evidence?.workerDeploymentId;
   const workerProven = result.target.observed?.worker !== true ||
     (
       evidence?.settingsReadable === true &&
       evidence.workerDeploymentId !== undefined &&
-      recordedDeploymentIds.has(evidence.workerDeploymentId)
+      recordedDeploymentIds.has(evidence.workerDeploymentId) &&
+      workerReleaseId !== undefined &&
+      recordedReleaseIds.has(workerReleaseId)
     );
   // The Container proof is the application running the durable_object
   // scheduling policy with a namespace that matches the Worker binding's
@@ -1765,6 +1808,7 @@ async function resolveEveTargetOwnership(
       if (evidence?.settingsReadable !== true) failures.push("Worker settings unreadable");
       else if (evidence.workerDeploymentId === undefined) failures.push("Worker deployment stamp absent");
       else if (!recordedDeploymentIds.has(evidence.workerDeploymentId)) failures.push("Worker deployment stamp differs from recorded identities");
+      else if (workerReleaseId === undefined || !recordedReleaseIds.has(workerReleaseId)) failures.push("Worker release stamp differs from recorded releases");
     }
     if (result.target.observed?.container === true) {
       if (evidence?.containerSchedulingPolicy !== "durable_object") failures.push("Container scheduling policy unproven");
@@ -2153,13 +2197,13 @@ const WRANGLER_OPERATION_TIMEOUT_MS = 120_000;
 /** Deadline for `wrangler deploy`, whose Container image preparation alone can approach two minutes. */
 const WRANGLER_PUBLICATION_TIMEOUT_MS = 600_000;
 
-function runWranglerWithInput(
+async function runWranglerWithInput(
   args: readonly string[],
-  cwd: string,
   input?: string,
   timeoutMs: number = WRANGLER_OPERATION_TIMEOUT_MS,
 ): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
-  return new Promise((resolveResult) => {
+  // The project's TypeScript lib predates Promise.withResolvers.
+  return withWranglerDirectory((cwd) => new Promise((resolveResult) => {
     const child = spawn(
       process.execPath,
       [wranglerEntrypoint, ...args],
@@ -2209,7 +2253,7 @@ function runWranglerWithInput(
     });
     if (input === undefined) child.stdin.end();
     else child.stdin.end(input);
-  });
+  }));
 }
 
 function defaultProtectedStore(
@@ -2226,7 +2270,6 @@ function defaultProtectedStore(
             "--name",
             workerName,
           ],
-          process.cwd(),
           request.values[name] === undefined ? "" : `${request.values[name]}\n`,
         );
         if (result.exitCode !== 0) {
@@ -2259,7 +2302,6 @@ async function defaultImagePublicationRunner(
     );
     const pushed = await runWranglerWithInput(
       ["containers", "push", request.localImageTag],
-      request.generationRoot,
     );
     if (pushed.exitCode !== 0) {
       return {
@@ -2336,7 +2378,6 @@ function defaultPublicationRunner(): EveDeploymentPublicationRunner {
         request.identity.environment,
         "--strict",
       ],
-      dirname(request.wranglerConfigPath),
       undefined,
       WRANGLER_PUBLICATION_TIMEOUT_MS,
     );
@@ -2868,14 +2909,31 @@ async function runEveDeployment(
     };
   }
   const matchingDeployment = Object.entries(retainedDeployments).find(([, entry]) =>
-    entry.eveVersion === candidate.eveVersion && entry.affinityContract === EDEN_AFFINITY_CONTRACT
+    entry.worldRpcAuth === true && entry.eveVersion === candidate.eveVersion && entry.affinityContract === EDEN_AFFINITY_CONTRACT
   )?.[0];
+  const affinityDeploymentId = `eden-affinity-${createHash("sha256").update(`${candidate.eveVersion}:${EDEN_AFFINITY_CONTRACT}`).digest("hex").slice(0, 24)}`;
   const deploymentId = !affinityEnabled ? releaseId : matchingDeployment ??
-    `eden-affinity-${createHash("sha256").update(`${candidate.eveVersion}:${EDEN_AFFINITY_CONTRACT}`).digest("hex").slice(0, 24)}`;
+    (affinityDeploymentId in retainedDeployments ? `${affinityDeploymentId}-${randomUUID().slice(0, 8)}` : affinityDeploymentId);
   const retiringDeployments: Record<string, EveAffinityDeployment> = { ...priorIdentity?.pendingRetirements };
   delete retiringDeployments[deploymentId];
   if (priorIdentity?.deploymentId !== undefined) delete retiringDeployments[priorIdentity.deploymentId];
   for (const id of prior?.protectedDeploymentIds ?? []) delete retiringDeployments[id];
+  // Old containers can access every session's World without authentication.
+  // Drop their routes even when live sessions or transfers would prevent drain.
+  const insecureRetirements = affinityEnabled
+    ? Object.entries(retainedDeployments).filter(([id, entry]) => id !== deploymentId && entry.worldRpcAuth !== true)
+    : [];
+  for (const [id, entry] of insecureRetirements) {
+    retiringDeployments[id] = entry;
+    delete retainedDeployments[id];
+  }
+  if (insecureRetirements.length > 0) {
+    resultWarnings.push({
+      id: "EVE_UNAUTHENTICATED_VERSIONS_RETIRED",
+      message: `${insecureRetirements.length} kept version${insecureRetirements.length === 1 ? " was" : "s were"} retired because World RPC was unauthenticated; their sessions ended.`,
+      remediation: 'Old sessions now fail; Eve may report "Failed to send the session message." Start new sessions on the current deployment.',
+    });
+  }
   const hasRetainedNoncurrentDeployments = priorIdentity?.retainedDeployments !== undefined &&
     Object.keys(retainedDeployments).some((id) => id !== priorIdentity.deploymentId);
   const controlToken = `${randomUUID()}${randomUUID()}`;
@@ -3475,9 +3533,10 @@ async function runEveDeployment(
         }
         completedRetirements.push(id);
       }
-      supersededImageCleanup = check("VAL-LIFE-007", "passed", "Drained deployment instances and their owned registry repositories were retired.");
-    } catch {
-      supersededImageCleanup = check("VAL-LIFE-007", "failed", "The deployment is healthy, but drained resource retirement was not proven; exact pending retirement records were retained for retry.", "Retry deploy to finish only recorded drained resource cleanup.");
+      supersededImageCleanup = check("VAL-LIFE-007", "passed", "Retired deployment instances and their owned registry repositories were removed.");
+    } catch (error: unknown) {
+      const reason = error instanceof Error ? safeText(error.message) : "Unknown retirement failure.";
+      supersededImageCleanup = check("VAL-LIFE-007", "failed", `The deployment is healthy, but resource retirement was not proven: ${reason} Exact pending retirement records were retained for retry.`, "Retry deploy to finish only recorded retired resource cleanup.");
     }
     if (completedRetirements.length > 0) {
       // Keep the immutable deployment record as evidence, but exclude proven
@@ -4575,6 +4634,8 @@ interface EveDeploymentRecord {
   readonly status: EveDeploymentStatus | undefined;
   /** Every deploymentId this target's records have ever published, used to prove a live remote Worker is one Eden deployed. */
   readonly deploymentIds: readonly string[];
+  /** Every per-publish release ID this target's records hold (the deploymentId for records that predate release IDs). */
+  readonly releaseIds: readonly string[];
   readonly protectedDeploymentIds?: readonly string[];
   /** True when the recorded Worker carried `EDEN_EVE_WORLD_CLOUDFLARE`. */
   readonly worldCloudflare: boolean;
@@ -4626,12 +4687,13 @@ async function readEveDeploymentRecord(
   const scanned: {
     readonly record: Omit<
       EveDeploymentRecord,
-      "generationRoot" | "deploymentIds"
+      "generationRoot" | "deploymentIds" | "releaseIds"
     > & { readonly deploymentId?: string | undefined };
     readonly generationRoot: string;
     readonly modifiedAt: number;
   }[] = [];
   const deploymentIds = new Set<string>();
+  const releaseIds = new Set<string>();
   for (const entry of entries) {
     const generationRoot = join(generationsRoot, entry);
     const recordPath = await deploymentRecordPath(generationRoot);
@@ -4658,6 +4720,8 @@ async function readEveDeploymentRecord(
       });
       const deploymentId = parsed.deploymentId;
       if (deploymentId !== undefined) deploymentIds.add(deploymentId);
+      const releaseId = parsed.identity.releaseId ?? deploymentId;
+      if (releaseId !== undefined) releaseIds.add(releaseId);
     }
   }
   scanned.sort((left, right) => right.modifiedAt - left.modifiedAt);
@@ -4730,6 +4794,7 @@ async function readEveDeploymentRecord(
     protectedDeploymentIds: [...protectedDeploymentIds],
     status: live.record.status,
     deploymentIds: [...deploymentIds],
+    releaseIds: [...releaseIds],
     worldCloudflare: live.record.worldCloudflare,
     durableObjects: historySource?.record.durableObjects,
   };
@@ -4741,7 +4806,7 @@ async function parseEveDeploymentRecord(
   name: string,
 ): Promise<(Omit<
   EveDeploymentRecord,
-  "generationRoot" | "deploymentIds"
+  "generationRoot" | "deploymentIds" | "releaseIds"
 > & { readonly deploymentId?: string | undefined }) | undefined> {
   const base = await parseEveDestroyRecord(recordPath, environment, name);
   if (base === undefined) return undefined;
@@ -4847,11 +4912,13 @@ async function defaultDestroyTargetRead(
   request: EveDestroyCloudflareReadRequest,
 ): Promise<EveDestroyTargetRead> {
   const account = await readWranglerJson(["whoami", "--json"]);
-  const { deployments, containerEntries: entries, deploymentEntries } =
+  const { containers, deployments, containerEntries: entries, deploymentEntries: listedDeployments } =
     await readExactTargetInventory(request.workerName, request.containerApplicationName);
   const accountId = authenticatedAccountId(account.value);
-  const workerExists = !deployments.failed &&
-    (deploymentEntries?.length ?? 0) > 0;
+  const deploymentEntries = deployments.failed &&
+    /(?:does not exist|not found|10007)/iu.test(deployments.stderr ?? "")
+    ? [] : deployments.failed ? undefined : listedDeployments;
+  const workerExists = (deploymentEntries?.length ?? 0) > 0;
   const firstContainer = entries === undefined ? undefined : entries[0];
   const ownedRepositories = request.registryRepositories;
   let registryTagsPresent: readonly string[] | undefined;
@@ -4874,6 +4941,12 @@ async function defaultDestroyTargetRead(
   }
   return {
     workerExists,
+    inventoryComplete: !account.failed && accountId !== undefined &&
+      !containers.failed && entries !== undefined && entries.length <= 1 &&
+      deploymentEntries !== undefined,
+    providerEvidence: await readProviderEvidence(
+      request.workerName, accountId, workerExists, firstContainer,
+    ),
     ...(firstContainer === undefined
       ? {}
       : { containerApplicationId: firstContainer.id }),
@@ -4918,7 +4991,6 @@ async function defaultWorkerDelete(
 ): Promise<"deleted" | "absent" | "indeterminate"> {
   const result = await runWranglerWithInput(
     ["delete", "--name", request.name, "--force"],
-    process.cwd(),
     "y\n",
   );
   if (result.exitCode === 0) return "deleted";
@@ -4933,7 +5005,6 @@ async function defaultContainerDelete(
 ): Promise<"deleted" | "absent" | "indeterminate"> {
   const result = await runWranglerWithInput(
     ["containers", "delete", request.applicationId],
-    process.cwd(),
   );
   if (result.exitCode === 0) return "deleted";
   if (/(?:does not exist|not found|not supported|10007)/iu.test(result.stderr)) {
@@ -4983,7 +5054,6 @@ async function defaultRegistryRepositoryDelete(
         `${request.repository}:${tag}`,
         "--skip-confirmation",
       ],
-      process.cwd(),
     );
     if (result.exitCode === 0) {
       deletedAny = true;
@@ -5214,6 +5284,7 @@ async function runEveDestroyLocked(
     const expectedContainer: string = record.identity.containerApplicationName;
     if (
       expectedWorker !== request.name ||
+      expectedContainer !== boundedResourceName(request.name, "container") ||
       typeof record.identity.accountId !== "string"
     ) {
       fail(
@@ -5246,6 +5317,9 @@ async function runEveDestroyLocked(
     const reader = options.destroyCloudflareRead ?? defaultDestroyTargetRead;
     eveProgress(options, "reading the exact remote inventory");
     const before = await readTarget();
+    if (before.inventoryComplete === false) {
+      fail("EVE_DESTROY_INDETERMINATE", "The exact remote inventory could not be read completely; nothing was deleted. Retry the read. If Wrangler returned a full Container page without the exact target, inspect and delete only the named Container application in the Cloudflare dashboard, then retry destroy.");
+    }
     if (
       before.accountId !== record.identity.accountId
     ) {
@@ -5276,6 +5350,27 @@ async function runEveDestroyLocked(
         ],
       });
       return;
+    }
+    if (before.workerExists) {
+      const ownership = await resolveEveTargetOwnership({
+        projectRoot: request.projectRoot,
+        environment: request.environment,
+        name: request.name,
+        projectId: record.identity.projectId ?? "unknown-project",
+        sourceDigest: "unknown",
+      }, {
+        accountAccess: "available",
+        containerAccess: "available",
+        accountId: before.accountId,
+        target: {
+          state: "unowned",
+          observed: { worker: true, container: before.containerApplicationId !== undefined },
+          ...(before.providerEvidence === undefined ? {} : { providerEvidence: before.providerEvidence }),
+        },
+      });
+      if (ownership.target.state !== "owned") {
+        fail("EVE_DESTROY_OWNERSHIP_UNPROVEN", "Live provider settings do not match the recorded Worker and Container identity; nothing was deleted.");
+      }
     }
 
     const deleteWorker = options.deleteWorker ?? defaultWorkerDelete;
@@ -5387,6 +5482,9 @@ async function runEveDestroyLocked(
 
     eveProgress(options, "verifying the exact target is absent");
     const after = await readTarget();
+    if (after.inventoryComplete === false) {
+      fail("EVE_DESTROY_INDETERMINATE", "The exact remote inventory could not be read completely after deletion; absence is unproven.");
+    }
     if (after.workerExists || after.containerApplicationId !== undefined) {
       emit({
         ok: false,

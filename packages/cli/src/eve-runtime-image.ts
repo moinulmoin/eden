@@ -1735,7 +1735,7 @@ export async function buildEveRuntimeImage(
       "--label",
       state.imageLabel,
       "--publish",
-      `${healthPort}:${INTERNAL_PORT}`,
+      `127.0.0.1:${healthPort}:${INTERNAL_PORT}`,
       ...(request.runtimeInjection === undefined
         ? Object.entries(runtimeEnvironment).flatMap(([name, value]) => [
           "--env",

@@ -70,7 +70,10 @@ save a build.
   `agent/channels/eve.ts` (`vercelOidc()`, `localDev()`, `placeholderAuth()`)
   rejects every Cloudflare caller with 401. Replace it with a real
   authenticator, for example a bearer token read from the env file. Keep
-  `localDev()` so `eve dev` still works locally; it is ignored in production:
+  `localDev()` so `eve dev` still works locally. Never set `EVE_DEV`,
+  `VERCEL`, `VERCEL_ENV`, or `VERCEL_TARGET_ENV` in the deployment env file:
+  they switch Eve into development mode and can let unauthenticated callers
+  in. Eden rejects these names with `EVE_ENV_RESERVED_VARIABLE`:
 
   ```ts
   import { localDev, type AuthFn } from "eve/channels/auth";

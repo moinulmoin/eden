@@ -20,20 +20,26 @@ How Eden handles it:
 - **Validated before anything else.** The file must be a regular file (no
   symbolic links), UTF-8 `KEY=VALUE` records, and must not set names Eden
   reserves for the host, such as `HOST`, `PORT`, `NITRO_*`, `NODE_ENV`,
-  `NODE_EXTRA_CA_CERTS`, or Eden's own identity variables. Eden checks that
-  the file does not change while the deploy runs. See the
-  [reference](./reference.md) for the exact rules.
+  `NODE_EXTRA_CA_CERTS`, or Eden's own identity variables. `EVE_DEV`,
+  `VERCEL`, `VERCEL_ENV`, and `VERCEL_TARGET_ENV` are also rejected: they
+  switch Eve into development mode, which can let unauthenticated callers
+  in. Eden checks that the file does not change while the deploy runs. See
+  the [reference](./reference.md) for the exact rules.
 - **Never in the image.** Eden copies your project into the builder without
   your env file, without any `.env*` file, and without credential files
   (`.npmrc`, `.pnpmrc`, `.pypirc`, `.yarnrc`, `.yarnrc.yml`, `.bunfig.toml`,
-  `credentials.json`, `service-account.json`, `*.pem`, `*.key`). If the
+  `.dev.vars`, `.dev.vars.*`, `.netrc`, `.git-credentials`, `id_rsa`,
+  `id_ecdsa`, `id_ed25519`, `id_dsa`, `*.p12`, `*.pfx`, `.aws/credentials`,
+  `*.tfvars`, `secrets.json`, `credentials.json`, `service-account.json`,
+  `*.pem`, `*.key`). Public SSH keys (`*.pub`) are not excluded. If the
   install or `eve build` output still contains one of those files, or a
   symbolic link that points outside the project, the deploy stops with
   `SECRET_EXCLUSION_FAILED`.
 - **Not from your shell.** Eden runs Docker with a minimal environment
   (`PATH`, `HOME`, `TMPDIR`, locale, and Docker settings) and starts the local
-  boot check with a private environment, so unrelated credentials in your
-  terminal do not reach the build.
+  boot check with a private environment bound to `127.0.0.1` only, so
+  unrelated credentials in your terminal do not reach the build and the
+  boot-check port is not exposed to other machines.
 - **Uploaded as Worker secrets.** Each value is uploaded with
   `wrangler secret put`, passing the value on standard input rather than as a
   command argument. Values are not written to command arguments, image
@@ -75,11 +81,15 @@ For Cloudflare World packages declaring `worldRpcAuth`, the container's World
 RPC endpoint requires a per-start secret supplied only to that container's
 World client. This protects workflow state across sessions; the RPC endpoint
 is not protected by the agent's Eve authenticator. Update both the CLI and
-the project's Cloudflare World package to enable it. Older World packages,
-including retained versions built without this capability, remain
-unauthenticated for compatibility and can expose cross-session workflow state.
-End sessions on those versions so they can retire. `EDEN_WORLD_TOKEN` is
-reserved and cannot be supplied through `--env-file`.
+the project's Cloudflare World package to enable it. Older kept versions
+without this capability could expose every session's workflow state through
+their sandbox. The next deploy now removes their routes and retires them
+regardless of live sessions, queued messages, or transfers. This includes
+the legacy `eden-cloudflare` version from Eden ≤`0.9.0`. Their sessions end;
+users must start new ones. Their next message fails; Eve may return the generic
+"Failed to send the session message" error. Authenticated kept versions retain normal drain
+behavior. `EDEN_WORLD_TOKEN` is reserved and cannot be supplied through
+`--env-file`.
 
 ## The sandbox
 
@@ -101,17 +111,28 @@ never switches accounts silently. For each target it creates one Worker, one
 Container application, its Durable Objects, registry images, and, only when
 your project has schedules, one Cron Trigger. The exact names are listed in
 the [reference](./reference.md).
+Wrangler runs in a fresh Eden-owned temporary directory outside the project;
+project `.env` and `.env.local` files cannot redirect account operations or
+secret uploads.
 
 - **Exact ownership.** Eden writes a deployment record under
   `.eden/eve-deploy/` in your project. A deploy only updates a target that
   record proves Eden created; anything else fails with
   `VAL-CLI-007-TARGET-CONFLICT` instead of being overwritten.
-- **Exact cleanup.** `destroy` checks the live Worker and Container
-  application against that record, deletes only those and the registry
-  images the records prove Eden pushed, then verifies they are gone. It never
-  deletes by name prefix or by searching your account. If Eden cannot prove a
-  result, it reports it as indeterminate and keeps its evidence rather than
-  guessing.
+- **Exact cleanup.** `destroy` requires the recorded Worker and derived
+  Container name and the authenticated account. When the Worker exists, Eden
+  compares its authenticated provider settings with the recorded deployment
+  and per-publish release IDs and verifies the Container's namespace matches
+  its binding.
+  If the Worker is already gone, the record, account, and exact names still
+  permit cleanup of leftover Containers and images. Failed inventory reads
+  are indeterminate, not proof of absence. Eden deletes only that target and
+  the registry images its records identify, then verifies they are gone.
+  It never deletes by name prefix.
+  Deployment and release IDs are public: these checks protect against stale
+  records and name reuse, not a malicious project carrying a forged `.eden`
+  record with a known account and release ID. Do not trust `.eden` state from
+  an untrusted project.
 - **Production is explicit.** `--env production` and `destroy` always require
   `--name`.
 

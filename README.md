@@ -44,19 +44,19 @@ change. New to Eve, or starting from `eve init`? Check
 `npx @moinulmoin/eden` needs no install. For a global `eden` command, use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.11.1
+npm install --global @moinulmoin/eden@0.11.2
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.11.1
+pnpm add --global @moinulmoin/eden@0.11.2
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.11.1
+bun add --global @moinulmoin/eden@0.11.2
 ```
 
 Confirm the installation:
@@ -247,6 +247,10 @@ Eden deploys; your Eve project still owns its:
   World, old sessions return HTTP 409 `session_stranded` after an Eve upgrade
   and users start new ones. Skill and code updates on the same Eve version
   keep sessions.
+  **Security exception:** the next deploy retires kept versions without World
+  RPC authentication, including versions from Eden ≤`0.9.0`, even with live
+  sessions. Those sessions end and their next message fails; users must start
+  new ones. Eve may show the generic "Failed to send the session message" error.
   Local Workflow World state resets on update, and Eden warns about it. To keep
   in-flight runs across updates, use the Postgres World (any direct, unpooled
   Postgres); see [docs/deploy.md](docs/deploy.md#durable-state-postgres-world).

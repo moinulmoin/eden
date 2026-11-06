@@ -53,8 +53,9 @@ export class WorldCore {
   private readonly waitUntil: (promise: Promise<void>) => void;
   private readonly retireDeployment: ((deploymentId: string) => Promise<void>) | undefined;
   private readonly currentDeploymentId: string | undefined;
-  constructor(opts: { sql: SqlExec; delivery: QueueDelivery; now?: () => number; scheduleAlarm: (atMs: number | null) => void | Promise<void>; waitUntil?: (promise: Promise<void>) => void; retireDeployment?: (deploymentId: string) => Promise<void>; currentDeploymentId?: string }) {
-    this.sql = opts.sql; this.delivery = opts.delivery; this.now = opts.now ?? Date.now; this.scheduleAlarm = opts.scheduleAlarm; this.waitUntil = opts.waitUntil ?? (() => {}); this.retireDeployment = opts.retireDeployment; this.currentDeploymentId = opts.currentDeploymentId;
+  private readonly isDeploymentRemoved: ((deploymentId: string) => boolean) | undefined;
+  constructor(opts: { sql: SqlExec; delivery: QueueDelivery; now?: () => number; scheduleAlarm: (atMs: number | null) => void | Promise<void>; waitUntil?: (promise: Promise<void>) => void; retireDeployment?: (deploymentId: string) => Promise<void>; currentDeploymentId?: string; isDeploymentRemoved?: (deploymentId: string) => boolean }) {
+    this.sql = opts.sql; this.delivery = opts.delivery; this.now = opts.now ?? Date.now; this.scheduleAlarm = opts.scheduleAlarm; this.waitUntil = opts.waitUntil ?? (() => {}); this.retireDeployment = opts.retireDeployment; this.currentDeploymentId = opts.currentDeploymentId; this.isDeploymentRemoved = opts.isDeploymentRemoved;
   }
   private rows(query: string, ...args: unknown[]) { return this.sql.exec(query, ...args).toArray(); }
   private atomic<T>(fn: () => T): T { return this.sql.transactionSync ? this.sql.transactionSync(fn) : fn(); }
@@ -112,7 +113,7 @@ export class WorldCore {
   }
   private run(id: string): WorkflowRun { const value = unpack<WorkflowRun>(this.rows('SELECT data FROM workflow_runs WHERE id = ?', id)[0]); if (!value) throw new WorkflowRunNotFoundError(id); return WorkflowRunSchema.parse(value); }
   private assertDeploymentActive(deploymentId: string): void {
-    if (this.rows('SELECT deployment_id FROM workflow_retired_deployments WHERE deployment_id=?',deploymentId).length) throw new WorkflowWorldError(`Deployment ${deploymentId} has been retired`,{status:409});
+    if (this.isDeploymentRemoved?.(deploymentId) || this.rows('SELECT deployment_id FROM workflow_retired_deployments WHERE deployment_id=?',deploymentId).length) throw new WorkflowWorldError(`Deployment ${deploymentId} has been retired; its sessions ended. Start a new session.`,{status:409});
   }
   deliverySettled(messageId: string, attempt: number): void {
     // Called by the receiving Container DO through the current World actor.
@@ -608,11 +609,23 @@ export class WorldCore {
           let result:{ok:boolean;retryAfterMs?:number;sandboxTransferCompleted?:boolean;sandboxTransferFailed?:boolean};try{
             const body = sqlBytes(row.body); const message = this.queueMessage(body);
             const deploymentId = this.queueTarget(message,row.deployment_id == null ? undefined : String(row.deployment_id));
-            this.assertDeploymentActive(deploymentId);
-            this.sql.exec('UPDATE workflow_queue_messages SET deployment_id=? WHERE id=?',deploymentId,id);
             let transfer = this.rows('SELECT * FROM workflow_sandbox_transfers WHERE message_id=?',id)[0];
             const sandbox = transfer ? undefined : this.successorSandbox(message);
-            const sourceDeploymentId = transfer ? String(transfer.source_deployment_id) : sandbox?.sourceDeploymentId ?? (row.source_deployment_id == null ? undefined : String(row.source_deployment_id));
+            const source = transfer ? String(transfer.source_deployment_id) : sandbox?.sourceDeploymentId ?? (row.source_deployment_id == null ? undefined : String(row.source_deployment_id));
+            if (this.isDeploymentRemoved?.(deploymentId) || (source && this.isDeploymentRemoved?.(source)) ||
+                this.rows('SELECT deployment_id FROM workflow_retired_deployments WHERE deployment_id=? OR deployment_id=?',deploymentId,source ?? deploymentId).length) {
+              // A removed deployment cannot ever accept this delivery again.
+              // Preserve run history, but settle the message instead of retrying.
+              this.atomic(()=>{
+                this.sql.exec('UPDATE workflow_sandbox_transfers SET completed=-1 WHERE message_id=? AND completed=0',id);
+                this.deliverySettled(id,attempt);
+                this.sql.exec('UPDATE workflow_queue_messages SET completed=1,idempotency_key=NULL,lease_until=0 WHERE id=?',id);
+              });
+              return;
+            }
+            this.assertDeploymentActive(deploymentId);
+            this.sql.exec('UPDATE workflow_queue_messages SET deployment_id=? WHERE id=?',deploymentId,id);
+            const sourceDeploymentId = source;
             if (sandbox && sourceDeploymentId && sourceDeploymentId !== deploymentId) {
               this.assertDeploymentActive(sourceDeploymentId);
               this.sql.exec('UPDATE workflow_queue_messages SET source_deployment_id=? WHERE id=?',sourceDeploymentId,id);
@@ -665,7 +678,7 @@ export class WorldCore {
         const ids = request.deploymentIds;
         if (this.currentDeploymentId && ids.includes(this.currentDeploymentId)) throw new WorkflowWorldError('Cannot retire the current deployment',{status:409});
         const states = this.drainState(ids);
-        if (ids.some(id=>!states[id]!.drained)) throw new WorkflowWorldError('Cannot retire a deployment with live runs, queued messages, or unfinished transfers',{status:409});
+        if (ids.some(id=>!this.isDeploymentRemoved?.(id) && !states[id]!.drained)) throw new WorkflowWorldError('Cannot retire a deployment with live runs, queued messages, or unfinished transfers',{status:409});
         if (!this.retireDeployment) throw new WorkflowWorldError('Deployment retirement is unavailable',{status:501});
         // Drain and admission fencing are synchronous in the same DO turn.
         // Keep fences durable even if external deletion must be retried.

@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.11.2 — 2026-11-07
+
+A security release. Update `@moinulmoin/eden`. Projects on the Cloudflare World
+need `@moinulmoin/eden-world-cloudflare` 0.10.0 or later; preflight now refuses
+older ones. The first deploy with this release ends sessions on kept versions
+that predate World authentication (see below).
+
+### Security
+
+- **A project's `.env` could take over your Cloudflare login.** Wrangler reads
+  `.env` and `.env.local` from the folder it runs in, and Eden ran the commands
+  that change your account (uploading secrets, deleting the Worker and
+  containers) from your current folder, usually the project. A `.env` that set
+  `CLOUDFLARE_API_BASE_URL` sent your Wrangler login token and the secret
+  values to that address; one that set `CLOUDFLARE_API_TOKEN` or
+  `CLOUDFLARE_ACCOUNT_ID` sent your secrets to another account. Every Wrangler
+  command now runs in an empty temporary folder Eden creates, and the
+  Cloudflare API address is fixed.
+- **Old Cloudflare World packages left the World open to the sandbox.** With
+  `@moinulmoin/eden-world-cloudflare` older than 0.10.0, code in the agent's
+  sandbox could read and change every session's workflow state (the problem
+  0.10.0 fixed), and nothing warned about it. Preflight and deploy now fail
+  with `EVE_WORLD_PAIRING` for those packages.
+- **Kept versions without World authentication are retired.** Versions kept
+  running after an Eve upgrade, including ones deployed with Eden 0.9.0 or
+  earlier, stayed open to the same sandbox access until their sessions ended,
+  which might be never. The next deploy removes them even with live sessions
+  and warns with `EVE_UNAUTHENTICATED_VERSIONS_RETIRED`. Their sessions end: a
+  message to one fails (Eve may show "Failed to send the session message."),
+  and users start a new session.
+- **Some env-file names let anyone in.** `EVE_DEV=1`, or `VERCEL` with
+  `VERCEL_ENV=development`, switch Eve into development mode, where the
+  `localDev()` channel authenticator accepts unauthenticated callers (Eve
+  `0.83.0` and earlier check only these variables). Eden now rejects
+  `EVE_DEV`, `VERCEL`, `VERCEL_ENV`, and `VERCEL_TARGET_ENV` in the env file
+  with `EVE_ENV_RESERVED_VARIABLE`, and the container never passes them to Eve.
+- **`destroy` checks the live target.** It trusted the local record alone, so
+  a planted or stale record could name a foreign container application, or a
+  same-name Worker that something else created later. It now requires the
+  exact container name Eden derives, checks that the live Worker carries a
+  release ID from Eden's records before deleting it (the deployment ID alone
+  is shared by every project on the same Eve version), and stops with
+  `EVE_DESTROY_INDETERMINATE` when Cloudflare can't be read instead of
+  reporting the target as gone. A target whose Worker is already gone but
+  whose containers or images remain is still cleaned up.
+- **Preflight's local test container** listened on every network interface
+  while holding the env file's values. It now listens on `127.0.0.1` only.
+- **More secret files stay out of the image:** `.dev.vars`, `.dev.vars.*`,
+  `.netrc`, `.git-credentials`, SSH private keys (`id_rsa`, `id_ecdsa`,
+  `id_ed25519`, `id_dsa`), `*.p12`, `*.pfx`, `.aws/credentials`, `*.tfvars`,
+  and `secrets.json` join `.env*`, `*.pem`, and `*.key`.
+- **Release pipeline:** the installer checks after publishing now run in a
+  separate job without npm publishing rights, so a compromised dependency they
+  download can't publish a version. GitHub releases wait for those checks.
+
 ## 0.11.1 — 2026-11-06
 
 Eve `1.0.0-rc.6`, which `npx eve init` installs today, couldn't start a session

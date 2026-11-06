@@ -16,6 +16,10 @@ export const EVE_RESERVED_HOST_VARIABLES = Object.freeze([
   "PORT",
   "NITRO_PORT",
   "NODE_ENV",
+  "EVE_DEV",
+  "VERCEL",
+  "VERCEL_ENV",
+  "VERCEL_TARGET_ENV",
   "NODE_EXTRA_CA_CERTS",
   "WORKFLOW_LOCAL_BASE_URL",
   "EDEN_WORLD_URL",
@@ -34,6 +38,10 @@ export const EVE_RESERVED_HOST_VARIABLES = Object.freeze([
   "PORT",
   "NITRO_PORT",
   "NODE_ENV",
+  "EVE_DEV",
+  "VERCEL",
+  "VERCEL_ENV",
+  "VERCEL_TARGET_ENV",
   "NODE_EXTRA_CA_CERTS",
   "WORKFLOW_LOCAL_BASE_URL",
   "EDEN_WORLD_URL",
@@ -323,7 +331,10 @@ function parseEnvironmentText(
       throw new EveRuntimeConfigError({
         code: "EVE_ENV_RESERVED_VARIABLE",
         message:
-          `The explicit Eve environment file attempts to override reserved host variable ${name}.`,
+          `The explicit Eve environment file attempts to override reserved host variable ${name}.` +
+          (["EVE_DEV", "VERCEL", "VERCEL_ENV", "VERCEL_TARGET_ENV"].includes(name)
+            ? " Remove it: Eve development-mode variables can let unauthenticated callers in."
+            : ""),
         source: EVE_ENV_FILE_SOURCE,
         variableName: name,
       });

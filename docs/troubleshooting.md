@@ -249,7 +249,7 @@ codes you will see:
 | `EVE_ENV_FILE_MALFORMED` | A line is not a valid assignment; the message names the line number. | Fix the malformed line. Use `KEY=VALUE` records only. |
 | `EVE_ENV_FILE_DUPLICATE` | The same variable is defined more than once; the message names the variable. | Keep one definition per variable. |
 | `EVE_ENV_FILE_RACE` | The file changed while Eden was reading or validating it. | Retry with a quiescent file. |
-| `EVE_ENV_RESERVED_VARIABLE` | The file tries to override a reserved host variable; the message names it. | Remove the reserved name. `HOST`, `NITRO_HOST`, `PORT`, `NITRO_PORT`, `NODE_ENV`, `NODE_EXTRA_CA_CERTS`, `WORKFLOW_LOCAL_BASE_URL`, `EDEN_WORLD_URL`, `EDEN_EVE_DEPLOYMENT_ID`, and `EDEN_EVE_GENERATION_ID` belong to the host. `EDEN_EVE_RUNTIME_REVISION` is host-owned too; it passes this check but fails the publish step with `EVE_HOST_CONFIG_INVALID` (the Worker-side check is `HOST_READINESS_UNPROVEN`). |
+| `EVE_ENV_RESERVED_VARIABLE` | The file tries to override a reserved host variable; the message names it. | Remove the reserved name (see [Reserved names](./reference.md#reserved-names)). Never set `EVE_DEV`, `VERCEL`, `VERCEL_ENV`, or `VERCEL_TARGET_ENV`: they switch Eve into development mode and can let unauthenticated callers in. `EDEN_EVE_RUNTIME_REVISION` is host-owned too; it passes this check but fails the publish step with `EVE_HOST_CONFIG_INVALID` (the Worker-side check is `HOST_READINESS_UNPROVEN`). |
 
 Keep the file outside source control, with the directory at mode `700` and
 the file at mode `600`:
@@ -285,7 +285,7 @@ not fire for the source tree, which Eden excludes by name. The check id is
 
 | Message fragment | Cause | Fix |
 | --- | --- | --- |
-| `contains a credential or environment file` | A dependency or build output ships a `.env*`, `.npmrc`, `.yarnrc*`, `.bunfig.toml`, `credentials.json`, `service-account.json`, `*.pem`, or `*.key` file. | Remove credential material from the project dependency and output closure and retry. |
+| `contains a credential or environment file` | A dependency or build output ships an environment or credential file from the [exclusion list](./security.md#secrets-and-the-env-file). | Remove credential material from the project dependency and output closure and retry. |
 | `contains an escaping symbolic link` | A dependency links outside the snapshot. | Regenerate dependencies and output without links outside the immutable snapshot. |
 | `escaped or changed during secret validation` | The closure changed while it was validated. | Regenerate dependencies and output inside the immutable project snapshot. |
 
@@ -906,6 +906,10 @@ Eve-bundled line. The pairing is version-specific: for Eve `0.68.0`, which
 bundles `@workflow/world` `5.0.0-beta.39`, the tested pair is
 `@workflow/world-postgres@5.0.0-beta.47`.
 
+The Cloudflare World must also declare `eden.capabilities.worldRpcAuth`.
+Without it, the agent's sandbox can read and change every session's workflow
+state. Install `@moinulmoin/eden-world-cloudflare@0.11.2` or later.
+
 On Eve `1.0.0-rc.6` and later with the Cloudflare World, the check also fails
 with:
 
@@ -914,7 +918,7 @@ with:
 > session would fail with HTTP 500.
 
 Eve now refuses to start a session on a World without them. Update the
-project's `@moinulmoin/eden-world-cloudflare` to `0.11.1` or later.
+project's `@moinulmoin/eden-world-cloudflare` to `0.11.2` or later.
 
 ## Destroy and cleanup leftovers
 
@@ -955,11 +959,22 @@ npx wrangler@4.147.0 whoami
 npx wrangler@4.147.0 login
 ```
 
+This also fails when the live Worker's authenticated provider settings do
+not match the recorded deployment identities, or its Container namespace
+does not match the Worker binding. Inspect the exact target before retrying;
+Eden refuses to delete a same-name replacement.
+
 ### `EVE_DESTROY_INDETERMINATE`
 
-The Worker or Container deletion did not complete with a terminal result. Eden
-attempts no broad cleanup. Inspect the retained deployment record and the
-Cloudflare inventory, then retry the exact target.
+The exact remote inventory could not be read completely, or a Worker or
+Container deletion did not complete with a terminal result. Eden never treats
+an authentication, permission, network, malformed or incomplete inventory
+result as absence. Inspect the retained deployment record and Cloudflare
+inventory, then retry the exact target.
+Wrangler does not expose the next Container page in JSON output. If its
+100-entry result does not include the exact target, Eden cannot prove
+absence. Retry, or inspect and delete only the named Container application
+in the Cloudflare dashboard, then retry destroy for the remaining cleanup.
 
 ### `EVE_DESTROY_ABSENCE_UNPROVEN`
 

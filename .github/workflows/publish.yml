@@ -38,7 +38,7 @@ jobs:
           node -e '
             const version = process.argv[1];
             if (!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(version)) {
-              throw new Error(`invalid release tag: v${version}`);
+              throw new Error("invalid release tag: v" + version);
             }
           ' "$version"
           grep -q "^## $version " CHANGELOG.md ||
@@ -76,11 +76,39 @@ jobs:
           node scripts/release-packages.mjs verify
           release-tarballs/release-manifest.json
 
+  smoke:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          registry-url: https://registry.npmjs.org
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Enable pinned pnpm
+        run: corepack enable
+
       - name: Smoke supported installers
-        env:
-          VERSION: ${{ steps.version.outputs.value }}
         # npm's tarball CDN can lag the registry metadata by minutes.
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node -e '
+            const version = process.argv[1];
+            if (!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(version)) {
+              throw new Error("invalid release tag: v" + version);
+            }
+          ' "$VERSION"
           retry() {
             for attempt in 1 2 3 4 5 6 7 8 9 10; do
               "$@" && return 0
@@ -95,7 +123,7 @@ jobs:
           retry npm view "@moinulmoin/eden-world-cloudflare@$VERSION" dist.integrity
 
   release:
-    needs: publish
+    needs: [publish, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

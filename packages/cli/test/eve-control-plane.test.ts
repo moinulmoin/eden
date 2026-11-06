@@ -1511,6 +1511,13 @@ describe("exact target Container inventory", () => {
 });
 
 describe("eden destroy", () => {
+  const destroyProviderEvidence = {
+    settingsReadable: true,
+    workerDeploymentId: "eve-deploy-test",
+    containerSchedulingPolicy: "durable_object",
+    containerNamespaceId: "namespace-test",
+    workerContainerNamespaceId: "namespace-test",
+  };
   async function createDeployedFixture(): Promise<{
     readonly root: string;
     readonly generationRoot: string;
@@ -1657,6 +1664,7 @@ describe("eden destroy", () => {
           eveControlPlane: {
             destroyCloudflareRead: async () => ({
               workerExists: exists,
+              providerEvidence: destroyProviderEvidence,
               ...(containerId === undefined
                 ? {}
                 : { containerApplicationId: containerId }),
@@ -1843,6 +1851,7 @@ describe("eden destroy", () => {
           eveControlPlane: {
             destroyCloudflareRead: async () => ({
               workerExists: true,
+              providerEvidence: destroyProviderEvidence,
               containerApplicationId: undefined,
               accountId: "account-test",
             }),
@@ -1888,6 +1897,7 @@ describe("eden destroy", () => {
             eveControlPlane: {
               destroyCloudflareRead: async () => ({
                 workerExists: true,
+                providerEvidence: destroyProviderEvidence,
                 containerApplicationId: undefined,
                 accountId: "account-test",
               }),
@@ -1927,6 +1937,7 @@ describe("eden destroy", () => {
           eveControlPlane: {
             destroyCloudflareRead: async () => ({
               workerExists: true,
+              providerEvidence: destroyProviderEvidence,
               containerApplicationId: "container-9",
               accountId: "account-test",
             }),
@@ -1974,6 +1985,7 @@ describe("eden destroy", () => {
           eveControlPlane: {
             destroyCloudflareRead: async () => ({
               workerExists: exists,
+              providerEvidence: destroyProviderEvidence,
               ...(containerId === undefined
                 ? {}
                 : { containerApplicationId: containerId }),
@@ -2556,6 +2568,9 @@ export default eveChannel({
           JSON.stringify({
             name: options.world ?? "@workflow/world-postgres",
             version: "5.0.0-beta.47",
+            ...(options.world === "@moinulmoin/eden-world-cloudflare"
+              ? { eden: { capabilities: { worldRpcAuth: true, atomicStartHook: true } } }
+              : {}),
             dependencies: { "@workflow/world": options.worldRange },
           }),
           "utf8",
@@ -2974,6 +2989,12 @@ describe("eden deploy in-place update", () => {
                 }),
                 "utf8",
               );
+              const worldRoot = join(request.snapshotRoot, "node_modules/@moinulmoin/eden-world-cloudflare");
+              await mkdir(worldRoot, { recursive: true });
+              await writeFile(join(worldRoot, "package.json"), JSON.stringify({
+                version: "0.11.1",
+                eden: { capabilities: { worldRpcAuth: true, atomicStartHook: true } },
+              }));
             }),
             onPublish: (request) => {
               publishedMigrations = request.hostConfig.worker.migrations;
@@ -3416,6 +3437,12 @@ describe("eden deploy in-place update", () => {
                 }),
                 "utf8",
               );
+              const worldRoot = join(request.snapshotRoot, "node_modules/@moinulmoin/eden-world-cloudflare");
+              await mkdir(worldRoot, { recursive: true });
+              await writeFile(join(worldRoot, "package.json"), JSON.stringify({
+                version: "0.11.1",
+                eden: { capabilities: { worldRpcAuth: true, atomicStartHook: true } },
+              }));
             }),
             onPublish: (request) => {
               publishedMigrations = request.hostConfig.worker.migrations;
