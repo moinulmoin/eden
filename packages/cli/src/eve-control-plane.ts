@@ -791,6 +791,27 @@ function eveRequiresAtomicStartHook(version: unknown): boolean {
 }
 
 /**
+ * The Cloudflare World declares the capability in its manifest. The Postgres
+ * World needs 5.1.1 or later, as Eve's own error says: 5.1.0 admits
+ * `start({ hook })`, but Eve passes `experimental_hook`. An unreadable
+ * version is left to Eve, the runtime authority.
+ */
+function worldAdmitsAtomicStartHook(
+  world: string,
+  manifest: { readonly version?: string; readonly eden?: { readonly capabilities?: { readonly atomicStartHook?: boolean } } },
+): boolean {
+  if (world === "@moinulmoin/eden-world-cloudflare") {
+    return manifest.eden?.capabilities?.atomicStartHook === true;
+  }
+  const match = typeof manifest.version === "string"
+    ? /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$/u.exec(manifest.version)
+    : null;
+  if (match === null) return true;
+  const order = Number(match[1]) - 5 || Number(match[2]) - 1 || Number(match[3]) - 1;
+  return order > 0 || (order === 0 && match[4] === undefined);
+}
+
+/**
  * Fails deploy/preflight when a known durable World would trip Eve's runtime
  * World-compatibility rejection. Unreadable manifests
  * mirror Eve's own behavior (skip); Eve is the runtime authority.
@@ -821,16 +842,16 @@ async function checkEveWorldPairing(
     );
   }
   if (
-    world === "@moinulmoin/eden-world-cloudflare" &&
     worldManifest !== undefined &&
     eveRequiresAtomicStartHook(eveManifest?.version) &&
-    worldManifest.eden?.capabilities?.atomicStartHook !== true
+    !worldAdmitsAtomicStartHook(world, worldManifest)
   ) {
+    const minimum = world === "@workflow/world-postgres" ? "5.1.1" : "0.11.2";
     return check(
       "EVE_WORLD_PAIRING",
       "failed",
       `Eve ${eveManifest?.version} needs a World with atomic start hooks, and the installed ${world} ${worldManifest.version ?? "(unknown version)"} does not have them; every new session would fail with HTTP 500.`,
-      `Install ${world}@0.11.2 or later; see docs/troubleshooting.md.`,
+      `Install ${world}@${minimum} or later; see docs/troubleshooting.md.`,
     );
   }
   const expectedRange = eveManifest === undefined

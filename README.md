@@ -44,19 +44,19 @@ change. New to Eve, or starting from `eve init`? Check
 `npx @moinulmoin/eden` needs no install. For a global `eden` command, use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.11.4
+npm install --global @moinulmoin/eden@0.11.5
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.11.4
+pnpm add --global @moinulmoin/eden@0.11.5
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.11.4
+bun add --global @moinulmoin/eden@0.11.5
 ```
 
 Confirm the installation:

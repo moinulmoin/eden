@@ -483,10 +483,10 @@ the Postgres World
 full `eden destroy` + `eden deploy` container replacement. This section is
 the tested recipe; other durable Worlds are project-owned and untested here.
 
-That result is historical, not a new Eve `0.83.0` Postgres validation. The
-database used for those proof notes has expired and its environment file was
-deleted; the notes do not provide a reachable database or reusable credentials.
-Use a current project-owned database and environment file for a new run.
+The latest live run, on 2026-11-07, used Eve `1.0.0-rc.6` with
+`@workflow/world-postgres` `5.1.1` and a Neon database: a new session ran bash
+and wrote a file, an in-place update kept that session going with the file
+intact, and a new session started after the update.
 
 Any Postgres reachable from Cloudflare works — for example a Neon project or
 a Supabase project. Cloudflare itself has no hosted Postgres; the database
@@ -507,11 +507,19 @@ easy to miss; `eden preflight` warns when it sees a pooled URL.
 
 Eve pins and validates its World at `eve build`, so the Postgres World
 version must match the `@workflow/world` version your Eve release bundles.
-Eve `0.68.0` bundles `@workflow/world` `5.0.0-beta.39` and pairs with:
+For Eve `1.0.0-rc.6` and later, which bundle `@workflow/world` `5.1.0`:
 
 ```sh
-npm add @workflow/world-postgres@5.0.0-beta.47
+npm add @workflow/world-postgres@5.1.1
 ```
+
+These Eve versions refuse to start a session unless the World creates the
+session's run and its start hook together, and the Postgres World does that
+from `5.1.1`. With an older release every new session fails with HTTP 500, so
+`eden preflight` and `eden deploy` stop with `EVE_WORLD_PAIRING` first.
+
+Eve `0.68.0` bundles `@workflow/world` `5.0.0-beta.39` and pairs with
+`@workflow/world-postgres@5.0.0-beta.47`.
 
 Use `pnpm add` instead for a pnpm project; keep the existing package manager
 and its matching lockfile.

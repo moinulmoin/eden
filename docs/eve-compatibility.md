@@ -235,8 +235,23 @@ channel address were not tested: Eve's HTTP channel only addresses sessions by
 ID.
 
 Eve also says sessions from Eve before `0.83.0` can't move to `rc.6`, and
-the Postgres World needs `@workflow/world-postgres` `5.1.1` or later. Postgres
-was not checked.
+the Postgres World needs `@workflow/world-postgres` `5.1.1` or later.
+
+## Eve 1.0.0-rc.6 with the Postgres World (2026-11-07)
+
+Released Eden `0.11.4` passed preflight on a fresh `rc.6` project with
+`@workflow/world-postgres` `5.0.5` and a Neon database, and the deployment
+answered health checks, but `POST /eve/v1/session` returned HTTP 500. The
+same image run locally logged the atomic start hook error above. Eden now
+fails `EVE_WORLD_PAIRING` before deploying when Eve needs atomic start hooks
+and the Postgres World is older than `5.1.1`. `5.1.0` declares the capability
+but reads `start({ hook })`, while Eve passes `experimental_hook`, which
+`5.1.1` reads.
+
+With `5.1.1`, live on Cloudflare: a new session replied and ran bash, which
+wrote a file; after a same-version in-place update the same session (same
+ID) read the file back; a new session ran after the update; destroy left the
+URL returning 404.
 
 ## Sandbox resume compatibility
 

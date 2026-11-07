@@ -902,23 +902,26 @@ transaction-mode pooled URL breaks live session streaming.
 > bundles `@workflow/core` <range>; Eve rejects this World at runtime.
 
 Install the `<world>` release whose `@workflow/core` dependency matches the
-Eve-bundled line. The pairing is version-specific: for Eve `0.68.0`, which
-bundles `@workflow/world` `5.0.0-beta.39`, the tested pair is
+Eve-bundled line. The pairing is version-specific: for Eve `1.0.0-rc.6`, which
+bundles `@workflow/world` `5.1.0`, the tested pair is
+`@workflow/world-postgres@5.1.1`; for Eve `0.68.0`, which bundles
+`@workflow/world` `5.0.0-beta.39`, it is
 `@workflow/world-postgres@5.0.0-beta.47`.
 
 The Cloudflare World must also declare `eden.capabilities.worldRpcAuth`.
 Without it, the agent's sandbox can read and change every session's workflow
 state. Install `@moinulmoin/eden-world-cloudflare@0.11.2` or later.
 
-On Eve `1.0.0-rc.6` and later with the Cloudflare World, the check also fails
-with:
+On Eve `1.0.0-rc.6` and later, the check also fails when the World can't
+start sessions the way Eve now requires:
 
 > Eve <version> needs a World with atomic start hooks, and the installed
-> `@moinulmoin/eden-world-cloudflare` <version> does not have them; every new
-> session would fail with HTTP 500.
+> <world> <version> does not have them; every new session would fail with
+> HTTP 500.
 
 Eve now refuses to start a session on a World without them. Update the
-project's `@moinulmoin/eden-world-cloudflare` to `0.11.2` or later.
+project's World: `@moinulmoin/eden-world-cloudflare` to `0.11.2` or later, or
+`@workflow/world-postgres` to `5.1.1` or later.
 
 ## Destroy and cleanup leftovers
 

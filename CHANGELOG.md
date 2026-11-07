@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.5 — 2026-11-08
+
+Update `@moinulmoin/eden`. Projects on the Postgres World with Eve
+`1.0.0-rc.6` or later also need `@workflow/world-postgres` `5.1.1` or later.
+
+### Fixed
+
+- **Postgres World on Eve `1.0.0-rc.6` passed preflight, then every new
+  session failed with HTTP 500.** Eve now refuses to start a session unless
+  the World creates the session's run and its start hook together, which
+  `@workflow/world-postgres` does from `5.1.1`. `eden preflight` and
+  `eden deploy` now stop with `EVE_WORLD_PAIRING` and name the version to
+  install, as they already did for the Cloudflare World.
+
+### Docs
+
+- The Postgres World recipe in `docs/deploy.md` now covers Eve `1.0.0-rc.6`
+  (`@workflow/world-postgres@5.1.1`), verified live: a session ran bash,
+  kept its file across an in-place update, and new sessions started.
+- `docs/faq.md` lists `1.0.0-rc.6` among the tested Eve versions.
+
 ## 0.11.4 — 2026-11-07
 
 ### Fixed

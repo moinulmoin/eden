@@ -2566,7 +2566,9 @@ export default eveChannel({
   });
 
   function postgresWorldBuilder(options: {
+    readonly eveVersion?: string;
     readonly eveCore?: string;
+    readonly worldVersion?: string;
     readonly worldRange?: string;
     readonly world?: string;
   }) {
@@ -2575,7 +2577,7 @@ export default eveChannel({
         join(request.snapshotRoot, "node_modules/eve/package.json"),
         JSON.stringify({
           name: "eve",
-          version: "0.31.3",
+          version: options.eveVersion ?? "0.31.3",
           bin: "bin/eve.js",
           dependencies: { "@workflow/core": options.eveCore ?? "5.0.0-beta.57" },
         }),
@@ -2599,6 +2601,12 @@ export default eveChannel({
         }),
         "utf8",
       );
+      if (options.eveVersion !== undefined) {
+        // Eve 0.83 and later builds must prepare a just-bash sandbox template.
+        const templates = join(request.snapshotRoot, ".eve/sandbox-cache/just-bash/templates");
+        await mkdir(templates, { recursive: true });
+        await writeFile(join(templates, "template.json"), "{}", "utf8");
+      }
       if (options.worldRange !== undefined) {
         await mkdir(
           join(request.snapshotRoot, "node_modules", options.world ?? "@workflow/world-postgres"),
@@ -2611,7 +2619,7 @@ export default eveChannel({
           ),
           JSON.stringify({
             name: options.world ?? "@workflow/world-postgres",
-            version: "5.0.0-beta.47",
+            version: options.worldVersion ?? "5.0.0-beta.47",
             ...(options.world === "@moinulmoin/eden-world-cloudflare"
               ? { eden: { capabilities: { worldRpcAuth: true, atomicStartHook: true } } }
               : {}),
@@ -2690,6 +2698,51 @@ export default eveChannel({
       value.id === "EVE_WORLD_PAIRING"
     );
     expect(pairing?.status).toBe("failed");
+  });
+
+  // Eve 1.0.0-rc.6 bundles @workflow/core 5.4.0 and refuses to start a
+  // session on a World without atomic start hooks; its own error names
+  // @workflow/world-postgres 5.1.1 as the first release that has them.
+  test.each([
+    { worldVersion: "5.0.5", worldRange: "5.0.5", exitCode: 1, status: "failed" },
+    { worldVersion: "5.1.0", worldRange: "5.1.0", exitCode: 1, status: "failed" },
+    { worldVersion: "5.1.1", worldRange: "5.1.0", exitCode: 0, status: "passed" },
+  ])("on Eve 1.0.0-rc.6, @workflow/world-postgres $worldVersion pre-checks $status", async ({ worldVersion, worldRange, exitCode, status }) => {
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    await mkdir(join(root, "agent"), { recursive: true });
+    await writeFile(
+      join(root, "agent/sandbox.ts"),
+      "import { defineSandbox } from 'eve/sandbox';\nimport { JustBashSandbox } from 'eve/sandbox/just-bash';\nexport const environment = JustBashSandbox.environment();\nexport default defineSandbox(() => environment.open());\n",
+    );
+    const output: string[] = [];
+
+    await expect(
+      runEdenCli(
+        ["preflight", "--project", root, "--env", "preview",
+        "--name", "eve-world-postgres-rc6", "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(
+            root,
+            postgresWorldBuilder({
+              eveVersion: "1.0.0-rc.6",
+              eveCore: "5.4.0",
+              worldVersion,
+              worldRange,
+            }),
+          ),
+        },
+      ),
+    ).resolves.toBe(exitCode);
+
+    const result = JSON.parse(output[0] as string) as {
+      readonly checks: readonly { readonly id: string; readonly status: string }[];
+    };
+    expect(
+      result.checks.find((value) => value.id === "EVE_WORLD_PAIRING")?.status,
+    ).toBe(status);
   });
 });
 
