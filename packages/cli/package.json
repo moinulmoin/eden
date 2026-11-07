@@ -1,6 +1,6 @@
 {
   "name": "@moinulmoin/eden",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "description": "Deploy existing Eve projects to your own Cloudflare account.",
   "keywords": [
     "ai",
@@ -32,7 +32,7 @@
     "NOTICE"
   ],
   "dependencies": {
-    "@moinulmoin/eden-runtime-cloudflare": "0.11.2",
+    "@moinulmoin/eden-runtime-cloudflare": "0.11.3",
     "wrangler": "4.147.0"
   },
   "scripts": {

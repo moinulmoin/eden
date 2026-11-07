@@ -711,6 +711,7 @@ const EVE_EXCLUDED_FILE_NAMES = new Set([
   ".pnpmrc",
   ".pypirc",
   ".bunfig.toml",
+  "bunfig.toml",
   ".yarnrc",
   ".yarnrc.yml",
   ".dev.vars",
@@ -720,6 +721,9 @@ const EVE_EXCLUDED_FILE_NAMES = new Set([
   "id_ecdsa",
   "id_ed25519",
   "id_dsa",
+  "id_ecdsa_sk",
+  "id_ed25519_sk",
+  "id_xmss",
   "secrets.json",
   "credentials.json",
   "service-account.json",
@@ -815,16 +819,24 @@ function isAllowedSystemAlias(path: string): boolean {
   return normalized === "/var" || normalized === "/tmp";
 }
 
+function isEnvironmentFile(name: string): boolean {
+  const normalizedName = name.toLowerCase();
+  return normalizedName.startsWith(".env") || normalizedName.endsWith(".env");
+}
+
 function isCredentialPath(relativePath: string): boolean {
   const parts = relativePath.split("/");
-  const name = parts[parts.length - 1];
-  return name !== undefined && (
+  const originalName = parts[parts.length - 1];
+  if (originalName === undefined) return false;
+  const name = originalName.toLowerCase();
+  return (
+    EVE_EXCLUDED_FILE_NAMES.has(originalName) ||
     EVE_EXCLUDED_FILE_NAMES.has(name) ||
     name.startsWith(".dev.vars.") ||
     name.endsWith(".pem") || name.endsWith(".key") ||
     name.endsWith(".p12") || name.endsWith(".pfx") ||
     name.endsWith(".tfvars") ||
-    (name === "credentials" && parts[parts.length - 2] === ".aws")
+    (name === "credentials" && parts[parts.length - 2]?.toLowerCase() === ".aws")
   );
 }
 
@@ -851,7 +863,7 @@ function isPathExcluded(
   if (runtimeEnvRelativePath !== undefined && relativePath === runtimeEnvRelativePath) {
     return { excluded: true, category: "runtime-env" };
   }
-  if (name !== undefined && name.startsWith(".env")) {
+  if (name !== undefined && isEnvironmentFile(name)) {
     return { excluded: true, category: "runtime-env" };
   }
   if (isCredentialPath(relativePath)) {
@@ -2292,7 +2304,7 @@ async function assertGeneratedTreesExcludeSecrets(
         : `${relativeDirectory}/${entry.name}`;
       const candidate = join(directory, entry.name);
       if (
-        entry.name.startsWith(".env") ||
+        isEnvironmentFile(entry.name) ||
         isCredentialPath(relativePath)
       ) {
         throw new EvePackagingError({

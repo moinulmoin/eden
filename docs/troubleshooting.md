@@ -971,10 +971,10 @@ Container deletion did not complete with a terminal result. Eden never treats
 an authentication, permission, network, malformed or incomplete inventory
 result as absence. Inspect the retained deployment record and Cloudflare
 inventory, then retry the exact target.
-Wrangler does not expose the next Container page in JSON output. If its
-100-entry result does not include the exact target, Eden cannot prove
-absence. Retry, or inspect and delete only the named Container application
-in the Cloudflare dashboard, then retry destroy for the remaining cleanup.
+Wrangler's JSON Container listing omits pagination metadata, so Eden instead
+uses the name-filtered Container applications API and follows its page tokens.
+A full response without pagination metadata or a failed page read is
+indeterminate, never proof that the named application is absent.
 
 ### `EVE_DESTROY_ABSENCE_UNPROVEN`
 

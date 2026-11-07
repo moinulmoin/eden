@@ -326,7 +326,8 @@ function parseEnvironmentText(
       });
     }
     if (
-      (EVE_RESERVED_HOST_VARIABLES as readonly string[]).includes(name)
+      (EVE_RESERVED_HOST_VARIABLES as readonly string[]).includes(name) ||
+      /^(DOCKER_|BUILDKIT_|BUILDX_|COMPOSE_|LD_|DYLD_)/u.test(name)
     ) {
       throw new EveRuntimeConfigError({
         code: "EVE_ENV_RESERVED_VARIABLE",

@@ -1876,6 +1876,47 @@ describe("eden destroy", () => {
     ).resolves.toBeDefined();
   });
 
+  test("refuses to delete a same-name Worker that another project published with the same affinity deployment ID", async () => {
+    const { root, generationRoot } = await createDeployedFixture();
+    const recordPath = join(generationRoot, "deployment.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as { identity: Record<string, unknown> };
+    // Every project on the same Eve version publishes the same affinity ID;
+    // only the per-publish release ID tells them apart.
+    record.identity.deploymentId = "eden-affinity-shared";
+    record.identity.releaseId = "eve-deploy-this-project";
+    await writeFile(recordPath, JSON.stringify(record), "utf8");
+    const errors: string[] = [];
+    const deleted: string[] = [];
+    await expect(
+      runEdenCli(
+        ["destroy", "--project", root, "--env", "preview", "--name", "eve-destroy-fixture", "--json"],
+        {
+          cwd: root,
+          stdout: () => undefined,
+          stderr: (line) => errors.push(line),
+          eveControlPlane: {
+            destroyCloudflareRead: async () => ({
+              workerExists: true,
+              providerEvidence: {
+                ...destroyProviderEvidence,
+                workerDeploymentId: "eden-affinity-shared",
+                workerReleaseId: "eve-deploy-other-project",
+              },
+              containerApplicationId: undefined,
+              accountId: "account-test",
+            }),
+            deleteWorker: async ({ name }) => {
+              deleted.push(name);
+              return "deleted";
+            },
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(deleted).toEqual([]);
+    expect(errors.join("\n")).toContain("EVE_DESTROY_OWNERSHIP_UNPROVEN");
+  });
+
   test("keeps the default Wrangler Worker deletion on the 120 second deadline", async () => {
     const { root } = await createDeployedFixture();
     const errors: string[] = [];
@@ -1909,7 +1950,10 @@ describe("eden destroy", () => {
 
     expect(calls).toEqual([
       {
-        args: ["delete", "--name", "eve-destroy-fixture", "--force"],
+        args: [
+          "delete", "--name", "eve-destroy-fixture", "--force",
+          "--config", expect.stringMatching(/eden-wrangler-[^/]+\/wrangler\.json$/u),
+        ],
         timeoutMs: 120_000,
       },
     ]);
@@ -3321,6 +3365,57 @@ describe("eden deploy in-place update", () => {
       result.checks.find((value) => value.id === "VAL-CLI-007-TARGET-CONFLICT")
         ?.status,
     ).toBe("failed");
+  });
+
+  test("updates only the Worker whose release ID this project recorded, not another project's Worker sharing its affinity ID", async () => {
+    const run = async (workerReleaseId: string) => {
+      const root = await createRoot();
+      await writeProject(root);
+      const { generationRoot } = await createOwnedTargetFixture(root);
+      const recordPath = join(generationRoot, "deployment.json");
+      const record = JSON.parse(await readFile(recordPath, "utf8")) as { identity: Record<string, unknown> };
+      record.identity.deploymentId = "eden-affinity-shared";
+      record.identity.releaseId = "eve-deploy-this-project";
+      await writeFile(recordPath, JSON.stringify(record), "utf8");
+      const operations: string[] = [];
+      const code = await runEdenCli(
+        ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: () => undefined,
+          eveControlPlane: {
+            ...updateControlPlane(root, operations),
+            cloudflareRead: async () => ({
+              accountAccess: "available" as const,
+              containerAccess: "available" as const,
+              accountId: "account-test",
+              workersDevSubdomain: "account",
+              target: {
+                state: "unowned" as const,
+                observed: { worker: true, container: true },
+                providerEvidence: {
+                  containerSchedulingPolicy: "durable_object",
+                  containerNamespaceId: "namespace-do-test",
+                  workerContainerNamespaceId: "namespace-do-test",
+                  workerDeploymentId: "eden-affinity-shared",
+                  workerReleaseId,
+                  settingsReadable: true,
+                },
+              },
+            }),
+          },
+        },
+      );
+      return { code, operations };
+    };
+
+    const foreign = await run("eve-deploy-other-project");
+    expect(foreign.code).toBe(1);
+    expect(foreign.operations).toEqual([]);
+
+    const own = await run("eve-deploy-this-project");
+    expect(own.code).toBe(0);
+    expect(own.operations).toContain("publish");
   });
 
   test("a retry after a health-failed update keeps the already-published migration tag", async () => {

@@ -1298,14 +1298,14 @@ function candidateMetadata(
   };
 }
 
-function safeWranglerEnvironment(): NodeJS.ProcessEnv {
+function safeWranglerEnvironment(cwd: string): NodeJS.ProcessEnv {
   return {
-    PATH: process.env.PATH,
-    HOME: process.env.HOME,
-    TMPDIR: process.env.TMPDIR,
-    LANG: process.env.LANG,
-    LC_ALL: process.env.LC_ALL,
+    ...safeDockerEnvironment(),
     CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
+    CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID,
+    NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS,
+    XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+    WRANGLER_CACHE_DIR: join(cwd, "cache"),
     CLOUDFLARE_API_BASE_URL: "https://api.cloudflare.com/client/v4",
     NODE_OPTIONS: undefined,
   };
@@ -1320,6 +1320,15 @@ function safeDockerEnvironment(): NodeJS.ProcessEnv {
     LC_ALL: process.env.LC_ALL,
     DOCKER_HOST: process.env.DOCKER_HOST,
     DOCKER_CONTEXT: process.env.DOCKER_CONTEXT,
+    DOCKER_CONFIG: process.env.DOCKER_CONFIG,
+    DOCKER_CERT_PATH: process.env.DOCKER_CERT_PATH,
+    DOCKER_TLS_VERIFY: process.env.DOCKER_TLS_VERIFY,
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    NO_PROXY: process.env.NO_PROXY,
+    http_proxy: process.env.http_proxy,
+    https_proxy: process.env.https_proxy,
+    no_proxy: process.env.no_proxy,
   };
 }
 
@@ -1332,8 +1341,11 @@ interface WranglerJsonResult {
 async function withWranglerDirectory<T>(
   operation: (cwd: string) => Promise<T>,
 ): Promise<T> {
+  // An explicit --config and WRANGLER_CACHE_DIR inside this private folder
+  // stop Wrangler from searching its (possibly shared) parent directories.
   const cwd = await mkdtemp(join(tmpdir(), "eden-wrangler-"));
   try {
+    await writeFile(join(cwd, "wrangler.json"), "{}\n", { mode: 0o600 });
     return await operation(cwd);
   } finally {
     await rm(cwd, { recursive: true, force: true });
@@ -1347,9 +1359,9 @@ async function readWranglerJson(
   try {
     const result = await withWranglerDirectory((cwd) => execFileAsync(
       process.execPath,
-      [wranglerEntrypoint, ...args],
+      [wranglerEntrypoint, ...args, "--config", join(cwd, "wrangler.json")],
       {
-        env: safeWranglerEnvironment(),
+        env: safeWranglerEnvironment(cwd),
         cwd,
         maxBuffer: 2 * 1024 * 1024,
         timeout: timeoutMs,
@@ -1385,6 +1397,7 @@ function jsonCollection(value: unknown): readonly unknown[] | undefined {
 function exactContainerEntries(
   value: unknown,
   name: string,
+  complete: boolean = false,
 ): readonly {
   readonly id: string;
   readonly name: string;
@@ -1409,7 +1422,8 @@ function exactContainerEntries(
       });
     }
   }
-  if (entries.length === 0 && collection.length >= 100) {
+  // Without proven pagination, a full page that lacks the name proves nothing.
+  if (entries.length === 0 && !complete && collection.length >= 100) {
     return undefined;
   }
   return entries;
@@ -1443,18 +1457,27 @@ function authenticatedAccountId(value: unknown): string | undefined {
   if (
     typeof account !== "object" ||
     account === null ||
-    typeof (account as { readonly id?: unknown }).id !== "string"
+    !("id" in account) ||
+    typeof account.id !== "string"
   ) {
     return undefined;
   }
-  return (account as { readonly id: string }).id;
+  const selectedAccount = process.env.CLOUDFLARE_ACCOUNT_ID;
+  if (selectedAccount && selectedAccount !== account.id) {
+    return undefined;
+  }
+  return account.id;
 }
 
 async function readWranglerOAuthToken(): Promise<string | undefined> {
-  const root = process.env.WRANGLER_HOME ??
+  const legacyRoot = join(homedir(), ".wrangler");
+  const legacyExists = (await lstat(legacyRoot).catch(() => undefined))?.isDirectory();
+  const configHome = process.env.XDG_CONFIG_HOME ??
     (process.platform === "darwin"
-      ? join(homedir(), "Library", "Preferences", ".wrangler")
-      : join(homedir(), ".config", ".wrangler"));
+      ? join(homedir(), "Library", "Preferences")
+      : join(homedir(), ".config"));
+  const root = process.env.WRANGLER_HOME ??
+    (legacyExists ? legacyRoot : join(configHome, ".wrangler"));
   const raw = await readFile(join(root, "config", "default.toml"), "utf8")
     .catch(() => undefined);
   if (raw === undefined) return undefined;
@@ -1512,19 +1535,67 @@ export function exactTargetContainerEntries(
   return exactContainerEntries(value, boundedResourceName(name, "container"));
 }
 
+async function readTargetContainers(name: string): Promise<WranglerJsonResult> {
+  const account = await readWranglerJson(["whoami", "--json"]);
+  const accountId = authenticatedAccountId(account.value);
+  const token = process.env.CLOUDFLARE_API_TOKEN || await readWranglerOAuthToken();
+  if (accountId === undefined || !token) return { failed: true };
+  // Unlike `containers list --json`, this endpoint supports an exact name
+  // filter and exposes result_info.next_page_token. No per_page means all.
+  const entries: unknown[] = [];
+  const seenTokens = new Set<string>();
+  let pageToken: string | undefined;
+  try {
+    do {
+      const url = new URL(
+        `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/containers/applications`,
+      );
+      url.searchParams.set("name", name);
+      if (pageToken !== undefined) url.searchParams.set("page_token", pageToken);
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!response.ok) return { failed: true };
+      const body: unknown = await response.json();
+      if (typeof body !== "object" || body === null ||
+        !("success" in body) || body.success !== true ||
+        !("result" in body) || !Array.isArray(body.result)) return { failed: true };
+      const info = "result_info" in body ? body.result_info : undefined;
+      if (info !== undefined &&
+        (typeof info !== "object" || info === null || Array.isArray(info))) {
+        return { failed: true };
+      }
+      const next = info !== undefined && "next_page_token" in info
+        ? info.next_page_token
+        : undefined;
+      if (next !== undefined && next !== null && typeof next !== "string") {
+        return { failed: true };
+      }
+      // Missing pagination metadata on a full page cannot prove absence.
+      if (info === undefined && body.result.length >= 100) return { failed: true };
+      entries.push(...body.result);
+      pageToken = typeof next === "string" && next.length > 0 ? next : undefined;
+      if (pageToken !== undefined) {
+        if (seenTokens.has(pageToken)) return { failed: true };
+        seenTokens.add(pageToken);
+      }
+    } while (pageToken !== undefined);
+    return { failed: false, value: entries };
+  } catch {
+    return { failed: true };
+  }
+}
+
 async function readExactTargetInventory(workerName: string, containerApp: string) {
-  // Wrangler's JSON output does not expose a pagination cursor. A full page
-  // without the exact name remains indeterminate in exactContainerEntries.
-  const containers = await readWranglerJson([
-    "containers", "list", "--json", "--per-page", "100",
-  ]);
+  const containers = await readTargetContainers(containerApp);
   const deployments = await readWranglerJson([
     "deployments", "list", "--name", workerName, "--json",
   ]);
   return {
     containers,
     deployments,
-    containerEntries: containers.failed ? undefined : exactContainerEntries(containers.value, containerApp),
+    containerEntries: containers.failed ? undefined : exactContainerEntries(containers.value, containerApp, true),
     deploymentEntries: exactDeploymentEntries(deployments.value),
   };
 }
@@ -2206,10 +2277,12 @@ async function runWranglerWithInput(
   return withWranglerDirectory((cwd) => new Promise((resolveResult) => {
     const child = spawn(
       process.execPath,
-      [wranglerEntrypoint, ...args],
+      [wranglerEntrypoint, ...args, ...(args.includes("--config")
+        ? []
+        : ["--config", join(cwd, "wrangler.json")])],
       {
         cwd,
-        env: safeWranglerEnvironment(),
+        env: safeWranglerEnvironment(cwd),
         stdio: ["pipe", "pipe", "pipe"],
       },
     );

@@ -26,12 +26,14 @@ How Eden handles it:
   in. Eden checks that the file does not change while the deploy runs. See
   the [reference](./reference.md) for the exact rules.
 - **Never in the image.** Eden copies your project into the builder without
-  your env file, without any `.env*` file, and without credential files
-  (`.npmrc`, `.pnpmrc`, `.pypirc`, `.yarnrc`, `.yarnrc.yml`, `.bunfig.toml`,
-  `.dev.vars`, `.dev.vars.*`, `.netrc`, `.git-credentials`, `id_rsa`,
-  `id_ecdsa`, `id_ed25519`, `id_dsa`, `*.p12`, `*.pfx`, `.aws/credentials`,
-  `*.tfvars`, `secrets.json`, `credentials.json`, `service-account.json`,
-  `*.pem`, `*.key`). Public SSH keys (`*.pub`) are not excluded. If the
+  your env file, without any `.env*` or `*.env` file, and without credential
+  files (`.npmrc`, `.pnpmrc`, `.pypirc`, `.yarnrc`, `.yarnrc.yml`,
+  `bunfig.toml`, `.bunfig.toml`, `.dev.vars`, `.dev.vars.*`, `.netrc`,
+  `.git-credentials`, `id_rsa`, `id_ecdsa`, `id_ed25519`, `id_dsa`,
+  `id_ecdsa_sk`, `id_ed25519_sk`, `id_xmss`, `*.p12`, `*.pfx`,
+  `.aws/credentials`, `*.tfvars`, `secrets.json`, `credentials.json`,
+  `service-account.json`, `*.pem`, `*.key`). These names match in any letter
+  case. Public SSH keys (`*.pub`) are not excluded. If the
   install or `eve build` output still contains one of those files, or a
   symbolic link that points outside the project, the deploy stops with
   `SECRET_EXCLUSION_FAILED`.
@@ -77,12 +79,12 @@ What the Worker does for you:
   deployment and generation IDs, and container instance name. They identify
   the deployment; they contain no secrets.
 
-For Cloudflare World packages declaring `worldRpcAuth`, the container's World
-RPC endpoint requires a per-start secret supplied only to that container's
-World client. This protects workflow state across sessions; the RPC endpoint
-is not protected by the agent's Eve authenticator. Update both the CLI and
-the project's Cloudflare World package to enable it. Older kept versions
-without this capability could expose every session's workflow state through
+The container's Cloudflare World RPC endpoint always requires a per-start
+secret supplied only to that container's World client; requests without it
+get `403`. This protects workflow state across sessions; the RPC endpoint is
+not protected by the agent's Eve authenticator. Preflight requires a
+Cloudflare World package with this capability (0.10.0 or later). Older kept
+versions without this capability could expose every session's workflow state through
 their sandbox. The next deploy now removes their routes and retires them
 regardless of live sessions, queued messages, or transfers. This includes
 the legacy `eden-cloudflare` version from Eden ≤`0.9.0`. Their sessions end;
@@ -111,9 +113,10 @@ never switches accounts silently. For each target it creates one Worker, one
 Container application, its Durable Objects, registry images, and, only when
 your project has schedules, one Cron Trigger. The exact names are listed in
 the [reference](./reference.md).
-Wrangler runs in a fresh Eden-owned temporary directory outside the project;
-project `.env` and `.env.local` files cannot redirect account operations or
-secret uploads.
+Wrangler runs in a fresh, private Eden-owned temporary directory outside the
+project, with its configuration file and account cache pinned inside it.
+Project `.env` files and configuration or cache files planted in a shared
+temporary directory cannot redirect account operations or secret uploads.
 
 - **Exact ownership.** Eden writes a deployment record under
   `.eden/eve-deploy/` in your project. A deploy only updates a target that

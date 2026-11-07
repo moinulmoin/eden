@@ -1150,6 +1150,15 @@ function safeDockerEnvironment(): NodeJS.ProcessEnv {
     LC_ALL: process.env.LC_ALL,
     DOCKER_HOST: process.env.DOCKER_HOST,
     DOCKER_CONTEXT: process.env.DOCKER_CONTEXT,
+    DOCKER_CONFIG: process.env.DOCKER_CONFIG,
+    DOCKER_CERT_PATH: process.env.DOCKER_CERT_PATH,
+    DOCKER_TLS_VERIFY: process.env.DOCKER_TLS_VERIFY,
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    NO_PROXY: process.env.NO_PROXY,
+    http_proxy: process.env.http_proxy,
+    https_proxy: process.env.https_proxy,
+    no_proxy: process.env.no_proxy,
   };
 }
 
@@ -1169,7 +1178,7 @@ async function docker(
   } = {},
 ): Promise<{ readonly stdout: string; readonly stderr: string }> {
   return execFileAsync(state.command, [...args], {
-    env: { ...state.env, ...options.environment },
+    env: { ...options.environment, ...state.env },
     cwd: state.generationRoot,
     maxBuffer: options.maxBuffer ?? 4 * 1024 * 1024,
   });
@@ -1716,7 +1725,8 @@ export async function buildEveRuntimeImage(
       });
     if (request.runtimeInjection !== undefined) {
       const collision = Object.keys(runtimeEnvironment).find((name) =>
-        DOCKER_CLI_OWNED_VARIABLES.includes(name)
+        DOCKER_CLI_OWNED_VARIABLES.includes(name) ||
+        /^(DOCKER_|BUILDKIT_|BUILDX_|COMPOSE_|LD_|DYLD_)/u.test(name)
       );
       if (collision !== undefined) {
         throw packagingError(

@@ -17,7 +17,7 @@ Eden has four commands and two top-level switches.
 | `eden skill` | Print the bundled Eden skill verbatim for coding agents |
 
 `eden --help` (or `-h`) prints the top-level usage. `eden --version` (or `-v`)
-prints the installed version, for example `0.11.2`. Running `eden` with no
+prints the installed version, for example `0.11.3`. Running `eden` with no
 arguments prints the same usage. An unknown command fails with
 `COMMAND_UNKNOWN`.
 
@@ -44,7 +44,7 @@ deployment records under `.eden/eve-deploy/`, the Docker daemon, and the
 Cloudflare account.
 
 Preflight changes nothing in your Cloudflare account: it performs read-only
-calls (`wrangler whoami --json`, `wrangler containers list --json`,
+calls (`wrangler whoami --json`, the name-filtered Container applications API,
 `wrangler deployments list --name <target> --json`, the account's
 `workers/subdomain` endpoint, and the Worker's script settings) and never
 uploads, publishes, or deletes. Locally it writes one generation directory
@@ -309,6 +309,11 @@ with `EVE_ENV_RESERVED_VARIABLE`:
 `EDEN_AFFINITY_CONTRACT`, `EVE_SCHEDULES_DISABLED`, `EDEN_EVE_CONTROL_TOKEN`,
 `EVE_DEV`, `VERCEL`, `VERCEL_ENV`, `VERCEL_TARGET_ENV`.
 
+Names beginning with `DOCKER_`, `BUILDKIT_`, `BUILDX_`, `COMPOSE_`, `LD_`,
+or `DYLD_` are also reserved. These configure the local Docker client or
+dynamic loader, not Eve; remove them from `--env-file`. Docker settings
+must come from your own shell.
+
 Remove the four development-mode variables rather than setting production
 values: they switch Eve into development mode, which can let unauthenticated
 callers in. The Worker rejects them too, and its container entrypoint unsets
@@ -348,8 +353,10 @@ in the account.
 | --- | --- | --- |
 | `EDEN_EVE_CONTAINER_SLEEP_AFTER` | `eden deploy` | Sets the container idle sleep window. Format: a number with an optional `ms`, `s`, `m`, `h`, or `d` suffix, where a bare number means seconds (`90s`, `3h`). Default `1h`; the maximum is `345m` (5 h 45 min), because Cloudflare stops a container within six hours of its Durable Object going idle and Eden must snapshot before that. A larger value fails the publish step with `EVE_HOST_CONFIG_INVALID`; the Worker-side check is `HOST_READINESS_UNPROVEN` |
 | `CLOUDFLARE_API_TOKEN` | Eden | Used instead of the Wrangler OAuth token for the account and subdomain reads |
-| `WRANGLER_HOME` | Eden | Directory that holds the Wrangler OAuth token. Defaults to `~/Library/Preferences/.wrangler` on macOS and `~/.config/.wrangler` elsewhere |
-| `DOCKER_HOST`, `DOCKER_CONTEXT` | Eden | Passed to the Docker CLI, so a remote or alternate Docker context can be used |
+| `WRANGLER_HOME` | Eden | Directory that holds the Wrangler OAuth token for direct API reads. Otherwise Eden follows Wrangler's legacy `~/.wrangler` directory when present, then `$XDG_CONFIG_HOME/.wrangler`, or `~/Library/Preferences/.wrangler` on macOS and `~/.config/.wrangler` elsewhere |
+| `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY` | Eden and Wrangler | Passed from your shell to the Docker CLI and Wrangler image push, so both use the same daemon and credentials |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and Wrangler | Passed from your shell to Docker and Wrangler |
+| `NODE_EXTRA_CA_CERTS`, `XDG_CONFIG_HOME`, `CLOUDFLARE_ACCOUNT_ID` | Wrangler (configuration/account selection also checked by Eden) | Trusted shell settings for certificate trust, configuration location, and account selection; Eden still requires exactly one authenticated account, matching `CLOUDFLARE_ACCOUNT_ID` when set |
 
 ### Variables Eden sets in the container
 

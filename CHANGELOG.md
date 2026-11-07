@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.11.3 — 2026-11-07
+
+Security hardening from a second review of 0.11.2. Update `@moinulmoin/eden`.
+
+### Security
+
+- **Env-file names that steer Docker are refused.** Values from `--env-file`
+  reached the local Docker client's own environment during preflight, so a
+  hostile env file could point Docker at another daemon (`DOCKER_CONFIG`) or
+  load a library into it (`LD_PRELOAD`). Names starting with `DOCKER_`,
+  `BUILDKIT_`, `BUILDX_`, `COMPOSE_`, `LD_`, or `DYLD_` now fail with
+  `EVE_ENV_RESERVED_VARIABLE`, and Docker's own settings come only from your
+  shell.
+- **Wrangler can't be steered from a shared temporary folder.** Wrangler looked
+  for a config file and its account cache in the parent folders of Eden's
+  temporary folder, which is the shared `/tmp` on Linux. Eden now gives every
+  Wrangler command an explicit config file and cache folder inside its own
+  private temporary folder.
+- **`destroy` no longer misses Containers past the first page.** Wrangler's JSON
+  Container list returns one page, so in an account with many Containers the
+  target could look absent and `destroy` cleared its record while the Container
+  stayed. Eden now asks the Cloudflare API for the exact name, follows every
+  page, and treats an incomplete read as indeterminate.
+- **More secret files stay out of the image:** `*.env` (such as
+  `production.env`), `bunfig.toml`, and the SSH keys `id_ecdsa_sk`,
+  `id_ed25519_sk`, and `id_xmss`. Secret file names now match in any letter
+  case.
+- **The World always requires its token.** The runtime asked for the per-start
+  World token only when the deployment declared it; it now requires it for
+  every request, so a hand-edited or third-party configuration can't open the
+  World to the sandbox.
+- **npm publishing is isolated from the build.** The release workflow's build
+  and tests now run in a job that cannot obtain npm publishing credentials; a
+  separate job publishes the exact checked tarballs.
+- **The site sends security headers** (Content-Security-Policy and friends),
+  and the repository has a `SECURITY.md` for private vulnerability reports.
+
+### Fixed
+
+- Wrangler now receives your shell's Docker settings (`DOCKER_HOST`,
+  `DOCKER_CONTEXT`, `DOCKER_CONFIG`, TLS settings), proxy settings
+  (`HTTP(S)_PROXY`, `NO_PROXY`), `NODE_EXTRA_CA_CERTS`, `XDG_CONFIG_HOME`, and
+  `CLOUDFLARE_ACCOUNT_ID`. Before, `wrangler containers push` ignored a
+  non-default Docker daemon and failed behind a proxy.
+
 ## 0.11.2 — 2026-11-07
 
 A security release. Update `@moinulmoin/eden`. Projects on the Cloudflare World

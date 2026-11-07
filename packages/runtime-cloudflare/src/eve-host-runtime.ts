@@ -427,17 +427,13 @@ export async function routeEveOutboundRequest(
     if (env.EDEN_EVE_DEPLOYMENTS !== undefined && route === undefined) {
       return new Response("Deployment retired; its sessions ended.", { status: 403 });
     }
-    const authRequired = route?.worldRpcAuth === true ||
-      (env.EDEN_EVE_DEPLOYMENTS === undefined && env.EDEN_EVE_WORLD_RPC_AUTH === true);
-    if (authRequired) {
-      const supplied = request.headers.get("x-eden-world-token") ?? "";
-      const encoder = new TextEncoder();
-      const expected = encoder.encode(expectedWorldToken ?? "");
-      const actual = encoder.encode(supplied);
-      const subtle = crypto.subtle as SubtleCrypto & { timingSafeEqual(a: ArrayBufferView, b: ArrayBufferView): boolean };
-      if (expected.length === 0 || actual.length !== expected.length || !subtle.timingSafeEqual(actual, expected)) {
-        return new Response(null, { status: 403 });
-      }
+    const supplied = request.headers.get("x-eden-world-token") ?? "";
+    const encoder = new TextEncoder();
+    const expected = encoder.encode(expectedWorldToken ?? "");
+    const actual = encoder.encode(supplied);
+    const subtle = crypto.subtle as SubtleCrypto & { timingSafeEqual(a: ArrayBufferView, b: ArrayBufferView): boolean };
+    if (expected.length === 0 || actual.length !== expected.length || !subtle.timingSafeEqual(actual, expected)) {
+      return new Response(null, { status: 403 });
     }
     const world = env.EDEN_WORLD as {
       idFromName(name: string): unknown;
