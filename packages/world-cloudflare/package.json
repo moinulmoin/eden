@@ -1,6 +1,6 @@
 {
   "name": "@moinulmoin/eden-world-cloudflare",
-  "version": "0.11.3",
+  "version": "0.11.4",
   "description": "Cloudflare Durable Object SQLite World for Eve workflows.",
   "eden": {
     "capabilities": {

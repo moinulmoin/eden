@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.4 — 2026-11-07
+
+### Fixed
+
+- **One oversized conversation could jam Eve upgrades on the Cloudflare
+  World.** When a session moved to a new Eve version and the conversation
+  files went over the 1 GiB carry limit, the move retried forever: both
+  versions stayed awake, the old one never retired, and after 10 versions
+  deploys were refused. The move now fails once with
+  `SANDBOX_EXPORT_FAILED`, the session stays on its current version with its
+  files, and everything else carries on.
+
+### Docs
+
+- `docs/security.md` now says plainly that any request, even a rejected one,
+  wakes the container and restarts its idle timer.
+
 ## 0.11.3 — 2026-11-07
 
 Security hardening from a second review of 0.11.2. Update `@moinulmoin/eden`.

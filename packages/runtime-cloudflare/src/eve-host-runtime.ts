@@ -226,6 +226,18 @@ interface EveStoredSandboxCarry {
   readonly at: number;
 }
 
+/**
+ * A required carry can never succeed while the sessions archive exceeds the
+ * carry cap, so the sandbox transfer must settle as terminally failed
+ * instead of retrying forever.
+ */
+class EveSandboxCarryLimitError extends Error {
+  constructor() {
+    super("The imported sandbox carry exceeds the archive limit.");
+    this.name = "EveSandboxCarryLimitError";
+  }
+}
+
 /** Snapshot attempts the alarm retries before destroying anyway so a stuck
  * snapshot path never keeps billing alive forever. */
 const EVE_HOST_SNAPSHOT_MAX_ATTEMPTS = 3;
@@ -248,7 +260,7 @@ interface EveQueueDeliveryClaim {
   readonly attempt: number;
 }
 
-type EveSandboxImportResult = "source-export-failed" | undefined;
+type EveSandboxImportResult = "source-export-failed" | "carry-limit-exceeded" | undefined;
 
 interface EveContainerLoopbackNamespace {
   getByName(name: string): {
@@ -307,7 +319,7 @@ export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnviro
           if (message.sourceDeploymentId && message.sourceDeploymentId !== deploymentId && message.sandboxSessionId) {
             try {
               const result = await target.importSandboxSessions(message.sourceDeploymentId, deploymentId, message.messageId, message.sandboxSessionId);
-              if (result === "source-export-failed") {
+              if (result === "source-export-failed" || result === "carry-limit-exceeded") {
                 await settleUnstarted();
                 return { ok: false, sandboxTransferFailed: true };
               }
@@ -1027,7 +1039,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       await reader.cancel().catch(() => undefined);
       if (overflowed) {
         await discardWrittenChunks();
-        if (required) throw new Error("The imported sandbox carry exceeds the archive limit.");
+        if (required) throw new EveSandboxCarryLimitError();
         console.error(
           `The Eve sandbox session carry exceeded ${EVE_HOST_CARRY_LIMITS.maxBytes} compressed bytes; keeping the previous carry.`,
         );
@@ -1377,7 +1389,20 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       // Persist imports before acknowledging them, including crash recovery.
       // An older whole-container snapshot must not hide the refreshed carry.
       await this.ctx.storage.delete(EVE_HOST_CONTAINER_SNAPSHOT_KEY);
-      await this.carrySandboxSessionsOut(runtime, true);
+      try {
+        await this.carrySandboxSessionsOut(runtime, true);
+      } catch (error: unknown) {
+        // An archive over the carry cap can never succeed, so the transfer
+        // must settle as terminally failed instead of retrying forever and
+        // pinning the deployment busy.
+        if (error instanceof EveSandboxCarryLimitError) {
+          console.error(
+            `The imported sandbox session carry exceeded ${EVE_HOST_CARRY_LIMITS.maxBytes} compressed bytes; failing the sandbox transfer.`,
+          );
+          return "carry-limit-exceeded";
+        }
+        throw error;
+      }
       await this.ctx.storage.put("eden.eve.host.has-imported-sandboxes", true);
       await this.ctx.storage.put(key, true);
       const cleanup = await runtime.exec(["rm", "-rf", stage], { stdout: "ignore", stderr: "ignore" });

@@ -62,6 +62,12 @@ localhost do not grant access on Cloudflare; replace the placeholder in
 [Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection)
 before you deploy.
 
+Any request wakes the container and restarts its idle timer (one hour by
+default), even one your authenticator rejects, because only Eve knows who is
+allowed in. Someone who finds the URL can therefore keep the container
+running, which costs you Container time; it cannot get past your
+authenticator.
+
 What the Worker does for you:
 
 - Returns `404` for Eve's internal workflow queue routes

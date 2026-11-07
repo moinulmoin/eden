@@ -17,7 +17,7 @@ Eden has four commands and two top-level switches.
 | `eden skill` | Print the bundled Eden skill verbatim for coding agents |
 
 `eden --help` (or `-h`) prints the top-level usage. `eden --version` (or `-v`)
-prints the installed version, for example `0.11.3`. Running `eden` with no
+prints the installed version, for example `0.11.4`. Running `eden` with no
 arguments prints the same usage. An unknown command fails with
 `COMMAND_UNKNOWN`.
 
