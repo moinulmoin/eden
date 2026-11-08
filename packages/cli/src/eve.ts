@@ -94,6 +94,19 @@ function eveErrorRemediation(code: string): string | undefined {
       return "Check the authenticated World's deployment-control response and health, then rerun eden deploy for the same target. Retain .eden and the existing deployments.";
     case "EVE_DESTROY_FAILED":
       return "Inspect the retained .eden evidence and Cloudflare target state, then rerun eden destroy with the same --project, --env, and --name.";
+    case "EVE_DESTROY_RECORD_UNPROVEN":
+      return "Run eden destroy from the project you deployed, or pass that project with --project, using the exact --env and --name the deploy printed; its .eden folder holds the deployment record. If this target was never deployed from this project, there is nothing for Eden to destroy.";
+    case "EVE_DESTROY_RECORD_MISMATCH":
+      return "Rerun eden destroy with the exact --env and --name the deploy printed.";
+    case "EVE_DESTROY_OWNERSHIP_UNPROVEN":
+      return "Sign in to the Cloudflare account that owns this deployment (npx wrangler@4.147.0 whoami, then login if needed) and rerun eden destroy. If a different Worker now uses this name, Eden will not delete it.";
+    case "EVE_DESTROY_INDETERMINATE":
+    case "EVE_DESTROY_ABSENCE_UNPROVEN":
+      return "Wait a minute for Cloudflare to settle, then rerun eden destroy with the same --project, --env, and --name. Keep the .eden folder; never delete resources by name prefix.";
+    case "EVE_DESTROY_IMAGES_RETAINED":
+      return "Rerun eden destroy with the same --project, --env, and --name, or delete only the listed repository tags with npx wrangler@4.147.0 containers images delete <repository:tag>.";
+    case "EVE_DESTROY_POINTER_UNCLEARED":
+      return "The Cloudflare resources are gone; only the local .eden/eve-deploy/targets/<env>-<name>/CURRENT pointer is left. Check that the .eden folder is writable, then rerun eden destroy with the same --project, --env, and --name.";
     case "EVE_EXECUTION_FAILED":
       return "Run eden preflight with the same --project, --env, and --name and resolve its failed checks before retrying.";
     default:

@@ -1331,7 +1331,7 @@ function emitEveDestroyOutcome(
     }
     return;
   }
-  (options.stdout ?? (() => undefined))(JSON.stringify(outcome, (_key, value: unknown) =>
+  (options.stdout ?? (() => undefined))(JSON.stringify({ command: "eden destroy", ...outcome }, (_key, value: unknown) =>
     typeof value === "string" ? redactEveRuntimeOutput(value) : value
   ));
 }

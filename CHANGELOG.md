@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `eden destroy --json` now includes `"command": "eden destroy"`, like
+  preflight and deploy.
+- Destroy failures now say what to do next: `EVE_DESTROY_RECORD_UNPROVEN`,
+  `EVE_DESTROY_RECORD_MISMATCH`, `EVE_DESTROY_OWNERSHIP_UNPROVEN`,
+  `EVE_DESTROY_INDETERMINATE`, `EVE_DESTROY_ABSENCE_UNPROVEN`,
+  `EVE_DESTROY_IMAGES_RETAINED`, and `EVE_DESTROY_POINTER_UNCLEARED` carry a
+  `remediation`.
+
+### Maintainers
+
+- The process-cleanup test helper retries a `ps` snapshot that fails once on
+  a busy machine, instead of failing the test.
+
 ## 0.12.0 — 2026-11-08
 
 Eden now needs Eve `0.91.0` or later, and every failure tells you, or your

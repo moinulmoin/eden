@@ -887,9 +887,16 @@ function resultFor({
               ? undefined
               : "cleanup-failure",
     remainingPids: async () => {
-      const observed = observeOwnedTree(reservation, {
-        allowTerminalRootGone: true,
-      });
+      // One `ps` run can exceed its timeout on a busy machine. Retry a
+      // failed snapshot a few times before calling the tree unobservable.
+      let observed;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (attempt > 0) await wait(OBSERVATION_RETRY_DELAY_MS);
+        observed = observeOwnedTree(reservation, {
+          allowTerminalRootGone: true,
+        });
+        if (observed.entries !== undefined) break;
+      }
       if (
         !observed.verified ||
         observed.entries === undefined ||
