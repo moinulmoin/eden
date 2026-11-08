@@ -3,20 +3,25 @@
 import { accessSync, constants as fsConstants, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { delimiter, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, URL } from "node:url";
 
 import {
   runOwnedProcess,
   spawnOwnedProcess,
 } from "../../test/owned-process.mjs";
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "minimal");
+const fixturesRoot = dirname(fileURLToPath(import.meta.url));
+const fixtures = process.argv.slice(2);
+if (fixtures.length === 0) fixtures.push("floor", "latest");
+assert(fixtures.every((name) => ["floor", "latest"].includes(name)), "Fixtures must be floor or latest.");
+assert(process.env.WORKFLOW_POSTGRES_URL, "WORKFLOW_POSTGRES_URL is required (use a disposable Postgres database with CREATEDB permission).");
+let root;
+let childEnvironment;
 const authToken = "eden-eve-compatibility-local";
-const childEnvironment = {
+const baseEnvironment = {
   ...process.env,
   EVE_COMPAT_AUTH_TOKEN: authToken,
 };
-
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
@@ -102,32 +107,43 @@ async function waitForHealth(origin, child) {
 }
 
 async function assertAuth(origin) {
-  const unauthenticated = await fetch(`${origin}/eve/v1/info`);
+  const unauthenticated = await fetch(`${origin}/eve/v1/session`, { method: "POST" });
   assert(
     unauthenticated.status === 401,
-    `Expected unauthenticated info to return 401, got ${unauthenticated.status}.`,
+    `Expected unauthenticated session create to return 401, got ${unauthenticated.status}.`,
   );
-
-  const authenticated = await fetch(`${origin}/eve/v1/info`, {
+  const authenticated = await fetch(`${origin}/eve/v1/session`, {
+    method: "POST",
     headers: { authorization: `Bearer ${authToken}` },
   });
-  assert(
-    authenticated.ok,
-    `Expected authenticated info to succeed, got ${authenticated.status}.`,
-  );
-  const body = await authenticated.json();
-  assert(
-    body !== null && typeof body === "object" && body.version === 5,
-    `Authenticated info did not return the Eve agent-info v5 contract: version=${body?.version}`,
-  );
+  const text = await authenticated.text();
+  assert(authenticated.status === 202, `Session admission failed: HTTP ${authenticated.status}: ${text}`);
+  const body = JSON.parse(text);
+  assert(typeof body.sessionId === "string" && body.sessionId.startsWith("wrun_"),
+    `Session admission did not return a wrun_ sessionId: ${text}`);
+  console.log(`Bodyless session admission: HTTP 202 ${body.sessionId}`);
 }
 
+for (const fixture of fixtures) {
+root = resolve(fixturesRoot, fixture);
+childEnvironment = baseEnvironment;
 await run(
   ["install", "--frozen-lockfile"],
   "eve-compat-install",
 );
+const { default: pg } = await import(join(root, "node_modules", "pg", "lib", "index.js"));
+const admin = new pg.Client({ connectionString: process.env.WORKFLOW_POSTGRES_URL });
+await admin.connect();
+const database = `eden_compat_${fixture}_${process.pid}_${Date.now()}`;
+await admin.query(`CREATE DATABASE "${database}"`);
+const databaseUrl = new URL(process.env.WORKFLOW_POSTGRES_URL);
+databaseUrl.pathname = `/${database}`;
+childEnvironment = { ...baseEnvironment, WORKFLOW_POSTGRES_URL: databaseUrl.href };
+try {
+
 await run(["run", "typecheck"], "eve-compat-typecheck");
 await run(["run", "build"], "eve-compat-build");
+await run(["exec", "bootstrap"], "eve-compat-postgres-bootstrap");
 
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 const pinnedEve = readJson(join(root, "package.json")).dependencies.eve;
@@ -168,7 +184,7 @@ try {
   await assertAuth(origin);
 
   if (process.env.AI_GATEWAY_API_KEY === undefined) {
-    console.log(`Eve ${installedEve} build, production boot, health, and bearer auth passed.`);
+    console.log(`${fixture}: Eve ${installedEve} build, production boot, health, bearer auth, and session admission passed.`);
     console.log("Model/tool eval skipped: AI_GATEWAY_API_KEY is not set.");
   } else {
     await run(
@@ -197,4 +213,12 @@ if (failure !== undefined) {
     failure instanceof Error ? failure.message : String(failure),
     output.length === 0 ? "" : `Eve output:\n${output}`,
   ].filter(Boolean).join("\n"));
+}
+} finally {
+  try {
+    await admin.query(`DROP DATABASE "${database}" WITH (FORCE)`);
+  } finally {
+    await admin.end();
+  }
+}
 }

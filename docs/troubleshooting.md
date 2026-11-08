@@ -31,13 +31,15 @@ Warnings do not stop a run. They print with an `!` and a remediation arrow:
   → Use the direct, unpooled Postgres URL for WORKFLOW_POSTGRES_URL …
 ```
 
-When the command itself fails, the error goes to stderr in the form
-`CODE [source]: message`, and the process exits with status `1`.
+When the command itself fails, human output sends
+`CODE [source]: message` to stderr and exits with status `1`.
 
-`preflight`, `deploy`, and `destroy` accept `--json`, which prints the
-machine-readable result object instead of the human summary. The object
-holds `command`, `ok`, `environment`, `name`, `checks`, `warnings`,
-`candidate`, and, for a deploy, `deployment`.
+`preflight`, `deploy`, and `destroy` accept `--json`. They print one JSON
+object, including on failure. Failed runs include `error.code`,
+`error.message`, `error.remediation`, `error.source`, and `error.diagnostics`.
+Read `error.remediation` and any failed check's `remediation` before retrying.
+Existing result fields, including `checks` and deploy `deployment` evidence,
+remain available when the command produced them.
 
 The codes come from three places:
 
@@ -85,6 +87,17 @@ Bun can install the package, but Eden always runs on Node. Do not run it with
 
 `Unknown Eden command "…".` You typed a command that does not exist. The
 four commands are `preflight`, `deploy`, `destroy`, and `skill`.
+
+### `VERSION_UNAVAILABLE`
+
+The installed Eden package manifest has no version. Reinstall Eden from the
+published package with your existing package manager.
+
+### `EVE_EXECUTION_FAILED`
+
+The command failed unexpectedly without a more specific error code. Read
+`error.remediation` in JSON output and retain the reported diagnostics when
+reporting the failure. Inspect any deployment evidence before retrying.
 
 ### `EVE_COMMAND_UNKNOWN`
 
@@ -205,6 +218,13 @@ test -x node_modules/.bin/eve
 
 For pnpm, inspect the exact `packageManager` pin, check for `pnpm-lock.yaml`,
 and run `pnpm install --frozen-lockfile` instead.
+
+### `EVE_NPM_INSTALL_SCRIPTS_SKIPPED`
+
+Eden's npm install skips dependency install scripts. The warning lists
+production dependencies that may fail at runtime. Use packages that need no
+install script, or switch to exact-pinned pnpm and list the required packages
+under `allowBuilds` in `pnpm-workspace.yaml`.
 
 ### `VAL-CROSS-004` — the source changed while Eden was reading it
 
@@ -360,6 +380,19 @@ Worker target. The same `wrangler whoami` and `wrangler login` check applies.
 
 ## Packaging and the `eve build`
 
+### `EVE_VERSION_UNSUPPORTED` — Eve is below the supported floor
+
+`eden preflight` and `eden deploy` require Eve `>=0.91.0`. Update the project's
+Eve dependency and lockfile, then retry. An Eve upgrade may strand existing
+Postgres-World sessions; read
+[session_stranded](#old-sessions-return-session_stranded-after-an-eve-upgrade)
+before upgrading.
+
+Existing older deployments keep running, and `eden destroy` still works.
+To redeploy the older project unchanged, use
+`npx @moinulmoin/eden@0.11.5 deploy` with the same `--project`, `--env`, `--name`,
+and `.eden` folder. That CLI is frozen and unmaintained.
+
 ### `Cannot find package 'just-bash'` inside the builder
 
 Declare `just-bash` as a production dependency of the Eve project and update
@@ -417,8 +450,8 @@ module, manifest, and updated lockfile, then retry `eden preflight`. Do not set
 `EVE_DEV`.
 
 If the message says the module `sits beside the agent/sandbox/ directory`, move
-it to `agent/sandbox/sandbox.ts`: Eve 0.83–0.86 silently ignores it there and
-0.87 and later fail the build.
+it to `agent/sandbox/sandbox.ts`: supported Eve versions fail the build when
+the module sits beside that directory.
 
 If the message says Eve `built no just-bash sandbox template`, the sandbox
 module passed the source check but `eve build` did not resolve it to JustBash,
@@ -427,8 +460,7 @@ for example because a helper file it imports returns `DefaultSandbox`. Select
 
 A module selecting Docker, Vercel Sandbox, or another provider fails with the
 same diagnostic and names the selected provider. A sandbox Dockerfile does not
-make those providers supported. Eve `0.83.0` removed microsandbox; on older
-versions Eden still hides `/dev/kvm` to preserve default `just-bash` selection.
+make those providers supported.
 
 An unsupported Container host requirement can also fail with `VAL-BUILD-007`:
 `The selected Eve sandbox has an unknown or unsupported Container host requirement.`
@@ -436,6 +468,16 @@ An unsupported Container host requirement can also fail with `VAL-BUILD-007`:
 A sandbox that never prepares a template also leaves the deployed agent
 without one. Eden ships the prepared template at `/workspace/.eve/sandbox-cache`,
 and without it Eve's sandbox tools fail on the deployed agent.
+
+### `UNSUPPORTED_HOST_REQUIREMENT`
+
+The project needs a host capability outside Eden's Linux/amd64 Container
+contract, or its requirements could not be established. Read the reported
+subject. Remove privileged execution, device access, unsupported kernel or
+network requirements, or durable local disk requirements. Use a durable World
+or external service for persistent state. If those requirements are essential,
+run the project on a host that supports them.
+
 
 ## Local image boot and health
 
@@ -488,18 +530,6 @@ the project; it does not replace those services.
 
 `No task-owned Eve health port was available in the allowed 4310-4399
 range.` Free a local port in that range and retry.
-
-### `EVE_SANDBOX_RESUME_PATCH` — the Eve sandbox file is not a known version
-
-> Eve's just-bash file is not a version Eden knows; conversations may lose
-> their sandbox after a skill change (eve#4440)
-
-The deploy still succeeds. Pin Eve to a version Eden knows, or update Eden so
-its known Eve versions include yours.
-
-This warning applies to older or otherwise unrecognized bindings. Eve
-`0.83.0` and later stable releases include the upstream fix and instead report
-`✓ EVE_SANDBOX_RESUME_PATCH — not needed`; Eden does not patch them.
 
 ### `CLEANUP_UNVERIFIED` — owned local resources were not proven absent
 
@@ -575,6 +605,11 @@ instance name, an invalid or reserved runtime variable name, a cron
 expression the wake trigger cannot express, or Durable Object history and
 bindings that are not safely reusable.
 
+### `EVE_HOST_BUNDLE_UNAVAILABLE`
+
+The installed runtime package lacks the vendored Eve host Worker bundle.
+Reinstall Eden from the published package with your existing package manager.
+
 ## Public health and promotion
 
 These codes come from the deploy run itself: the inline checks, the health
@@ -638,6 +673,50 @@ is unreadable or does not carry a readable Durable Object history. Eden
 refuses to update rather than emit a divergent migration list. Re-run the
 last successful deploy generation, or destroy the exact target.
 
+### `EVE_AFFINITY_REQUIRED`
+
+This target retains affinity deployments, but the installed World package does
+not declare `deploymentAffinity`. Install a World package that declares the
+capability before updating the same target.
+
+### `EVE_AFFINITY_CONTROL_ACTIVATION_TIMEOUT`
+
+The rotated deployment-control credential did not activate within 60 seconds.
+Eden refused publication. Confirm the current Worker is reachable and retry
+with the same target.
+
+### `EVE_AFFINITY_DRAIN_UNPROVEN`
+
+The authenticated World returned missing or invalid deployment drain states.
+Eden cannot establish which old deployments are idle. Check the World package
+and its deployment-control RPC support before retrying.
+
+### `EVE_AFFINITY_RETIRE_UNPROVEN`
+
+The World did not prove that noncurrent deployments were durably fenced for
+retirement. Check the World package's retirement support and retry the same
+target. Do not delete retained deployments by hand.
+
+### `EVE_AFFINITY_LIMIT`
+
+At most 10 affinity deployments may be retained. Publication was refused.
+The message lists blocking deployments and their live sessions, live runs,
+pending messages, and unfinished transfers. Let that work finish before
+deploying again.
+
+### `EVE_UNAUTHENTICATED_VERSIONS_RETIRED`
+
+Eden retired kept versions whose World RPC was unauthenticated. Their sessions
+ended. Start new sessions on the current deployment. Old sessions may report
+`Failed to send the session message.`
+
+### `EVE_DESTROY_FAILED`
+
+The destroy operation failed. Read the failed cleanup check and its
+remediation. Keep the project's `.eden` ownership records and retry only the
+same exact target after resolving that check.
+
+
 ### `EVE_UPDATE_IN_FLIGHT`
 
 Same-version updates resume durable World runs on new code. Let pending
@@ -652,7 +731,7 @@ Update both the Eden CLI and the project's World package. The installed
 World must declare `deploymentAffinity`; updating the CLI alone is not
 enough. Older Worlds still warn that an Eve upgrade can end existing
 sessions, even when sandbox files are carried. Start new sessions on that
-path. See the [recorded older-World upgrade](./eve-compatibility.md#eve-0820-to-0830-live-upgrade-2026-10-23).
+path. See the [recorded older-World upgrade](./eve-compatibility-history.md#eve-0820-to-0830-live-upgrade-2026-10-23).
 
 With the updated Cloudflare World, running work finishes on the old version.
 Existing sessions move to the new version on their next message; idle ones
@@ -904,9 +983,8 @@ transaction-mode pooled URL breaks live session streaming.
 Install the `<world>` release whose `@workflow/core` dependency matches the
 Eve-bundled line. The pairing is version-specific: for Eve `1.0.0-rc.6`, which
 bundles `@workflow/world` `5.1.0`, the tested pair is
-`@workflow/world-postgres@5.1.1`; for Eve `0.68.0`, which bundles
-`@workflow/world` `5.0.0-beta.39`, it is
-`@workflow/world-postgres@5.0.0-beta.47`.
+`@workflow/world-postgres@5.1.1`; for Eve `0.91.0`, which bundles
+`@workflow/world` `5.0.5`, it is `@workflow/world-postgres@5.0.5`.
 
 The Cloudflare World must also declare `eden.capabilities.worldRpcAuth`.
 Without it, the agent's sandbox can read and change every session's workflow

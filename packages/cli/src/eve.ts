@@ -56,18 +56,48 @@ export class EveCliError extends Error {
   readonly code: string;
   readonly source: string | undefined;
   readonly diagnostics: readonly EveCliDiagnostic[];
+  readonly remediation: string | undefined;
 
   constructor(options: {
     readonly code: string;
     readonly message: string;
     readonly source?: string;
     readonly diagnostics?: readonly EveCliDiagnostic[];
+    readonly remediation?: string;
   }) {
     super(options.message);
     this.name = "EveCliError";
     this.code = options.code;
     this.source = options.source;
     this.diagnostics = options.diagnostics ?? [];
+    this.remediation = options.remediation ?? eveErrorRemediation(options.code);
+  }
+}
+
+function eveErrorRemediation(code: string): string | undefined {
+  switch (code) {
+    case "COMMAND_UNKNOWN":
+    case "EVE_ARGUMENT_UNKNOWN":
+      return "Run eden --help to see supported commands and options.";
+    case "EVE_PROJECT_ROOT_INVALID":
+      return "Pass --project with an existing canonical project directory, not a symbolic link.";
+    case "DEPLOY_INDETERMINATE":
+      return "Check the deployment URL's /eve/v1/health and inspect the retained .eden evidence, then rerun eden deploy with the exact same --project, --env, and --name. Never switch names, delete resources by prefix, or delete .eden.";
+    case "EVE_AFFINITY_REQUIRED":
+      return "Install a World package declaring deploymentAffinity, then rerun eden deploy for the same target.";
+    case "EVE_AFFINITY_LIMIT":
+      return "Let the listed deployments finish their live sessions, runs, messages, and transfers, then rerun eden deploy for the same target.";
+    case "EVE_AFFINITY_CONTROL_ACTIVATION_TIMEOUT":
+      return "Check the existing deployment's health and connectivity, then rerun eden deploy for the same target after its deployment-control credential activates.";
+    case "EVE_AFFINITY_DRAIN_UNPROVEN":
+    case "EVE_AFFINITY_RETIRE_UNPROVEN":
+      return "Check the authenticated World's deployment-control response and health, then rerun eden deploy for the same target. Retain .eden and the existing deployments.";
+    case "EVE_DESTROY_FAILED":
+      return "Inspect the retained .eden evidence and Cloudflare target state, then rerun eden destroy with the same --project, --env, and --name.";
+    case "EVE_EXECUTION_FAILED":
+      return "Run eden preflight with the same --project, --env, and --name and resolve its failed checks before retrying.";
+    default:
+      return undefined;
   }
 }
 

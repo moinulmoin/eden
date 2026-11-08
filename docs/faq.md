@@ -44,13 +44,18 @@ the setup, including the sandbox module.
 
 ### Which Eve versions work?
 
-Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, `0.82.0`,
-`0.83.0`, `0.91.0`, `1.0.0-rc.3`, and `1.0.0-rc.6`. The `0.83.0` Cloudflare World run
-preserved sandbox files and a queued task across a same-version skill update.
-With an updated Cloudflare World declaring `deploymentAffinity`, Eve
-upgrades keep existing sessions working. Update both the CLI and the World
-package. Older Worlds still warn that upgrades can return `session_stranded`. See
-[Eve compatibility](./eve-compatibility.md).
+Current `eden preflight` and `eden deploy` require Eve `>=0.91.0`.
+Existing deployments on older Eve keep running, and `eden destroy` still works.
+To redeploy an older project unchanged, use
+`npx @moinulmoin/eden@0.11.5 deploy` with the same `--project`, `--env`, `--name`,
+and `.eden` folder. That CLI is frozen and unmaintained. Upgrading Eve instead
+may strand Postgres-World sessions; see
+[session_stranded](./troubleshooting.md#old-sessions-return-session_stranded-after-an-eve-upgrade).
+
+With an updated Cloudflare World declaring `deploymentAffinity`, Eve upgrades
+keep existing sessions working; update both the CLI and the World package.
+See [Eve compatibility](./eve-compatibility.md) for the tested versions and the
+World each one needs.
 
 ### Are npm, Bun, or Windows supported?
 

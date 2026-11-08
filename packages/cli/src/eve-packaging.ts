@@ -37,6 +37,7 @@ const execFileAsync = promisify(execFile);
 export type EvePackagingCode =
   | "ROOT_INVALID"
   | "UNSUPPORTED_TOOLCHAIN"
+  | "EVE_VERSION_UNSUPPORTED"
   | "DEPENDENCY_AMBIGUITY"
   | "SOURCE_RACE"
   | "EVE_BUILD_FAILED"
@@ -299,14 +300,6 @@ export interface EveProjectPackagingResult {
   readonly image: EveProjectImage | null;
   readonly secrets: EveProjectSecretsEvidence;
   readonly checks: readonly EvePackagingCheck[];
-  /**
-   * Outcome of the builder's temporary eve#4440 sandbox-resume patch:
-   * `applied` when the shipped just-bash binding carries it, `fixed` when the
-   * installed Eve already includes the upstream fix, `skipped` when the
-   * binding is a version Eden does not know, `absent` when this Eve build has
-   * no just-bash binding or packaging never reached the image.
-   */
-  readonly sandboxResumePatch: EveSandboxResumePatchStatus;
   readonly candidateImageId: string | null;
   readonly candidateImageRetainedLocally: boolean;
   readonly writtenPaths: readonly string[];
@@ -350,69 +343,62 @@ export class EvePackagingError extends Error {
 const IGNORED_BUILDS_GUARD =
   `node -e 'const m=JSON.parse(require("fs").readFileSync("node_modules/.modules.yaml","utf8"));const b=(m.ignoredBuilds||[]).filter((p)=>!p.startsWith("cbor-extract@"));if(b.length){console.error("ERR_PNPM_IGNORED_BUILDS Ignored build scripts: "+b.join(", "));process.exit(1)}'`;
 
-/**
- * Eden's temporary fix for upstream https://github.com/vercel/eve/issues/4440
- * (repro: https://github.com/moinulmoin/eve-justbash-resume-repro).
- * Eve's just-bash provider permanently refuses to resume a conversation once
- * the sandbox template changes (skills, `agent/sandbox/workspace/`, or the
- * sandbox definition) and never falls back, so one `eden deploy` update would
- * break every existing conversation's sandbox forever. The isolated builder
- * rewrites one file in the installed Eve copy so an existing session reopens
- * against the current template instead of throwing; user files under
- * `/workspace` always win over the template. The patch applies only when the
- * target file's sha256 matches a known binding and selects that binding's
- * replacement; it is removed entirely once upstream ships the fix.
- */
-export const EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256 =
-  "0ba0ac3a237c99af2f67a6028f1675bf7c04b22454b4ebfb4cd9d19e5bf5aaf8";
-/** Eve 0.79.1 stores a template key instead of an absolute template path. */
-export const EVE_SANDBOX_RESUME_PATCH_LATEST_SHA256 =
-  "ab8b1ad7398af8f6fd2a1e91eb0d1ff8d2b9b9afe1836234f36ce0e896791c45";
-/** Marker the patched binding always contains; proves the patch shipped. */
-export const EVE_SANDBOX_RESUME_PATCH_SIGNATURE = "edenRefreshJustBashSessionSkills";
-/**
- * First Eve release whose just-bash provider keeps a session's files across
- * template changes (vercel/eve#5132), so the patch is not needed from here on.
- */
-export const EVE_SANDBOX_RESUME_FIXED_VERSION = "0.83.0";
-
-/** `major.minor.patch` of a version string; prerelease and build suffixes are dropped. */
-function parseEveRelease(version: unknown): readonly [number, number, number] | null {
+/** Parse an exact Eve semver, retaining the prerelease for release-specific features. */
+export function parseEveRelease(version: unknown): readonly [number, number, number, string?] | null {
   const match = typeof version === "string"
-    ? /^(\d+)\.(\d+)\.(\d+)/u.exec(version)
+    ? /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/u.exec(version)
     : null;
   return match === null
     ? null
-    : [Number(match[1]), Number(match[2]), Number(match[3])];
+    : match[4] === undefined
+      ? [Number(match[1]), Number(match[2]), Number(match[3])]
+      : [Number(match[1]), Number(match[2]), Number(match[3]), match[4]];
 }
 
-/**
- * True when an installed Eve version already ships the eve#4440 fix. A
- * prerelease of the fixed version sorts before it (semver), so it may predate
- * the fix and keeps the patch.
- */
-export function eveIncludesSandboxResumeFix(version: unknown): boolean {
-  const installed = parseEveRelease(version);
-  const fixed = parseEveRelease(EVE_SANDBOX_RESUME_FIXED_VERSION);
-  if (installed === null || fixed === null) return false;
-  for (let index = 0; index < 3; index += 1) {
-    if (installed[index] !== fixed[index]) {
-      return (installed[index] ?? 0) > (fixed[index] ?? 0);
-    }
-  }
-  return typeof version === "string" && !/^\d+\.\d+\.\d+-/u.test(version);
-}
+export const EVE_MINIMUM_VERSION = "0.91.0";
 
-/** Eve 0.83.0 and later no longer fall back to just-bash in production builds. */
-function eveRequiresExplicitJustBash(version: unknown): boolean {
+export function eveMeetsMinimumVersion(version: unknown): boolean {
   const release = parseEveRelease(version);
-  return release !== null && (release[0] > 0 || release[1] >= 83);
+  if (release === null) return false;
+  if (release[0] !== 0) return release[0] > 0;
+  if (release[1] !== 91) return release[1] > 91;
+  return release[2] > 0 || release[3] === undefined;
+}
+
+function unsupportedEveVersion(version: string): {
+  code: "EVE_VERSION_UNSUPPORTED"; message: string; remediation: string;
+} | undefined {
+  if (eveMeetsMinimumVersion(version)) return undefined;
+  return {
+    code: "EVE_VERSION_UNSUPPORTED",
+    message: `Eve ${version} is unsupported; Eden requires Eve >=${EVE_MINIMUM_VERSION}.`,
+    remediation: "Upgrade Eve and its lockfile following docs/deploy.md, or use the frozen, unmaintained previous CLI: npx @moinulmoin/eden@0.11.5 deploy with the same --project, --env, --name, and .eden state.",
+  };
+}
+
+export async function checkEveVersion(projectRoot: string): Promise<{
+  code: "EVE_VERSION_UNSUPPORTED"; message: string; remediation: string;
+} | undefined> {
+  const object = (value: unknown): Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown> : {};
+  const json = async (path: string): Promise<Record<string, unknown>> => {
+    try { return object(JSON.parse(await readFile(join(projectRoot, path), "utf8"))); }
+    catch { return {}; }
+  };
+  const installed = await json("node_modules/eve/package.json");
+  const lock = await json("package-lock.json");
+  const pnpmLock = await readFile(join(projectRoot, "pnpm-lock.yaml"), "utf8").catch(() => "");
+  const pnpmVersion = /^\s{6}eve:\s*\r?\n\s{8}specifier:[^\n]*\r?\n\s{8}version:\s*['"]?(\d+\.\d+\.\d+(?:-[^('"\s]+)?)/mu.exec(pnpmLock)?.[1];
+  const locked = object(object(lock.packages)["node_modules/eve"]).version;
+  const version = typeof installed.version === "string" ? installed.version
+    : typeof locked === "string" ? locked : pnpmVersion;
+  return typeof version === "string" ? unsupportedEveVersion(version) : undefined;
 }
 
 /**
  * Eve reads its sandbox module from either path, with any source extension.
- * When `agent/sandbox/` exists only the nested module counts: Eve 0.83–0.86
- * silently ignores `agent/sandbox.ts` and 0.87+ fails the build.
+ * When `agent/sandbox/` exists only the nested module counts.
  */
 const EVE_SANDBOX_MODULE_PATHS = ["agent/sandbox", "agent/sandbox/sandbox"].flatMap((base) =>
   ["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx"].map((extension) => `${base}.${extension}`));
@@ -423,14 +409,12 @@ function justBashRemediation(command: string, path: string): string {
 
 /**
  * Early, source-level rejection of sandbox setups that cannot work in Eden's
- * isolated builder: a native provider named in the sandbox module, or, on Eve
- * 0.83.0 and later, DefaultSandbox (no module, or one that names it without
- * JustBash). Anything it cannot recognize is left to
+ * isolated builder: a native provider or DefaultSandbox (no module, or one
+ * that names it without JustBash). Anything it cannot recognize is left to
  * checkPreparedJustBashTemplate, which inspects what `eve build` produced.
  */
 export async function checkEveSandboxProvider(
   projectRoot: string,
-  resolvedVersion?: string,
 ): Promise<EvePackagingError | undefined> {
   const source = async (path: string): Promise<string> =>
     readFile(join(projectRoot, path), "utf8").catch(() => "");
@@ -445,19 +429,6 @@ export async function checkEveSandboxProvider(
     }
   };
   const manifest = await json("package.json");
-  const dependencies = manifest.dependencies as Record<string, unknown> | undefined;
-  const lock = await json("package-lock.json");
-  const packages = lock.packages as Record<string, { version?: string }> | undefined;
-  const pnpmLock = await source("pnpm-lock.yaml");
-  const pnpmVersion = /^\s{6}eve:\s*\r?\n\s{8}specifier:[^\n]*\r?\n\s{8}version:\s*['"]?(\d+\.\d+\.\d+(?:-[^('"\s]+)?)/mu
-    .exec(pnpmLock)?.[1];
-  const installed = await json("node_modules/eve/package.json");
-  const declared = typeof dependencies?.eve === "string"
-    ? /^[~^]?(\d+\.\d+\.\d+)/u.exec(dependencies.eve)?.[1]
-    : undefined;
-  const version = resolvedVersion ?? packages?.["node_modules/eve"]?.version ??
-    pnpmVersion ?? installed.version ?? declared;
-  const requiresExplicit = eveRequiresExplicitJustBash(version);
   const sandboxDirectory = (await lstat(join(projectRoot, "agent/sandbox")).catch(() => undefined))
     ?.isDirectory() === true;
   let path: string | undefined;
@@ -479,8 +450,8 @@ export async function checkEveSandboxProvider(
     new RegExp(`\\b${binding}\\s*\\.\\s*environment\\s*\\(`, "u").test(module);
   const native = otherProvider !== undefined && otherProvider !== "DefaultSandbox";
   const usesDefault = path === undefined || (otherProvider === "DefaultSandbox" && !explicit);
-  const shadowed = requiresExplicit && sandboxDirectory && path?.startsWith("agent/sandbox.") === true;
-  if (!native && !shadowed && !(requiresExplicit && usesDefault)) return undefined;
+  const shadowed = sandboxDirectory && path?.startsWith("agent/sandbox.") === true;
+  if (!native && !shadowed && !usesDefault) return undefined;
   const target = shadowed || (path === undefined && sandboxDirectory)
     ? "agent/sandbox/sandbox.ts"
     : path ?? "agent/sandbox.ts";
@@ -492,12 +463,12 @@ export async function checkEveSandboxProvider(
     code: "EVE_SANDBOX_PROVIDER",
     subject: target,
     reason: shadowed
-      ? `${String(path)} sits beside the agent/sandbox/ directory, where Eve ${String(version)} reads only agent/sandbox/sandbox.ts: Eve 0.83–0.86 ignores ${String(path)} and falls back to DefaultSandbox, and 0.87 and later fail the build.`
+      ? `${String(path)} sits beside the agent/sandbox/ directory, where Eve reads only agent/sandbox/sandbox.ts.`
       : native
       ? `${target} selects ${otherProvider}, which Eden does not support; use explicit JustBash instead.`
       : path === undefined
-        ? `Eve ${String(version)} has no sandbox module, so it uses DefaultSandbox, which has no provider in Eden's isolated builder: production builds no longer fall back to just-bash.`
-        : `${target} selects DefaultSandbox, which has no provider in Eden's isolated builder on Eve ${String(version)}: production builds no longer fall back to just-bash.`,
+        ? "The project has no sandbox module, so it uses DefaultSandbox, which has no provider in Eden's isolated builder."
+        : `${target} selects DefaultSandbox, which has no provider in Eden's isolated builder.`,
     remediation: shadowed
       ? `Move ${String(path)} to agent/sandbox/sandbox.ts (delete it instead if agent/sandbox/sandbox.ts already exists), then retry eden preflight.`
       : justBashRemediation(command, target),
@@ -505,15 +476,14 @@ export async function checkEveSandboxProvider(
 }
 
 /**
- * Ground truth after `eve build`: on Eve 0.83.0 and later an agent whose
- * sandbox resolved to no provider prepares no template and would fail to open
+ * Ground truth after `eve build`: an agent whose sandbox resolved to no
+ * provider prepares no template and would fail to open
  * its sandbox on Cloudflare, however its sandbox module is written.
  */
 async function checkPreparedJustBashTemplate(
   snapshotRoot: string,
   version: string,
 ): Promise<EvePackagingError | undefined> {
-  if (!eveRequiresExplicitJustBash(version)) return undefined;
   const templatesPath = `${EVE_SANDBOX_CACHE_ROOT}/just-bash/templates`;
   const templates = await readdir(join(snapshotRoot, templatesPath)).catch(() => []);
   if (templates.length > 0) return undefined;
@@ -524,158 +494,6 @@ async function checkPreparedJustBashTemplate(
     remediation: justBashRemediation("npm install just-bash (or pnpm add just-bash)", "agent/sandbox.ts (agent/sandbox/sandbox.ts when agent/sandbox/ exists)"),
   });
 }
-
-/** Path of the just-bash binding inside the resolved Eve package root. */
-const EVE_JUST_BASH_BINDING_PATH =
-  "dist/src/execution/sandbox/bindings/just-bash.js";
-
-/** The exact `resume()` implementation in Eve 0.68.0, 0.71.2, 0.72.1, and 0.79.1. */
-export const EVE_JUST_BASH_RESUME_ORIGINAL =
-  `async resume(e,n,r){let i=requirePreparedJustBashArtifact(n),a=requireJustBashSessionState(r),o=createSandboxProviderIdentity({artifact:i,version:1}),s=sessionRootPath(e,i);if(a.generation!==o||a.rootPath!==s)throw Error(\`just-bash session state is incompatible with this environment.\`);if(!await pathExists(a.rootPath))throw Error(\`just-bash session root "\${a.rootPath}" no longer exists.\`);return await openHandle(e,a.rootPath,t)}`;
-
-/**
- * The replacement `resume()`: a session whose template generation moved is
- * contained to the same sessions directory and reopened with its authored
- * skills refreshed from the current template. A session folder that is gone
- * (for example a deploy that could not carry it) is recreated from the
- * current template instead of failing every later sandbox call.
- */
-export const EVE_SANDBOX_RESUME_PATCHED =
-  `async resume(e,n,r){let i=requirePreparedJustBashArtifact(n),a=requireJustBashSessionState(r),o=createSandboxProviderIdentity({artifact:i,version:1}),s=sessionRootPath(e,i);if((a.generation!==o||a.rootPath!==s)&&dirname(a.rootPath)!==dirname(s))throw Error(\`just-bash session state is incompatible with this environment.\`);await ensureSessionRoot(i,a.rootPath);if(a.generation!==o)await edenRefreshJustBashSessionSkills(i.templateRootPath,a.rootPath);return await openHandle(e,a.rootPath,t)}`;
-
-/**
- * Eve 0.79.1 resolves the current template key under the runtime cache.
- * Its ensureSessionRoot accepts that path, not the prepared artifact.
- */
-export const EVE_SANDBOX_RESUME_PATCHED_LATEST =
-  `async resume(e,n,r){let i=requirePreparedJustBashArtifact(n),a=requireJustBashSessionState(r),o=createSandboxProviderIdentity({artifact:i,version:1}),s=sessionRootPath(e,i);if((a.generation!==o||a.rootPath!==s)&&dirname(a.rootPath)!==dirname(s))throw Error(\`just-bash session state is incompatible with this environment.\`);let c=resolveTemplateRootPath(e.storagePath,i.templateKey);await ensureSessionRoot(c,a.rootPath);if(a.generation!==o)await edenRefreshJustBashSessionSkills(c,a.rootPath);return await openHandle(e,a.rootPath,t)}`;
-
-/**
- * Helpers appended to the patched binding. They use only identifiers the
- * module already imports (`readdir`, `rm`, `join`, `pathExists`,
- * `copyDirectoryAtomically`). Skills live at `$HOME/.agents/skills` inside a
- * just-bash root, so the session keeps the same path relative to its `fs`
- * directory as the template; the template's `fs` is scanned because `$HOME`
- * is only known inside the sandbox.
- */
-export const EVE_SANDBOX_RESUME_PATCH_HELPERS = `async function edenRefreshJustBashSessionSkills(e,t){let n=await edenFindTemplateSkillsRelativePath(join(e,"fs"));if(n===void 0)return;let r=join(t,"fs",n);await rm(r,{force:!0,recursive:!0}),await copyDirectoryAtomically(join(e,"fs",n),r)}
-async function edenFindTemplateSkillsRelativePath(e){let t=[["",0]];for(;t.length>0;){let n=t.shift(),r=n[0],i=n[1];if(i>3)continue;let a=[];try{a=await readdir(join(e,r),{withFileTypes:!0})}catch{a=[]}for(let o of a){if(!o.isDirectory())continue;let s=r===""?o.name:r+"/"+o.name;if(o.name===".agents")return await pathExists(join(e,s,"skills"))?s+"/skills":void 0;t.push([s,i+1])}}return void 0}
-`;
-
-/**
- * The CommonJS patcher the isolated builder runs between the frozen install
- * and `eve build` (and again for the production reinstall). It never touches
- * project files, applies only against known sha256 hashes, verifies the
- * replacement matched exactly once, validates the result with `node --check`,
- * and breaks hardlinks by writing a temp file and renaming it into place.
- */
-export const EVE_SANDBOX_RESUME_PATCH_SCRIPT = `// Eden temporary fix for https://github.com/vercel/eve/issues/4440: Eve's
-// just-bash provider permanently refuses to resume a conversation after the
-// sandbox template changes (skills, agent/sandbox/workspace/, sandbox
-// definition) and never falls back. This rewrites one file in the installed
-// Eve copy so an existing session reopens against the current template. It
-// runs only against sha256 hashes Eden knows, with a replacement specific to
-// each binding, and is removed once upstream ships the fix.
-const fs = require("node:fs");
-const path = require("node:path");
-const crypto = require("node:crypto");
-const { spawnSync } = require("node:child_process");
-const KNOWN_PATCHES = ${JSON.stringify({
-  [EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256]: {
-    original: EVE_JUST_BASH_RESUME_ORIGINAL,
-    replacement: EVE_SANDBOX_RESUME_PATCHED,
-  },
-  [EVE_SANDBOX_RESUME_PATCH_LATEST_SHA256]: {
-    original: EVE_JUST_BASH_RESUME_ORIGINAL,
-    replacement: EVE_SANDBOX_RESUME_PATCHED_LATEST,
-  },
-})};
-const SIGNATURE = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_SIGNATURE)};
-const BINDING_PATH = ${JSON.stringify(EVE_JUST_BASH_BINDING_PATH)};
-const HELPERS = ${JSON.stringify(EVE_SANDBOX_RESUME_PATCH_HELPERS)};
-const FIXED_VERSION = ${JSON.stringify(EVE_SANDBOX_RESUME_FIXED_VERSION)};
-function finish(outcome, detail) {
-  console.log("eden-eve-sandbox-resume-patch: " + outcome + " (" + detail + ")");
-}
-function parseRelease(version) {
-  const match = typeof version === "string" ? /^(\\d+)\\.(\\d+)\\.(\\d+)/.exec(version) : null;
-  return match === null ? null : [Number(match[1]), Number(match[2]), Number(match[3])];
-}
-function includesFix(version) {
-  const installed = parseRelease(version);
-  const fixed = parseRelease(FIXED_VERSION);
-  if (installed === null || fixed === null) return false;
-  for (let index = 0; index < 3; index += 1) {
-    if (installed[index] !== fixed[index]) return installed[index] > fixed[index];
-  }
-  return !/^\\d+\\.\\d+\\.\\d+-/.test(version);
-}
-let packageJsonPath;
-try {
-  packageJsonPath = fs.realpathSync("node_modules/eve/package.json");
-} catch {
-  finish("absent", "no project-local eve package to patch");
-  process.exit(0);
-}
-const binding = path.join(path.dirname(packageJsonPath), BINDING_PATH);
-let source;
-try {
-  source = fs.readFileSync(binding, "utf8");
-} catch {
-  finish("absent", "this eve build has no just-bash binding");
-  process.exit(0);
-}
-let eveVersion;
-try {
-  eveVersion = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")).version;
-} catch {
-  eveVersion = undefined;
-}
-if (!source.includes(SIGNATURE) && includesFix(eveVersion)) {
-  finish("fixed", "eve " + eveVersion + " includes the upstream fix for eve#4440");
-  process.exit(0);
-}
-if (source.includes(SIGNATURE)) {
-  finish("applied", "already patched");
-  process.exit(0);
-}
-const digest = crypto.createHash("sha256").update(source).digest("hex");
-const patch = KNOWN_PATCHES[digest];
-if (patch === undefined) {
-  finish("skipped", "sha256 " + digest + " is not a version Eden knows (eve#4440)");
-  process.exit(0);
-}
-const { original: ORIGINAL, replacement: PATCHED_RESUME } = patch;
-const first = source.indexOf(ORIGINAL);
-if (first === -1 || source.indexOf(ORIGINAL, first + 1) !== -1) {
-  console.error("eden-eve-sandbox-resume-patch: the known resume implementation did not match exactly once; refusing to patch");
-  process.exit(1);
-}
-const patched = source.slice(0, first) + PATCHED_RESUME +
-  source.slice(first + ORIGINAL.length) + "\\n" + HELPERS + "\\n";
-const temporary = binding + ".tmp.js";
-fs.rmSync(temporary, { force: true });
-fs.writeFileSync(temporary, patched);
-const parsed = spawnSync(process.execPath, ["--check", temporary], { encoding: "utf8" });
-if (parsed.status !== 0) {
-  fs.rmSync(temporary, { force: true });
-  console.error("eden-eve-sandbox-resume-patch: the patched file failed node --check; refusing to install it" + (typeof parsed.stderr === "string" ? "\\n" + parsed.stderr : ""));
-  process.exit(1);
-}
-// Rename (not write) so any hardlink to the original inode is broken.
-fs.renameSync(temporary, binding);
-finish("applied", "temporary eve#4440 fix written into the isolated builder image");
-`;
-
-/** The heredoc COPY + RUN inserted after each frozen install in the builder. */
-const EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP =
-  `COPY <<'EDEN_EVE_PATCH_EOF' /tmp/eden-eve-sandbox-resume-patch.cjs
-${EVE_SANDBOX_RESUME_PATCH_SCRIPT}EDEN_EVE_PATCH_EOF
-RUN node /tmp/eden-eve-sandbox-resume-patch.cjs
-`;
-
-/** Outcome of the builder's sandbox-resume patch for the packaged image. */
-export type EveSandboxResumePatchStatus = "applied" | "fixed" | "skipped" | "absent";
 
 const INSTALL_COMMAND = [
   "corepack",
@@ -1841,7 +1659,7 @@ RUN ${managerSetup} \\
   && ${lockCheck} \\
   && ${install}${policy} \\
   && ${lockCheck}
-${EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP}RUN ${lockCheck}
+RUN ${lockCheck}
 COPY . ./
 RUN test -x ./node_modules/.bin/eve \\
   && ./node_modules/.bin/eve build \\
@@ -1852,7 +1670,7 @@ RUN rm -rf node_modules \\
   && ${productionInstall}${policy} \\
   && ${lockCheck} \\
   && for l in node_modules/.bin/*; do t=$(readlink "$l") || continue; case "$t" in /*) ln -sfn "$(realpath --relative-to=node_modules/.bin "$t")" "$l" ;; esac; done
-${EVE_SANDBOX_RESUME_PATCH_DOCKERFILE_STEP}RUN ${lockCheck}
+RUN ${lockCheck}
 
 FROM --platform=linux/amd64 ${image} AS runtime
 WORKDIR /app
@@ -2573,7 +2391,6 @@ function blockedResult(
       reason: error.message,
       remediation: error.remediation,
     }],
-    sandboxResumePatch: "absent",
     candidateImageId: null,
     candidateImageRetainedLocally: false,
     writtenPaths: extra.writtenPaths ?? [],
@@ -2581,39 +2398,6 @@ function blockedResult(
   };
 }
 
-/**
- * Decides the sandbox-resume patch outcome from the `node_modules` the
- * builder copied out of the finished image: the shipped just-bash binding is
- * the single source of truth and stays correct under Docker layer caching
- * (a cached patch step still ships the patched file). Reading never throws —
- * an unreadable tree counts as `absent`.
- */
-async function detectEveSandboxResumePatch(
-  snapshotRoot: string,
-): Promise<EveSandboxResumePatchStatus> {
-  try {
-    const packageJsonPath = await realpath(
-      join(snapshotRoot, "node_modules/eve/package.json"),
-    );
-    const binding = await readFile(
-      join(dirname(packageJsonPath), EVE_JUST_BASH_BINDING_PATH),
-      "utf8",
-    );
-    if (binding.includes(EVE_SANDBOX_RESUME_PATCH_SIGNATURE)) return "applied";
-    const version = await readFile(packageJsonPath, "utf8")
-      .then((text): unknown => {
-        const manifest: unknown = JSON.parse(text);
-        return typeof manifest === "object" && manifest !== null &&
-            "version" in manifest
-          ? manifest.version
-          : undefined;
-      })
-      .catch(() => undefined);
-    return eveIncludesSandboxResumeFix(version) ? "fixed" : "skipped";
-  } catch {
-    return "absent";
-  }
-}
 
 async function currentInputIdentity(
   runtimeConfig: EveRuntimeConfigExclusion | undefined,
@@ -2946,9 +2730,13 @@ export async function buildEveProjectSnapshot(
     }
 
     const eve = await resolveProjectLocalEve(snapshotRoot);
-    const sandboxProviderAfterBuild = await checkEveSandboxProvider(snapshotRoot, eve.version);
+    const versionError = unsupportedEveVersion(eve.version);
+    if (versionError !== undefined) throw new EvePackagingError({
+      code: versionError.code, subject: "eve", reason: versionError.message,
+      remediation: versionError.remediation,
+    });
+    const sandboxProviderAfterBuild = await checkEveSandboxProvider(snapshotRoot);
     if (sandboxProviderAfterBuild !== undefined) throw sandboxProviderAfterBuild;
-    const sandboxResumePatch = await detectEveSandboxResumePatch(snapshotRoot);
     const output = await scanGeneratedOutput(snapshotRoot);
     const sandboxCache = await scanGeneratedSandboxCache(snapshotRoot);
     const preparedTemplate = await checkPreparedJustBashTemplate(snapshotRoot, eve.version);
@@ -3139,26 +2927,7 @@ export async function buildEveProjectSnapshot(
           reason: "The resolved Eve executable is inside the isolated project dependency tree.",
           remediation: null,
         },
-        ...(sandboxResumePatch === "applied"
-          ? [{
-              id: "EVE_SANDBOX_RESUME_PATCH",
-              status: "pass",
-              subject: "eve-sandbox-resume",
-              reason: "applied temporary fix for eve#4440",
-              remediation: null,
-            } satisfies EvePackagingCheck]
-          : []),
-        ...(sandboxResumePatch === "fixed"
-          ? [{
-              id: "EVE_SANDBOX_RESUME_PATCH",
-              status: "pass",
-              subject: "eve-sandbox-resume",
-              reason: `not needed: Eve ${EVE_SANDBOX_RESUME_FIXED_VERSION} and later include the fix for eve#4440`,
-              remediation: null,
-            } satisfies EvePackagingCheck]
-          : []),
       ],
-      sandboxResumePatch,
       candidateImageId: buildResult.imageId ?? null,
       candidateImageRetainedLocally: buildResult.imageId !== undefined,
       writtenPaths,

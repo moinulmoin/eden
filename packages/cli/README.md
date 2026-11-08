@@ -12,15 +12,15 @@ If you already have an Eve project, start with `eden deploy`.
 Use any one of these package managers:
 
 ```sh
-npm install --global @moinulmoin/eden@0.11.5
+npm install --global @moinulmoin/eden
 ```
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.11.5
+pnpm add --global @moinulmoin/eden
 ```
 
 ```sh
-bun add --global @moinulmoin/eden@0.11.5
+bun add --global @moinulmoin/eden
 ```
 
 Then confirm the CLI is available:

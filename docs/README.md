@@ -36,5 +36,7 @@ Cloudflare account without rewriting it. Start with
 
 - [Validation and cleanup](./validation.md): the pinned Eve compatibility gate
   and deployed cleanup checks. Not needed for a first run.
-- [Eve compatibility](./eve-compatibility.md): which published Eve versions
-  are tested and how to advance the tested line.
+- [Eve compatibility](./eve-compatibility.md): supported Eve versions, the
+  World each one needs, and how Eden checks them.
+- [Eve compatibility history](./eve-compatibility-history.md): dated live runs
+  and notes about older Eve versions.

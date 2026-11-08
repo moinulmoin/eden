@@ -50,7 +50,9 @@ import {
 import {
   buildEveProjectSnapshot,
   checkEveSandboxProvider,
+  checkEveVersion,
   createDockerEveProjectBuilder,
+  parseEveRelease,
   revalidateEveProjectCandidateInputs,
   EvePackagingError,
   IMAGE_ID_PATTERN,
@@ -143,6 +145,8 @@ export type EveDeploymentStatus =
 
 export interface EveDeploymentMetadata {
   readonly status: EveDeploymentStatus;
+  readonly reason?: string;
+  readonly evidenceLocation?: string;
   /**
    * `create` is a first deploy onto an absent target; `update` is an
    * in-place redeploy of a provably Eden-owned target that keeps the Worker,
@@ -168,15 +172,52 @@ export interface EvePreflightWarning {
   readonly remediation?: string;
 }
 
+interface EveOutcomeError {
+  readonly code: string;
+  readonly message: string;
+  readonly remediation: string;
+  readonly source: string;
+  readonly diagnostics: readonly { readonly code: string; readonly message: string; readonly source?: string }[];
+}
+
+function eveOutcomeError(error: unknown, source: string): EveOutcomeError {
+  const failure = error instanceof EveCliError ? error : new EveCliError({
+    code: error instanceof EveRuntimeConfigError ? error.code : "EVE_EXECUTION_FAILED",
+    message: error instanceof Error ? error.message : "The Eve operation failed.",
+    source: error instanceof EveRuntimeConfigError ? error.source ?? source : source,
+    ...(error instanceof EveRuntimeConfigError && error.remediation !== undefined
+      ? { remediation: error.remediation }
+      : {}),
+  });
+  return {
+    code: failure.code,
+    message: safeText(failure.message),
+    remediation: failure.remediation ?? "Inspect the retained .eden evidence and resolve the reported failure before retrying the same exact target.",
+    source: failure.source ?? source,
+    diagnostics: failure.diagnostics.map((diagnostic) => ({
+      ...diagnostic,
+      message: safeText(diagnostic.message),
+    })),
+  };
+}
+
 export interface EvePreflightResult {
-  readonly command: "eve preflight" | "eve deploy";
+  readonly command: "eden preflight" | "eden deploy";
   readonly ok: boolean;
   readonly environment: EveCliEnvironment;
   readonly name: string;
   readonly checks: readonly EvePreflightCheck[];
   readonly warnings: readonly EvePreflightWarning[];
   readonly candidate: EvePreflightCandidate | null;
-  readonly deployment?: EveDeploymentMetadata;
+  readonly deployment?: EveDeploymentMetadata | (
+    Partial<EveDeploymentMetadata> & {
+      readonly status: "indeterminate";
+      readonly reason: string;
+      readonly evidenceRetained: true;
+      readonly evidenceLocation: string;
+    }
+  );
+  readonly error?: EveOutcomeError;
 }
 
 export type EveCloudflareTargetState =
@@ -620,7 +661,6 @@ function mapPackagingCheck(value: EvePackagingCheck): EvePreflightCheck {
         return "VAL-SEC-003";
       case "DOCKER_PLATFORM_BLOCKED":
         return "VAL-BUILD-005";
-      case "EVE_SANDBOX_RESUME_PATCH":
       case "EVE_SANDBOX_PROVIDER":
         return value.id;
       default:
@@ -779,14 +819,12 @@ async function readInstalledManifest(
  * admits start Hooks atomically; earlier prereleases of 1.0.0 do not ask.
  */
 function eveRequiresAtomicStartHook(version: unknown): boolean {
-  const match = typeof version === "string"
-    ? /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/u.exec(version)
-    : null;
-  if (match === null) return false;
-  const [major, minor, patch] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const release = parseEveRelease(version);
+  if (release === null) return false;
+  const [major, minor, patch, prerelease] = release;
   if (major !== 1 || minor !== 0 || patch !== 0) return major >= 1;
-  if (match[4] === undefined) return true;
-  const rc = /^rc\.(\d+)$/u.exec(match[4]);
+  if (prerelease === undefined) return true;
+  const rc = /^rc\.(\d+)$/u.exec(prerelease);
   return rc !== null && Number(rc[1]) >= 6;
 }
 
@@ -1189,9 +1227,9 @@ function humanEveResultLines(
     }
   }
   const elapsed = formatEveElapsed(startedAt);
-  const commandLabel = result.command === "eve deploy" ? "deploy" : "preflight";
+  const commandLabel = result.command === "eden deploy" ? "deploy" : "preflight";
   if (result.ok) {
-    if (result.command === "eve deploy") {
+    if (result.command === "eden deploy") {
       const url = result.deployment?.stableWorkersDevOrigin;
       lines.push(
         "",
@@ -1214,11 +1252,11 @@ function humanEveResultLines(
   if (result.deployment !== undefined) {
     lines.push(
       "",
-      `✗ ${commandLabel} ${result.deployment.status}`,
+      `✗ ${commandLabel} ${result.deployment.status === "deployed" ? "deployed; cleanup failed" : result.deployment.status}`,
       `  → ${result.deployment.status === "indeterminate"
         ? "The outcome is indeterminate; inspect the retained ownership evidence before retrying the same exact target."
         : result.deployment.status === "deployed"
-          ? "The deployment is live; only image cleanup failed (local runtime image or the superseded registry tag), so do not retry the deployment."
+          ? "The deployment is live; cleanup failed, so do not retry the deployment."
           : "The deployment failed before promotion; the exact target was not claimed."
       }`,
     );
@@ -1246,7 +1284,9 @@ function emitEveResult(
     }
     return;
   }
-  emitLine(options, JSON.stringify(result));
+  (options.stdout ?? (() => undefined))(JSON.stringify(result, (_key, value: unknown) =>
+    typeof value === "string" ? redactEveRuntimeOutput(value) : value
+  ));
 }
 
 /**
@@ -1291,7 +1331,9 @@ function emitEveDestroyOutcome(
     }
     return;
   }
-  emitLine(options, JSON.stringify(outcome));
+  (options.stdout ?? (() => undefined))(JSON.stringify(outcome, (_key, value: unknown) =>
+    typeof value === "string" ? redactEveRuntimeOutput(value) : value
+  ));
 }
 
 function runtimeConfigExclusion(
@@ -2814,9 +2856,11 @@ function deploymentMetadata(
     readonly generationId?: string | undefined;
     readonly containerImage?: string | undefined;
   },
+  outcome?: { readonly reason: string; readonly evidenceLocation: string },
 ): EveDeploymentMetadata {
   return {
     status,
+    ...outcome,
     operation,
     targetKey,
     deploymentId: identity.deploymentId,
@@ -2843,7 +2887,7 @@ function deploymentFailure(
   return new EveCliError({
     code,
     message: safeText(message),
-    source: "eve deploy",
+    source: "eden deploy",
   });
 }
 
@@ -2851,6 +2895,7 @@ async function runEveDeployment(
   request: EveCliExecutionRequest,
   options: EvePreflightOptions,
   collected: EvePreflightCollection,
+  onPromotion: (result: EvePreflightResult) => void,
 ): Promise<EvePreflightResult> {
   const candidate = collected.candidate;
   const cloudflare = collected.cloudflare;
@@ -3300,9 +3345,10 @@ async function runEveDeployment(
   try {
     eveProgress(options, "publishing Worker and Container application");
     publication = await publishOne(publicationRequest);
-  } catch {
-    await writeFailureRecord("indeterminate", "publication-threw-before-terminal-result");
-    const deployment = deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded);
+  } catch (error: unknown) {
+    const reason = error instanceof Error ? safeText(error.message) : "Publication threw before a terminal result.";
+    await writeFailureRecord("indeterminate", reason);
+    const deployment = deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason, evidenceLocation: candidate.generationRoot });
     return {
       ...collected.result,
       ok: false,
@@ -3314,7 +3360,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(publication.reason), evidenceLocation: candidate.generationRoot }),
     };
   }
   if (
@@ -3336,7 +3382,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(publication.reason) + " Resource ownership is unproven.", evidenceLocation: candidate.generationRoot }),
       };
     }
     if (
@@ -3355,7 +3401,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(publication.reason) + " Exact compensation is unavailable.", evidenceLocation: candidate.generationRoot }),
       };
     }
     if (
@@ -3380,7 +3426,7 @@ async function runEveDeployment(
         return {
           ...collected.result,
           ok: false,
-          deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+          deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(publication.reason) + " Exact compensation was not proven.", evidenceLocation: candidate.generationRoot }),
         };
       }
     }
@@ -3399,7 +3445,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "failed", operation, superseded),
+      deployment: deploymentMetadata(identity, targetKey, "failed", operation, superseded, { reason: publication.status === "failed" ? safeText(publication.reason) : "Publication identity did not match the immutable candidate.", evidenceLocation: candidate.generationRoot }),
     };
   }
 
@@ -3410,18 +3456,19 @@ async function runEveDeployment(
       identity,
       origin: stableWorkersDevOrigin,
     });
-  } catch {
+  } catch (error: unknown) {
+    const reason = error instanceof Error ? safeText(error.message) : "Health verification threw before a terminal result.";
     await writeEveDeploymentRecord(
       candidate,
       identity,
       hostConfig,
       "indeterminate",
-      { evidence: "health-threw-before-terminal-result" },
+      { evidence: reason },
     );
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason, evidenceLocation: candidate.generationRoot }),
     };
   }
   if (health.status === "indeterminate") {
@@ -3435,7 +3482,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(health.reason), evidenceLocation: candidate.generationRoot }),
     };
   }
   const observedHealthIdentity = health.status === "ready"
@@ -3462,7 +3509,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: (health.status === "failed" ? safeText(health.reason) : "Health identity did not match the immutable candidate.") + " Resource ownership is unproven.", evidenceLocation: candidate.generationRoot }),
       };
     }
     if (
@@ -3480,7 +3527,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+        deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: (health.status === "failed" ? safeText(health.reason) : "Health identity did not match the immutable candidate.") + " Exact compensation is unavailable.", evidenceLocation: candidate.generationRoot }),
       };
     }
     if (
@@ -3501,7 +3548,7 @@ async function runEveDeployment(
         return {
           ...collected.result,
           ok: false,
-          deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+          deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: (health.status === "failed" ? safeText(health.reason) : "Health identity did not match the immutable candidate.") + " Exact compensation was not proven.", evidenceLocation: candidate.generationRoot }),
         };
       }
     }
@@ -3520,7 +3567,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "failed", operation, superseded),
+      deployment: deploymentMetadata(identity, targetKey, "failed", operation, superseded, { reason: health.status === "failed" ? safeText(health.reason) : "Health identity did not match the immutable candidate.", evidenceLocation: candidate.generationRoot }),
     };
   }
 
@@ -3549,7 +3596,7 @@ async function runEveDeployment(
         return {
           ...collected.result,
           ok: false,
-          deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+          deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: (error instanceof Error ? safeText(error.message) : "Candidate inputs changed after health.") + " Exact compensation was not proven.", evidenceLocation: candidate.generationRoot }),
         };
       }
       await writeEveDeploymentRecord(
@@ -3566,7 +3613,7 @@ async function runEveDeployment(
       return {
         ...collected.result,
         ok: false,
-        deployment: deploymentMetadata(identity, targetKey, "failed", operation, superseded),
+        deployment: deploymentMetadata(identity, targetKey, "failed", operation, superseded, { reason: error instanceof Error ? safeText(error.message) : "Candidate inputs changed after health.", evidenceLocation: candidate.generationRoot }),
       };
     }
     await writeEveDeploymentRecord(
@@ -3583,7 +3630,7 @@ async function runEveDeployment(
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded),
+      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: error instanceof Error ? safeText(error.message) : "Candidate inputs changed after health without exact compensation.", evidenceLocation: candidate.generationRoot }),
     };
   }
   await writeEveDeploymentRecord(
@@ -3604,6 +3651,13 @@ async function runEveDeployment(
     `${request.environment}-${request.name}`,
     candidate.generationRoot,
   );
+  onPromotion({
+    ...collected.result,
+    deployment: deploymentMetadata(identity, targetKey, "deployed", operation, superseded, {
+      reason: "The deployment is healthy and promoted.",
+      evidenceLocation: candidate.generationRoot,
+    }),
+  });
   await options.afterPromotion?.();
   let supersededImageCleanup: EvePreflightCheck | undefined;
   if (affinityEnabled && Object.keys(retiringDeployments).length > 0) {
@@ -3725,7 +3779,7 @@ async function runEveDeployment(
     ...(postPromotionChecks.length === 0
       ? {}
       : { checks: [...collected.result.checks, ...postPromotionChecks] }),
-    deployment: deploymentMetadata(identity, targetKey, "deployed", operation, superseded),
+    deployment: deploymentMetadata(identity, targetKey, "deployed", operation, superseded, { reason: postPromotionChecks.some((value) => value.status === "failed") ? "The deployment is live, but post-promotion cleanup failed." : "The deployment is healthy and promoted.", evidenceLocation: candidate.generationRoot }),
   };
 }
 
@@ -3816,7 +3870,7 @@ async function collectEvePreflight(
     );
     return {
       result: {
-        command: request.command === "deploy" ? "eve deploy" : "eve preflight",
+        command: request.command === "deploy" ? "eden deploy" : "eden preflight",
         ok: false,
         environment: request.environment,
         name: request.name,
@@ -3828,7 +3882,8 @@ async function collectEvePreflight(
     };
   }
 
-  const sandboxProvider = await checkEveSandboxProvider(request.projectRoot);
+  const sandboxProvider = await checkEveVersion(request.projectRoot) ??
+    await checkEveSandboxProvider(request.projectRoot);
   if (sandboxProvider !== undefined) {
     checks.push(check(
       sandboxProvider.code,
@@ -3838,7 +3893,7 @@ async function collectEvePreflight(
     ));
     return {
       result: {
-        command: request.command === "deploy" ? "eve deploy" : "eve preflight",
+        command: request.command === "deploy" ? "eden deploy" : "eden preflight",
         ok: false,
         environment: request.environment,
         name: request.name,
@@ -3908,7 +3963,6 @@ async function collectEvePreflight(
         redactionRegisteredBeforeChildren: false,
       },
       checks: [],
-      sandboxResumePatch: "absent",
       candidateImageId: null,
       candidateImageRetainedLocally: false,
       writtenPaths: [],
@@ -3916,15 +3970,6 @@ async function collectEvePreflight(
     };
   }
   checks.push(...packaging.checks.map(mapPackagingCheck));
-  if (packaging.sandboxResumePatch === "skipped") {
-    warnings.push({
-      id: "EVE_SANDBOX_RESUME_PATCH",
-      message:
-        "Eve's just-bash file is not a version Eden knows; conversations may lose their sandbox after a skill change (eve#4440)",
-      remediation:
-        "Pin Eve to a version Eden knows, or update Eden so its known Eve versions include yours.",
-    });
-  }
   const discardPackagingImage = async (): Promise<void> => {
     if (
       packaging.candidateImageId === null ||
@@ -3974,7 +4019,7 @@ async function collectEvePreflight(
     );
     return {
       result: {
-        command: request.command === "deploy" ? "eve deploy" : "eve preflight",
+        command: request.command === "deploy" ? "eden deploy" : "eden preflight",
         ok: false,
         environment: request.environment,
         name: request.name,
@@ -4029,7 +4074,7 @@ async function collectEvePreflight(
     await discardPackagingImage();
     return {
       result: {
-        command: request.command === "deploy" ? "eve deploy" : "eve preflight",
+        command: request.command === "deploy" ? "eden deploy" : "eden preflight",
         ok: false,
         environment: request.environment,
         name: request.name,
@@ -4072,7 +4117,7 @@ async function collectEvePreflight(
       );
       return {
         result: {
-          command: "eve deploy",
+          command: "eden deploy",
           ok: false,
           environment: request.environment,
           name: request.name,
@@ -4123,7 +4168,7 @@ async function collectEvePreflight(
       await discardPackagingImage();
       return {
         result: {
-          command: "eve deploy",
+          command: "eden deploy",
           ok: false,
           environment: request.environment,
           name: request.name,
@@ -4314,7 +4359,7 @@ async function collectEvePreflight(
     );
     return {
       result: {
-        command: request.command === "deploy" ? "eve deploy" : "eve preflight",
+        command: request.command === "deploy" ? "eden deploy" : "eden preflight",
         ok: false,
         environment: request.environment,
         name: request.name,
@@ -4355,7 +4400,7 @@ async function collectEvePreflight(
       );
       return {
         result: {
-          command: "eve preflight",
+          command: "eden preflight",
           ok: false,
           environment: request.environment,
           name: request.name,
@@ -4371,7 +4416,7 @@ async function collectEvePreflight(
   await discardPackagingImage();
   return {
     result: {
-      command: request.command === "deploy" ? "eve deploy" : "eve preflight",
+      command: request.command === "deploy" ? "eden deploy" : "eden preflight",
       ok: allChecksClear(checks),
       environment: request.environment,
       name: request.name,
@@ -4405,22 +4450,27 @@ export async function runEveControlPlane(
       `eden ${request.command} — ${request.name} (${request.environment})`,
     );
   }
-  const lock = request.command === "deploy"
-    ? await acquireEveTargetLock(
-      request.projectRoot,
-      request.environment,
-      request.name,
-    )
-    : undefined;
+  let lock: EveTargetLock | undefined;
   let collected: EvePreflightCollection | undefined;
+  let result: EvePreflightResult = {
+    command: request.command === "deploy" ? "eden deploy" : "eden preflight",
+    ok: false,
+    environment: request.environment,
+    name: request.name,
+    checks: [],
+    warnings: [],
+    candidate: null,
+  };
   let primaryError: unknown;
   let failed = false;
   let lockReleased = true;
   try {
+    lock = request.command === "deploy"
+      ? await acquireEveTargetLock(request.projectRoot, request.environment, request.name)
+      : undefined;
     collected = await collectEvePreflight(request, options);
-    const eveVersion = collected.candidate?.eveVersion;
-    if (!collected.result.ok) {
-      emitEveResult(options, collected.result, startedAt, eveVersion);
+    result = collected.result;
+    if (!result.ok) {
       throw new EveCliError({
         code: request.command === "deploy"
           ? "EVE_DEPLOY_CHECKS_FAILED"
@@ -4431,15 +4481,11 @@ export async function runEveControlPlane(
             : "The Eve preflight checks failed; no remote mutation or active-state promotion was attempted.",
       });
     }
-    if (request.command === "preflight") {
-      emitEveResult(options, collected.result, startedAt, eveVersion);
-    } else {
-      const deploymentResult = await runEveDeployment(
-        request,
-        options,
-        collected,
-      );
-      emitEveResult(options, deploymentResult, startedAt, eveVersion);
+    if (request.command === "deploy") {
+      const deploymentResult = await runEveDeployment(request, options, collected, (promoted) => {
+        result = promoted;
+      });
+      result = deploymentResult;
       if (!deploymentResult.ok) {
         const status = deploymentResult.deployment?.status;
         throw new EveCliError({
@@ -4450,10 +4496,10 @@ export async function runEveControlPlane(
               : "EVE_DEPLOYMENT_FAILED",
           message:
             status === "indeterminate"
-              ? "The Eve deployment outcome is indeterminate; inspect the retained exact ownership evidence before retrying."
+              ? deploymentResult.deployment?.reason ?? "The Eve deployment outcome is indeterminate; inspect the retained exact ownership evidence before retrying."
               : status === "deployed"
                 ? "The Eve deployment is healthy and promoted, but exact image cleanup failed; do not retry the deployment."
-              : "The Eve deployment failed before exact target promotion.",
+              : deploymentResult.deployment?.reason ?? "The Eve deployment failed before exact target promotion.",
         });
       }
     }
@@ -4461,16 +4507,47 @@ export async function runEveControlPlane(
     failed = true;
     primaryError = error;
   } finally {
-    collected?.runtimeConfig?.dispose();
-    lockReleased = lock === undefined || await releaseEveTargetLock(lock);
+    try {
+      collected?.runtimeConfig?.dispose();
+    } catch (error: unknown) {
+      if (!failed) primaryError = error;
+      failed = true;
+    }
+    try {
+      lockReleased = lock === undefined || await releaseEveTargetLock(lock);
+    } catch (error: unknown) {
+      if (!failed) primaryError = error;
+      failed = true;
+      lockReleased = false;
+    }
   }
   if (!lockReleased) {
-    throw new EveCliError({
+    primaryError = new EveCliError({
       code: "EVE_DEPLOY_LOCK_RELEASE_UNPROVEN",
       message:
         "The Eve deployment lock could not be released with exact ownership proof; local residue was retained.",
       source: "deployment-lock",
     });
+    failed = true;
+  }
+  if (result !== undefined) {
+    if (failed) {
+      const error = eveOutcomeError(primaryError, `eden ${request.command}`);
+      result = {
+        ...result,
+        ok: false,
+        error,
+        ...(error.code === "DEPLOY_INDETERMINATE" && result.deployment === undefined
+          ? { deployment: {
+            status: "indeterminate" as const,
+            reason: error.message,
+            evidenceRetained: true as const,
+            evidenceLocation: collected?.candidate?.generationRoot ?? join(request.projectRoot, ".eden"),
+          } }
+          : {}),
+      };
+    }
+    emitEveResult(options, result, startedAt, collected?.candidate?.eveVersion);
   }
   if (failed) {
     throw primaryError;
@@ -4483,6 +4560,7 @@ export interface EveDestroyOutcome {
   readonly environment: EveCliEnvironment;
   readonly name: string;
   readonly checks: readonly EvePreflightCheck[];
+  readonly error?: EveOutcomeError;
 }
 
 interface EveDestroyRecord {
@@ -5319,40 +5397,59 @@ export async function runEveDestroy(
     );
   }
   const checks: EvePreflightCheck[] = [];
+  let result: EveDestroyOutcome | undefined;
   const emit = (outcome: EveDestroyOutcome): void => {
-    emitEveDestroyOutcome(options, outcome, startedAt);
+    result = outcome;
   };
   const fail = (code: string, message: string): never => {
-    throw new EveCliError({ code, message, source: "eve destroy" });
+    throw new EveCliError({ code, message, source: "eden destroy" });
   };
 
-  let lockReleased = false;
+  let primaryError: unknown;
+  let lockReleased = true;
   try {
     const lock = await acquireEveTargetLock(
       request.projectRoot,
       request.environment,
       request.name,
     );
+    lockReleased = false;
     try {
       await runEveDestroyLocked(request, options, checks, emit, fail);
     } finally {
       lockReleased = await releaseEveTargetLock(lock);
     }
   } catch (error: unknown) {
-    if (error instanceof EveCliError) throw error;
-    if (error instanceof EveRuntimeConfigError) throw error;
-    throw new EveCliError({
-      code: "EVE_DESTROY_FAILED",
-      message: "The eve destroy operation failed.",
-      source: "eve destroy",
-    });
+    primaryError = error instanceof EveCliError || error instanceof EveRuntimeConfigError
+      ? error
+      : new EveCliError({
+        code: "EVE_DESTROY_FAILED",
+        message: "The eden destroy operation failed.",
+        source: "eden destroy",
+      });
   }
   if (!lockReleased) {
-    fail(
-      "EVE_DEPLOY_LOCK_RELEASE_UNPROVEN",
-      "The Eve destroy lock could not be released with exact ownership proof; local residue was retained.",
-    );
+    primaryError = new EveCliError({
+      code: "EVE_DEPLOY_LOCK_RELEASE_UNPROVEN",
+      message: "The Eve destroy lock could not be released with exact ownership proof; local residue was retained.",
+      source: "deployment-lock",
+    });
   }
+  if (primaryError !== undefined) {
+    const error = eveOutcomeError(primaryError, "eden destroy");
+    result = {
+      ...(result ?? {
+        status: error.code === "EVE_DESTROY_INDETERMINATE" ? "indeterminate" as const : "failed" as const,
+        environment: request.environment,
+        name: request.name,
+        checks,
+      }),
+      ok: false,
+      error,
+    };
+  }
+  if (result !== undefined) emitEveDestroyOutcome(options, result, startedAt);
+  if (primaryError !== undefined) throw primaryError;
 }
 
 async function runEveDestroyLocked(

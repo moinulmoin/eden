@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "includePaths": ["validation/eve-compat/latest/**"],
+  "enabledManagers": ["npm"],
+  "dependencyDashboard": false,
+  "ignoreUnstable": false,
+  "respectLatest": false,
+  "rangeStrategy": "pin",
+  "groupName": null,
+  "separateMajorMinor": true,
+  "separateMinorPatch": true,
+  "automerge": false,
+  "packageRules": [
+    {
+      "matchPackageNames": ["*"],
+      "enabled": false
+    },
+    {
+      "matchPackageNames": ["eve", "@workflow/world-postgres", "just-bash"],
+      "enabled": true
+    }
+  ]
+}

@@ -17,7 +17,7 @@ Eden has four commands and two top-level switches.
 | `eden skill` | Print the bundled Eden skill verbatim for coding agents |
 
 `eden --help` (or `-h`) prints the top-level usage. `eden --version` (or `-v`)
-prints the installed version, for example `0.11.5`. Running `eden` with no
+prints the installed version, such as `1.2.3`. Running `eden` with no
 arguments prints the same usage. An unknown command fails with
 `COMMAND_UNKNOWN`.
 
@@ -628,14 +628,29 @@ no decimals above it.
 ### `--json` result objects
 
 `--json` prints one JSON object on a single line and no progress or summary
-lines. A command that fails before its result object exists prints the error
-on standard error instead and exits with `1`.
+lines. Failures also print one object and exit with `1`, including failures
+before a normal result exists.
+
+On failure, the object includes `error` with these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `code` | The failure code |
+| `message` | The failure description |
+| `remediation` | What to do next |
+| `source` | Where the failure was reported |
+| `diagnostics` | Additional failure details |
+
+Read `error.code` and `error.remediation` first. If checks are available,
+also read the first failed check's `remediation`. Existing result fields,
+including `checks` and deploy `deployment` evidence, remain available when
+the command produced them.
 
 `preflight` and `deploy` print the result object:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `command` | `"eve preflight"` or `"eve deploy"` | |
+| `command` | `"eden preflight"` or `"eden deploy"` | |
 | `ok` | boolean | |
 | `environment` | `"preview"` or `"production"` | |
 | `name` | string | The exact target name |

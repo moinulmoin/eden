@@ -8,7 +8,9 @@ description: Deploy, update, check, or remove a Vercel Eve agent on the user's o
 Eden (`@moinulmoin/eden`) builds an existing Eve project as-is and runs it in a
 Cloudflare Container behind a Worker on the user's own account. It never
 rewrites the project; you make any needed changes yourself, guided by
-preflight.
+preflight. Where this guide and the notes `eve init` prints disagree (for
+example its advice to use Vercel Connect), follow this guide: those notes
+target Vercel.
 
 `npx @moinulmoin/eden skill` prints this guide for the installed CLI version.
 Docs: https://github.com/moinulmoin/eden (failure and warning codes:
@@ -48,14 +50,23 @@ Docs: https://github.com/moinulmoin/eden (failure and warning codes:
 ## Project setup Cloudflare needs
 
 These are what preflight checks most often. Fix them before the first run to
-save a build.
+save a build. For a fresh `eve init` project, run
+`npm install just-bash @moinulmoin/eden-world-cloudflare`, then make the
+sandbox, channel auth, and durable state edits below.
 
+- **Eve floor.** `preflight` and `deploy` require Eve `>=0.91.0`; older
+  projects fail with `EVE_VERSION_UNSUPPORTED`. Existing deployments keep
+  running, and `destroy` still works. To redeploy an older project unchanged,
+  use `npx @moinulmoin/eden@0.11.5 deploy` with the same `--project`, `--env`,
+  `--name`, and `.eden` folder. That CLI is frozen and unmaintained.
+  Upgrading Eve instead may strand Postgres-World sessions; see
+  [session_stranded](https://github.com/moinulmoin/eden/blob/main/docs/troubleshooting.md#old-sessions-return-session_stranded-after-an-eve-upgrade).
 - **One lockfile.** Either a root `package-lock.json`, or an exact
   `"packageManager": "pnpm@x.y.z"` with a root `pnpm-lock.yaml`. Not both, not
   Bun. Dependency install scripts do not run.
-- **Sandbox.** Add `just-bash` as a production dependency. On Eve `0.83.0` and
-  later, also select it explicitly in `agent/sandbox.ts` (or
-  `agent/sandbox/sandbox.ts` if an `agent/sandbox/` folder exists):
+- **Sandbox.** Add `just-bash` as a production dependency and select it
+  explicitly in `agent/sandbox.ts` (or `agent/sandbox/sandbox.ts` if an
+  `agent/sandbox/` folder exists):
 
   ```ts
   import { defineSandbox } from 'eve/sandbox';
@@ -134,7 +145,8 @@ save a build.
 ## Commands
 
 ```sh
-# deploy to preview; the name comes from package.json
+# deploy to preview; the name is derived from package.json plus a short
+# suffix, so keep the exact `name` the result prints
 npx @moinulmoin/eden deploy --env-file ~/.config/<agent>/preview.env --json
 
 # ship a change: the same command updates in place, on the same URL
@@ -149,13 +161,15 @@ npx @moinulmoin/eden destroy --name <name> --json
 ```
 
 - `--project <dir>` selects a project other than the current directory.
-- A fresh deploy takes a few minutes, mostly building the container. The
-  result's `deployment.stableWorkersDevOrigin` is the live URL.
+- A fresh deploy takes a few minutes, mostly building the container. Read
+  `ok`, `warnings`, `name`, and `deployment.stableWorkersDevOrigin` (the live
+  URL) from the result.
 - An `eve init` project's `npm run deploy` script still deploys to Vercel, not
   Eden.
-- Confirm with the user before any `destroy` or production deploy. Destroy
-  deletes the agent immediately, even mid-conversation, and with the Cloudflare
-  World also its stored sessions. An external Postgres database is not touched.
+- Get the user's explicit go-ahead before any `destroy` or production deploy;
+  a request that already says to tear the agent down counts. Destroy deletes
+  the agent immediately, even mid-conversation, and with the Cloudflare World
+  also its stored sessions. An external Postgres database is not touched.
 
 ## Verify
 
@@ -166,9 +180,11 @@ curl -s https://<url>/eve/v1/health   # expect "status":"ready"
 ```
 
 Then prove auth, the model key, and the agent work with a real message, using
-the channel's credential (the bearer token from the env file):
+the channel's credential (the bearer token from the env file). Load it into
+the shell without printing it:
 
 ```sh
+AGENT_AUTH_TOKEN="$(sed -n 's/^AGENT_AUTH_TOKEN=//p' ~/.config/<agent>/preview.env)"
 curl -s -X POST https://<url>/eve/v1/session \
   -H "Authorization: Bearer $AGENT_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
@@ -178,8 +194,11 @@ curl -s -N https://<url>/eve/v1/session/<sessionId>/stream \
   -H "Authorization: Bearer $AGENT_AUTH_TOKEN"
 ```
 
-Load the token into the shell from the env file without printing it. The
-first request after the agent sleeps takes about 10–15 seconds.
+The stream is one JSON event per line. The answer is the
+`content.completed` event whose `data` has `"phase":"reply"`; its `value` is
+the text. Reasoning events come first. Stop reading at the `turn.settled`
+event: the stream keeps sending heartbeats after it. The first request after
+the agent sleeps takes about 10–15 seconds.
 
 ## Upgrading Eve
 
@@ -202,8 +221,10 @@ first request after the agent sleeps takes about 10–15 seconds.
 
 ## When something fails
 
-- Checks run before anything changes on Cloudflare. Fix the first failed
-  check by its `remediation` and run again.
+- `--json` prints one object even when the command fails. Read `error.code`
+  and `error.remediation`, or the first failed check's `remediation`.
+  Keep any `deployment` evidence. Resolve the reported cause before retrying;
+  a failed run may already have changed remote resources.
 - `VAL-CLI-007-TARGET-CONFLICT`: a resource with that name exists that Eden
   cannot prove it owns. For a brand-new agent, pick another `--name`; never
   delete the resource to make room.

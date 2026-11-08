@@ -56,7 +56,7 @@ async function writeCandidate(
   );
   await writeFile(
     join(snapshotRoot, "node_modules/eve/package.json"),
-    JSON.stringify({ name: "eve", version: "0.31.3", bin: "bin/eve.js" }),
+    JSON.stringify({ name: "eve", version: "0.91.0", bin: "bin/eve.js" }),
     "utf8",
   );
   await writeFile(
@@ -89,7 +89,7 @@ async function writeCandidate(
   }
 
   let sandboxCache: EveRuntimeImageRequest["candidate"]["sandboxCache"] = null;
-  if (options.sandboxCache === true) {
+  if (options.sandboxCache !== false) {
     const templateRoot = join(
       snapshotRoot,
       ".eve/sandbox-cache/just-bash/templates",
@@ -210,7 +210,7 @@ async function writeCandidate(
     installCommand: ["corepack", "pnpm", "install", "--frozen-lockfile"],
     buildCommand: ["./node_modules/.bin/eve", "build"],
     eveExecutable: "node_modules/.bin/eve",
-    eveVersion: "0.31.3",
+    eveVersion: "0.91.0",
     packageJsonSha256: "a".repeat(64),
     lockfileSha256: "b".repeat(64),
     sourceDigest: "c".repeat(64),
@@ -705,7 +705,7 @@ describe("Eve runtime image boundary", () => {
     );
     await writeFile(
       join(candidate.snapshotRoot, "pnpm-workspace.yaml"),
-      "minimumReleaseAgeExclude:\n  - eve@0.66.3\n",
+      "minimumReleaseAgeExclude:\n  - eve@0.91.0\n",
       "utf8",
     );
     await writeFile(
@@ -752,12 +752,12 @@ describe("Eve runtime image boundary", () => {
     expect(dockerfile).not.toContain(".env");
     expect(dockerfile).not.toContain("RUNTIME_SECRET");
     expect(dockerfile).not.toContain("do-not-copy");
-    expect(dockerfile).not.toContain(".eve/sandbox-cache");
+    expect(dockerfile).toContain(".eve/sandbox-cache");
   });
 
   test("ships the prepared sandbox template at /workspace/.eve/sandbox-cache", async () => {
     const root = await createRoot("eden-eve-runtime-image-sandbox-");
-    const candidate = await writeCandidate(root, {}, { sandboxCache: true });
+    const candidate = await writeCandidate(root);
     const fakeDocker = await writeFakeDocker(root);
 
     const result = await buildEveRuntimeImage({
@@ -843,7 +843,7 @@ describe("Eve runtime image boundary", () => {
 
   test("rejects an extracted sandbox template that escapes its runtime root", async () => {
     const root = await createRoot("eden-eve-runtime-image-sandbox-link-");
-    const candidate = await writeCandidate(root, {}, { sandboxCache: true });
+    const candidate = await writeCandidate(root);
     await symlink(
       "/etc/hostname",
       join(
@@ -884,7 +884,7 @@ describe("Eve runtime image boundary", () => {
 
   test("rejects a sandbox template that no longer matches the candidate evidence", async () => {
     const root = await createRoot("eden-eve-runtime-image-sandbox-drift-");
-    const candidate = await writeCandidate(root, {}, { sandboxCache: true });
+    const candidate = await writeCandidate(root);
     await writeFile(
       join(
         candidate.snapshotRoot,
@@ -925,7 +925,7 @@ describe("Eve runtime image boundary", () => {
 
   test("rejects a sandbox template present without candidate evidence", async () => {
     const root = await createRoot("eden-eve-runtime-image-sandbox-unevidenced-");
-    const candidate = await writeCandidate(root);
+    const candidate = await writeCandidate(root, {}, { sandboxCache: false });
     await mkdir(
       join(
         candidate.snapshotRoot,
@@ -1196,6 +1196,6 @@ describe("Eve runtime image boundary", () => {
     const closure = await revalidateEveRuntimeCandidate(candidate);
 
     expect(closure.eveStartClosureRetained).toBe(true);
-    expect(closure.files).toHaveLength(6);
+    expect(closure.files).toHaveLength(7);
   });
 });

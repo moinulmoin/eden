@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.12.0 — 2026-11-08
+
+Eden now needs Eve `0.91.0` or later, and every failure tells you, or your
+coding agent, what to do next. Update `@moinulmoin/eden`.
+
+### Changed
+
+- `eden preflight` and `eden deploy` now require Eve `>=0.91.0` and stop
+  older projects with `EVE_VERSION_UNSUPPORTED` before building. Existing
+  deployments keep running, and `eden destroy` still works.
+- To redeploy an older Eve project unchanged, use
+  `npx @moinulmoin/eden@0.11.5 deploy` with the same `--project`, `--env`,
+  `--name`, and `.eden` folder. That CLI is frozen and unmaintained.
+  Upgrading Eve instead may strand existing Postgres-World sessions; see
+  [session_stranded](docs/troubleshooting.md#old-sessions-return-session_stranded-after-an-eve-upgrade).
+- With `--json`, every run now prints exactly one JSON object on stdout. A
+  failure has `ok: false` and an `error` with `code`,
+  `message`, and, where Eden knows the fix, `remediation`. Before, a failure
+  after preflight printed only a text line on stderr and nothing on stdout.
+- An `indeterminate` deployment now includes the reason and where Eden kept
+  its evidence. A deployment that went live but whose cleanup failed is
+  reported as live, not as a failed deploy.
+- Without `--json`, errors now end with a `→` line naming the next step.
+- JSON results now name the command `eden preflight`, `eden deploy`, or
+  `eden destroy` instead of `eve preflight`, `eve deploy`, or `eve destroy`.
+  Update scripts that match on `command`.
+
+### Removed
+
+- The temporary fix for Eve's just-bash resume bug
+  ([eve#4440](https://github.com/vercel/eve/issues/4440)) and every other code
+  path that only served Eve versions below `0.91.0`. Eve `0.83.0` and later
+  include the upstream fix. Eden no longer changes any Eve file.
+
+### Docs
+
+- `docs/eve-compatibility.md` is now a short page: supported versions, the
+  World each one needs, and how Eden checks them. Dated runs moved to
+  `docs/eve-compatibility-history.md`.
+- `docs/troubleshooting.md` covers 12 more failure codes.
+- Install commands no longer pin a version.
+
+### Maintainers
+
+- CI and the release workflow now build and boot two pinned Eve projects
+  (`0.91.0` and `1.0.0-rc.6`) on the Postgres World and require a real
+  session to start. This catches an Eve and World pairing that would fail
+  every session, like the one fixed in 0.11.5.
+- Renovate proposes new `eve`, `@workflow/world-postgres`, and `just-bash`
+  releases, including release candidates, for the newer pinned project.
+- `AGENTS.md` lists what else to update when you change something, and the
+  release steps.
+
 ## 0.11.5 — 2026-11-08
 
 Update `@moinulmoin/eden`. Projects on the Postgres World with Eve

@@ -44,19 +44,19 @@ change. New to Eve, or starting from `eve init`? Check
 `npx @moinulmoin/eden` needs no install. For a global `eden` command, use npm:
 
 ```sh
-npm install --global @moinulmoin/eden@0.11.5
+npm install --global @moinulmoin/eden
 ```
 
 Or pnpm:
 
 ```sh
-pnpm add --global @moinulmoin/eden@0.11.5
+pnpm add --global @moinulmoin/eden
 ```
 
 Or Bun:
 
 ```sh
-bun add --global @moinulmoin/eden@0.11.5
+bun add --global @moinulmoin/eden
 ```
 
 Confirm the installation:
@@ -104,6 +104,8 @@ nothing on Cloudflare.
 - Docker or OrbStack with Linux/amd64 container support
 - an Eve project with one root `package-lock.json`, or an exact
   `packageManager: "pnpm@..."` entry and matching root `pnpm-lock.yaml`
+- Eve `>=0.91.0`; `preflight` and `deploy` reject older versions with
+  `EVE_VERSION_UNSUPPORTED`.
 - `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`).
   On Eve `0.83.0` and later, explicitly select `JustBashSandbox` as shown
   [below](#starting-from-a-fresh-eve-project); the production default no longer
@@ -124,12 +126,11 @@ installs that require project `.npmrc` configuration are not supported.
 
 ### Starting from a fresh Eve project
 
-Eden has been deployed live with Eve `0.68.0`, `0.79.1`, `0.81.0`, `0.82.0`,
-`0.83.0`, `0.91.0`, `1.0.0-rc.3`, and `1.0.0-rc.6`, including a fresh npm
-project on `0.82.0` and sandbox-file carry plus a queued task across a
-same-version skill update on `0.83.0`. These recorded live runs
-are listed in [Eve compatibility](./docs/eve-compatibility.md). To start a new
-project on Eve `0.91.0`, the latest stable release:
+Eden needs Eve `0.91.0` or later; see [Eve compatibility](./docs/eve-compatibility.md)
+for the tested versions, the World each one needs, and how to redeploy an
+older project unchanged.
+
+To start a new project on Eve `0.91.0`, the latest stable release:
 
 ```sh
 npx eve@0.91.0 init my-agent --non-interactive
@@ -151,15 +152,12 @@ export const environment = JustBashSandbox.environment();
 export default defineSandbox(() => environment.open());
 ```
 
-Eve `0.83.0` no longer falls back to `just-bash` in production; its default
-selects Vercel Sandbox or Docker when available, neither of which is available
-inside Eden's isolated builder.
-Eden rejects that default early with setup instructions. Older Eve versions
-keep their existing default-to-`just-bash` behavior in Eden.
+Eve's default sandbox selects Vercel Sandbox or Docker, neither of which is
+available inside Eden's isolated builder, so Eden rejects it early with these
+setup instructions.
 
 Keep the generated `package-lock.json`; Eden installs it with `npm ci` without
-converting the project to pnpm. See the recorded
-[npm launch run](./docs/eve-compatibility.md#fresh-eve-0820-npm-launch-run-2026-10-22).
+converting the project to pnpm.
 
 Replace the production placeholder in `agent/channels/eve.ts` with your real
 [Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection)
@@ -274,11 +272,6 @@ Things that differ from Vercel, and what Eden does about each:
   `345m`) so the snapshot always happens first.
 - **An update starts a new container from a new image.** Eden copies every
   conversation's sandbox files into it before it serves requests.
-- **Eve's `just-bash` sandbox refuses to resume a conversation after a skill
-  change** ([eve#4440](https://github.com/vercel/eve/issues/4440)). On Eve
-  `0.68.0`–`0.82.0` Eden applies a small temporary fix at build time, only for
-  Eve files it recognizes. Eve `0.83.0` includes the upstream fix, so Eden
-  leaves it alone there.
 - **Eve prepares its sandbox at build time, on the machine that builds.** A
   real Linux sandbox (microsandbox or Docker) needs KVM or a Docker daemon
   there; Eden's builder has neither, so agents get `just-bash`. microsandbox

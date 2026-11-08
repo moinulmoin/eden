@@ -185,17 +185,9 @@ If the same-version restart's conversation-file copy fails, the update still
 goes ahead and those conversations lose their sandbox files. File transfers
 between versions can instead be retried without overwriting active files.
 
-Eve `0.83.0` and later stable releases fix the
-[just-bash resume bug](https://github.com/vercel/eve/issues/4440) upstream;
-Eden leaves their binding unchanged and reports
-`✓ EVE_SANDBOX_RESUME_PATCH — not needed`. For older Eve releases, Eden's
-builder applies a temporary fix inside the throwaway build container only,
-and only when the binding matches a recognized checksum. An unknown older
-binding is left unchanged and prints an `EVE_SANDBOX_RESUME_PATCH` warning.
-
 The historical `0.82.0` → `0.83.0` upgrade returned HTTP 409
 `session_stranded` with an older World. See
-[Eve compatibility](./eve-compatibility.md).
+[Eve compatibility history](./eve-compatibility-history.md#eve-0820-to-0830-live-upgrade-2026-10-23).
 
 Same-version updates still resume sessions, pending approvals, and sleeping
 steps on new code (`EVE_UPDATE_IN_FLIGHT`). Keep step names and state shapes

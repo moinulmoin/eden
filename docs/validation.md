@@ -6,19 +6,34 @@ This is the maintainer runbook. First-time users should start with
 
 ## Eve compatibility gate
 
-The repository ships a pinned compatibility project under
-`validation/eve-compat/minimal/` that installs a real, published Eve version
-with a frozen lockfile. Run the local gate from the repository root:
+The gate tests two frozen fixtures: `validation/eve-compat/floor/` pins Eve
+0.91.0 and `@workflow/world-postgres` 5.0.5; `validation/eve-compat/latest/`
+pins Eve 1.0.0-rc.6 and World 5.1.1. Renovate updates only the latest fixture's
+Eve, World, and `just-bash` exact pins, in separate pull requests without
+automerge; the floor stays frozen.
+
+Start a local Postgres service, then run both fixtures from the repository root:
 
 ```sh
-pnpm run compat:eve:local
+docker run --rm -d --name eden-compat-postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+WORKFLOW_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm run compat:eve:local
 ```
 
-The gate performs the frozen install, typecheck, and production build/start of
-the fixture, checks public health and fail-closed bearer auth, and
-runs the public Eve eval runner when a model credential is available. See
-[Current Eve compatibility](./eve-compatibility.md) for the pinned versions and
-how to advance the tested Eve line.
+Append `floor` or `latest` to run only that fixture. Wait until Postgres is ready
+before running the gate. The database user must have `CREATEDB`: the script
+creates and deletes fresh databases for each run.
+
+The gate performs a frozen install, typecheck, production build/start, and
+bootstrap. It checks public health, fail-closed bearer auth, and keyless session
+admission. The public Eve eval runner is optional and runs when a model API key
+is available. CI and publish gates run both fixtures against Postgres 16.
+See [Current Eve compatibility](./eve-compatibility.md) for compatibility details.
+
+Stop the local service afterward:
+
+```sh
+docker stop eden-compat-postgres
+```
 
 ## Deployed validation
 

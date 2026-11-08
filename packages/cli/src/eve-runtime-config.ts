@@ -108,18 +108,25 @@ export class EveRuntimeConfigError extends Error {
   readonly code: EveRuntimeConfigErrorCode;
   readonly source: string | undefined;
   readonly variableName: string | undefined;
+  readonly remediation: string | undefined;
 
   constructor(options: {
     readonly code: EveRuntimeConfigErrorCode;
     readonly message: string;
     readonly source?: string;
     readonly variableName?: string;
+    readonly remediation?: string;
   }) {
     super(options.message);
     this.name = "EveRuntimeConfigError";
     this.code = options.code;
     this.source = options.source;
     this.variableName = options.variableName;
+    this.remediation = options.remediation ?? (
+      options.code.startsWith("EVE_ENV_")
+        ? "Correct the --env-file path or contents described by this error, then rerun the same command."
+        : undefined
+    );
   }
 }
 

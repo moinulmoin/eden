@@ -14,7 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { join, relative } from "node:path";
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -33,7 +33,6 @@ import type {
 } from "../src/index.js";
 import type { EveProjectBuilderRequest } from "../src/eve-packaging.js";
 import type { EveProjectBuilder } from "../src/eve-packaging.js";
-import { EVE_SANDBOX_RESUME_PATCH_SIGNATURE } from "../src/eve-packaging.js";
 import { exactTargetContainerEntries } from "../src/eve-control-plane.js";
 
 const roots: string[] = [];
@@ -97,6 +96,12 @@ async function withFakeWrangler(
 async function createRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "eden-cli-eve-namespace-"));
   roots.push(root);
+  await mkdir(join(root, "agent"), { recursive: true });
+  await writeFile(
+    join(root, "agent/sandbox.ts"),
+    "import { defineSandbox } from 'eve/sandbox';\nimport { JustBashSandbox } from 'eve/sandbox/just-bash';\nexport const environment = JustBashSandbox.environment();\nexport default defineSandbox(() => environment.open());\n",
+    "utf8",
+  );
   return root;
 }
 
@@ -108,7 +113,7 @@ async function writeSuccessfulBuild(
   });
   await writeFile(
     join(request.snapshotRoot, "node_modules/eve/package.json"),
-    JSON.stringify({ name: "eve", version: "0.31.3", bin: "bin/eve.js" }),
+    JSON.stringify({ name: "eve", version: "0.91.0", bin: "bin/eve.js" }),
     "utf8",
   );
   await writeFile(
@@ -131,6 +136,34 @@ async function writeSuccessfulBuild(
     "export default {};\n",
     "utf8",
   );
+  const templateKey = "7bc778099a3b436ce4ad98ba";
+  const templateRoot = join(
+    request.snapshotRoot,
+    ".eve/sandbox-cache/just-bash/templates",
+    templateKey,
+  );
+  await mkdir(join(templateRoot, "fs/workspace"), { recursive: true });
+  await writeFile(
+    join(templateRoot, "metadata.json"),
+    JSON.stringify({ templateKey }),
+    "utf8",
+  );
+  await mkdir(join(request.snapshotRoot, ".output/.eve/compile"), { recursive: true });
+  await writeFile(
+    join(request.snapshotRoot, ".output/.eve/compile/sandbox-prepared-artifacts.json"),
+    JSON.stringify({
+      entries: [{
+        artifact: {
+          templateRootPath: `/workspace/.eve/sandbox-cache/just-bash/templates/${templateKey}`,
+        },
+        nodeId: "__root__",
+        providerName: "just-bash",
+      }],
+      kind: "eve-sandbox-prepared-artifacts",
+      version: 2,
+    }),
+    "utf8",
+  );
 }
 
 function fakeBuilder(
@@ -140,7 +173,7 @@ function fakeBuilder(
     async build(request: EveProjectBuilderRequest) {
       await writeSuccessfulBuild(request);
       await mutate?.(request);
-      return { eveVersion: "0.31.3" };
+      return { eveVersion: "0.91.0" };
     },
   };
 }
@@ -305,10 +338,15 @@ describe("top-level Eden Deploy commands", () => {
       ),
     ).resolves.toBe(1);
 
-    expect(output.join("\n")).toContain('"command":"eve preflight"');
+    expect(output.join("\n")).toContain('"command":"eden preflight"');
     expect(output.join("\n")).toContain('"checks"');
-    expect(errors.join("\n")).toContain("EVE_PREFLIGHT_FAILED");
-    expect(errors.join("\n")).not.toContain("EVE_EXECUTION_UNAVAILABLE");
+    expect(output).toHaveLength(1);
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      ok: false,
+      error: { code: "EVE_PREFLIGHT_FAILED" },
+    });
+    expect(errors).toEqual([]);
+    expect(output.join("\n")).not.toContain("EVE_EXECUTION_UNAVAILABLE");
   });
 
   test("produces a passing immutable candidate with exact read-only target evidence", async () => {
@@ -409,7 +447,7 @@ describe("top-level Eden Deploy commands", () => {
         readonly imageDigest?: string;
       } | null;
     };
-    expect(result.command).toBe("eve preflight");
+    expect(result.command).toBe("eden preflight");
     expect(result.ok).toBe(true);
     expect(result.candidate?.generationId).toBe("generation-one");
     expect(result.candidate?.imageDigest).toBe(`sha256:${"a".repeat(64)}`);
@@ -618,7 +656,11 @@ describe("top-level Eden Deploy commands", () => {
       id: "VAL-CLI-007-TARGET-CONFLICT",
       status: "failed",
     }));
-    expect(errors.join("\n")).toContain("EVE_PREFLIGHT_FAILED");
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      error: { code: "EVE_PREFLIGHT_FAILED" },
+    });
+    expect(output).toHaveLength(1);
+    expect(errors).toEqual([]);
     expect(operations).toEqual(["exact-target-read"]);
   });
 
@@ -1147,13 +1189,16 @@ describe("top-level Eden Deploy commands", () => {
     expect(operations).toEqual(["publish", "health", "discard-runtime-image"]);
     expect(promotedAfterHealth).toBe(true);
     expect(output.join("\n")).not.toContain(marker);
-    expect(output.join("\n")).toContain("eve deploy");
+    expect(output.join("\n")).toContain("eden deploy");
     expect(output.join("\n")).toContain("VAL-CROSS-004");
-    if (expectedErrorCode === undefined) {
-      expect(errors).toEqual([]);
-    } else {
-      expect(errors.join("\n")).toContain(expectedErrorCode);
-      expect(errors.join("\n")).toContain("do not retry");
+    expect(output).toHaveLength(1);
+    expect(errors).toEqual([]);
+    if (expectedErrorCode !== undefined) {
+      expect(JSON.parse(output[0] as string)).toMatchObject({
+        ok: false,
+        error: { code: expectedErrorCode },
+      });
+      expect(output.join("\n")).toContain("do not retry");
     }
   });
 
@@ -1814,8 +1859,11 @@ describe("eden destroy", () => {
     ).resolves.toBe(1);
     expect(output.join("\n")).toContain('"status":"failed"');
     expect(output.join("\n")).toContain(destroyRegistryRepository);
-    expect(errors.join("\n")).toContain("EVE_DESTROY_IMAGES_RETAINED");
-    expect(errors.join("\n")).toContain(destroyRegistryRepository);
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      error: { code: "EVE_DESTROY_IMAGES_RETAINED" },
+    });
+    expect(output).toHaveLength(1);
+    expect(errors).toEqual([]);
     await expect(
       lstat(
         join(
@@ -1861,7 +1909,11 @@ describe("eden destroy", () => {
       ),
     ).resolves.toBe(1);
     expect(output.join("\n")).toContain('"status":"indeterminate"');
-    expect(errors.join("\n")).toContain("EVE_DESTROY_INDETERMINATE");
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      error: { code: "EVE_DESTROY_INDETERMINATE" },
+    });
+    expect(output).toHaveLength(1);
+    expect(errors).toEqual([]);
     await expect(
       lstat(
         join(
@@ -1886,13 +1938,14 @@ describe("eden destroy", () => {
     record.identity.releaseId = "eve-deploy-this-project";
     await writeFile(recordPath, JSON.stringify(record), "utf8");
     const errors: string[] = [];
+    const output: string[] = [];
     const deleted: string[] = [];
     await expect(
       runEdenCli(
         ["destroy", "--project", root, "--env", "preview", "--name", "eve-destroy-fixture", "--json"],
         {
           cwd: root,
-          stdout: () => undefined,
+          stdout: (line) => output.push(line),
           stderr: (line) => errors.push(line),
           eveControlPlane: {
             destroyCloudflareRead: async () => ({
@@ -1914,12 +1967,17 @@ describe("eden destroy", () => {
       ),
     ).resolves.toBe(1);
     expect(deleted).toEqual([]);
-    expect(errors.join("\n")).toContain("EVE_DESTROY_OWNERSHIP_UNPROVEN");
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      error: { code: "EVE_DESTROY_OWNERSHIP_UNPROVEN" },
+    });
+    expect(output).toHaveLength(1);
+    expect(errors).toEqual([]);
   });
 
   test("keeps the default Wrangler Worker deletion on the 120 second deadline", async () => {
     const { root } = await createDeployedFixture();
     const errors: string[] = [];
+    const output: string[] = [];
     const calls = await withFakeWrangler(async () => {
       await expect(
         runEdenCli(
@@ -1933,7 +1991,7 @@ describe("eden destroy", () => {
           "--json",],
           {
             cwd: root,
-            stdout: () => undefined,
+            stdout: (line) => output.push(line),
             stderr: (line) => errors.push(line),
             eveControlPlane: {
               destroyCloudflareRead: async () => ({
@@ -1957,7 +2015,11 @@ describe("eden destroy", () => {
         timeoutMs: 120_000,
       },
     ]);
-    expect(errors.join("\n")).toContain("EVE_DESTROY_INDETERMINATE");
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      error: { code: "EVE_DESTROY_INDETERMINATE" },
+    });
+    expect(output).toHaveLength(1);
+    expect(errors).toEqual([]);
   });
 
   test("keeps CURRENT and fails when absence cannot be verified after deletion", async () => {
@@ -1993,7 +2055,11 @@ describe("eden destroy", () => {
       ),
     ).resolves.toBe(1);
     expect(output.join("\n")).toContain('"status":"failed"');
-    expect(errors.join("\n")).toContain("EVE_DESTROY_ABSENCE_UNPROVEN");
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      error: { code: "EVE_DESTROY_ABSENCE_UNPROVEN" },
+    });
+    expect(output).toHaveLength(1);
+    expect(errors).toEqual([]);
     await expect(
       lstat(
         join(
@@ -2122,6 +2188,43 @@ describe("Workflow World warnings", () => {
       }),
     };
   }
+  test("rejects installed Eve 0.90.x before building and accepts the 0.91.0 floor", async () => {
+    for (const version of ["0.90.9", "0.91.0"]) {
+      const root = await createRoot();
+      await writeFixtureProject(root);
+      await mkdir(join(root, "node_modules/eve"), { recursive: true });
+      await writeFile(
+        join(root, "node_modules/eve/package.json"),
+        JSON.stringify({ name: "eve", version }),
+        "utf8",
+      );
+      const output: string[] = [];
+      const builder = fakeBuilder();
+      const build = vi.spyOn(builder, "build");
+      await expect(runEdenCli(
+        ["preflight", "--project", root, "--name", "eve-version-floor", "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: passingControlPlane(root, builder),
+        },
+      )).resolves.toBe(version === "0.90.9" ? 1 : 0);
+      const result = JSON.parse(output[0] as string) as {
+        checks: { id: string; status: string }[];
+      };
+      const failure = result.checks.find((check) =>
+        check.id === "EVE_VERSION_UNSUPPORTED" && check.status === "failed"
+      );
+      if (version === "0.90.9") {
+        expect(failure).toBeDefined();
+        expect(build).not.toHaveBeenCalled();
+      } else {
+        expect(failure).toBeUndefined();
+        expect(build).toHaveBeenCalledOnce();
+      }
+    }
+  });
+
 
   test.each([
     { manager: "npm@11.11.1", custom: false },
@@ -2177,13 +2280,14 @@ export default eveChannel({
     { command: "preflight", directory: false, provider: "DefaultSandbox" },
     { command: "preflight", directory: true, provider: "DockerSandbox" },
     { command: "deploy", directory: false, provider: "VercelSandbox" },
-  ])("rejects unsupported 0.83 sandbox before building or remote access ($command, $provider, directory=$directory)", async ({ command, directory, provider }) => {
+  ])("rejects unsupported sandbox before building or remote access ($command, $provider, directory=$directory)", async ({ command, directory, provider }) => {
     const root = await createRoot();
     await writeFixtureProject(root);
     await writeFile(join(root, "package.json"), JSON.stringify({
       name: "eve-sandbox-fixture",
-      dependencies: { eve: "^0.83.0" },
+      dependencies: { eve: "^0.91.0" },
     }));
+    await rm(join(root, "agent/sandbox.ts"));
     const modulePath = directory ? "agent/sandbox/sandbox.ts" : "agent/sandbox.ts";
     await mkdir(join(root, directory ? "agent/sandbox" : "agent"), { recursive: true });
     if (provider !== undefined) {
@@ -2214,6 +2318,7 @@ export default eveChannel({
     expect(build).not.toHaveBeenCalled();
     expect(cloudflareRead).not.toHaveBeenCalled();
   });
+
 
   test("warns when the compiled agent uses Eve's default local World", async () => {
     const root = await createRoot();
@@ -2263,89 +2368,6 @@ export default eveChannel({
     expect(text).toContain("preflight passed");
   });
 
-  test("warns when the builder's Eve is not a known just-bash version", async () => {
-    const root = await createRoot();
-    await writeFixtureProject(root);
-    const output: string[] = [];
-
-    await expect(
-      runEdenCli(
-        ["preflight", "--project", root, "--env", "preview",
-        "--name", "eve-patch-unknown", "--json"],
-        {
-          cwd: root,
-          stdout: (line) => output.push(line),
-          eveControlPlane: passingControlPlane(
-            root,
-            fakeBuilder(async (request) => {
-              const binding = join(
-                request.snapshotRoot,
-                "node_modules/eve/dist/src/execution/sandbox/bindings/just-bash.js",
-              );
-              await mkdir(dirname(binding), { recursive: true });
-              await writeFile(binding, "export const provider = {};\n", "utf8");
-            }),
-          ),
-        },
-      ),
-    ).resolves.toBe(0);
-
-    const result = JSON.parse(output[0] as string) as {
-      readonly warnings: readonly { readonly id: string }[];
-    };
-    expect(result.warnings.map((value) => value.id)).toContain(
-      "EVE_SANDBOX_RESUME_PATCH",
-    );
-  });
-
-  test("does not warn when the builder applied the sandbox-resume patch", async () => {
-    const root = await createRoot();
-    await writeFixtureProject(root);
-    const output: string[] = [];
-
-    await expect(
-      runEdenCli(
-        ["preflight", "--project", root, "--env", "preview",
-        "--name", "eve-patch-applied", "--json"],
-        {
-          cwd: root,
-          stdout: (line) => output.push(line),
-          eveControlPlane: passingControlPlane(
-            root,
-            fakeBuilder(async (request) => {
-              const binding = join(
-                request.snapshotRoot,
-                "node_modules/eve/dist/src/execution/sandbox/bindings/just-bash.js",
-              );
-              await mkdir(dirname(binding), { recursive: true });
-              await writeFile(
-                binding,
-                `// patched\nconst ${EVE_SANDBOX_RESUME_PATCH_SIGNATURE} = async () => undefined;\n`,
-                "utf8",
-              );
-            }),
-          ),
-        },
-      ),
-    ).resolves.toBe(0);
-
-    const result = JSON.parse(output[0] as string) as {
-      readonly warnings: readonly { readonly id: string }[];
-      readonly checks: readonly {
-        readonly id: string;
-        readonly status: string;
-        readonly message: string;
-      }[];
-    };
-    expect(result.warnings.map((value) => value.id)).not.toContain(
-      "EVE_SANDBOX_RESUME_PATCH",
-    );
-    expect(result.checks).toContainEqual({
-      id: "EVE_SANDBOX_RESUME_PATCH",
-      status: "passed",
-      message: "applied temporary fix for eve#4440",
-    });
-  });
 
   test("does not warn when the compiled agent selects a durable World", async () => {
     const root = await createRoot();
@@ -2577,7 +2599,7 @@ export default eveChannel({
         join(request.snapshotRoot, "node_modules/eve/package.json"),
         JSON.stringify({
           name: "eve",
-          version: options.eveVersion ?? "0.31.3",
+          version: options.eveVersion ?? "0.91.0",
           bin: "bin/eve.js",
           dependencies: { "@workflow/core": options.eveCore ?? "5.0.0-beta.57" },
         }),
@@ -2601,12 +2623,6 @@ export default eveChannel({
         }),
         "utf8",
       );
-      if (options.eveVersion !== undefined) {
-        // Eve 0.83 and later builds must prepare a just-bash sandbox template.
-        const templates = join(request.snapshotRoot, ".eve/sandbox-cache/just-bash/templates");
-        await mkdir(templates, { recursive: true });
-        await writeFile(join(templates, "template.json"), "{}", "utf8");
-      }
       if (options.worldRange !== undefined) {
         await mkdir(
           join(request.snapshotRoot, "node_modules", options.world ?? "@workflow/world-postgres"),
@@ -3044,7 +3060,11 @@ describe("eden deploy in-place update", () => {
       result.checks.find((value) => value.id === "VAL-CLI-007-TARGET-CONFLICT")
         ?.status,
     ).toBe("failed");
-    expect(errors.join("\n")).toContain("EVE_DEPLOY_CHECKS_FAILED");
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      error: { code: "EVE_DEPLOY_CHECKS_FAILED" },
+    });
+    expect(output).toHaveLength(1);
+    expect(errors).toEqual([]);
   });
 
   test("keeps migration history append-only and appends v2 when the World class is first introduced", async () => {

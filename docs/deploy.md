@@ -220,16 +220,6 @@ Deploy rotates the reserved `EDEN_EVE_CONTROL_TOKEN` Worker secret to manage
 old versions. This creates an additional Worker version and can take seconds
 to activate. The token is not saved locally or written to logs.
 
-A skill change need not break an existing just-bash session. Eve `0.83.0`
-and later stable releases fix Eve's
-[just-bash resume bug](https://github.com/vercel/eve/issues/4440) upstream
-(Eve would otherwise permanently refuse to resume a conversation after its
-sandbox template changes), and preflight reports
-`✓ EVE_SANDBOX_RESUME_PATCH — not needed`. For older Eve versions, Eden's
-builder applies a temporary fix inside its throwaway build image only, and
-only when Eve's file matches a known checksum; on an unknown older version the
-deploy still succeeds and prints an `EVE_SANDBOX_RESUME_PATCH` warning instead.
-
 ### Eve upgrades and retained sessions
 
 Update both the Eden CLI and the project's Cloudflare World package. With a
@@ -265,7 +255,7 @@ check can fail. Let that work finish, then retry the same target.
 `deploymentAffinity`, Eden keeps the previous single-image update behavior
 and warns that changing Eve can strand sessions. That includes older
 Cloudflare World packages; upgrading the CLI alone does not enable affinity.
-The [recorded `0.82.0` → `0.83.0` failure](./eve-compatibility.md#eve-0820-to-0830-live-upgrade-2026-10-23)
+The [recorded `0.82.0` → `0.83.0` failure](./eve-compatibility-history.md#eve-0820-to-0830-live-upgrade-2026-10-23)
 shows what happens with an older World.
 
 The summary prints `✓ updated <name>` (in `--json`, `deployment.operation` is
@@ -347,7 +337,7 @@ associated with `WORKER_NAME`. An unreachable URL alone is not sufficient
 cleanup evidence.
 
 Maintainers validating Eden against the current Eve release should also follow
-the [current Eve compatibility runbook](./eve-compatibility.md).
+the [Eve compatibility page](./eve-compatibility.md).
 
 ## Preview and production
 
@@ -433,7 +423,7 @@ idle, and Eden must snapshot before that.
 
 ## Durable state on Cloudflare (no database)
 
-**Experimental.** With Eve `0.68.0`, add `@moinulmoin/eden-world-cloudflare`
+**Experimental.** Add `@moinulmoin/eden-world-cloudflare` (`0.11.2` or later)
 to the agent project's production dependencies and select it in `agent.ts`:
 
 ```ts
@@ -518,8 +508,8 @@ session's run and its start hook together, and the Postgres World does that
 from `5.1.1`. With an older release every new session fails with HTTP 500, so
 `eden preflight` and `eden deploy` stop with `EVE_WORLD_PAIRING` first.
 
-Eve `0.68.0` bundles `@workflow/world` `5.0.0-beta.39` and pairs with
-`@workflow/world-postgres@5.0.0-beta.47`.
+Eve `0.91.0` bundles `@workflow/world` `5.0.5` and pairs with
+`@workflow/world-postgres@5.0.5`.
 
 Use `pnpm add` instead for a pnpm project; keep the existing package manager
 and its matching lockfile.

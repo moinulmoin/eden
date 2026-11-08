@@ -1,12 +1,9 @@
 import {
   createHash,
 } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import {
   access,
   chmod,
-  cp,
-  lstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -19,7 +16,6 @@ import {
   tmpdir,
 } from "node:os";
 import {
-  dirname,
   join,
 } from "node:path";
 
@@ -29,14 +25,6 @@ import {
   buildEveProjectSnapshot,
   checkEveSandboxProvider,
   createDockerEveProjectBuilder,
-  EVE_JUST_BASH_RESUME_ORIGINAL,
-  EVE_SANDBOX_RESUME_PATCHED,
-  EVE_SANDBOX_RESUME_PATCHED_LATEST,
-  EVE_SANDBOX_RESUME_PATCH_HELPERS,
-  EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256,
-  EVE_SANDBOX_RESUME_PATCH_LATEST_SHA256,
-  EVE_SANDBOX_RESUME_PATCH_SCRIPT,
-  EVE_SANDBOX_RESUME_PATCH_SIGNATURE,
   jsonBytes,
   type EveProjectBuilder,
   type EveProjectBuilderRequest,
@@ -75,6 +63,9 @@ async function writeProject(
   );
   await mkdir(join(root, "src"), { recursive: true });
   await writeFile(join(root, "src/index.ts"), "export const value = 1;\n", "utf8");
+  await mkdir(join(root, "agent"), { recursive: true });
+  await writeFile(join(root, "agent/sandbox.ts"),
+    "import { defineSandbox } from 'eve/sandbox';\nimport { JustBashSandbox } from 'eve/sandbox/just-bash';\nexport const environment = JustBashSandbox.environment();\nexport default defineSandbox(() => environment.open());\n");
 }
 
 function fakeBuilder(
@@ -91,7 +82,7 @@ function fakeBuilder(
         requests.push(request);
         await configure(request);
         return {
-          eveVersion: "0.31.3",
+          eveVersion: "0.91.0",
           imageId: `sha256:${"1".repeat(64)}`,
           imagePlatform: "linux/amd64",
           imageReference: "eve-fixture-image",
@@ -108,7 +99,7 @@ async function writeSuccessfulBuild(
   await mkdir(join(eveDirectory, "bin"), { recursive: true });
   await writeFile(
     join(eveDirectory, "package.json"),
-    JSON.stringify({ name: "eve", version: "0.31.3", bin: "bin/eve.js" }),
+    JSON.stringify({ name: "eve", version: "0.91.0", bin: "bin/eve.js" }),
     "utf8",
   );
   await writeFile(join(eveDirectory, "bin/eve.js"), "#!/usr/bin/env node\n", {
@@ -130,6 +121,11 @@ async function writeSuccessfulBuild(
     "export default {};\n",
     "utf8",
   );
+  const template = join(request.snapshotRoot, ".eve/sandbox-cache/just-bash/templates/7bc778099a3b436ce4ad98ba");
+  await mkdir(join(template, "fs/workspace"), { recursive: true });
+  await writeFile(join(template, "metadata.json"), JSON.stringify({
+    version: 1, templateKey: "7bc778099a3b436ce4ad98ba", env: { HOME: "/home/agent" },
+  }) + "\n");
 }
 
 async function writeFakeDockerCommand(
@@ -186,7 +182,7 @@ else if (args[0] === "build") {
     fs.mkdirSync(path.join(eve, "bin"), { recursive: true });
     fs.writeFileSync(
       path.join(eve, "package.json"),
-      JSON.stringify({ name: "eve", version: ${JSON.stringify(options.eveVersion ?? "0.31.3")} }),
+      JSON.stringify({ name: "eve", version: ${JSON.stringify(options.eveVersion ?? "0.91.0")} }),
     );
     fs.writeFileSync(path.join(eve, "bin/eve.js"), "#!/usr/bin/env node\\n");
     fs.chmodSync(path.join(eve, "bin/eve.js"), 0o755);
@@ -206,7 +202,7 @@ else if (args[0] === "build") {
       fs.mkdirSync(path.join(template, "fs/workspace"), { recursive: true });
       fs.writeFileSync(
         path.join(template, "metadata.json"),
-        JSON.stringify({ version: 1, env: { HOME: "/home/agent" } }) + "\\n",
+        JSON.stringify({ version: 1, templateKey: "7bc778099a3b436ce4ad98ba", env: { HOME: "/home/agent" } }) + "\\n",
       );
       if (sandboxCacheMode === "escaping-symlink") {
         fs.symlinkSync("/etc/hostname", path.join(template, "fs/escape"));
@@ -236,49 +232,26 @@ afterEach(async () => {
 
 describe("Eve project snapshot/build boundary", () => {
   test.each([
-    { version: "0.68.0", provider: undefined, failed: false },
-    { version: "0.82.0", provider: "DefaultSandbox", failed: false },
-    { version: "0.83.0", provider: undefined, failed: true },
-    { version: "0.83.0-canary.1", provider: "DefaultSandbox", failed: true },
+    { version: "0.91.0", provider: undefined, failed: true },
+    { version: "0.91.0", provider: "DefaultSandbox", failed: true },
     { version: "1.0.0", provider: undefined, failed: true },
-    { version: "0.82.0", provider: "DockerSandbox", failed: true },
-    { version: "0.83.0", provider: "JustBashSandbox", failed: false },
-  ])("gates Eve $version with $provider at the explicit-provider boundary", async ({ version, provider, failed }) => {
+    { version: "0.91.0", provider: "DockerSandbox", failed: true },
+    { version: "0.91.0", provider: "JustBashSandbox", failed: false },
+  ])("gates Eve $version with $provider at the explicit-provider boundary", async ({ provider, failed }) => {
     const root = await createRoot("eden-eve-sandbox-provider-");
     await writeProject(root);
+    await rm(join(root, "agent"), { recursive: true, force: true });
     if (provider !== undefined) {
       await mkdir(join(root, "agent/sandbox"), { recursive: true });
       const specifier = provider === "JustBashSandbox" ? "eve/sandbox/just-bash" : "eve/sandbox";
       await writeFile(join(root, "agent/sandbox/sandbox.ts"),
         `import { ${provider} } from '${specifier}';\nexport const environment = ${provider}.environment();\nexport default defineSandbox(() => environment.open());\n`);
     }
-    const error = await checkEveSandboxProvider(root, version);
+    const error = await checkEveSandboxProvider(root);
     expect(error?.code).toBe(failed ? "EVE_SANDBOX_PROVIDER" : undefined);
     if (failed) expect(error?.remediation).toContain("pnpm add just-bash");
   });
 
-  test.each(["npm", "pnpm"])("uses the locked Eve version rather than an older declared range (%s)", async (manager) => {
-    const root = await createRoot("eden-eve-sandbox-locked-");
-    await writeProject(root, { packageJson: JSON.stringify({
-      name: "eve-fixture",
-      dependencies: { eve: "^0.82.0" },
-    }) });
-    if (manager === "npm") {
-      await writeFile(join(root, "package-lock.json"), JSON.stringify({
-        packages: { "node_modules/eve": { version: "0.83.0" } },
-      }));
-    } else {
-      await writeFile(join(root, "pnpm-lock.yaml"), `lockfileVersion: '9.0'
-importers:
-  .:
-    dependencies:
-      eve:
-        specifier: ^0.82.0
-        version: 0.83.0(zod@4.5.4)
-`);
-    }
-    expect((await checkEveSandboxProvider(root))?.code).toBe("EVE_SANDBOX_PROVIDER");
-  });
 
   test.each([undefined, "npm@11.13.0"])("packages npm locks without converting source (%s)", async (packageManager) => {
     const root = await createRoot("eden-eve-package-npm-");
@@ -392,10 +365,10 @@ importers:
         installCommand: ["corepack", "pnpm", "install", "--frozen-lockfile"],
         buildCommand: ["./node_modules/.bin/eve", "build"],
         eveExecutable: "node_modules/.bin/eve",
-        eveVersion: "0.31.3",
+        eveVersion: "0.91.0",
       },
       snapshot: {
-        includedFileCount: 3,
+        includedFileCount: 4,
         sourceRaceChecked: true,
       },
     });
@@ -592,7 +565,7 @@ importers:
       async build(request) {
         requests.push(request);
         await writeSuccessfulBuild(request);
-        return { eveVersion: "0.31.3" };
+        return { eveVersion: "0.91.0" };
       },
     };
 
@@ -608,7 +581,7 @@ importers:
       deployable: true,
       candidate: {
         packageManagerVersion: "11.21.0",
-        eveVersion: "0.31.3",
+        eveVersion: "0.91.0",
         buildCommand: ["./node_modules/.bin/eve", "build"],
         generatedOutput: {
           entrypointPath: ".output/server/index.mjs",
@@ -663,7 +636,7 @@ importers:
       await writeSuccessfulBuild(request);
       await writeFile(
         join(request.snapshotRoot, "node_modules/eve/package.json"),
-        JSON.stringify({ name: "not-eve", version: "0.31.3", bin: "bin/eve.js" }),
+        JSON.stringify({ name: "not-eve", version: "0.91.0", bin: "bin/eve.js" }),
         "utf8",
       );
     });
@@ -1050,7 +1023,7 @@ importers:
       await mkdir(join(eveDirectory, "bin"), { recursive: true });
       await writeFile(
         join(eveDirectory, "package.json"),
-        JSON.stringify({ name: "eve", version: "0.31.3", bin: "bin/eve.js" }),
+        JSON.stringify({ name: "eve", version: "0.91.0", bin: "bin/eve.js" }),
         "utf8",
       );
       await writeFile(join(eveDirectory, "bin/eve.js"), "#!/usr/bin/env node\n", {
@@ -1287,7 +1260,7 @@ importers:
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test.each(["0.82.0", "0.83.0"])("extracts the prepared JustBash sandbox template for Eve %s into the generation snapshot", async (eveVersion) => {
+  test.each(["0.91.0"])("extracts the prepared JustBash sandbox template for Eve %s into the generation snapshot", async (eveVersion) => {
     const root = await createRoot("eden-eve-package-sandbox-extract-");
     const artifacts = await createRoot("eden-eve-package-sandbox-artifacts-");
     await writeProject(root);
@@ -1351,36 +1324,8 @@ export default defineSandbox(() => environment.open());
     expect(runtimeManifest.sandboxCache).toEqual(result.candidate?.sandboxCache);
   });
 
-  test("ships no sandbox cache when the builder prepared no template", async () => {
-    const root = await createRoot("eden-eve-package-sandbox-absent-");
-    const artifacts = await createRoot("eden-eve-package-sandbox-absent-artifacts-");
-    await writeProject(root);
-    const fakeDocker = await writeFakeDockerCommand(artifacts, {
-      sandboxCache: "absent",
-    });
-    const builder = createDockerEveProjectBuilder({
-      nodeImage: {
-        reference: "node:24.17.0-bookworm-slim",
-        digest: `sha256:${"0".repeat(64)}`,
-      },
-      dockerCommand: fakeDocker.command,
-    });
 
-    const result = await buildEveProjectSnapshot({
-      projectRoot: root,
-      artifactRoot: join(artifacts, "generation-one"),
-      builder,
-    });
-
-    expect(result.status).toBe("ready");
-    expect(result.candidate?.sandboxCache).toBeNull();
-    const snapshotPath = result.snapshot?.path as string;
-    await expect(lstat(join(snapshotPath, ".eve"))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-  });
-
-  test("blocks an Eve 0.83 build that prepared no just-bash template though the sandbox module passed the source check", async () => {
+  test("blocks a build that prepared no just-bash template though the sandbox module passed the source check", async () => {
     const root = await createRoot("eden-eve-package-sandbox-unresolved-");
     const artifacts = await createRoot("eden-eve-package-sandbox-unresolved-artifacts-");
     await writeProject(root);
@@ -1394,7 +1339,7 @@ export default defineSandbox(() => environment.open());
     await writeFile(join(root, "agent/sandbox-env.ts"), `import { DefaultSandbox } from 'eve/sandbox';
 export const environment = DefaultSandbox.environment();
 `);
-    const fakeDocker = await writeFakeDockerCommand(artifacts, { eveVersion: "0.83.0", sandboxCache: "absent" });
+    const fakeDocker = await writeFakeDockerCommand(artifacts, { eveVersion: "0.91.0", sandboxCache: "absent" });
     const builder = createDockerEveProjectBuilder({
       nodeImage: {
         reference: "node:24.17.0-bookworm-slim",
@@ -1686,568 +1631,3 @@ export const environment = DefaultSandbox.environment();
   });
 });
 
-describe("Eve sandbox-resume patch (eve#4440)", () => {
-  const bindingRelativePath =
-    "node_modules/eve/dist/src/execution/sandbox/bindings/just-bash.js";
-  const bindings = [
-    {
-      version: "0.68.0/0.71.2/0.72.1",
-      sha256: EVE_SANDBOX_RESUME_PATCH_KNOWN_SHA256,
-      replacement: EVE_SANDBOX_RESUME_PATCHED,
-      shape: "legacy",
-    },
-    {
-      version: "0.79.1",
-      sha256: EVE_SANDBOX_RESUME_PATCH_LATEST_SHA256,
-      replacement: EVE_SANDBOX_RESUME_PATCHED_LATEST,
-      shape: "template-key",
-    },
-  ] as const;
-  type BindingShape = (typeof bindings)[number]["shape"];
-
-  /** A minimal but parseable module embedding the known resume text. */
-  function fixtureModule(resumeText: string): string {
-    return [
-      `import{dirname,join}from"node:path";`,
-      `const t={};`,
-      `function requirePreparedJustBashArtifact(){return{templateRootPath:"/tmp/template"}}`,
-      `const provider={${resumeText}};`,
-      `export{provider};`,
-    ].join("\n");
-  }
-
-  function patcherScriptWithHash(
-    knownSha256: string,
-    expectedSha256: string,
-  ): string {
-    const knownLiteral = JSON.stringify(knownSha256);
-    expect(
-      EVE_SANDBOX_RESUME_PATCH_SCRIPT.split(knownLiteral).length - 1,
-    ).toBe(1);
-    return EVE_SANDBOX_RESUME_PATCH_SCRIPT.replace(
-      knownLiteral,
-      JSON.stringify(expectedSha256),
-    );
-  }
-
-  async function writeEveFixture(
-    root: string,
-    bindingSource: string,
-  ): Promise<string> {
-    const packageRoot = join(root, "project/node_modules/eve");
-    const bindingPath = join(
-      packageRoot,
-      "dist/src/execution/sandbox/bindings/just-bash.js",
-    );
-    await mkdir(dirname(bindingPath), { recursive: true });
-    await writeFile(
-      join(packageRoot, "package.json"),
-      JSON.stringify({ name: "eve", version: "0.72.1", type: "module" }),
-      "utf8",
-    );
-    await writeFile(bindingPath, bindingSource, "utf8");
-    return bindingPath;
-  }
-
-  async function runPatcher(
-    projectRoot: string,
-    script: string,
-  ): Promise<{ readonly status: number | null; readonly output: string }> {
-    const scriptPath = join(projectRoot, "..", "patcher.cjs");
-    await writeFile(scriptPath, script, "utf8");
-    const run = spawnSync(process.execPath, [scriptPath], {
-      cwd: projectRoot,
-      encoding: "utf8",
-    });
-    return {
-      status: run.status,
-      output: `${run.stdout ?? ""}${run.stderr ?? ""}`,
-    };
-  }
-
-  test.each(bindings)("applies once against $version and produces parseable JavaScript", async (binding) => {
-    const root = await createRoot("eden-eve-patch-apply-");
-    const fixture = fixtureModule(EVE_JUST_BASH_RESUME_ORIGINAL);
-    const bindingPath = await writeEveFixture(root, fixture);
-    const script = patcherScriptWithHash(
-      binding.sha256,
-      createHash("sha256").update(fixture).digest("hex"),
-    );
-
-    const first = await runPatcher(join(root, "project"), script);
-    expect(first.status).toBe(0);
-    expect(first.output).toContain(
-      "eden-eve-sandbox-resume-patch: applied",
-    );
-
-    const patched = await readFile(bindingPath, "utf8");
-    expect(patched).not.toContain(EVE_JUST_BASH_RESUME_ORIGINAL);
-    expect(patched.split(binding.replacement).length - 1).toBe(1);
-    expect(patched).not.toContain(
-      binding.shape === "legacy"
-        ? EVE_SANDBOX_RESUME_PATCHED_LATEST
-        : EVE_SANDBOX_RESUME_PATCHED,
-    );
-    expect(patched.split(EVE_SANDBOX_RESUME_PATCH_SIGNATURE).length - 1)
-      .toBeGreaterThan(0);
-    expect(spawnSync(process.execPath, ["--check", bindingPath], {
-      encoding: "utf8",
-    }).status).toBe(0);
-    const temporaryFiles = (await readdir(dirname(bindingPath)))
-      .filter((name) => name.includes(".tmp.js"));
-    expect(temporaryFiles).toEqual([]);
-
-    const second = await runPatcher(join(root, "project"), script);
-    expect(second.status).toBe(0);
-    expect(second.output).toContain("eden-eve-sandbox-resume-patch: applied");
-    expect(second.output).toContain("already patched");
-  });
-
-  test("skips an unknown binding and leaves every project file untouched", async () => {
-    const root = await createRoot("eden-eve-patch-skip-");
-    const mutatedResume = EVE_JUST_BASH_RESUME_ORIGINAL.replace(
-      "version:1",
-      "version:2",
-    );
-    expect(mutatedResume).not.toBe(EVE_JUST_BASH_RESUME_ORIGINAL);
-    const bindingPath = await writeEveFixture(root, fixtureModule(mutatedResume));
-    const otherSource = join(root, "project/src/index.ts");
-    await mkdir(dirname(otherSource), { recursive: true });
-    await writeFile(otherSource, "export const value = 1;\n", "utf8");
-
-    const run = await runPatcher(
-      join(root, "project"),
-      EVE_SANDBOX_RESUME_PATCH_SCRIPT,
-    );
-    expect(run.status).toBe(0);
-    expect(run.output).toContain("eden-eve-sandbox-resume-patch: skipped");
-    expect(await readFile(bindingPath, "utf8")).toBe(
-      fixtureModule(mutatedResume),
-    );
-    expect(await readFile(otherSource, "utf8")).toBe(
-      "export const value = 1;\n",
-    );
-  });
-
-  test("reports absent when the eve build has no just-bash binding", async () => {
-    const root = await createRoot("eden-eve-patch-absent-");
-    await writeEveFixture(root, "export const provider = {};\n");
-    await rm(join(root, "project", bindingRelativePath));
-
-    const run = await runPatcher(
-      join(root, "project"),
-      EVE_SANDBOX_RESUME_PATCH_SCRIPT,
-    );
-    expect(run.status).toBe(0);
-    expect(run.output).toContain("eden-eve-sandbox-resume-patch: absent");
-  });
-
-  test("runs the patch step in the builder and the production reinstall stages", async () => {
-    const root = await createRoot("eden-eve-patch-dockerfile-");
-    const artifacts = await createRoot("eden-eve-patch-dockerfile-artifacts-");
-    await writeProject(root);
-    const { builder, requests } = fakeBuilder(writeSuccessfulBuild);
-
-    const result = await buildEveProjectSnapshot({
-      projectRoot: root,
-      artifactRoot: join(artifacts, "generation-one"),
-      builder,
-      nodeImage: {
-        reference: "node:24.17.0-bookworm",
-        digest: `sha256:${"a".repeat(64)}`,
-      },
-    });
-
-    expect(result.status).toBe("ready");
-    const dockerfilePath = requests[0]?.dockerfilePath;
-    expect(dockerfilePath).toBeDefined();
-    const dockerfile = await readFile(dockerfilePath ?? "", "utf8");
-    const step = "RUN node /tmp/eden-eve-sandbox-resume-patch.cjs";
-    expect(dockerfile.split(step).length - 1).toBe(2);
-    expect(dockerfile.split("COPY <<'EDEN_EVE_PATCH_EOF'").length - 1).toBe(2);
-    const installIndex = dockerfile.indexOf(
-      "corepack pnpm install --frozen-lockfile",
-    );
-    const prodInstallIndex = dockerfile.indexOf(
-      "corepack pnpm install --frozen-lockfile --prod",
-    );
-    const firstStep = dockerfile.indexOf(step);
-    const secondStep = dockerfile.indexOf(step, firstStep + 1);
-    expect(firstStep).toBeGreaterThan(installIndex);
-    expect(firstStep).toBeLessThan(prodInstallIndex);
-    expect(secondStep).toBeGreaterThan(prodInstallIndex);
-    expect(dockerfile.indexOf("./node_modules/.bin/eve build")).toBeGreaterThan(
-      firstStep,
-    );
-    // The heredoc delimiter is quoted, so the script never sees shell expansion.
-    expect(dockerfile).toContain("EDEN_EVE_PATCH_EOF");
-  });
-
-  test("reports the shipped binding as the patch outcome", async () => {
-    const root = await createRoot("eden-eve-patch-detect-");
-    const artifacts = await createRoot("eden-eve-patch-detect-artifacts-");
-    await writeProject(root);
-    const applied = fakeBuilder(async (request) => {
-      await writeSuccessfulBuild(request);
-      await mkdir(dirname(join(request.snapshotRoot, bindingRelativePath)), {
-        recursive: true,
-      });
-      await writeFile(
-        join(request.snapshotRoot, bindingRelativePath),
-        fixtureModule(EVE_SANDBOX_RESUME_PATCHED),
-        "utf8",
-      );
-    });
-    const appliedResult = await buildEveProjectSnapshot({
-      projectRoot: root,
-      artifactRoot: join(artifacts, "generation-one"),
-      builder: applied.builder,
-    });
-    expect(appliedResult.sandboxResumePatch).toBe("applied");
-    expect(appliedResult.checks).toContainEqual({
-      id: "EVE_SANDBOX_RESUME_PATCH",
-      status: "pass",
-      subject: "eve-sandbox-resume",
-      reason: "applied temporary fix for eve#4440",
-      remediation: null,
-    });
-
-    const skipped = fakeBuilder(async (request) => {
-      await writeSuccessfulBuild(request);
-      await mkdir(dirname(join(request.snapshotRoot, bindingRelativePath)), {
-        recursive: true,
-      });
-      await writeFile(
-        join(request.snapshotRoot, bindingRelativePath),
-        fixtureModule(EVE_JUST_BASH_RESUME_ORIGINAL),
-        "utf8",
-      );
-    });
-    const skippedResult = await buildEveProjectSnapshot({
-      projectRoot: root,
-      artifactRoot: join(artifacts, "generation-two"),
-      builder: skipped.builder,
-    });
-    expect(skippedResult.sandboxResumePatch).toBe("skipped");
-    expect(
-      skippedResult.checks.some((value) =>
-        value.id === "EVE_SANDBOX_RESUME_PATCH"
-      ),
-    ).toBe(false);
-  });
-
-  test.each([
-    { eveVersion: "0.83.0", outcome: "fixed" },
-    { eveVersion: "0.83.0-beta.1", outcome: "skipped" },
-  ])("reports Eve $eveVersion's unpatched just-bash binding as $outcome", async ({ eveVersion, outcome }) => {
-    const root = await createRoot("eden-eve-patch-fixed-");
-    const artifacts = await createRoot("eden-eve-patch-fixed-artifacts-");
-    await writeProject(root);
-    await mkdir(join(root, "agent"), { recursive: true });
-    await writeFile(join(root, "agent/sandbox.ts"), `import { defineSandbox } from 'eve/sandbox';
-import { JustBashSandbox } from 'eve/sandbox/just-bash';
-export const environment = JustBashSandbox.environment();
-export default defineSandbox(() => environment.open());
-`);
-    const { builder } = fakeBuilder(async (request) => {
-      await writeSuccessfulBuild(request);
-      await writeFile(
-        join(request.snapshotRoot, "node_modules/eve/package.json"),
-        JSON.stringify({ name: "eve", version: eveVersion, bin: "bin/eve.js" }),
-      );
-      await mkdir(dirname(join(request.snapshotRoot, bindingRelativePath)), { recursive: true });
-      await writeFile(
-        join(request.snapshotRoot, bindingRelativePath),
-        fixtureModule(EVE_JUST_BASH_RESUME_ORIGINAL),
-      );
-      const template = join(request.snapshotRoot, ".eve/sandbox-cache/just-bash/templates/7bc778099a3b436ce4ad98ba");
-      await mkdir(join(template, "fs/workspace"), { recursive: true });
-      await writeFile(join(template, "metadata.json"), `${JSON.stringify({ version: 1 })}\n`);
-    });
-
-    const result = await buildEveProjectSnapshot({
-      projectRoot: root,
-      artifactRoot: join(artifacts, "generation-one"),
-      builder,
-    });
-
-    expect(result.status).toBe("ready");
-    expect(result.sandboxResumePatch).toBe(outcome);
-    expect(result.checks.some((value) =>
-      value.id === "EVE_SANDBOX_RESUME_PATCH" && value.status === "pass"
-    )).toBe(outcome === "fixed");
-  });
-
-  interface ResumeFixture {
-    readonly templateRoot: string;
-    readonly sessionsDir: string;
-    readonly sessionRoot: string;
-    resume(
-      state: { readonly generation: string; readonly rootPath: string },
-    ): Promise<unknown>;
-    readonly openCalls: string[];
-  }
-
-  async function createResumeFixture(
-    root: string,
-    shape: BindingShape,
-    generation = "gen-2",
-  ): Promise<ResumeFixture> {
-    const templateRoot = shape === "legacy"
-      ? join(root, "template")
-      : join(root, "just-bash/templates", generation);
-    const sessionsDir = shape === "legacy"
-      ? join(root, "sessions")
-      : join(root, "just-bash/sessions");
-    const sessionRoot = join(sessionsDir, `${generation}-session-1`);
-    const openCalls: string[] = [];
-    const harness = new Function(
-      "requirePreparedJustBashArtifact",
-      "requireJustBashSessionState",
-      "createSandboxProviderIdentity",
-      "sessionRootPath",
-      "pathExists",
-      "ensureSessionRoot",
-      "openHandle",
-      "dirname",
-      "join",
-      "rm",
-      "readdir",
-      "copyDirectoryAtomically",
-      "resolveTemplateRootPath",
-      "t",
-      `${EVE_SANDBOX_RESUME_PATCH_HELPERS}\nreturn { ${shape === "legacy" ? EVE_SANDBOX_RESUME_PATCHED : EVE_SANDBOX_RESUME_PATCHED_LATEST} };`,
-    );
-    const scope = harness(
-      (artifact: { readonly templateKey?: string }) =>
-        shape === "legacy" ? artifact : { templateKey: artifact.templateKey },
-      (state: { readonly generation: string; readonly rootPath: string }) =>
-        state,
-      ({ artifact }: {
-        readonly artifact: {
-          readonly generation?: string;
-          readonly templateKey?: string;
-        };
-      }) => shape === "legacy" ? artifact.generation : artifact.templateKey,
-      (
-        context: { readonly sessionsDir: string },
-        artifact: {
-          readonly generation?: string;
-          readonly templateKey?: string;
-        },
-      ) => join(
-        context.sessionsDir,
-        `${shape === "legacy" ? artifact.generation : artifact.templateKey}-session-1`,
-      ),
-      async (path: string) =>
-        await access(path).then(() => true, () => false),
-      async (
-        template: string | { readonly templateRootPath: string },
-        rootPath: string,
-      ) => {
-        expect(typeof template).toBe(shape === "legacy" ? "object" : "string");
-        if (
-          await access(rootPath).then(() => true, () => false)
-        ) return;
-        await mkdir(dirname(rootPath), { recursive: true });
-        await cp(
-          typeof template === "string" ? template : template.templateRootPath,
-          rootPath,
-          { recursive: true },
-        );
-      },
-      async (
-        _context: unknown,
-        rootPath: string,
-        options: unknown,
-      ) => {
-        openCalls.push(rootPath);
-        return { opened: rootPath, options };
-      },
-      dirname,
-      join,
-      rm,
-      readdir,
-      async (from: string, to: string) => {
-        await mkdir(dirname(to), { recursive: true });
-        await cp(from, to, { recursive: true });
-      },
-      (storagePath: string, templateKey: string) =>
-        join(storagePath, "just-bash/templates", templateKey),
-      { autoInstall: false },
-    );
-    return {
-      templateRoot,
-      sessionsDir,
-      sessionRoot,
-      resume: (state) => scope.resume(
-        { sessionsDir, storagePath: root },
-        shape === "legacy"
-          ? { templateRootPath: templateRoot, generation }
-          : { templateKey: generation },
-        state,
-      ) as Promise<unknown>,
-      openCalls,
-    };
-  }
-
-  async function writeTemplateFixture(templateRoot: string): Promise<void> {
-    await mkdir(join(templateRoot, "fs/.agents/skills/greet"), {
-      recursive: true,
-    });
-    await mkdir(join(templateRoot, "fs/workspace"), { recursive: true });
-    await writeFile(
-      join(templateRoot, "fs/.agents/skills/greet/SKILL.md"),
-      "---\nname: greet\n---\n\nSay hello (v2).\n",
-      "utf8",
-    );
-    await writeFile(
-      join(templateRoot, "fs/workspace/seed.txt"),
-      "seed\n",
-      "utf8",
-    );
-    await writeFile(
-      join(templateRoot, "fs/workspace/notes.txt"),
-      "template notes\n",
-      "utf8",
-    );
-  }
-
-  /** Seeds an existing session root with stale skills and user data. */
-  async function writeSessionFixture(sessionRoot: string): Promise<void> {
-    await mkdir(join(sessionRoot, "fs/.agents/skills/old"), {
-      recursive: true,
-    });
-    await mkdir(join(sessionRoot, "fs/workspace"), { recursive: true });
-    await writeFile(
-      join(sessionRoot, "fs/.agents/skills/old/SKILL.md"),
-      "stale\n",
-      "utf8",
-    );
-  }
-
-  test.each(bindings)("$version reopens a session after the template changed and refreshes only its skills", async ({ shape }) => {
-    const root = await createRoot("eden-eve-patch-resume-");
-    const fixture = await createResumeFixture(root, shape);
-    await writeTemplateFixture(fixture.templateRoot);
-    await writeSessionFixture(fixture.sessionRoot);
-    await writeFile(
-      join(fixture.sessionRoot, "fs/workspace/notes.txt"),
-      "user data\n",
-      "utf8",
-    );
-
-    await fixture.resume(
-      { generation: "gen-1", rootPath: fixture.sessionRoot },
-    );
-
-    expect(fixture.openCalls).toEqual([fixture.sessionRoot]);
-    expect(
-      await readFile(
-        join(fixture.sessionRoot, "fs/.agents/skills/greet/SKILL.md"),
-        "utf8",
-      ),
-    ).toContain("Say hello (v2)");
-    await expect(
-      access(join(fixture.sessionRoot, "fs/.agents/skills/old")),
-    ).rejects.toThrow();
-    expect(
-      await readFile(
-        join(fixture.sessionRoot, "fs/workspace/notes.txt"),
-        "utf8",
-      ),
-    ).toBe("user data\n");
-    await expect(
-      access(join(fixture.sessionRoot, "fs/workspace/seed.txt")),
-    ).rejects.toThrow();
-  });
-
-  test.each(bindings)("$version recreates a missing session from the current template", async ({ shape }) => {
-    const root = await createRoot("eden-eve-patch-resume-missing-");
-    const fixture = await createResumeFixture(root, shape);
-    await writeTemplateFixture(fixture.templateRoot);
-
-    await fixture.resume(
-      { generation: "gen-1", rootPath: fixture.sessionRoot },
-    );
-
-    expect(fixture.openCalls).toEqual([fixture.sessionRoot]);
-    expect(
-      await readFile(
-        join(fixture.sessionRoot, "fs/.agents/skills/greet/SKILL.md"),
-        "utf8",
-      ),
-    ).toContain("Say hello (v2)");
-    expect(
-      await readFile(
-        join(fixture.sessionRoot, "fs/workspace/seed.txt"),
-        "utf8",
-      ),
-    ).toBe("seed\n");
-  });
-
-  test.each(bindings)("$version keeps throwing for a session root outside the sessions directory", async ({ shape }) => {
-    const root = await createRoot("eden-eve-patch-resume-escape-");
-    const fixture = await createResumeFixture(root, shape);
-    await writeTemplateFixture(fixture.templateRoot);
-    const escapedRoot = join(root, "elsewhere", "session-1");
-
-    await expect(
-      fixture.resume(
-        { generation: "gen-1", rootPath: escapedRoot },
-      ),
-    ).rejects.toThrow("incompatible with this environment");
-    await expect(
-      fixture.resume(
-        { generation: "gen-2", rootPath: escapedRoot },
-      ),
-    ).rejects.toThrow("incompatible with this environment");
-    expect(fixture.openCalls).toEqual([]);
-    await expect(access(escapedRoot)).rejects.toThrow();
-  });
-
-  test.each(bindings)("$version reopens an unchanged session as-is and recreates a missing one", async ({ shape }) => {
-    const root = await createRoot("eden-eve-patch-resume-same-");
-    const fixture = await createResumeFixture(root, shape, "gen-1");
-    await writeTemplateFixture(fixture.templateRoot);
-    await writeSessionFixture(fixture.sessionRoot);
-
-    await fixture.resume(
-      { generation: "gen-1", rootPath: fixture.sessionRoot },
-    );
-    expect(fixture.openCalls).toEqual([fixture.sessionRoot]);
-    expect(
-      await readFile(
-        join(fixture.sessionRoot, "fs/.agents/skills/old/SKILL.md"),
-        "utf8",
-      ),
-    ).toBe("stale\n");
-
-    const gone = join(fixture.sessionsDir, "gone");
-    await fixture.resume(
-      { generation: "gen-1", rootPath: gone },
-    );
-    expect(fixture.openCalls).toEqual([fixture.sessionRoot, gone]);
-    await expect(access(gone)).resolves.toBeUndefined();
-  });
-
-  test.each(bindings)("$version leaves session skills untouched when the template has none", async ({ shape }) => {
-    const root = await createRoot("eden-eve-patch-resume-noskills-");
-    const fixture = await createResumeFixture(root, shape);
-    await mkdir(join(fixture.templateRoot, "fs/workspace"), {
-      recursive: true,
-    });
-    await writeSessionFixture(fixture.sessionRoot);
-
-    await fixture.resume(
-      { generation: "gen-1", rootPath: fixture.sessionRoot },
-    );
-    expect(fixture.openCalls).toEqual([fixture.sessionRoot]);
-    expect(
-      await readFile(
-        join(fixture.sessionRoot, "fs/.agents/skills/old/SKILL.md"),
-        "utf8",
-      ),
-    ).toBe("stale\n");
-  });
-});

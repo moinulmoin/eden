@@ -2,6 +2,7 @@
 import ArrowDownRight from "@lucide/astro/icons/arrow-down-right";
 import GithubMark from "./GithubMark.astro";
 import { links } from "../links";
+import { version } from "../version";
 ---
 
 <header class="nav">
@@ -12,7 +13,7 @@ import { links } from "../links";
     </a>
     <a class="release" href={links.releases}>
       <span class="pulse" aria-hidden="true"></span>
-      <span>v0.11.5 is out</span>
+      <span>v{version} is out</span>
     </a>
     <nav class="nav__links" aria-label="Sections">
       <a href="#how">How it works</a>

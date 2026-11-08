@@ -1,0 +1,5 @@
+ignoredOptionalDependencies:
+  - "@mongodb-js/zstd"
+  - node-liblzma
+allowBuilds:
+  cbor-extract: false

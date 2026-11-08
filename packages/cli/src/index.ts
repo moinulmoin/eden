@@ -107,7 +107,6 @@ export type {
   EveProjectSnapshotOptions,
   EveProjectToolchain,
   EveRuntimeConfigExclusion,
-  EveSandboxResumePatchStatus,
 } from "./eve-packaging.js";
 export type {
   EveHostRequirements,
@@ -264,6 +263,7 @@ function errorLines(error: unknown): readonly string[] {
     const source = error.source === undefined ? "" : ` [${error.source}]`;
     return [
       `${error.code}${source}: ${error.message}`,
+      ...(error.remediation === undefined ? [] : [`  → ${error.remediation}`]),
       ...error.diagnostics.map((diagnostic) => {
         const diagnosticSource = diagnostic.source === undefined
           ? ""
@@ -274,7 +274,10 @@ function errorLines(error: unknown): readonly string[] {
   }
   if (error instanceof EveRuntimeConfigError) {
     const source = error.source === undefined ? "" : ` [${error.source}]`;
-    return [`${error.code}${source}: ${error.message}`];
+    return [
+      `${error.code}${source}: ${error.message}`,
+      ...(error.remediation === undefined ? [] : [`  → ${error.remediation}`]),
+    ];
   }
   return [
     error instanceof Error
@@ -371,7 +374,50 @@ export async function runEdenCli(
   args: readonly string[],
   options: EdenCliRunOptions = {},
 ): Promise<number> {
-  const stdout = options.stdout ?? defaultStdout;
+  const writeStdout = options.stdout ?? defaultStdout;
+  const json = args.includes("--json");
+  const output: string[] = [];
+  const stdout = json
+    ? (text: string): void => { output.push(text); }
+    : (text: string): void => { writeStdout(redactEveRuntimeOutput(text)); };
+  const command = (EVE_CLI_COMMANDS as readonly string[]).includes(args[0] ?? "")
+    ? `eden ${args[0]}`
+    : "eden";
+  const flushJson = (error?: unknown): void => {
+    let result: Record<string, unknown> | undefined;
+    for (const text of output) {
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          result = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Help and version text are wrapped below rather than printed separately.
+      }
+    }
+    result ??= { command, ok: error === undefined, ...(output.length === 0 ? {} : { output: output.join("\n") }) };
+    if (error !== undefined) {
+      result = {
+        ...result,
+        ok: false,
+        error: {
+          code: error instanceof EveCliError || error instanceof EveRuntimeConfigError
+            ? error.code : "EVE_EXECUTION_FAILED",
+          message: error instanceof Error ? error.message : "The Eden command failed unexpectedly.",
+          ...(error instanceof EveCliError || error instanceof EveRuntimeConfigError ? {
+            ...(error.remediation === undefined ? {} : { remediation: error.remediation }),
+            ...(error.source === undefined ? {} : { source: error.source }),
+            ...(error instanceof EveCliError && error.diagnostics.length > 0 ? { diagnostics: error.diagnostics } : {}),
+          } : {
+            remediation: "Run eden preflight for the same project and target, resolve its failed checks, then retry the command.",
+          }),
+        },
+      };
+    }
+    // Redact strings before serialization so replacement cannot break JSON escaping.
+    writeStdout(JSON.stringify(result, (_key, value: unknown) =>
+      typeof value === "string" ? redactEveRuntimeOutput(value) : value));
+  };
   const stderr = options.stderr ?? defaultStderr;
   try {
     if (
@@ -380,15 +426,18 @@ export async function runEdenCli(
       args[0] === "-h"
     ) {
       stdout(USAGE.trimEnd());
+      if (json) flushJson();
       return 0;
     }
     if (args[0] === "--version" || args[0] === "-v") {
       stdout(edenVersion());
+      if (json) flushJson();
       return 0;
     }
     if (args[0] === "skill") {
       if (args.length === 2 && (args[1] === "--help" || args[1] === "-h")) {
         stdout("Usage: eden skill");
+        if (json) flushJson();
         return 0;
       }
       if (args.length !== 1) {
@@ -398,8 +447,8 @@ export async function runEdenCli(
         });
       }
       const skill = readFileSync(new URL("./SKILL.md", import.meta.url), "utf8");
-      if (options.stdout === undefined) process.stdout.write(skill);
-      else options.stdout(skill);
+      stdout(skill);
+      if (json) flushJson();
       return 0;
     }
     if (!(EVE_CLI_COMMANDS as readonly string[]).includes(args[0] ?? "")) {
@@ -415,6 +464,7 @@ export async function runEdenCli(
       parsed.kind === "help"
     ) {
       stdout(eveHelpText(parsed.scope));
+      if (json) flushJson();
       return 0;
     }
     await runEveInvocation(parsed, {
@@ -422,8 +472,13 @@ export async function runEdenCli(
       stdout,
       stderr,
     });
+    if (json) flushJson();
     return 0;
   } catch (error: unknown) {
+    if (json) {
+      flushJson(error);
+      return 1;
+    }
     for (const line of errorLines(error)) {
       stderr(redactEveRuntimeOutput(line));
     }

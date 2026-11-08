@@ -78,11 +78,11 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   const deployDoc = await readRepositoryFile("docs/deploy.md");
   const validationDoc = await readRepositoryFile("docs/validation.md");
   const workflow = await readRepositoryFile(".github/workflows/ci.yml");
-  const { version } = JSON.parse(await readRepositoryFile("package.json"));
   for (const document of [readme, packageReadme]) {
-    expect(document).toContain(`npm install --global @moinulmoin/eden@${version}`);
-    expect(document).toContain(`pnpm add --global @moinulmoin/eden@${version}`);
-    expect(document).toContain(`bun add --global @moinulmoin/eden@${version}`);
+    // Install commands stay unversioned so they never go stale between releases.
+    expect(document).toMatch(/^npm install --global @moinulmoin\/eden$/mu);
+    expect(document).toMatch(/^pnpm add --global @moinulmoin\/eden$/mu);
+    expect(document).toMatch(/^bun add --global @moinulmoin\/eden$/mu);
     expect(document).toMatch(/Node `>=24\.17\.0`/u);
     expect(document).toContain("Docker or OrbStack");
     expect(document).toContain("npx wrangler@4.147.0 login");
