@@ -15,9 +15,9 @@ const needs: { text: string; command?: string; code?: string }[] = [
   { text: "A Cloudflare account on Workers Paid, which Containers require" },
   { text: "Wrangler signed in", command: "npx wrangler@4.147.0 login" },
   { text: "Docker or OrbStack that builds linux/amd64" },
-  { text: "An Eve project with its root lockfile: npm, or pnpm with an exact pin", code: "package-lock.json" },
+  { text: "An Eve 0.91 or later project with its root lockfile: npm, or pnpm with an exact pin", code: "package-lock.json" },
   { text: "just-bash as a production dependency", command: "npm install just-bash" },
-  { text: "On Eve 0.83 and later, JustBash selected in agent/sandbox.ts", code: "JustBashSandbox.environment()" },
+  { text: "JustBash selected in agent/sandbox.ts", code: "JustBashSandbox.environment()" },
 ];
 
 const limits = [
