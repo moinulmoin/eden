@@ -1135,7 +1135,7 @@ commands `eden destroy` itself runs.
 2. Delete the Worker. It is named exactly `<name>`. Its secrets (one per
    env-file variable), its Cron Trigger, and its Durable Object data are part
    of the Worker; with the Cloudflare World that data includes every stored
-   session.
+   session. Wrangler asks you to confirm the deletion.
 
    ```sh
    npx wrangler@4.147.0 delete --name <name>
@@ -1152,6 +1152,9 @@ commands `eden destroy` itself runs.
 4. Delete the registry images. Eden's repositories for the target start with
    `eden-eve-<environment>-<name>-`. Delete every tag of each one: the
    `candidate` tag and any `rootfs-snapshot-*` or `rootfs-set-*` tags.
+   Wrangler asks you to confirm each deletion. Only a target that has slept
+   has the `rootfs-*` tags; deleting them was not exercised in the live run
+   of these steps.
 
    ```sh
    npx wrangler@4.147.0 containers images list
@@ -1159,7 +1162,12 @@ commands `eden destroy` itself runs.
    ```
 
 5. Run the two list commands again and confirm nothing with the target name
-   is left.
+   is left. Confirm the Worker is gone too; this command must fail with
+   `This Worker does not exist on your account. [code: 10007]`:
+
+   ```sh
+   npx wrangler@4.147.0 deployments list --name <name>
+   ```
 
 Match the exact names only. A name that merely starts the same way can
 belong to another target. An external Postgres database is not touched by any
