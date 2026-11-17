@@ -65,6 +65,9 @@ needed no change.
   reported that as a failed cleanup.
 - The process-cleanup test helper retries a `ps` snapshot that fails once on
   a busy machine, instead of failing the test.
+- Renovate waits until a release of `eve`, `@workflow/world-postgres`, or
+  `just-bash` is one day old before it opens a pull request, so the
+  fixture's frozen install passes pnpm's release-age check.
 
 ## 0.12.0 — 2026-11-08
 

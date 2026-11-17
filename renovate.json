@@ -2,7 +2,7 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "includePaths": ["validation/eve-compat/latest/**"],
   "enabledManagers": ["npm"],
-  "dependencyDashboard": false,
+  "dependencyDashboard": { "enabled": false },
   "ignoreUnstable": false,
   "respectLatest": false,
   "rangeStrategy": "pin",
@@ -17,7 +17,8 @@
     },
     {
       "matchPackageNames": ["eve", "@workflow/world-postgres", "just-bash"],
-      "enabled": true
+      "enabled": true,
+      "minimumReleaseAge": "1 day"
     }
   ]
 }

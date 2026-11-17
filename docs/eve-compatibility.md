@@ -68,9 +68,10 @@ all three.
   one per row above, with the Postgres World, and requires a real session to
   start. It runs on every push and before every release. See
   [validation](./validation.md).
-- **Renovate** opens a pull request when `eve`, `@workflow/world-postgres`, or
-  `just-bash` publishes a new version, including release candidates, so CI runs
-  against it the same day.
+- **Renovate** opens a pull request when a new version of `eve`,
+  `@workflow/world-postgres`, or `just-bash`, including release candidates, is
+  one day old, so CI runs against it. The wait matches pnpm's one-day release
+  age, which the fixture's frozen install enforces.
 - **A live check on Cloudflare** runs by hand before any release that changes
   deploy, runtime, or World code: deploy a fresh project, start a session that
   runs bash, update it in place, send the same session another message, start a
