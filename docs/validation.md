@@ -10,7 +10,7 @@ The gate tests two frozen fixtures: `validation/eve-compat/floor/` pins Eve
 0.91.0 and `@workflow/world-postgres` 5.0.5; `validation/eve-compat/latest/`
 pins Eve 1.0.2 and World 5.2.1. Renovate updates only the latest fixture's
 Eve, World, and `just-bash` exact pins, in separate pull requests without
-automerge; the floor stays frozen.
+automerge, once a release is one day old; the floor stays frozen.
 
 Start a local Postgres service, then run both fixtures from the repository root:
 
