@@ -21,8 +21,8 @@ for what happens to running sessions.
 
 | Eve | Postgres World | Cloudflare World | Tested |
 | --- | --- | --- | --- |
-| `0.91.0`, the oldest supported | `@workflow/world-postgres` `5.0.5` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI, every push and release |
-| `1.0.2`, the latest stable | `@workflow/world-postgres` `5.2.1` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI, every push and release |
+| `0.91.0`, the oldest supported | `@workflow/world-postgres` `5.0.5` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI, every push and release: the Postgres World at this version, and the Cloudflare World at the version being built |
+| `1.0.2`, the latest stable | `@workflow/world-postgres` `5.2.1` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI, every push and release: the Postgres World at this version, and the Cloudflare World at the version being built |
 
 From `1.0.0-rc.6`, Eve refuses to start a session unless the World creates the
 session's run and its start hook together. Older Worlds fail every new session
@@ -65,9 +65,11 @@ all three.
   `EVE_WORLD_PAIRING` (World version line, atomic start hooks, and the
   Cloudflare World's RPC auth).
 - **CI** builds and boots two pinned projects under `validation/eve-compat/`,
-  one per row above, with the Postgres World, and requires a real session to
-  start. It runs on every push and before every release. See
-  [validation](./validation.md).
+  one per row above, and requires a real session to start. It does this twice:
+  with `eve start` on the Postgres World, and with `eden preflight` and Eden's
+  own image on the Cloudflare World built from this repository. The second run
+  uses the World's core over local RPC, not a Durable Object. It runs on every
+  push and before every release. See [validation](./validation.md).
 - **Renovate** opens a pull request when a new version of `eve`,
   `@workflow/world-postgres`, or `just-bash`, including release candidates, is
   one day old, so CI runs against it. The wait matches pnpm's one-day release

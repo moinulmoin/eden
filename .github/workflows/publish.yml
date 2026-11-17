@@ -75,7 +75,7 @@ jobs:
           EDEN_PACKAGE_TEST_TIMEOUT_MS: "600000"
           EDEN_PACKAGE_TEST_SCRIPTS_TIMEOUT_MS: "900000"
 
-      - name: Current Eve compatibility
+      - name: Current Eve and Eden compatibility
         # Match Eden's builder and Container, which never expose KVM.
         run: |
           sudo rm -f /dev/kvm

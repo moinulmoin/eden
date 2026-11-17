@@ -61,6 +61,13 @@ needed no change.
   updates in place, upgrades Eve, lets the container sleep and wakes it, and
   always destroys the target. Its first run passed from Eve `0.91.0` to
   `1.0.2`; see `docs/eve-compatibility-history.md`.
+- The compatibility gate now tests Eden, not only Eve. For each fixture it
+  also installs the Cloudflare World built from this repository, runs the
+  built `eden preflight` up to the Cloudflare access checks, and requires a
+  session to start in Eden's linux/amd64 image. It needs Docker and no
+  Cloudflare account. The World runs as its core over local RPC, not as a
+  Durable Object. With the World source from before `0.11.1`, this leg fails
+  with the HTTP 500 that release fixed.
 - The latest compatibility fixture pins Eve `1.0.2`,
   `@workflow/world-postgres` `5.2.1`, `just-bash` `3.6.1`, and `ai` `7.0.173`
   (Eve `1.0.2` needs `ai` `^7.0.172`). Its `pnpm-workspace.yaml` exempts the
