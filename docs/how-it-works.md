@@ -39,7 +39,10 @@ Each step prints a progress line, in this order. Nothing on Cloudflare changes
 until the checks in steps 1–4 have passed.
 
 1. **Validate the env file** (only with `--env-file`): format, reserved names,
-   and that the file does not change during the run.
+   and that the file does not change during the run. Eden then checks the
+   Eve version, the sandbox module, and your Cloudflare login
+   (`checking Cloudflare access`), and stops here with every problem it
+   found if one of them fails.
 2. **Package the project** (`packaging project — snapshot, frozen install, eve
    build`). Eden copies your project into a throwaway Linux/amd64 Docker
    builder, leaving out `node_modules`, `.git`, build caches, your env file,

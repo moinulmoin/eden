@@ -285,6 +285,9 @@ eden destroy \
 ```
 
 `destroy` rejects `--env-file`; cleanup does not need application secrets.
+Destroy needs the project's `.eden/` folder from the machine that deployed;
+if it is lost, remove the deployment by hand as described in
+[The `.eden/` folder is lost](./troubleshooting.md#the-eden-folder-is-lost).
 Destroy requires Eden's immutable ownership record, checks the current remote
 identity, removes only that Worker and Container application and **every
 retained container instance**, verifies bounded absence, and only then clears

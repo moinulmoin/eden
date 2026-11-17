@@ -143,7 +143,8 @@ blocking versions and live session counts. There is no override flag.
 Node, and Wrangler access can deploy. Updating or destroying an existing
 target needs the deployment records Eden wrote under `.eden/eve-deploy/` on
 the machine that created it; without them Eden refuses to touch the target
-rather than guess.
+rather than guess. If they are lost, see
+[The `.eden/` folder is lost](./troubleshooting.md#the-eden-folder-is-lost).
 
 ### How do I remove everything?
 

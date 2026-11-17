@@ -7,6 +7,33 @@ needed no change.
 
 ### Changed
 
+- `eden preflight` and `eden deploy` check the Cloudflare login before the
+  build. Without a login they now stop in about 5 seconds instead of after the
+  full build (299 seconds in the same test), and the remediation names the
+  commands: `npx wrangler@4.147.0 login`, then `npx wrangler@4.147.0 whoami`.
+- The first run reports every problem Eden can see without building, together:
+  the env file, the Eve version, the sandbox module, Cloudflare access, and
+  the `EVE_AUTH_SCAFFOLD`, `EVE_WORLD_LOCAL`, and `EVE_AI_GATEWAY_KEY_MISSING`
+  warnings. Before, an untouched `eve init` project showed only
+  `EVE_SANDBOX_PROVIDER`, and the warnings appeared after the next full build.
+- Every failure now carries a `remediation`, in text and in `--json`,
+  including `EVE_NAME_REQUIRED`, `EVE_OPTION_UNKNOWN`, `EVE_PREFLIGHT_FAILED`,
+  `EVE_DEPLOY_CHECKS_FAILED`, and the other argument, lock, promotion, and
+  image codes. `EVE_OPTION_UNKNOWN` names the unknown option.
+- A failed env-file check starts with its code, for example
+  `EVE_ENV_FILE_NOT_FOUND`, and a missing file says to create it or correct
+  the path. A failed env file no longer adds four `blocked` filler checks.
+- The README's Quick start and fresh-project steps now match the skill:
+  sandbox, channel auth, Workflow World, env file with the model key, then
+  preflight.
+- `docs/troubleshooting.md` explains `node: <path>: not found` (exit 9): with
+  `npx`, a missing `--env-file` path stops npm's own Node process before
+  Eden starts.
+- `docs/troubleshooting.md` has a new entry, "The `.eden/` folder is lost",
+  with the manual removal steps for the Worker, Container application, and
+  registry images. `docs/deploy.md` and `docs/faq.md` link to it.
+- `PRODUCT.md` is removed. It described Eve `0.66.3`, pnpm-only projects,
+  and a 1 GiB container. The README and `docs/` hold the current facts.
 - Eve `1.0.2` with `@workflow/world-postgres` `5.2.1` replaces `1.0.0-rc.6`
   as the latest tested pair in CI. Eve `0.91.0` stays the oldest supported
   version.

@@ -56,7 +56,7 @@ export class EveCliError extends Error {
   readonly code: string;
   readonly source: string | undefined;
   readonly diagnostics: readonly EveCliDiagnostic[];
-  readonly remediation: string | undefined;
+  readonly remediation: string;
 
   constructor(options: {
     readonly code: string;
@@ -74,11 +74,57 @@ export class EveCliError extends Error {
   }
 }
 
-function eveErrorRemediation(code: string): string | undefined {
+function eveErrorRemediation(code: string): string {
   switch (code) {
     case "COMMAND_UNKNOWN":
+    case "EVE_COMMAND_UNKNOWN":
     case "EVE_ARGUMENT_UNKNOWN":
+    case "EVE_OPTION_UNKNOWN":
+    case "EVE_OPTION_VALUE_MISSING":
+    case "EVE_PROJECT_INVALID":
+    case "EVE_PROJECT_REPEATED":
+    case "EVE_ENV_INVALID":
+    case "EVE_ENV_REPEATED":
+    case "EVE_NAME_INVALID":
+    case "EVE_NAME_REPEATED":
+    case "EVE_ENV_FILE_INVALID":
+    case "EVE_ENV_FILE_REPEATED":
       return "Run eden --help to see supported commands and options.";
+    case "EVE_ENV_FILE_UNSUPPORTED":
+      return "Rerun eden destroy without --env-file; cleanup needs no application secrets.";
+    case "EVE_NAME_REQUIRED":
+      return "Rerun with --name <name>. For destroy, use the exact name the deploy printed.";
+    case "EVE_NAME_DERIVATION_FAILED":
+      return "Rerun with an explicit --name <name>.";
+    case "VERSION_UNAVAILABLE":
+    case "EVE_HOST_BUNDLE_UNAVAILABLE":
+      return "Reinstall Eden from the published package with your existing package manager.";
+    case "EVE_PREFLIGHT_FAILED":
+      return "Fix each failed check using its remediation, then rerun eden preflight.";
+    case "EVE_DEPLOY_CHECKS_FAILED":
+      return "Fix each failed check using its remediation, then rerun eden deploy.";
+    case "EVE_DEPLOY_BUSY":
+      return "Wait for the other eden run on this target to finish, then retry. If that run was killed, confirm no eden process is still running before you remove .eden/eve-deploy/locks/<env>-<name>.lock by hand.";
+    case "EVE_DEPLOY_LOCK_RELEASE_UNPROVEN":
+      return "Confirm no eden process is still running against the target, then remove the stale lock file at .eden/eve-deploy/locks/<env>-<name>.lock.";
+    case "EVE_DEPLOY_PROMOTION_FAILED":
+      return "Inspect the local record under .eden/eve-deploy/targets/<env>-<name>/CURRENT and the live target before retrying.";
+    case "EVE_DEPLOYMENT_FAILED":
+      return "Read the last check and .eden/eve-deploy/generations/<generation>/deployment.json, resolve the cause, then rerun eden deploy for the same target.";
+    case "EVE_RUNTIME_IMAGE_CLEANUP_FAILED":
+      return "The deployment is live; do not redeploy. Remove only the recorded local runtime image or superseded registry tag.";
+    case "EVE_HEALTH_PORT_UNAVAILABLE":
+      return "Free a local port in the 4310-4399 range, then retry.";
+    case "EVE_IMAGE_IDENTITY_MISMATCH":
+      return "Rerun eden deploy so Eden resolves the image reference from the verified local image again.";
+    case "EVE_IMAGE_IDENTITY_UNAVAILABLE":
+      return "Rebuild with the pinned Docker or OrbStack runtime by rerunning eden deploy.";
+    case "EVE_UPDATE_RECORD_UNAVAILABLE":
+      return "Re-run the last successful deploy generation, or destroy the exact target with eden destroy.";
+    case "EVE_ORIGIN_UNAVAILABLE":
+      return "Run npx wrangler@4.147.0 whoami to confirm the account, log in with npx wrangler@4.147.0 login if needed, then retry.";
+    case "EVE_HOST_CONFIG_INVALID":
+      return "Correct the value the message names, then rerun eden deploy.";
     case "EVE_PROJECT_ROOT_INVALID":
       return "Pass --project with an existing canonical project directory, not a symbolic link.";
     case "DEPLOY_INDETERMINATE":
@@ -110,7 +156,7 @@ function eveErrorRemediation(code: string): string | undefined {
     case "EVE_EXECUTION_FAILED":
       return "Run eden preflight with the same --project, --env, and --name and resolve its failed checks before retrying.";
     default:
-      return undefined;
+      return "Look up this code in docs/troubleshooting.md and resolve the reported cause before retrying the same command.";
   }
 }
 
@@ -383,7 +429,7 @@ export function parseEveArguments(
     if (argument.startsWith("-")) {
       throw eveError(
         "EVE_OPTION_UNKNOWN",
-        "The Eve command contains an unknown option.",
+        `Unknown option ${argument.split("=")[0] ?? argument}.`,
       );
     }
     throw eveError(

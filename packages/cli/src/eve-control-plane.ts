@@ -185,14 +185,14 @@ function eveOutcomeError(error: unknown, source: string): EveOutcomeError {
     code: error instanceof EveRuntimeConfigError ? error.code : "EVE_EXECUTION_FAILED",
     message: error instanceof Error ? error.message : "The Eve operation failed.",
     source: error instanceof EveRuntimeConfigError ? error.source ?? source : source,
-    ...(error instanceof EveRuntimeConfigError && error.remediation !== undefined
+    ...(error instanceof EveRuntimeConfigError
       ? { remediation: error.remediation }
       : {}),
   });
   return {
     code: failure.code,
     message: safeText(failure.message),
-    remediation: failure.remediation ?? "Inspect the retained .eden evidence and resolve the reported failure before retrying the same exact target.",
+    remediation: failure.remediation,
     source: failure.source ?? source,
     diagnostics: failure.diagnostics.map((diagnostic) => ({
       ...diagnostic,
@@ -995,13 +995,25 @@ async function vercelConnectSourcePaths(projectRoot: string): Promise<string[]> 
   return paths.sort();
 }
 
+function eveGatewayKeyWarning(source: string): EvePreflightWarning {
+  return {
+    id: "EVE_AI_GATEWAY_KEY_MISSING",
+    message: `The model in ${source} routes through Vercel AI Gateway, but --env-file has no non-blank AI_GATEWAY_API_KEY. Cloudflare has no Vercel OIDC project identity, so model calls fail.`,
+    remediation: 'Add AI_GATEWAY_API_KEY from https://vercel.com/dashboard/ai/api-keys to your --env-file, or use a direct provider such as openai("gpt-5") from @ai-sdk/openai with OPENAI_API_KEY in that file.',
+  };
+}
+
+function gatewayKeySupplied(runtimeConfig: EveRuntimeConfig | undefined): boolean {
+  return runtimeConfig?.withProtectedValues((values) =>
+    (values.AI_GATEWAY_API_KEY?.trim().length ?? 0) > 0) === true;
+}
+
 /** Eve persists its compile-time routing decision, including its default model. */
 async function collectEveGatewayWarnings(
   candidate: EveProjectBuildCandidate,
   runtimeConfig: EveRuntimeConfig | undefined,
 ): Promise<EvePreflightWarning[]> {
-  if (runtimeConfig?.withProtectedValues((values) =>
-    (values.AI_GATEWAY_API_KEY?.trim().length ?? 0) > 0) === true) return [];
+  if (gatewayKeySupplied(runtimeConfig)) return [];
   try {
     const manifest = JSON.parse(await readFile(
       join(candidate.snapshotRoot, EVE_COMPILED_MANIFEST_PATH), "utf8",
@@ -1015,11 +1027,7 @@ async function collectEveGatewayWarnings(
     const source = typeof manifest.config.source?.logicalPath === "string"
       ? manifest.config.source.logicalPath
       : "agent/agent.ts";
-    return [{
-      id: "EVE_AI_GATEWAY_KEY_MISSING",
-      message: `The model in ${source} routes through Vercel AI Gateway, but --env-file has no non-blank AI_GATEWAY_API_KEY. Cloudflare has no Vercel OIDC project identity, so model calls fail.`,
-      remediation: 'Add AI_GATEWAY_API_KEY from https://vercel.com/dashboard/ai/api-keys to your --env-file, or use a direct provider such as openai("gpt-5") from @ai-sdk/openai with OPENAI_API_KEY in that file.',
-    }];
+    return [eveGatewayKeyWarning(source)];
   } catch {
     // Unknown or older compiled formats are not evidence of Gateway routing.
     return [];
@@ -1032,6 +1040,7 @@ async function collectEveGatewayWarnings(
  */
 async function collectEveSetupWarnings(
   projectRoot: string,
+  gatewayKeyMissing: boolean,
 ): Promise<EvePreflightWarning[]> {
   const warnings: EvePreflightWarning[] = [];
   const source = async (path: string): Promise<string> => {
@@ -1074,6 +1083,13 @@ async function collectEveSetupWarnings(
         message: "Local World stores memory on container disk; updates or a lost sleep snapshot reset sessions and approvals.",
         remediation: EVE_WORLD_LOCAL_REMEDIATION,
       });
+    }
+    // A string model routes through AI Gateway; the compiled manifest confirms it after the build.
+    if (
+      gatewayKeyMissing &&
+      /\bmodel\s*:\s*["'`][^"'`]+["'`]/u.test(agent.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/gu, ""))
+    ) {
+      warnings.push(eveGatewayKeyWarning("agent/agent.ts"));
     }
     if (
       manifest.dependencies?.["just-bash"] === undefined &&
@@ -2109,19 +2125,38 @@ async function defaultRuntimeRunner(
   };
 }
 
+type EveCloudflareAccess = Pick<
+  EveCloudflareReadResult,
+  "accountAccess" | "containerAccess"
+>;
+
+/** The login and Container read that need no build, so they run before it. */
+async function defaultCloudflareAccess(name: string): Promise<EveCloudflareAccess> {
+  const account = await readWranglerJson(["whoami", "--json"]);
+  if (account.failed || authenticatedAccountId(account.value) === undefined) {
+    return { accountAccess: "unavailable", containerAccess: "unavailable" };
+  }
+  const containers = await readTargetContainers(boundedResourceName(name, "container"));
+  return {
+    accountAccess: "available",
+    containerAccess: containers.failed ? "unavailable" : "available",
+  };
+}
+
+function cloudflareAccessBlocked(result: EveCloudflareAccess): EvePreflightCheck {
+  return check(
+    "VAL-CLI-007-CLOUDFLARE-ACCESS",
+    "blocked",
+    "Authenticated Cloudflare account and Container access could not be verified without a mutating operation.",
+    result.accountAccess === "available"
+      ? "Wrangler is logged in, but the account's Containers could not be read. Confirm that the account npx wrangler@4.147.0 whoami shows is on the Workers Paid plan, or switch accounts with npx wrangler@4.147.0 login, then retry."
+      : "Run npx wrangler@4.147.0 login, confirm the account with npx wrangler@4.147.0 whoami, then retry.",
+  );
+}
+
 function cloudflareChecks(
   result: EveCloudflareReadResult,
 ): readonly EvePreflightCheck[] {
-  const accessMessage =
-    result.accountAccess === "available" &&
-      result.containerAccess === "available"
-      ? "Authenticated account and Container access were verified through the read-only adapter."
-      : "Authenticated Cloudflare account and Container access could not be verified without a mutating operation.";
-  const accessRemediation =
-    result.accountAccess === "available" &&
-      result.containerAccess === "available"
-      ? undefined
-      : "Use an authenticated read-only adapter with account and Container access; preflight never uploads, publishes, or changes remote state.";
   const target = result.target;
   const targetPasses =
     target.state === "absent" || target.state === "owned";
@@ -2137,17 +2172,14 @@ function cloudflareChecks(
     : target.remediation ??
       "Inspect only the exact target and resolve ownership or identity ambiguity before deploy; do not broaden the target.";
   return [
-    check(
-      "VAL-CLI-007-CLOUDFLARE-ACCESS",
-      accessMessage === undefined ? "blocked" : (
-        result.accountAccess === "available" &&
-          result.containerAccess === "available"
-          ? "passed"
-          : "blocked"
-      ),
-      accessMessage,
-      accessRemediation,
-    ),
+    result.accountAccess === "available" &&
+      result.containerAccess === "available"
+      ? check(
+        "VAL-CLI-007-CLOUDFLARE-ACCESS",
+        "passed",
+        "Authenticated account and Container access were verified through the read-only adapter.",
+      )
+      : cloudflareAccessBlocked(result),
     check(
       "VAL-CLI-007-TARGET-CONFLICT",
       targetPasses ? "passed" : "failed",
@@ -3788,6 +3820,7 @@ async function collectEvePreflight(
   options: EvePreflightOptions,
 ): Promise<EvePreflightCollection> {
   let runtimeConfig: EveRuntimeConfig | undefined;
+  let envFileRead = true;
   const warnings: EvePreflightWarning[] = [];
   const checks: EvePreflightCheck[] = [];
   if (request.envFile !== undefined) {
@@ -3838,50 +3871,29 @@ async function collectEvePreflight(
       );
     }
   } catch (error: unknown) {
+    envFileRead = false;
     checks.push(
-      check(
-        "VAL-SEC-001",
-        "failed",
-        error instanceof EveRuntimeConfigError
-          ? error.message
-          : "The explicit environment file could not be validated safely.",
-        "Fix the explicit environment file through the documented opaque grammar, then retry.",
-      ),
+      error instanceof EveRuntimeConfigError
+        ? check(
+          "VAL-SEC-001",
+          "failed",
+          `${error.code}: ${error.message}`,
+          error.remediation,
+        )
+        : check(
+          "VAL-SEC-001",
+          "failed",
+          "The explicit environment file could not be validated safely.",
+          "Fix the explicit environment file through the documented opaque grammar, then retry.",
+        ),
       blockedAfterFailure(
         "VAL-SEC-002",
         "Reserved-name validation was blocked because explicit environment validation failed.",
       ),
-      blockedAfterFailure(
-        "VAL-CLI-004",
-        "Project and Eve build checks were blocked by explicit environment validation.",
-      ),
-      blockedAfterFailure(
-        "VAL-BUILD-005",
-        "Image, Eve-start, and health checks were blocked by explicit environment validation.",
-      ),
-      blockedAfterFailure(
-        "VAL-CLI-007-CLOUDFLARE-ACCESS",
-        "Cloudflare access checks were blocked before any remote read.",
-      ),
-      blockedAfterFailure(
-        "VAL-CLI-007-TARGET-CONFLICT",
-        "Exact target conflict checks were blocked before any remote read.",
-      ),
     );
-    return {
-      result: {
-        command: request.command === "deploy" ? "eden deploy" : "eden preflight",
-        ok: false,
-        environment: request.environment,
-        name: request.name,
-        checks,
-        warnings,
-        candidate: null,
-      },
-      runtimeConfig,
-    };
   }
 
+  // Everything Eden can know without building is reported in this one run.
   const sandboxProvider = await checkEveVersion(request.projectRoot) ??
     await checkEveSandboxProvider(request.projectRoot);
   if (sandboxProvider !== undefined) {
@@ -3891,6 +3903,27 @@ async function collectEvePreflight(
       sandboxProvider.message,
       sandboxProvider.remediation,
     ));
+  }
+  warnings.push(
+    ...(await collectEveSetupWarnings(
+      request.projectRoot,
+      envFileRead && !gatewayKeySupplied(runtimeConfig),
+    )).filter((warning) =>
+      // The failed sandbox check already says to install just-bash.
+      sandboxProvider === undefined || warning.id !== "EVE_JUST_BASH_MISSING"
+    ),
+  );
+  if (options.cloudflareRead === undefined) {
+    eveProgress(options, "checking Cloudflare access");
+    const access = await defaultCloudflareAccess(request.name);
+    if (
+      access.accountAccess === "unavailable" ||
+      access.containerAccess === "unavailable"
+    ) {
+      checks.push(cloudflareAccessBlocked(access));
+    }
+  }
+  if (!allChecksClear(checks)) {
     return {
       result: {
         command: request.command === "deploy" ? "eden deploy" : "eden preflight",
@@ -3904,8 +3937,6 @@ async function collectEvePreflight(
       runtimeConfig,
     };
   }
-
-  warnings.push(...await collectEveSetupWarnings(request.projectRoot));
 
   eveProgress(
     options,
@@ -4036,9 +4067,11 @@ async function collectEvePreflight(
   if (workflowWorld === "@moinulmoin/eden-world-cloudflare") {
     checks.push(check("EVE-WORLD", "passed", "world: Cloudflare Durable Object"));
   }
-  // Compiled configuration supersedes the early generated-source hint.
-  const localHint = warnings.findIndex((warning) => warning.id === "EVE_WORLD_LOCAL");
-  if (localHint !== -1) warnings.splice(localHint, 1);
+  // Compiled configuration supersedes the early source hints.
+  for (const id of ["EVE_WORLD_LOCAL", "EVE_AI_GATEWAY_KEY_MISSING"]) {
+    const hint = warnings.findIndex((warning) => warning.id === id);
+    if (hint !== -1) warnings.splice(hint, 1);
+  }
   warnings.push(
     ...(await collectEveWorldWarnings(candidate, undefined)),
   );
@@ -4108,7 +4141,7 @@ async function collectEvePreflight(
           "VAL-CLI-007-CLOUDFLARE-ACCESS",
           "failed",
           "The exact read-only Cloudflare adapter failed without a safe result.",
-          "Retry with an authenticated read-only account, Container, and exact-target adapter; no remote mutation was attempted.",
+          "Confirm the account with npx wrangler@4.147.0 whoami, then retry; nothing was changed on Cloudflare.",
         ),
         blockedAfterFailure(
           "VAL-CLI-007-TARGET-CONFLICT",
@@ -4391,7 +4424,7 @@ async function collectEvePreflight(
           "VAL-CLI-007-CLOUDFLARE-ACCESS",
           "failed",
           "The exact read-only Cloudflare adapter failed without a safe result.",
-          "Retry with an authenticated read-only account, Container, and exact-target adapter; no remote mutation was attempted.",
+          "Confirm the account with npx wrangler@4.147.0 whoami, then retry; nothing was changed on Cloudflare.",
         ),
         blockedAfterFailure(
           "VAL-CLI-007-TARGET-CONFLICT",

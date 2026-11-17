@@ -31,13 +31,19 @@ From inside an npm or pnpm Eve project, with Docker running:
 
 ```sh
 npx wrangler@4.147.0 login
+npx @moinulmoin/eden preflight --env-file ~/.config/my-agent/preview.env
 npx @moinulmoin/eden deploy --env-file ~/.config/my-agent/preview.env
 ```
 
+A project straight from `eve init` fails these commands until it has the
+five changes in
+[Starting from a fresh Eve project](#starting-from-a-fresh-eve-project).
+`preflight` changes nothing on Cloudflare and lists everything that is
+missing in its first run, before it builds.
+
 The env file holds your model key and auth secrets and lives outside the
 project. Deploy prints the live URL. Run the same command again to ship a
-change. New to Eve, or starting from `eve init`? Check
-[Requirements](#requirements) first.
+change.
 
 ## Install
 
@@ -136,10 +142,13 @@ To start a new project on Eve `1.0.2`, the latest stable release:
 npx eve@1.0.2 init my-agent --non-interactive
 cd my-agent
 npm pkg set dependencies.eve="1.0.2"
-npm add just-bash
+npm install just-bash @moinulmoin/eden-world-cloudflare
 ```
 
-Explicitly select the supported sandbox in `agent/sandbox.ts`. If the project
+Then make the five changes below. They are the same ones the
+[coding-agent skill](#with-a-coding-agent) makes.
+
+**1. Sandbox.** Explicitly select the supported sandbox in `agent/sandbox.ts`. If the project
 has an `agent/sandbox/` folder (for example `agent/sandbox/workspace/`), put
 the module in `agent/sandbox/sandbox.ts` instead; Eve ignores or rejects
 `agent/sandbox.ts` next to that folder:
@@ -159,12 +168,67 @@ setup instructions.
 Keep the generated `package-lock.json`; Eden installs it with `npm ci` without
 converting the project to pnpm.
 
-Replace the production placeholder in `agent/channels/eve.ts` with your real
-[Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection)
-before deploying: the generated Vercel/localhost authenticators do not grant
-access on Cloudflare. Put your model provider key (for an AI Gateway model,
-`AI_GATEWAY_API_KEY`) and authentication secrets in an environment file outside
-the project.
+**2. Channel auth.** Replace the generated auth in `agent/channels/eve.ts`
+with your real
+[Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection):
+the generated Vercel/localhost authenticators do not grant access on
+Cloudflare. A bearer token read from the env file is enough to start:
+
+```ts
+import { localDev, type AuthFn } from "eve/channels/auth";
+import { eveChannel } from "eve/channels/eve";
+
+const authenticate: AuthFn<Request> = (request) => {
+  const expected = process.env.AGENT_AUTH_TOKEN;
+  if (!expected || request.headers.get("authorization") !== `Bearer ${expected}`) {
+    return null;
+  }
+  return {
+    attributes: {},
+    authenticator: "bearer-token",
+    principalId: "app-client",
+    principalType: "app",
+  };
+};
+
+export default eveChannel({ auth: [authenticate, localDev()] });
+```
+
+**3. Workflow World.** Eve's default local World loses sessions and pending
+approvals on every update. For durable state without a database, select the
+Cloudflare World in `agent/agent.ts`:
+
+```ts
+export default defineAgent({
+  model: "openai/gpt-6-luna-fast",
+  reasoning: "high",
+  experimental: { workflow: { world: "@moinulmoin/eden-world-cloudflare" } },
+});
+```
+
+To use Postgres instead, see
+[docs/deploy.md](docs/deploy.md#durable-state-postgres-world).
+
+**4. Env file.** Put the model key and the auth token in a file outside the
+project. A string model such as `"openai/gpt-6-luna-fast"` goes through Vercel
+AI Gateway and needs `AI_GATEWAY_API_KEY`; a direct provider needs its own
+key instead. Use exactly `KEY=value` per line, without quotes:
+
+```sh
+mkdir -p ~/.config/my-agent && chmod 700 ~/.config/my-agent
+touch ~/.config/my-agent/preview.env && chmod 600 ~/.config/my-agent/preview.env
+```
+
+```text
+AI_GATEWAY_API_KEY=<your key>
+AGENT_AUTH_TOKEN=<a long random string>
+```
+
+**5. Preflight.** Check the project before the first deploy:
+
+```sh
+npx @moinulmoin/eden preflight --env-file ~/.config/my-agent/preview.env
+```
 
 ## Deploy
 
