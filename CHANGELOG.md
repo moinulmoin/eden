@@ -56,6 +56,11 @@ needed no change.
 
 ### Maintainers
 
+- The live check on Cloudflare is now one command, `pnpm run check:live`. It
+  deploys a fresh project to a temporary target, runs bash in a session,
+  updates in place, upgrades Eve, lets the container sleep and wakes it, and
+  always destroys the target. Its first run passed from Eve `0.91.0` to
+  `1.0.2`; see `docs/eve-compatibility-history.md`.
 - The latest compatibility fixture pins Eve `1.0.2`,
   `@workflow/world-postgres` `5.2.1`, `just-bash` `3.6.1`, and `ai` `7.0.173`
   (Eve `1.0.2` needs `ai` `^7.0.172`). Its `pnpm-workspace.yaml` exempts the

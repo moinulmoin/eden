@@ -4,6 +4,60 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Scripted live check, Eve 0.91.0 to 1.0.2 (2026-11-17)
+
+The first run of `pnpm run check:live`, on macOS with Docker, against the
+maintainer's Cloudflare account. The CLI was built from main at `7899dc9`.
+The project came from `npx eve@0.91.0 init` with `just-bash` `3.6.1` and
+`@moinulmoin/eden-world-cloudflare` `0.12.0` from npm. The idle window was
+`EDEN_EVE_CONTAINER_SLEEP_AFTER=90s`. The run took 27 minutes, from
+`21:50:18Z` to `22:17:13Z`. Other builds were running on the machine, so
+the times below are slow ones.
+
+- `eden preflight` passed 14 checks with no warnings in 231 seconds.
+- The fresh deploy took 333 seconds. Health was ready on the first request.
+  An unauthenticated session request returned HTTP 401.
+- Session `wrun_01M7NRCAPX2GMMG5SK2AB3E1ZK` started on Eve `0.91.0`. Bash
+  wrote a file and read it back with exit code 0.
+- The same-version update took 235 seconds, on the same URL, and printed the
+  `EVE_UPDATE_IN_FLIGHT` warning. The same session answered and bash read
+  the file back. A new session ran bash.
+- After the project moved to Eve `1.0.2`, the deploy took 322 seconds, on
+  the same URL. The same session answered with the same ID, its two earlier
+  turns were still in its stream, and bash read the file back. A new session
+  reported Eve `1.0.2` and ran bash.
+- After 165 seconds with no requests, the first health request took 6.4
+  seconds. The server process was 7 seconds old when the session asked, so
+  the container had stopped and started. Bash read the file back again.
+- `eden destroy` took 196 seconds. The URL returned 404. Wrangler showed no
+  Worker, no secrets, no Container application, and no registry image for
+  the target.
+
+This is the first live run on Eve `1.0.2`, and the first dated run of a
+session moving across an Eve upgrade.
+
+A second run started on Eve `1.0.2` with no upgrade: preflight took 126
+seconds and the fresh deploy 220 seconds. It was then interrupted with
+SIGINT on purpose. The script ran `eden destroy` (61 seconds) and nothing
+of that target was left.
+
+Three earlier attempts on the same day stopped before the full run passed:
+
+- `pnpm run` exports `npm_*` settings that pointed the project's
+  `npm install` at the Eden repository. The script now removes them.
+- The free model was not available (`MODEL_CALL_FAILED`), which ended the
+  session. The script now uses the fixtures' fallback models. Destroy ran
+  after that failure and left nothing behind.
+- Under heavy machine load, preflight's local boot did not become healthy
+  in time (`EVE_HEALTH_FAILED`). The next run passed unchanged.
+
+On a second temporary target the `.eden/` folder was moved aside. `eden
+destroy` stopped with `EVE_DESTROY_RECORD_UNPROVEN`. The manual steps in
+[The `.eden/` folder is lost](./troubleshooting.md#the-eden-folder-is-lost)
+then removed the Worker, the Container application, and the registry image.
+The URL returned 404 and nothing with the name was left. That target had not
+slept, so it had no `rootfs-snapshot-*` tags to delete.
+
 ## Eve 1.0.2 checks (2026-11-17)
 
 Run on macOS with Docker, without Cloudflare credentials. No live Cloudflare

@@ -32,7 +32,7 @@ The Eve compatibility gate needs Postgres; see
 | A failure or warning code, or its remediation | Its entry in `docs/troubleshooting.md`; `skills/eden/SKILL.md` if agents hit it often |
 | A command, flag, environment variable, or JSON output field | `docs/reference.md`, `skills/eden/SKILL.md`, and the help text in `packages/cli/src/eve.ts` |
 | The supported Eve or World versions | The table in `docs/eve-compatibility.md`, the fixtures in `validation/eve-compat/`, the `EVE_VERSION_UNSUPPORTED` and `EVE_WORLD_PAIRING` checks, and the README's fresh-project steps |
-| Deploy, update, destroy, runtime, or World behavior | Run the live check on Cloudflare before release (see `docs/eve-compatibility.md`); update `docs/how-it-works.md` |
+| Deploy, update, destroy, runtime, or World behavior | Run the live check on Cloudflare before release (`pnpm run check:live`, see `docs/validation.md`); update `docs/how-it-works.md` |
 | Anything about secrets, auth, or what Eden can change | `docs/security.md` |
 | Anything a user can notice | `CHANGELOG.md` |
 
@@ -46,7 +46,9 @@ The Eve compatibility gate needs Postgres; see
    `@moinulmoin/eden-world-cloudflare` dev dependency), and
    `packages/world-cloudflare/package.json`. Run
    `pnpm install --no-frozen-lockfile`.
-3. Run the checks above, plus the live check when the change needs it.
+3. Run the checks above. When the change needs the live check, run
+   `pnpm run check:live -- --env-file <file>` on a machine with the Wrangler
+   login and add the dated result to `docs/eve-compatibility-history.md`.
 4. Get the maintainer's approval. Commit explicit paths, push `main`, then
    push the tag `vX.Y.Z`. The Publish workflow tests, publishes to npm with
    provenance, smoke-tests the installers, and creates the GitHub release.
