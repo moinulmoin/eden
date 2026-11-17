@@ -495,8 +495,9 @@ easy to miss; `eden preflight` warns when it sees a pooled URL.
 
 ### 1. Add the version-paired dependency
 
-Eve pins and validates its World at `eve build`, so the Postgres World
-version must match the `@workflow/world` version your Eve release bundles.
+Eve pins and validates its World at `eve build`, so the Postgres World must
+be on the same major version as the `@workflow/world` your Eve release
+bundles. The pairs below are the tested ones.
 For Eve `1.0.2`, which bundles `@workflow/world` `5.2.0`:
 
 ```sh
