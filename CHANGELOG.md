@@ -2,8 +2,20 @@
 
 ## Unreleased
 
+Eve `1.0.2`, the first stable Eve 1.0, is now a tested version. Eden itself
+needed no change.
+
 ### Changed
 
+- Eve `1.0.2` with `@workflow/world-postgres` `5.2.1` replaces `1.0.0-rc.6`
+  as the latest tested pair in CI. Eve `0.91.0` stays the oldest supported
+  version.
+- The README's fresh-project steps now start from `npx eve@1.0.2 init`. A
+  project made that way passed the build and boot checks of `eden preflight`.
+- `docs/deploy.md` and `docs/troubleshooting.md` name the Postgres World
+  release for Eve `1.0.2`. `docs/eve-compatibility.md` explains the Node.js
+  `26.x` pin in new Eve projects and the `queueAuthMode` log line on the
+  Cloudflare World.
 - `eden destroy --json` now includes `"command": "eden destroy"`, like
   preflight and deploy.
 - Destroy failures now say what to do next: `EVE_DESTROY_RECORD_UNPROVEN`,
@@ -14,6 +26,13 @@
 
 ### Maintainers
 
+- The latest compatibility fixture pins Eve `1.0.2`,
+  `@workflow/world-postgres` `5.2.1`, `just-bash` `3.6.1`, and `ai` `7.0.173`
+  (Eve `1.0.2` needs `ai` `^7.0.172`). Its `pnpm-workspace.yaml` exempts the
+  releases published in the last day from pnpm's release-age check.
+- The compatibility gate waits for the Eve server to exit. Eve `1.0.2` takes
+  about five seconds to stop after a session has started, and the gate
+  reported that as a failed cleanup.
 - The process-cleanup test helper retries a `ps` snapshot that fails once on
   a busy machine, instead of failing the test.
 

@@ -4,6 +4,24 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Eve 1.0.2 checks (2026-11-17)
+
+Run on macOS with Docker, without Cloudflare credentials. No live Cloudflare
+run was made for Eve `1.0.2`.
+
+- The compatibility gate passed for both fixtures: Eve `0.91.0` with
+  `@workflow/world-postgres` `5.0.5`, and Eve `1.0.2` with `5.2.1`.
+- A project from `npx eve@1.0.2 init`, set up with the README's fresh-project
+  steps, passed every build and boot check of `eden preflight`
+  (`VAL-BUILD-001` to `VAL-BUILD-007`). The two Cloudflare access checks did
+  not run.
+- Eve `1.0.2` with `@moinulmoin/eden-world-cloudflare` `0.12.0`, against the
+  World's core served over RPC on the same machine: a session was admitted
+  with HTTP 202 and its first turn ran up to the model call, which had no
+  model key.
+- Once a session has started, Eve `1.0.2` with the Postgres World takes about
+  five seconds to exit after SIGTERM. Eve `1.0.0-rc.6` exited within a second.
+
 ## Eve 0.83.0 sandbox selection
 
 Eve `0.83.0` removed microsandbox and changed `DefaultSandbox`: production no

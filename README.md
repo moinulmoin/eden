@@ -130,12 +130,12 @@ Eden needs Eve `0.91.0` or later; see [Eve compatibility](./docs/eve-compatibili
 for the tested versions, the World each one needs, and how to redeploy an
 older project unchanged.
 
-To start a new project on Eve `0.91.0`, the latest stable release:
+To start a new project on Eve `1.0.2`, the latest stable release:
 
 ```sh
-npx eve@0.91.0 init my-agent --non-interactive
+npx eve@1.0.2 init my-agent --non-interactive
 cd my-agent
-npm pkg set dependencies.eve="0.91.0"
+npm pkg set dependencies.eve="1.0.2"
 npm add just-bash
 ```
 
