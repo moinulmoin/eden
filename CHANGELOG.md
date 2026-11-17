@@ -56,6 +56,9 @@ needed no change.
 
 ### Maintainers
 
+- CI runs the gate's Eden leg in one parallel job per fixture, so a push
+  waits for the slowest job instead of their sum. Publish still runs the
+  whole gate in one step.
 - The compatibility gate now tests Eden, not only Eve. For each fixture it
   also installs the Cloudflare World built from this repository, runs the
   built `eden preflight` up to the Cloudflare access checks, and requires a
