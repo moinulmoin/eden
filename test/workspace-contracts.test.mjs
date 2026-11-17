@@ -28,6 +28,7 @@ test("the repository declares the Eden workspaces and root quality scripts", asy
     lint: "pnpm exec eslint . --max-warnings 0",
     test: "pnpm exec vitest run --maxWorkers=1",
     "compat:eve:local": "node validation/eve-compat/run-local.mjs",
+    "check:live": "node validation/live-cloudflare/run.mjs",
   });
   expect(lockfile).toMatch(/lockfileVersion: ['"]9\.0['"]/);
   expect(workspace).toMatch(/packages\/\*/);

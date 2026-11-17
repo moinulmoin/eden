@@ -56,6 +56,13 @@ needed no change.
 
 ### Maintainers
 
+- The live check on Cloudflare is now one command, `pnpm run check:live`. It
+  deploys a fresh project to a temporary target, runs bash in a session,
+  updates in place, upgrades Eve, lets the container sleep and wakes it, then
+  destroys the target. Once a deploy has started, `eden destroy` also runs
+  when a step fails and on Ctrl-C; if destroy itself fails, the script prints
+  the retry command. Three attempts failed before the first passing run,
+  from Eve `0.91.0` to `1.0.2`; see `docs/eve-compatibility-history.md`.
 - CI runs the gate's Eden leg in one parallel job per fixture, so a push
   waits for the slowest job instead of their sum. Publish still runs the
   whole gate in one step.

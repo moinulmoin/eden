@@ -74,12 +74,12 @@ all three.
   `@workflow/world-postgres`, or `just-bash`, including release candidates, is
   one day old, so CI runs against it. The wait matches pnpm's one-day release
   age, which the fixture's frozen install enforces.
-- **A live check on Cloudflare** runs by hand before any release that changes
-  deploy, runtime, or World code: deploy a fresh project, start a session that
-  runs bash, update it in place, send the same session another message, start a
-  new session, destroy, and confirm the URL returns 404. When the change
-  touches version retirement or session moves, the update also changes the Eve
-  version.
+- **A live check on Cloudflare** runs before any release that changes deploy,
+  runtime, or World code. One command, `pnpm run check:live`, deploys a fresh
+  project to a temporary target, runs bash in a session, updates in place,
+  upgrades Eve, lets the container sleep and wakes it, then destroys the
+  target. It needs the maintainer's Wrangler login, so it does not run in CI.
+  See [validation](./validation.md#live-check-on-cloudflare).
 
 ## Session behavior across Eve upgrades
 

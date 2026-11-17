@@ -62,25 +62,73 @@ Stop the local service afterward:
 docker stop eden-compat-postgres
 ```
 
-## Deployed validation
+## Live check on Cloudflare
 
-An authorized remote validation deploys the fixture (or another pinned Eve
-project) to a unique temporary target and removes it afterward:
+Run this before a release that changes deploy, update, destroy, runtime, or
+World behavior. It uses the real Cloudflare account that Wrangler on this
+machine is logged in to, and Docker. It does not run in CI.
 
-1. Run `eden deploy --project <project> --env preview --name <unique-name>`
-   with `--env-file` if the project needs runtime values.
-2. Poll the printed `workers.dev` URL until health reports ready, then exercise
-   the application's real endpoints.
-3. Compare the remote behavior with a local `eve start` run of the same
-   project.
-4. Remove exactly the deployed target with
-   `eden destroy --project <project> --env preview --name <unique-name>` and
-   verify the URL is unreachable and no Worker, Container, or secret entries
-   for the temporary name remain in the Cloudflare account.
+```sh
+pnpm run check:live -- --env-file ~/.config/eden/eve-compat.env
+```
 
-Never use production as an implicit temporary target. Destroy requires Eden's
-immutable ownership record and the current remote identity, so cleanup cannot
-broaden to similarly named resources.
+The env file must hold `AI_GATEWAY_API_KEY=<key>`. The script copies only
+that value into its own temporary env file and never prints it. A run takes
+about 30 minutes.
+
+What it does, in order:
+
+1. Builds the local CLI.
+2. Makes a fresh project with `npx eve@<version> init` and the steps from
+   `eden skill`: `just-bash`, the sandbox module, a bearer-token authenticator, and
+   the Cloudflare World from npm.
+3. Runs `eden preflight`, then `eden deploy`, and waits for health.
+4. Starts a session whose turn runs bash and writes a file.
+5. Deploys again on the same Eve version. The URL must not change. The same
+   session must answer and still have its file. A new session must start.
+6. Upgrades the project's Eve version and deploys. The same session must
+   continue with the same ID, its earlier turns, and its file. A new session
+   must report the new Eve version.
+7. Sends no requests for longer than the idle window, then sends one. The
+   server process must be younger than the wait, and the file must still be
+   there.
+8. Runs `eden destroy`, then confirms the URL returns 404 and that no Worker,
+   secret, Container application, or registry image with the target's name
+   is left.
+
+Each step prints `✓` or `✗` with its time. The last output is one JSON
+object with `ok`, the target, and every step. The exit code is `0` only when
+every step passed.
+
+Defaults and options:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--eve <version>` | The floor fixture's Eve | Eve version the project starts on |
+| `--upgrade-to <version>` | The latest fixture's Eve | Eve version for step 6; the step is skipped when it equals `--eve` |
+| `--world <version>` | `latest` | `@moinulmoin/eden-world-cloudflare` version from npm |
+| `--model <id>` | The fixtures' model and fallbacks | AI Gateway model |
+| `--sleep-after <time>` | `90s` | Idle window for step 7, set with `EDEN_EVE_CONTAINER_SLEEP_AFTER` |
+| `--skip-sleep` | off | Skip step 7 and keep the 1 hour default |
+| `--keep-work` | off | Keep the temporary project folder; the target is still destroyed |
+
+Safety:
+
+- The target name is generated for each run (`eden-live-<date>-<8 hex>`).
+  There is no option to choose it, and the script refuses to run `eden`
+  against any other name.
+- Once a deploy has started, `eden destroy` runs when a step fails and on
+  Ctrl-C. If destroy itself fails, the script prints the retry command and
+  keeps the project folder, because destroy needs its `.eden` records. A
+  killed process (SIGKILL) cleans up nothing.
+- Eden rejects `file:` dependencies, so the project installs the Cloudflare
+  World from npm. A World change is checked live only after it is published.
+- The proof of each bash step is the tool's own output in the session
+  stream, not the model's wording. A model that ignores the request gets two
+  more tries.
+
+Add a dated entry for each run to
+[Eve compatibility history](./eve-compatibility-history.md).
 
 ## Provisional limits
 
