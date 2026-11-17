@@ -12,7 +12,7 @@ pnpm install
 pnpm run build && pnpm run typecheck && pnpm run lint && pnpm run test
 ```
 
-The Eve compatibility gate needs Postgres; see
+The Eve compatibility gate needs Postgres and Docker; see
 [docs/validation.md](docs/validation.md).
 
 ## Rules
