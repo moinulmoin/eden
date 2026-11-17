@@ -54,9 +54,37 @@ jobs:
         env:
           EDEN_PACKAGE_TEST_TIMEOUT_MS: "600000"
           EDEN_PACKAGE_TEST_SCRIPTS_TIMEOUT_MS: "900000"
-      - name: Current Eve and Eden compatibility
+      - name: Current Eve compatibility
         # Eve selects microsandbox whenever /dev/kvm exists. Eden's builder and
         # Container never expose KVM, so the gate builds the same way.
         run: |
           sudo rm -f /dev/kvm
-          pnpm run compat:eve:local
+          pnpm run compat:eve:local postgres
+
+  # The Eden leg builds two images per fixture, so each fixture gets its own
+  # job and a push waits for the slowest job, not their sum.
+  eden-compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [floor, latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Enable pinned pnpm
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Current Eden compatibility (${{ matrix.fixture }})
+        run: pnpm run compat:eve:local ${{ matrix.fixture }} eden
