@@ -93,6 +93,11 @@ async function withFakeWrangler(
   }
 }
 
+/** Keeps a preflight that fails locally from running the real Wrangler access check. */
+const unreachedCloudflareRead = (): never => {
+  throw new Error("The Cloudflare read must not run.");
+};
+
 async function createRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "eden-cli-eve-namespace-"));
   roots.push(root);
@@ -332,6 +337,7 @@ describe("top-level Eden Deploy commands", () => {
         "--json",],
         {
           cwd: root,
+          eveControlPlane: { cloudflareRead: unreachedCloudflareRead },
           stdout: (line) => output.push(line),
           stderr: (line) => errors.push(line),
         },
@@ -1502,6 +1508,7 @@ describe("top-level Eden Deploy commands", () => {
         "eve-human-failure",],
         {
           cwd: root,
+          eveControlPlane: { cloudflareRead: unreachedCloudflareRead },
           stdout: (line) => output.push(line),
           stderr: (line) => errors.push(line),
         },

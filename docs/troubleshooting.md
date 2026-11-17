@@ -32,7 +32,12 @@ Warnings do not stop a run. They print with an `!` and a remediation arrow:
 ```
 
 When the command itself fails, human output sends
-`CODE [source]: message` to stderr and exits with status `1`.
+`CODE [source]: message` and a remediation arrow to stderr and exits with
+status `1`.
+
+Problems Eden can see without building are reported together in the first
+run, before the build starts: the env file, the Eve version, the sandbox
+module, Cloudflare access, and the project setup warnings.
 
 `preflight`, `deploy`, and `destroy` accept `--json`. They print one JSON
 object, including on failure. Failed runs include `error.code`,
@@ -106,14 +111,25 @@ reporting the failure. Inspect any deployment evidence before retrying.
 ### `EVE_ARGUMENT_UNKNOWN` and `EVE_OPTION_UNKNOWN`
 
 The command contains an invalid argument or an unknown option, or a
-positional argument where none is accepted. Run `eden <command> --help` for
-the accepted options.
+positional argument where none is accepted. `EVE_OPTION_UNKNOWN` names the
+option, for example `Unknown option --bogus.` Run `eden <command> --help`
+for the accepted options.
+
+### `node: <path>: not found`, exit status 9
+
+The `--env-file` path does not exist, and the command was started through
+`npx` or `pnpm dlx`. Their own Node process reads `--env-file`
+and stops before Eden starts, so there is no Eden code and no JSON object.
+Create the file or correct the path. A globally installed `eden` reports the
+same mistake as `EVE_ENV_FILE_NOT_FOUND` under
+[`VAL-SEC-001`](#val-sec-001--the---env-file-could-not-be-read).
 
 ### `EVE_NAME_REQUIRED`
 
 `An explicit --name is required for destroy and for production targets.`
 Preview `preflight` and `deploy` derive a target name from `package.json`,
-but `destroy` and `--env production` always need one:
+but `destroy` and `--env production` always need one. For `destroy`, use the
+exact name the deploy printed:
 
 ```sh
 eden deploy --env production --name my-eve-production
@@ -257,8 +273,9 @@ The same check also carries the build-output problems, which report as
 
 ### `VAL-SEC-001` — the `--env-file` could not be read
 
-The check message carries the runtime-config error code. These are the
-codes you will see:
+The check message starts with the runtime-config error code, for example
+`EVE_ENV_FILE_NOT_FOUND: The explicit Eve environment file does not exist.`
+These are the codes you will see:
 
 | Code | Meaning | Fix |
 | --- | --- | --- |
@@ -317,17 +334,22 @@ The check is blocked with
 `Authenticated Cloudflare account and Container access could not be verified
 without a mutating operation.` Eden reads the account and the Container
 inventory through a read-only adapter and never mutates during preflight.
+`preflight` and `deploy` run this check before the build, so a missing login
+fails in a few seconds.
 
-Confirm the account first:
+When Wrangler is not logged in, the remediation is
+`Run npx wrangler@4.147.0 login, confirm the account with npx wrangler@4.147.0
+whoami, then retry.`:
 
 ```sh
-npx wrangler@4.147.0 whoami
 npx wrangler@4.147.0 login
+npx wrangler@4.147.0 whoami
 ```
 
-The account must be on the Workers Paid plan, which Cloudflare Containers
-requires. Review the account that `whoami` returns before you retry; Eden
-never selects a different Cloudflare account silently.
+When Wrangler is logged in but the account's Containers cannot be read, the
+remediation says so. The account must be on the Workers Paid plan, which
+Cloudflare Containers requires. Review the account that `whoami` returns
+before you retry; Eden never selects a different Cloudflare account silently.
 
 When the read-only adapter itself fails, the check reports
 `The exact read-only Cloudflare adapter failed without a safe result.` and no
@@ -625,7 +647,8 @@ it.
 ### `EVE_PREFLIGHT_FAILED`
 
 `The Eve preflight checks failed; no remote mutation or active-state
-promotion was attempted.`
+promotion was attempted.` Fix each failed check using its remediation, then
+rerun `eden preflight`.
 
 ### `EVE_DEPLOY_PROMOTION_FAILED`
 
@@ -1023,7 +1046,8 @@ Destroy reports one check per step:
 `No immutable deployed record matched the exact target; destroy refuses to
 guess or broaden cleanup.` Eden keeps its deployment records under
 `<project>/.eden/eve-deploy`. Deploy from this project root, or point
-`--project` at the project you deployed, and retry.
+`--project` at the project you deployed, and retry. If the folder no longer
+exists anywhere, see [The `.eden/` folder is lost](#the-eden-folder-is-lost).
 
 ### `EVE_DESTROY_RECORD_MISMATCH`
 
@@ -1087,6 +1111,59 @@ The remote resources are already gone; only the local pointer under
 local residue was retained.` Confirm no `eden` process is still running
 against the target, then remove the stale lock file at
 `<project>/.eden/eve-deploy/locks/<environment>-<name>.lock`.
+
+### The `.eden/` folder is lost
+
+Without `<project>/.eden/eve-deploy/` Eden cannot prove it owns a target, so
+`eden deploy` stops with `VAL-CLI-007-TARGET-CONFLICT` and `eden destroy`
+stops with `EVE_DESTROY_RECORD_UNPROVEN`. The deployment keeps running and
+the Container is billed while it is awake. Look for the folder first: on the
+machine that deployed, in backups, or in another clone. If it is gone, remove
+the deployment by hand. These are the resources Eden creates for a target
+(see [What Eden creates](./reference.md#what-eden-creates)) and the Wrangler
+commands `eden destroy` itself runs.
+
+1. Confirm the account, and the exact target name the deploy printed (a
+   derived preview name is the `package.json` name plus a dash and eight
+   hexadecimal characters):
+
+   ```sh
+   npx wrangler@4.147.0 whoami
+   npx wrangler@4.147.0 deployments list --name <name>
+   ```
+
+2. Delete the Worker. It is named exactly `<name>`. Its secrets (one per
+   env-file variable), its Cron Trigger, and its Durable Object data are part
+   of the Worker; with the Cloudflare World that data includes every stored
+   session.
+
+   ```sh
+   npx wrangler@4.147.0 delete --name <name>
+   ```
+
+3. Delete the Container application. It is named `<name>-container`
+   (truncated to 63 characters). Find its ID in the list, then delete by ID:
+
+   ```sh
+   npx wrangler@4.147.0 containers list
+   npx wrangler@4.147.0 containers delete <application-id>
+   ```
+
+4. Delete the registry images. Eden's repositories for the target start with
+   `eden-eve-<environment>-<name>-`. Delete every tag of each one: the
+   `candidate` tag and any `rootfs-snapshot-*` or `rootfs-set-*` tags.
+
+   ```sh
+   npx wrangler@4.147.0 containers images list
+   npx wrangler@4.147.0 containers images delete <repository>:<tag>
+   ```
+
+5. Run the two list commands again and confirm nothing with the target name
+   is left.
+
+Match the exact names only. A name that merely starts the same way can
+belong to another target. An external Postgres database is not touched by any
+of this.
 
 ### Checking for leftovers yourself
 

@@ -258,12 +258,15 @@ async function selectedEveProjectRoot(
   return canonical;
 }
 
+const UNEXPECTED_FAILURE_REMEDIATION =
+  "Run eden preflight for the same project and target, resolve its failed checks, then retry the command.";
+
 function errorLines(error: unknown): readonly string[] {
   if (error instanceof EveCliError) {
     const source = error.source === undefined ? "" : ` [${error.source}]`;
     return [
       `${error.code}${source}: ${error.message}`,
-      ...(error.remediation === undefined ? [] : [`  → ${error.remediation}`]),
+      `  → ${error.remediation}`,
       ...error.diagnostics.map((diagnostic) => {
         const diagnosticSource = diagnostic.source === undefined
           ? ""
@@ -276,13 +279,12 @@ function errorLines(error: unknown): readonly string[] {
     const source = error.source === undefined ? "" : ` [${error.source}]`;
     return [
       `${error.code}${source}: ${error.message}`,
-      ...(error.remediation === undefined ? [] : [`  → ${error.remediation}`]),
+      `  → ${error.remediation}`,
     ];
   }
   return [
-    error instanceof Error
-      ? error.message
-      : "The Eden command failed unexpectedly.",
+    `EVE_EXECUTION_FAILED: ${error instanceof Error ? error.message : "The Eden command failed unexpectedly."}`,
+    `  → ${UNEXPECTED_FAILURE_REMEDIATION}`,
   ];
 }
 
@@ -405,11 +407,11 @@ export async function runEdenCli(
             ? error.code : "EVE_EXECUTION_FAILED",
           message: error instanceof Error ? error.message : "The Eden command failed unexpectedly.",
           ...(error instanceof EveCliError || error instanceof EveRuntimeConfigError ? {
-            ...(error.remediation === undefined ? {} : { remediation: error.remediation }),
+            remediation: error.remediation,
             ...(error.source === undefined ? {} : { source: error.source }),
             ...(error instanceof EveCliError && error.diagnostics.length > 0 ? { diagnostics: error.diagnostics } : {}),
           } : {
-            remediation: "Run eden preflight for the same project and target, resolve its failed checks, then retry the command.",
+            remediation: UNEXPECTED_FAILURE_REMEDIATION,
           }),
         },
       };

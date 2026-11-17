@@ -108,7 +108,7 @@ export class EveRuntimeConfigError extends Error {
   readonly code: EveRuntimeConfigErrorCode;
   readonly source: string | undefined;
   readonly variableName: string | undefined;
-  readonly remediation: string | undefined;
+  readonly remediation: string;
 
   constructor(options: {
     readonly code: EveRuntimeConfigErrorCode;
@@ -125,7 +125,7 @@ export class EveRuntimeConfigError extends Error {
     this.remediation = options.remediation ?? (
       options.code.startsWith("EVE_ENV_")
         ? "Correct the --env-file path or contents described by this error, then rerun the same command."
-        : undefined
+        : "Retry the same command; if it fails again, report this code with the output of eden --version."
     );
   }
 }
@@ -211,6 +211,7 @@ async function observeEnvironmentFile(path: string): Promise<EveRuntimeFileObser
         code: "EVE_ENV_FILE_NOT_FOUND",
         message: "The explicit Eve environment file does not exist.",
         source: EVE_ENV_FILE_SOURCE,
+        remediation: "Create the file or point --env-file at the right path, then rerun the same command.",
       });
     }
     throw new EveRuntimeConfigError({
@@ -641,6 +642,7 @@ function redactRuntimeConfigError(
   return new EveRuntimeConfigError({
     code: error.code,
     message: redactEveRuntimeOutput(error.message),
+    remediation: error.remediation,
     ...(error.source === undefined
       ? {}
       : { source: redactEveRuntimeOutput(error.source) }),

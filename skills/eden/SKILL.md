@@ -27,7 +27,9 @@ Docs: https://github.com/moinulmoin/eden (failure and warning codes:
    ```
 
    Preflight builds and boots the agent locally and checks Cloudflare access.
-   It changes nothing on Cloudflare. It prints one JSON object:
+   It changes nothing on Cloudflare. Before it builds, it reports every
+   setup problem it can see (env file, Eve version, sandbox, Cloudflare
+   login, and the warnings) in one run. It prints one JSON object:
    `ok`, `checks[]` (`id`, `status`, `message`, `remediation`) and
    `warnings[]` (`id`, `message`, `remediation`).
 4. Fix every failed check, then every warning, using its `remediation`. Re-run
@@ -166,6 +168,12 @@ npx @moinulmoin/eden destroy --name <name> --json
   URL) from the result.
 - An `eve init` project's `npm run deploy` script still deploys to Vercel, not
   Eden.
+- Eden writes build output and deployment records to `.eden/` in the project.
+  Do not commit it (one build was 245 MB in a test, and it records absolute
+  local paths): add `.eden` to the project's `.gitignore`. Never delete it.
+  Updates and `destroy` must run from the machine and project folder that
+  deployed. If it is lost, follow "The `.eden/` folder is lost" in
+  `docs/troubleshooting.md`.
 - Get the user's explicit go-ahead before any `destroy` or production deploy;
   a request that already says to tear the agent down counts. Destroy deletes
   the agent immediately, even mid-conversation, and with the Cloudflare World
@@ -229,8 +237,11 @@ the agent sleeps takes about 10–15 seconds.
   cannot prove it owns. For a brand-new agent, pick another `--name`; never
   delete the resource to make room.
 - `VAL-CLI-007-CLOUDFLARE-ACCESS`: Wrangler is not logged in or the account
-  lacks Workers Paid/Containers. The user has to fix this
-  (`npx wrangler@4.147.0 whoami`).
+  lacks Workers Paid/Containers. It is checked before the build. The user has
+  to fix this (`npx wrangler@4.147.0 login`, then
+  `npx wrangler@4.147.0 whoami`).
+- `node: <path>: not found` with exit status 9 and no JSON: the `--env-file`
+  path does not exist. `npx` stopped before Eden started. Correct the path.
 - `DEPLOY_INDETERMINATE`: Eden could not prove the result; the old version
   usually keeps serving. Check the URL's health, then retry with the exact
   same `--project`, `--env`, and `--name`. Never switch to a new name to get

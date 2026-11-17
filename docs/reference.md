@@ -47,7 +47,8 @@ Preflight changes nothing in your Cloudflare account: it performs read-only
 calls (`wrangler whoami --json`, the name-filtered Container applications API,
 `wrangler deployments list --name <target> --json`, the account's
 `workers/subdomain` endpoint, and the Worker's script settings) and never
-uploads, publishes, or deletes. Locally it writes one generation directory
+uploads, publishes, or deletes. The login and Container reads run once before
+the build and again with the target reads after it. Locally it writes one generation directory
 under `.eden/eve-deploy/generations/` and removes the Docker images it built.
 
 The account is resolved only when the Wrangler login names exactly one
@@ -541,6 +542,7 @@ Human output starts with one header line, `eden <command> — <name>
 
 ```text
 ... validating environment file                     (only with --env-file)
+... checking Cloudflare access
 ... packaging project — snapshot, frozen install, eve build
 ... building linux/amd64 runtime image, booting eve, checking health
 ... checking Cloudflare access and exact target
@@ -550,6 +552,7 @@ Human output starts with one header line, `eden <command> — <name>
 
 ```text
 ... validating environment file                     (only with --env-file)
+... checking Cloudflare access
 ... packaging project — snapshot, frozen install, eve build
 ... checking Cloudflare access and exact target
 ... building linux/amd64 runtime image, booting eve, checking health
@@ -560,6 +563,10 @@ Human output starts with one header line, `eden <command> — <name>
 ... verifying health at <public origin>
 ... deleting superseded registry repository <repository>   (only on an update)
 ```
+
+When the env file, the Eve version, the sandbox module, or Cloudflare access
+fails, the run stops after `checking Cloudflare access` and reports those
+problems together with the project setup warnings, without building.
 
 The update and registry-cleanup lines above describe the in-place path.
 With affinity, only unneeded images are superseded: a retained image is not
