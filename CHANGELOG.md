@@ -61,6 +61,9 @@ needed no change.
   updates in place, upgrades Eve, lets the container sleep and wakes it, and
   always destroys the target. Its first run passed from Eve `0.91.0` to
   `1.0.2`; see `docs/eve-compatibility-history.md`.
+- CI runs the gate's Eden leg in one parallel job per fixture, so a push
+  waits for the slowest job instead of their sum. Publish still runs the
+  whole gate in one step.
 - The compatibility gate now tests Eden, not only Eve. For each fixture it
   also installs the Cloudflare World built from this repository, runs the
   built `eden preflight` up to the Cloudflare access checks, and requires a

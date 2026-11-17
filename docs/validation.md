@@ -51,7 +51,9 @@ workspace (`pnpm run build`), and no Cloudflare account:
 4. It checks health, fail-closed bearer auth, and keyless session admission,
    then removes the container, both images, and the copied project.
 
-CI and publish gates run both legs on both fixtures, with Postgres 16.
+CI and publish gates run both legs on both fixtures, with Postgres 16. On a
+push, CI runs the Postgres leg in the main job and the Eden leg in one parallel
+job per fixture. Publish runs the whole gate in one step.
 See [Current Eve compatibility](./eve-compatibility.md) for compatibility details.
 
 Stop the local service afterward:
