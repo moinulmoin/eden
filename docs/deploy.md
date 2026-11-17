@@ -169,6 +169,13 @@ eden deploy \
 
 Again, omit `--env-file` when it is not needed.
 
+Eden writes its build output and deployment records to `.eden/` in the
+project. Do not commit it: one build was 245 MB in a test, and its files
+record absolute paths on your machine. Add `.eden` to the project's
+`.gitignore`, and keep the folder: updates and `destroy` must run from the
+machine and project folder that deployed. If it is lost, see
+[The `.eden/` folder is lost](./troubleshooting.md#the-eden-folder-is-lost).
+
 A successful command prints progress lines and a summary ending with the
 exact `workers.dev` URL on its own line. Eden promotes the generation only
 after the public `/eve/v1/health` route reports the expected ready identity.

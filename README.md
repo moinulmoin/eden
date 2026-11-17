@@ -230,6 +230,18 @@ AGENT_AUTH_TOKEN=<a long random string>
 npx @moinulmoin/eden preflight --env-file ~/.config/my-agent/preview.env
 ```
 
+Eden writes its build output and deployment records to `.eden/` in the
+project. Do not commit it: one build was 245 MB in a test, and its files
+record absolute paths on your machine. Add it to `.gitignore`:
+
+```sh
+echo .eden >> .gitignore
+```
+
+Keep the folder, though. Updates and `destroy` must run from the machine and
+project folder that deployed. If it is lost, see
+[The `.eden/` folder is lost](./docs/troubleshooting.md#the-eden-folder-is-lost).
+
 ## Deploy
 
 From inside the Eve project:

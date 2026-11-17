@@ -168,6 +168,12 @@ npx @moinulmoin/eden destroy --name <name> --json
   URL) from the result.
 - An `eve init` project's `npm run deploy` script still deploys to Vercel, not
   Eden.
+- Eden writes build output and deployment records to `.eden/` in the project.
+  Do not commit it (one build was 245 MB in a test, and it records absolute
+  local paths): add `.eden` to the project's `.gitignore`. Never delete it.
+  Updates and `destroy` must run from the machine and project folder that
+  deployed. If it is lost, follow "The `.eden/` folder is lost" in
+  `docs/troubleshooting.md`.
 - Get the user's explicit go-ahead before any `destroy` or production deploy;
   a request that already says to tear the agent down counts. Destroy deletes
   the agent immediately, even mid-conversation, and with the Cloudflare World

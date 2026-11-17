@@ -32,6 +32,9 @@ needed no change.
 - `docs/troubleshooting.md` has a new entry, "The `.eden/` folder is lost",
   with the manual removal steps for the Worker, Container application, and
   registry images. `docs/deploy.md` and `docs/faq.md` link to it.
+- The README, the skill, and `docs/deploy.md` now say not to commit `.eden/`,
+  to add it to `.gitignore`, and that updates and `destroy` must run from the
+  machine and project folder that deployed.
 - `PRODUCT.md` is removed. It described Eve `0.66.3`, pnpm-only projects,
   and a 1 GiB container. The README and `docs/` hold the current facts.
 - Eve `1.0.2` with `@workflow/world-postgres` `5.2.1` replaces `1.0.0-rc.6`
