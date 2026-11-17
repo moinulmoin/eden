@@ -9,12 +9,19 @@ import {
   runOwnedProcess,
   spawnOwnedProcess,
 } from "../../test/owned-process.mjs";
+import { runEdenLeg } from "./eden-leg.mjs";
 
 const fixturesRoot = dirname(fileURLToPath(import.meta.url));
-const fixtures = process.argv.slice(2);
+const selected = process.argv.slice(2);
+assert(
+  selected.every((name) => ["floor", "latest", "postgres", "eden"].includes(name)),
+  "Arguments must be fixtures (floor, latest) or legs (postgres, eden).",
+);
+const fixtures = selected.filter((name) => ["floor", "latest"].includes(name));
 if (fixtures.length === 0) fixtures.push("floor", "latest");
-assert(fixtures.every((name) => ["floor", "latest"].includes(name)), "Fixtures must be floor or latest.");
-assert(process.env.WORKFLOW_POSTGRES_URL, "WORKFLOW_POSTGRES_URL is required (use a disposable Postgres database with CREATEDB permission).");
+const legs = selected.filter((name) => ["postgres", "eden"].includes(name));
+if (legs.length === 0) legs.push("postgres", "eden");
+assert(!legs.includes("postgres") || process.env.WORKFLOW_POSTGRES_URL, "WORKFLOW_POSTGRES_URL is required (use a disposable Postgres database with CREATEDB permission).");
 let root;
 let childEnvironment;
 const authToken = "eden-eve-compatibility-local";
@@ -124,7 +131,7 @@ async function assertAuth(origin) {
   console.log(`Bodyless session admission: HTTP 202 ${body.sessionId}`);
 }
 
-for (const fixture of fixtures) {
+async function runPostgresLeg(fixture) {
 root = resolve(fixturesRoot, fixture);
 childEnvironment = baseEnvironment;
 await run(
@@ -226,4 +233,9 @@ if (failure !== undefined) {
     await admin.end();
   }
 }
+}
+
+for (const fixture of fixtures) {
+  if (legs.includes("postgres")) await runPostgresLeg(fixture);
+  if (legs.includes("eden")) await runEdenLeg(fixture);
 }

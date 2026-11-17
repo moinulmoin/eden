@@ -19,14 +19,39 @@ docker run --rm -d --name eden-compat-postgres -e POSTGRES_PASSWORD=postgres -p 
 WORKFLOW_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm run compat:eve:local
 ```
 
-Append `floor` or `latest` to run only that fixture. Wait until Postgres is ready
-before running the gate. The database user must have `CREATEDB`: the script
-creates and deletes fresh databases for each run.
+Append `floor` or `latest` to run only that fixture, and `postgres` or `eden`
+to run only that leg. Wait until Postgres is ready before running the gate. The
+database user must have `CREATEDB`: the script creates and deletes fresh
+databases for each run.
 
-The gate performs a frozen install, typecheck, production build/start, and
-bootstrap. It checks public health, fail-closed bearer auth, and keyless session
-admission. The public Eve eval runner is optional and runs when a model API key
-is available. CI and publish gates run both fixtures against Postgres 16.
+The gate runs two legs for each fixture.
+
+The Postgres leg tests Eve itself. It performs a frozen install, typecheck,
+production build/start, and bootstrap. It checks public health, fail-closed
+bearer auth, and keyless session admission. The public Eve eval runner is
+optional and runs when a model API key is available.
+
+The Eden leg tests Eden. It needs Docker with linux/amd64 support and a built
+workspace (`pnpm run build`), and no Cloudflare account:
+
+1. It copies the fixture, selects `@moinulmoin/eden-world-cloudflare` in
+   `agent/agent.ts`, and installs that package from a tarball packed from
+   `packages/world-cloudflare`. The tarball is served over local HTTP because
+   Eden installs a project from its lockfile inside a Docker build. The
+   lockfile is resolved at run time, as a user's `npm install` would.
+2. It runs the built `eden preflight --json` in-process with a Cloudflare read
+   that reports no access. `VAL-BUILD-001` to `VAL-BUILD-007` and every other
+   check must pass; only the two `VAL-CLI-007` Cloudflare checks may not. The
+   only warning allowed is the missing model key.
+3. It builds Eden's image again through the CLI package's own functions,
+   because preflight removes the one it built, and starts it. The World core
+   from the installed package serves the World RPC inside the container, from
+   `packages/world-cloudflare/test/server.mjs`. This is the same core the
+   Durable Object wraps, not the Durable Object itself.
+4. It checks health, fail-closed bearer auth, and keyless session admission,
+   then removes the container, both images, and the copied project.
+
+CI and publish gates run both legs on both fixtures, with Postgres 16.
 See [Current Eve compatibility](./eve-compatibility.md) for compatibility details.
 
 Stop the local service afterward:
