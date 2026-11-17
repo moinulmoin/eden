@@ -201,7 +201,12 @@ try {
 } catch (error) {
   failure = error;
 } finally {
-  const cleaned = await eve.terminateOwned();
+  // Eve 1.0 can take five seconds to exit after SIGTERM once a session has
+  // started, and its pnpm wrapper exits first. Wait for the server to go.
+  let cleaned = await eve.terminateOwned();
+  for (let attempt = 0; !cleaned && attempt < 5; attempt += 1) {
+    cleaned = await eve.terminateOwned();
+  }
   if (!cleaned && failure === undefined) {
     failure = new Error("Eve server cleanup could not be verified.");
   }

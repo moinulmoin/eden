@@ -21,12 +21,21 @@ for what happens to running sessions.
 
 | Eve | Postgres World | Cloudflare World | Tested |
 | --- | --- | --- | --- |
-| `0.91.0`, the oldest supported and latest stable | `@workflow/world-postgres` `5.0.5` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI, every push and release |
-| `1.0.0-rc.6`, npm `latest` | `@workflow/world-postgres` `5.1.1` or later | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI, every push and release |
+| `0.91.0`, the oldest supported | `@workflow/world-postgres` `5.0.5` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI, every push and release |
+| `1.0.2`, the latest stable | `@workflow/world-postgres` `5.2.1` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI, every push and release |
 
 From `1.0.0-rc.6`, Eve refuses to start a session unless the World creates the
 session's run and its start hook together. Older Worlds fail every new session
 with HTTP 500, so preflight stops them with `EVE_WORLD_PAIRING`.
+
+New Eve `1.0.2` projects pin `engines.node` to `26.x`. Eden builds and runs
+every project on Node.js `24.17.0`, which Eve still supports, so the pin needs
+no change.
+
+With the Cloudflare World, Eve `1.0.2` logs that the World declares no
+`queueAuthMode` and that the workflow route should be protected. Eden's Worker
+already answers `404` for that route from the internet. The log line is
+harmless.
 
 ## What every project needs
 

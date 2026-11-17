@@ -981,9 +981,9 @@ transaction-mode pooled URL breaks live session streaming.
 > bundles `@workflow/core` <range>; Eve rejects this World at runtime.
 
 Install the `<world>` release whose `@workflow/core` dependency matches the
-Eve-bundled line. The pairing is version-specific: for Eve `1.0.0-rc.6`, which
-bundles `@workflow/world` `5.1.0`, the tested pair is
-`@workflow/world-postgres@5.1.1`; for Eve `0.91.0`, which bundles
+Eve-bundled line. The pairing is version-specific: for Eve `1.0.2`, which
+bundles `@workflow/world` `5.2.0`, the tested pair is
+`@workflow/world-postgres@5.2.1`; for Eve `0.91.0`, which bundles
 `@workflow/world` `5.0.5`, it is `@workflow/world-postgres@5.0.5`.
 
 The Cloudflare World must also declare `eden.capabilities.worldRpcAuth`.

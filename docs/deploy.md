@@ -497,13 +497,13 @@ easy to miss; `eden preflight` warns when it sees a pooled URL.
 
 Eve pins and validates its World at `eve build`, so the Postgres World
 version must match the `@workflow/world` version your Eve release bundles.
-For Eve `1.0.0-rc.6` and later, which bundle `@workflow/world` `5.1.0`:
+For Eve `1.0.2`, which bundles `@workflow/world` `5.2.0`:
 
 ```sh
-npm add @workflow/world-postgres@5.1.1
+npm add @workflow/world-postgres@5.2.1
 ```
 
-These Eve versions refuse to start a session unless the World creates the
+Eve `1.0.0-rc.6` and later refuse to start a session unless the World creates the
 session's run and its start hook together, and the Postgres World does that
 from `5.1.1`. With an older release every new session fails with HTTP 500, so
 `eden preflight` and `eden deploy` stop with `EVE_WORLD_PAIRING` first.
