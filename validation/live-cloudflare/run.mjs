@@ -2,7 +2,10 @@
 
 // Live Cloudflare check: runs Eden's whole life cycle against the real
 // Cloudflare account this machine's Wrangler is logged in to, on one temporary
-// target that it always destroys. See docs/validation.md.
+// target. Once a deploy has started, eden destroy runs at the end, when a step
+// fails, and on Ctrl-C. If destroy fails, the retry command is printed and the
+// target stays. A killed process (SIGKILL) cleans up nothing. See
+// docs/validation.md.
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";

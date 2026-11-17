@@ -6,8 +6,10 @@ see [Eve compatibility](./eve-compatibility.md).
 
 ## Scripted live check, Eve 0.91.0 to 1.0.2 (2026-11-17)
 
-The first run of `pnpm run check:live`, on macOS with Docker, against the
-maintainer's Cloudflare account. The CLI was built from main at `7899dc9`.
+The first passing run of `pnpm run check:live`, on macOS with Docker,
+against the maintainer's Cloudflare account. Three earlier attempts the same
+day failed: a script bug, an unavailable model, and a loaded machine. They
+are listed below. The CLI was built from main at `7899dc9`.
 The project came from `npx eve@0.91.0 init` with `just-bash` `3.6.1` and
 `@moinulmoin/eden-world-cloudflare` `0.12.0` from npm. The idle window was
 `EDEN_EVE_CONTAINER_SLEEP_AFTER=90s`. The run took 27 minutes, from
@@ -33,15 +35,16 @@ the times below are slow ones.
   Worker, no secrets, no Container application, and no registry image for
   the target.
 
-This is the first live run on Eve `1.0.2`, and the first dated run of a
-session moving across an Eve upgrade.
+This is the first passing live run on Eve `1.0.2`, and the first dated run
+of a session moving across an Eve upgrade.
 
 A second run started on Eve `1.0.2` with no upgrade: preflight took 126
 seconds and the fresh deploy 220 seconds. It was then interrupted with
 SIGINT on purpose. The script ran `eden destroy` (61 seconds) and nothing
 of that target was left.
 
-Three earlier attempts on the same day stopped before the full run passed:
+The three earlier attempts on the same day failed before the full run
+passed:
 
 - `pnpm run` exports `npm_*` settings that pointed the project's
   `npm install` at the Eden repository. The script now removes them.
@@ -51,7 +54,7 @@ Three earlier attempts on the same day stopped before the full run passed:
 - Under heavy machine load, preflight's local boot did not become healthy
   in time (`EVE_HEALTH_FAILED`). The next run passed unchanged.
 
-On a second temporary target the `.eden/` folder was moved aside. `eden
+On another temporary target the `.eden/` folder was moved aside. `eden
 destroy` stopped with `EVE_DESTROY_RECORD_UNPROVEN`. The manual steps in
 [The `.eden/` folder is lost](./troubleshooting.md#the-eden-folder-is-lost)
 then removed the Worker, the Container application, and the registry image.

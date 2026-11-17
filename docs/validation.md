@@ -117,9 +117,10 @@ Safety:
 - The target name is generated for each run (`eden-live-<date>-<8 hex>`).
   There is no option to choose it, and the script refuses to run `eden`
   against any other name.
-- `eden destroy` runs when a step fails and on Ctrl-C. If destroy itself
-  fails, the script prints the retry command and keeps the project folder,
-  because destroy needs its `.eden` records.
+- Once a deploy has started, `eden destroy` runs when a step fails and on
+  Ctrl-C. If destroy itself fails, the script prints the retry command and
+  keeps the project folder, because destroy needs its `.eden` records. A
+  killed process (SIGKILL) cleans up nothing.
 - Eden rejects `file:` dependencies, so the project installs the Cloudflare
   World from npm. A World change is checked live only after it is published.
 - The proof of each bash step is the tool's own output in the session
