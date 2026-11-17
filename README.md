@@ -235,7 +235,7 @@ project. Do not commit it: one build was 245 MB in a test, and its files
 record absolute paths on your machine. Add it to `.gitignore`:
 
 ```sh
-echo .eden >> .gitignore
+printf '\n.eden/\n' >> .gitignore
 ```
 
 Keep the folder, though. Updates and `destroy` must run from the machine and

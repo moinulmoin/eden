@@ -3894,15 +3894,16 @@ async function collectEvePreflight(
   }
 
   // Everything Eden can know without building is reported in this one run.
-  const sandboxProvider = await checkEveVersion(request.projectRoot) ??
-    await checkEveSandboxProvider(request.projectRoot);
-  if (sandboxProvider !== undefined) {
-    checks.push(check(
-      sandboxProvider.code,
-      "failed",
-      sandboxProvider.message,
-      sandboxProvider.remediation,
-    ));
+  const sandboxProvider = await checkEveSandboxProvider(request.projectRoot);
+  for (const failure of [await checkEveVersion(request.projectRoot), sandboxProvider]) {
+    if (failure !== undefined) {
+      checks.push(check(
+        failure.code,
+        "failed",
+        failure.message,
+        failure.remediation,
+      ));
+    }
   }
   warnings.push(
     ...(await collectEveSetupWarnings(
@@ -4041,11 +4042,11 @@ async function collectEvePreflight(
       ),
       blockedAfterFailure(
         "VAL-CLI-007-CLOUDFLARE-ACCESS",
-        "Cloudflare access checks were blocked before any remote read.",
+        "The Cloudflare access check after the build was blocked because no immutable candidate was produced.",
       ),
       blockedAfterFailure(
         "VAL-CLI-007-TARGET-CONFLICT",
-        "Exact target conflict checks were blocked before any remote read.",
+        "Exact target conflict checks were blocked because no immutable candidate was produced.",
       ),
     );
     return {
