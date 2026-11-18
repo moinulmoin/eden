@@ -7,22 +7,24 @@ needed no change.
 
 ### Fixed
 
-- `eden destroy` succeeds again on a target that has slept or moved to a new
-  Eve version. As of 2026-11-18 Cloudflare's registry refuses to delete
-  container snapshot tags (`rootfs-snapshot-*`, `rootfs-set-*`), so destroy
-  removed everything else and then failed with `EVE_DESTROY_IMAGES_RETAINED`
-  on every retry. Destroy now ends with `destroyed` and the new warning
-  `EVE_SNAPSHOTS_RETAINED`, which lists the tags Cloudflare keeps and the
-  date by which it removes them (30 days after each was created or last
-  restored). `eden destroy --json` adds `warnings`, `retainedSnapshotTags`,
-  and `retainedSnapshotsExpireBy` in that case. Any other tag left behind
-  still fails with `EVE_DESTROY_IMAGES_RETAINED`. Destroy asks Cloudflare
-  about one snapshot tag and, once the registry says snapshots cannot be
-  deleted, skips the rest, so a target with many snapshots is not slow to
-  destroy.
-- `eden deploy` no longer fails `VAL-LIFE-007` when it removes a version that
-  is no longer needed and Cloudflare keeps that version's snapshot tags. It
-  prints `EVE_SNAPSHOTS_RETAINED` instead.
+- `eden destroy` succeeds again on a target that has container snapshots.
+  On 2026-11-18 Cloudflare's registry was observed refusing to delete
+  snapshot tags, so destroy removed everything else and then failed with
+  `EVE_DESTROY_IMAGES_RETAINED` on every retry. Destroy still asks Wrangler
+  to delete every tag. When a delete fails, it repeats that delete against
+  the registry and reads the answer. A tag whose answer is the registry's
+  snapshot refusal is listed in the new warning `EVE_SNAPSHOTS_RETAINED`,
+  and destroy ends with `destroyed` when such tags are all that is left.
+  `eden destroy --json` then adds `warnings`, `retainedSnapshotTags`, and
+  `retainedSnapshotsExpiryEstimate`. The date is Eden's estimate, the day of
+  the run plus the 30 days Cloudflare documents, and not a confirmation. A
+  kept snapshot still holds the agent's files until Cloudflare removes it.
+  Any other tag left behind, and any other answer, still fails with
+  `EVE_DESTROY_IMAGES_RETAINED`.
+- `eden deploy` handles the same refusal when it removes a superseded
+  version's registry repository: `VAL-LIFE-007` passes, and the result adds
+  `EVE_SNAPSHOTS_RETAINED`, `retainedSnapshotTags`, and
+  `retainedSnapshotsExpiryEstimate`.
 - Two Eden builds can run at the same time on one Docker host. Before, both
   picked local port 4310 for the boot check. The second failed with
   `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.

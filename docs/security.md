@@ -124,12 +124,18 @@ never switches accounts silently. For each target it creates one Worker, one
 Container application, its Durable Objects, registry images, and, only when
 your project has schedules, one Cron Trigger. The exact names are listed in
 the [reference](./reference.md).
-One request does not go through Wrangler. When Cloudflare's registry refuses
-to delete a snapshot tag, Wrangler prints only `403 Forbidden`. Eden then
-asks Wrangler for a registry credential that is valid for five minutes and
-repeats that one delete against `registry.cloudflare.com` to read the
-reason. The credential is used for that request only; Eden does not store or
-print it.
+Eden also reads the target's state from Cloudflare's API with requests of
+its own. One of its own requests can change something, and it is Eden's
+first direct registry mutation: when a Wrangler registry delete fails, Eden
+repeats that delete for the same tag against `registry.cloudflare.com` to
+read the registry's answer, because Wrangler prints only the status. For
+this, Eden asks Wrangler for a registry credential (push and pull on your
+account's registry, valid for five minutes), checks that it names the
+account in the deployment record, and reuses it for at most four minutes
+within one command. The request uses a connection of its own: no proxy,
+certificate verification always on, no redirect followed, 30 seconds at
+most, and at most 4 KiB of response read. Eden does not store or print the
+credential.
 Wrangler runs in a fresh, private Eden-owned temporary directory outside the
 project, with its configuration file and account cache pinned inside it.
 Project `.env` files and configuration or cache files planted in a shared
@@ -149,17 +155,19 @@ temporary directory cannot redirect account operations or secret uploads.
   are indeterminate, not proof of absence. Eden deletes only that target and
   the registry images its records identify, then verifies they are gone.
   It never deletes by name prefix.
-- **Snapshots outlive destroy.** A snapshot holds the container's whole disk
-  from the moment it was taken, including the agent's files. Cloudflare does
-  not allow deleting one and removes it 30 days after it was created or last
-  restored. Until then its tags stay in your account's Cloudflare registry,
-  and a registry read with your account's credentials still returns the
-  snapshot's manifest. `destroy` lists the tags and the date in
-  `EVE_SNAPSHOTS_RETAINED`.
   Deployment and release IDs are public: these checks protect against stale
   records and name reuse, not a malicious project carrying a forged `.eden`
   record with a known account and release ID. Do not trust `.eden` state from
   an untrusted project.
+- **Snapshots outlive destroy.** A snapshot holds the container's whole disk
+  from the moment it was taken, including the agent's files and, with the
+  default local World, its workflow state. Cloudflare's registry refuses to
+  delete one. Cloudflare documents that it removes a snapshot 30 days after
+  it was created or last restored; Eden cannot confirm when that happens.
+  Until then the tags stay in your account's Cloudflare registry, and a
+  registry read with your account's credentials still returns the
+  snapshot's manifest. `destroy` lists the exact tags and an estimated date
+  in `EVE_SNAPSHOTS_RETAINED`.
 - **Production is explicit.** `--env production` and `destroy` always require
   `--name`.
 

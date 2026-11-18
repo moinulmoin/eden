@@ -567,12 +567,12 @@ async function verifyGone() {
   const images = await wrangler(["containers", "images", "list", "--json"]);
   if (images.code !== 0) problems.push("wrangler containers images list failed: " + tail(images.stderr, 3));
   else {
-    // Cloudflare refuses to delete snapshot tags. Only the ones destroy
-    // reported may remain.
+    // Only the exact tags destroy reported as refused snapshots may remain.
+    // This sees tags, not untagged registry entries.
     const refs = JSON.parse(images.stdout).flatMap((image) => image.name.includes(target) ? image.tags.map((tag) => image.name + ":" + tag) : []);
-    const unexpected = refs.filter((ref) => !retainedSnapshotTags.includes(ref) || !/:rootfs-(?:snapshot|set)-/u.test(ref));
-    if (unexpected.length > 0) problems.push("registry image tag(s) remain that destroy did not report as snapshots: " + unexpected.join(", "));
-    else notes.push(refs.length === 0 ? "no registry image" : "no registry image except the " + refs.length + " snapshot tag(s) destroy reported");
+    const unexpected = refs.filter((ref) => !retainedSnapshotTags.includes(ref));
+    if (unexpected.length > 0) problems.push("registry tag(s) remain that destroy did not report as refused snapshots: " + unexpected.join(", "));
+    else notes.push(refs.length === 0 ? "no registry tag" : "no registry tag except the " + refs.length + " snapshot tag(s) destroy reported");
   }
   if (problems.length > 0) throw new Error(problems.join("; "));
   return notes.join(", ");
@@ -676,8 +676,8 @@ try {
         retainedSnapshotTags = output.retainedSnapshotTags ?? [];
         if (retainedSnapshotTags.length === 0) return undefined;
         summary.retainedSnapshotTags = retainedSnapshotTags;
-        summary.retainedSnapshotsExpireBy = output.retainedSnapshotsExpireBy;
-        return "Cloudflare keeps " + retainedSnapshotTags.length + " snapshot tag(s) until " + output.retainedSnapshotsExpireBy + " at the latest:\n" + retainedSnapshotTags.join("\n");
+        summary.retainedSnapshotsExpiryEstimate = output.retainedSnapshotsExpiryEstimate;
+        return "Cloudflare's registry refused to delete " + retainedSnapshotTags.length + " snapshot tag(s); estimated removal by " + output.retainedSnapshotsExpiryEstimate + " if nothing restores them:\n" + retainedSnapshotTags.join("\n");
       });
       await step("Nothing of the target remains", verifyGone);
       cleaned = true;

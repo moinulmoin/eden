@@ -1,4 +1,5 @@
 import { setTimeout as waitForActivation } from "node:timers/promises";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import {
   createRequire,
 } from "node:module";
@@ -205,6 +206,10 @@ export interface EvePreflightResult {
   readonly name: string;
   readonly checks: readonly EvePreflightCheck[];
   readonly warnings: readonly EvePreflightWarning[];
+  /** On deploy, with `EVE_SNAPSHOTS_RETAINED`: the `repository:tag` refs Cloudflare's registry refused to delete. */
+  readonly retainedSnapshotTags?: readonly string[];
+  /** Eden's estimate of the UTC date by which Cloudflare removes them. */
+  readonly retainedSnapshotsExpiryEstimate?: string;
   readonly candidate: EvePreflightCandidate | null;
   readonly deployment?: EveDeploymentMetadata | (
     Partial<EveDeploymentMetadata> & {
@@ -587,17 +592,17 @@ export type EveContainerDeleteRunner = (
 >;
 
 /**
- * `snapshots-retained`: every tag Eden pushed is gone and the only tags left
- * are container snapshot tags that Cloudflare refused to delete.
+ * The object form: every other tag is gone, and each listed `repository:tag`
+ * is one that Cloudflare's registry refused to delete as a snapshot.
  */
 export type EveRegistryRepositoryDeleteOutcome =
   | "deleted"
   | "absent"
-  | "snapshots-retained"
-  | "indeterminate";
+  | "indeterminate"
+  | { readonly retainedSnapshotTags: readonly string[] };
 
 export type EveRegistryRepositoryDeleteRunner = (
-  request: { readonly repository: string },
+  request: { readonly repository: string; readonly accountId: string },
 ) => EveRegistryRepositoryDeleteOutcome | Promise<EveRegistryRepositoryDeleteOutcome>;
 
 
@@ -1244,6 +1249,9 @@ function humanEveResultLines(
     if (warning.remediation !== undefined) {
       lines.push(`  → ${safeText(warning.remediation)}`);
     }
+  }
+  for (const ref of result.retainedSnapshotTags ?? []) {
+    lines.push(`  kept: ${safeText(ref)}`);
   }
   const elapsed = formatEveElapsed(startedAt);
   const commandLabel = result.command === "eden deploy" ? "deploy" : "preflight";
@@ -3683,7 +3691,7 @@ async function runEveDeployment(
   });
   await options.afterPromotion?.();
   let supersededImageCleanup: EvePreflightCheck | undefined;
-  const snapshotRepositoriesKept: string[] = [];
+  const snapshotTagsKept: string[] = [];
   if (affinityEnabled && Object.keys(retiringDeployments).length > 0) {
     const ids = Object.keys(retiringDeployments);
     const completedRetirements: string[] = [];
@@ -3701,15 +3709,15 @@ async function runEveDeployment(
           ...identity, deploymentId: id, containerImage: retained.image, generationId: retained.generationId,
         }, request.environment, request.name, accountId);
         if (repository !== undefined) {
-          const deleted = await deleteRegistryRepository({ repository });
+          const deleted = await deleteRegistryRepository({ repository, accountId });
           if (deleted === "indeterminate") throw new Error(`Repository deletion was not proven: ${repository}`);
-          if (deleted === "snapshots-retained") snapshotRepositoriesKept.push(repository);
+          if (typeof deleted === "object") snapshotTagsKept.push(...deleted.retainedSnapshotTags);
         }
         completedRetirements.push(id);
       }
-      supersededImageCleanup = check("VAL-LIFE-007", "passed", snapshotRepositoriesKept.length === 0
+      supersededImageCleanup = check("VAL-LIFE-007", "passed", snapshotTagsKept.length === 0
         ? "Retired deployment instances and their owned registry repositories were removed."
-        : "Retired deployment instances and the images Eden pushed for them were removed. Cloudflare keeps their snapshot tags until they expire; see EVE_SNAPSHOTS_RETAINED.");
+        : "Retired deployment instances and every other tag of their owned registry repositories were removed. Cloudflare's registry refused to delete their snapshot tags; see EVE_SNAPSHOTS_RETAINED.");
     } catch (error: unknown) {
       const reason = error instanceof Error ? safeText(error.message) : "Unknown retirement failure.";
       supersededImageCleanup = check("VAL-LIFE-007", "failed", `The deployment is healthy, but resource retirement was not proven: ${reason} Exact pending retirement records were retained for retry.`, "Retry deploy to finish only recorded retired resource cleanup.");
@@ -3742,11 +3750,11 @@ async function runEveDeployment(
       let deleted: EveRegistryRepositoryDeleteOutcome = "indeterminate";
       try {
         deleted = await (options.deleteRegistryRepository ??
-          registryRepositoryDeleter())({ repository: previousRepository });
+          registryRepositoryDeleter())({ repository: previousRepository, accountId });
       } catch {
         deleted = "indeterminate";
       }
-      if (deleted === "snapshots-retained") snapshotRepositoriesKept.push(previousRepository);
+      if (typeof deleted === "object") snapshotTagsKept.push(...deleted.retainedSnapshotTags);
       supersededImageCleanup = deleted === "indeterminate"
         ? check(
           "VAL-LIFE-007",
@@ -3759,9 +3767,9 @@ async function runEveDeployment(
           "passed",
           deleted === "deleted"
             ? "The superseded generation's registry repository (all tags, including snapshots) was deleted after promotion."
-            : deleted === "snapshots-retained"
-            ? "The superseded generation's image was deleted after promotion. Cloudflare keeps its snapshot tags until they expire; see EVE_SNAPSHOTS_RETAINED."
-            : "The superseded generation's registry repository was already absent.",
+            : deleted === "absent"
+            ? "The superseded generation's registry repository was already absent."
+            : "Every other tag of the superseded generation's registry repository was deleted after promotion. Cloudflare's registry refused to delete its snapshot tags; see EVE_SNAPSHOTS_RETAINED.",
         );
     }
   }
@@ -3803,10 +3811,15 @@ async function runEveDeployment(
     ...(supersededImageCleanup === undefined ? [] : [supersededImageCleanup]),
     ...(runtimeImageCleanup === undefined ? [] : [runtimeImageCleanup]),
   ];
+  const keptSnapshots = snapshotTagsKept.length === 0
+    ? undefined
+    : retainedSnapshots(snapshotTagsKept);
   return {
     ...collected.result,
-    ...(snapshotRepositoriesKept.length === 0 ? {} : {
-      warnings: [...collected.result.warnings, retainedSnapshots(snapshotRepositoriesKept, "repositories").warning],
+    ...(keptSnapshots === undefined ? {} : {
+      warnings: [...collected.result.warnings, keptSnapshots.warning],
+      retainedSnapshotTags: snapshotTagsKept,
+      retainedSnapshotsExpiryEstimate: keptSnapshots.expiryEstimate,
     }),
     ok: runtimeImageCleanup?.status !== "failed" &&
       supersededImageCleanup?.status !== "failed",
@@ -4597,10 +4610,10 @@ export interface EveDestroyOutcome {
   readonly checks: readonly EvePreflightCheck[];
   /** Present with `EVE_SNAPSHOTS_RETAINED` when Cloudflare kept snapshot tags. */
   readonly warnings?: readonly EvePreflightWarning[];
-  /** The kept `repository:tag` refs. */
+  /** The `repository:tag` refs Cloudflare's registry refused to delete. */
   readonly retainedSnapshotTags?: readonly string[];
-  /** The UTC date by which Cloudflare's 30-day retention removes them. */
-  readonly retainedSnapshotsExpireBy?: string;
+  /** Eden's estimate of the UTC date by which Cloudflare removes them. */
+  readonly retainedSnapshotsExpiryEstimate?: string;
   readonly error?: EveOutcomeError;
 }
 
@@ -5227,141 +5240,196 @@ async function defaultContainerDelete(
 }
 
 
-const SNAPSHOT_TAG_PATTERN = /^rootfs-(?:snapshot|set)-/u;
 const SNAPSHOT_RETENTION_DAYS = 30;
+const CLOUDFLARE_REGISTRY_HOST = "registry.cloudflare.com";
+/** The registry's answer to deleting a container snapshot, observed on 2026-11-18. */
+const SNAPSHOT_DELETE_REFUSAL = "snapshot manifests cannot be deleted through this API";
 
 /**
- * Cloudflare offers no way to delete a container snapshot. It removes each
- * one 30 days after it was created or last restored, and nothing restores
- * the snapshots of a deployment that is gone.
+ * The warning for tags Cloudflare's registry refused to delete as snapshots.
+ * The date is an estimate, not a confirmation: this machine's clock plus the
+ * 30 days Cloudflare documents, which holds only when nothing restores a
+ * snapshot later. Eden cannot see when Cloudflare removes one.
  */
-function retainedSnapshots(kept: readonly string[], unit: "tags" | "repositories"): {
+function retainedSnapshots(kept: readonly string[]): {
   readonly warning: EvePreflightWarning;
-  readonly expireBy: string;
+  readonly expiryEstimate: string;
 } {
-  const expireBy = new Date(Date.now() + SNAPSHOT_RETENTION_DAYS * 86_400_000).toISOString().slice(0, 10);
-  const what = unit === "tags"
-    ? `${kept.length} container snapshot tag(s) of this target`
-    : `the container snapshot tags of ${kept.length} superseded image repository(ies): ${kept.join(", ")}`;
+  const expiryEstimate = new Date(Date.now() + SNAPSHOT_RETENTION_DAYS * 86_400_000).toISOString().slice(0, 10);
   return {
     warning: {
       id: "EVE_SNAPSHOTS_RETAINED",
-      message: `Cloudflare keeps ${what}. Cloudflare does not allow deleting snapshots. It removes each one ${SNAPSHOT_RETENTION_DAYS} days after it was created or last restored, so by ${expireBy} at the latest.`,
-      remediation: `Nothing to do; Cloudflare removes them itself. To confirm after ${expireBy}, run npx wrangler@4.147.0 containers images list.`,
+      message: `Cloudflare's registry refused to delete ${kept.length} container snapshot tag(s). Cloudflare documents that it removes a snapshot ${SNAPSHOT_RETENTION_DAYS} days after it was created or last restored. Eden estimates that as ${expiryEstimate} if nothing restores them; it cannot confirm the removal.`,
+      remediation: `Nothing to retry. A kept snapshot still holds the container's files until Cloudflare removes it. To check after ${expiryEstimate}, run npx wrangler@4.147.0 containers images list.`,
     },
-    expireBy,
+    expiryEstimate,
   };
 }
 
-const CLOUDFLARE_REGISTRY_HOST = "registry.cloudflare.com";
-
-/**
- * Wrangler prints only `403 Forbidden` for a refused delete. This repeats the
- * delete against Cloudflare's registry, with a five-minute credential from
- * Wrangler, to read the reason. True only for the registry's own
- * `snapshot manifests cannot be deleted` answer.
- */
-async function registryRefusesSnapshotDeletes(
-  repository: string,
-  tag: string,
-): Promise<boolean> {
-  const credentials = await readWranglerJson([
-    "containers", "registries", "credentials", CLOUDFLARE_REGISTRY_HOST,
-    "--push", "--pull", "--expiration-minutes", "5", "--json",
-  ]);
-  if (credentials.failed || typeof credentials.value !== "object" || credentials.value === null) {
-    return false;
-  }
-  const { account_id: accountId, registry_host: host, username, password } =
-    credentials.value as Record<string, unknown>;
-  if (
-    host !== CLOUDFLARE_REGISTRY_HOST || typeof accountId !== "string" ||
-    typeof username !== "string" || typeof password !== "string"
-  ) return false;
+/** True only for the registry's structured refusal to delete a snapshot manifest. */
+function isSnapshotDeleteRefusal(status: number, body: string): boolean {
+  if (status !== 403) return false;
+  let parsed: unknown;
   try {
-    const response = await fetch(
-      `https://${CLOUDFLARE_REGISTRY_HOST}/v2/${accountId}/${repository}/manifests/${tag}`,
-      {
-        method: "DELETE",
-        headers: { Authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}` },
-        redirect: "error",
-        signal: AbortSignal.timeout(30_000),
-      },
-    );
-    return response.status === 403 &&
-      (await response.text()).includes("snapshot manifests cannot be deleted");
+    parsed = JSON.parse(body);
   } catch {
     return false;
   }
+  const errors = typeof parsed === "object" && parsed !== null
+    ? (parsed as { readonly errors?: unknown }).errors
+    : undefined;
+  if (!Array.isArray(errors) || errors.length !== 1) return false;
+  const error = errors[0] as { readonly code?: unknown; readonly message?: unknown } | null;
+  return typeof error === "object" && error !== null &&
+    error.code === "DENIED" && error.message === SNAPSHOT_DELETE_REFUSAL;
 }
 
 /**
- * Returns a runner that deletes every tag in an owned registry repository —
- * the `candidate` tag Eden pushed plus any `rootfs-snapshot-*`/`rootfs-set-*`
- * tags container snapshots created under the source image repository. Each
- * tag is deleted individually. As of 2026-11-18 Cloudflare's registry refuses
- * to delete a snapshot tag; when those are all that is left, the outcome is
- * `snapshots-retained`. After the registry gives that answer once, the runner
- * asks for no other snapshot tag, in this or a later repository.
+ * One DELETE to Cloudflare's registry on a connection of its own: no proxy,
+ * certificate verification on, no redirect followed, 30 seconds for the whole
+ * exchange, and at most 4 KiB of response. Whatever the process-wide proxy or
+ * TLS settings are, the credential goes only to the registry.
+ */
+function registryDelete(
+  path: string,
+  authorization: string,
+): Promise<{ readonly status: number; readonly body: string } | undefined> {
+  return new Promise((resolve) => {
+    const request = httpsRequest({
+      host: CLOUDFLARE_REGISTRY_HOST,
+      port: 443,
+      method: "DELETE",
+      path,
+      headers: { Authorization: authorization, Accept: "application/json" },
+      agent: new HttpsAgent({ keepAlive: false }),
+      rejectUnauthorized: true,
+      signal: AbortSignal.timeout(30_000),
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      response.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > 4_096) {
+          request.destroy();
+          resolve(undefined);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("end", () => resolve({
+        status: response.statusCode ?? 0,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+      response.on("close", () => resolve(undefined));
+    });
+    request.on("error", () => resolve(undefined));
+    request.end();
+  });
+}
+
+/**
+ * Returns a runner that deletes every tag in an owned registry repository:
+ * the `candidate` tag Eden pushed and any tag Cloudflare added for a
+ * container snapshot. Each tag gets its own Wrangler delete.
+ *
+ * Cloudflare's registry refuses to delete a snapshot (observed on
+ * 2026-11-18). Wrangler prints only `403 Forbidden` for that, so after a
+ * failed Wrangler delete the runner repeats the delete for that same tag
+ * against the registry and reads the answer. A tag counts as kept by
+ * Cloudflare only on that structured refusal for that tag; its name is never
+ * evidence. The runner reuses one registry credential for four minutes of
+ * its five-minute life.
  */
 function registryRepositoryDeleter(): EveRegistryRepositoryDeleteRunner {
-  let snapshotDeletesRefused = false;
-  return async (request) => {
-  // Catalog reads include Cloudflare snapshot tags and can exceed 30 seconds.
-  const images = await readWranglerJson([
-    "containers",
-    "images",
-    "list",
-    "--json",
-  ], WRANGLER_OPERATION_TIMEOUT_MS);
-  const collection = jsonCollection(images.value);
-  if (images.failed || collection === undefined) return "indeterminate";
-  const entry = collection.find(
-    (candidate) =>
-      typeof candidate === "object" &&
-      candidate !== null &&
-      (candidate as { readonly name?: unknown }).name === request.repository,
-  );
-  if (entry === undefined) return "absent";
-  const tags = (entry as { readonly tags?: unknown }).tags;
-  if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== "string")) {
-    return "indeterminate";
-  }
-  let deletedAny = false;
-  const refusedSnapshotTags = new Set<string>();
-  for (const tag of tags) {
-    const snapshot = SNAPSHOT_TAG_PATTERN.test(tag);
-    if (snapshot && snapshotDeletesRefused) {
-      refusedSnapshotTags.add(tag);
-      continue;
-    }
-    const result = await runWranglerWithInput(
-      [
-        "containers",
-        "images",
-        "delete",
-        `${request.repository}:${tag}`,
-        "--skip-confirmation",
-      ],
-    );
-    if (snapshot && /\b403 Forbidden\b/u.test(result.stdout + result.stderr)) {
-      if (await registryRefusesSnapshotDeletes(request.repository, tag)) {
-        snapshotDeletesRefused = true;
-        refusedSnapshotTags.add(tag);
+  let credential: { readonly authorization: string; readonly mintedAt: number } | undefined;
+  let credentialUnavailable = false;
+  const refusedAsSnapshot = async (
+    accountId: string,
+    repository: string,
+    tag: string,
+  ): Promise<boolean> => {
+    if (
+      credentialUnavailable ||
+      !/^[A-Za-z0-9_-]{1,64}$/u.test(accountId) ||
+      !/^[a-z0-9]+(?:[._-]+[a-z0-9]+)*$/u.test(repository) ||
+      !/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/u.test(tag)
+    ) return false;
+    if (credential === undefined || Date.now() - credential.mintedAt > 4 * 60_000) {
+      const minted = await readWranglerJson([
+        "containers", "registries", "credentials", CLOUDFLARE_REGISTRY_HOST,
+        "--push", "--pull", "--expiration-minutes", "5", "--json",
+      ]);
+      const value = minted.failed || typeof minted.value !== "object" || minted.value === null
+        ? {}
+        : minted.value as Record<string, unknown>;
+      if (
+        value.account_id !== accountId || value.registry_host !== CLOUDFLARE_REGISTRY_HOST ||
+        typeof value.username !== "string" || typeof value.password !== "string"
+      ) {
+        credentialUnavailable = true;
+        return false;
       }
-    } else if (result.exitCode === 0) {
-      deletedAny = true;
+      credential = {
+        authorization: `Basic ${Buffer.from(`${value.username}:${value.password}`).toString("base64")}`,
+        mintedAt: Date.now(),
+      };
     }
-  }
-  const after = await readWranglerJson(
-    ["containers", "images", "list", "--json"],
-    WRANGLER_OPERATION_TIMEOUT_MS,
-  );
-  const tagsAfter = after.failed ? undefined : registryTagsByRepository(after.value);
-  if (tagsAfter === undefined) return "indeterminate";
-  const remaining = tagsAfter.get(request.repository) ?? [];
-  if (remaining.length === 0) return deletedAny ? "deleted" : "absent";
-  return remaining.every((tag) => refusedSnapshotTags.has(tag)) ? "snapshots-retained" : "indeterminate";
+    const response = await registryDelete(
+      `/v2/${encodeURIComponent(accountId)}/${encodeURIComponent(repository)}/manifests/${encodeURIComponent(tag)}`,
+      credential.authorization,
+    );
+    return response !== undefined && isSnapshotDeleteRefusal(response.status, response.body);
+  };
+  return async (request) => {
+    // Catalog reads include Cloudflare snapshot tags and can exceed 30 seconds.
+    const images = await readWranglerJson([
+      "containers",
+      "images",
+      "list",
+      "--json",
+    ], WRANGLER_OPERATION_TIMEOUT_MS);
+    const collection = jsonCollection(images.value);
+    if (images.failed || collection === undefined) return "indeterminate";
+    const entry = collection.find(
+      (candidate) =>
+        typeof candidate === "object" &&
+        candidate !== null &&
+        (candidate as { readonly name?: unknown }).name === request.repository,
+    );
+    if (entry === undefined) return "absent";
+    const tags = (entry as { readonly tags?: unknown }).tags;
+    if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== "string")) {
+      return "indeterminate";
+    }
+    let deletedAny = false;
+    const refused = new Set<string>();
+    for (const tag of tags as readonly string[]) {
+      const result = await runWranglerWithInput(
+        [
+          "containers",
+          "images",
+          "delete",
+          `${request.repository}:${tag}`,
+          "--skip-confirmation",
+        ],
+      );
+      if (result.exitCode === 0) {
+        deletedAny = true;
+      } else if (await refusedAsSnapshot(request.accountId, request.repository, tag)) {
+        refused.add(tag);
+      }
+    }
+    const after = await readWranglerJson(
+      ["containers", "images", "list", "--json"],
+      WRANGLER_OPERATION_TIMEOUT_MS,
+    );
+    const tagsAfter = after.failed ? undefined : registryTagsByRepository(after.value);
+    if (tagsAfter === undefined) return "indeterminate";
+    const remaining = tagsAfter.get(request.repository) ?? [];
+    if (remaining.length === 0) return deletedAny ? "deleted" : "absent";
+    return remaining.every((tag) => refused.has(tag))
+      ? { retainedSnapshotTags: remaining.map((tag) => `${request.repository}:${tag}`) }
+      : "indeterminate";
   };
 }
 
@@ -5785,7 +5853,7 @@ async function runEveDestroyLocked(
       for (const repository of deletable) {
         repositoryDeletes.set(
           repository,
-          await deleteRegistryRepository({ repository }),
+          await deleteRegistryRepository({ repository, accountId: record.identity.accountId }),
         );
       }
     }
@@ -5817,25 +5885,26 @@ async function runEveDestroyLocked(
       );
     }
     const presentTagsAfter = after.registryTagsPresent ?? [];
-    // Snapshot tags Cloudflare refused to delete are a known outcome, not a
-    // failure. Any other tag that is still there fails the destroy.
-    const snapshotRepositories = ownedRegistryRepositories.filter(
-      (repository) => repositoryDeletes.get(repository) === "snapshots-retained",
+    // Only the exact refs the registry refused to delete as snapshots may
+    // remain. Any other tag that is still there fails the destroy, whatever
+    // its name and whenever it appeared.
+    const confirmedSnapshotRefs = new Set(
+      [...repositoryDeletes.values()].flatMap((outcome) =>
+        typeof outcome === "object" ? outcome.retainedSnapshotTags : []
+      ),
     );
-    const snapshotTagsKept = presentTagsAfter.filter((ref) => {
-      const [repository = "", tag = ""] = ref.split(":");
-      return snapshotRepositories.includes(repository) && SNAPSHOT_TAG_PATTERN.test(tag);
-    });
+    const snapshotTagsKept = presentTagsAfter.filter((ref) => confirmedSnapshotRefs.has(ref));
     const keptSnapshots = snapshotTagsKept.length === 0
       ? undefined
-      : retainedSnapshots(snapshotTagsKept, "tags");
+      : retainedSnapshots(snapshotTagsKept);
     const retainedRepositories = ownedRegistryRepositories.filter(
       (repository) =>
         presentTagsAfter.some((ref) =>
-          ref.startsWith(`${repository}:`) && !snapshotTagsKept.includes(ref)
+          ref.startsWith(`${repository}:`) && !confirmedSnapshotRefs.has(ref)
         ) ||
         (after.registryTagsPresent === undefined &&
-          ["indeterminate", "snapshots-retained"].includes(repositoryDeletes.get(repository) ?? "")),
+          (repositoryDeletes.get(repository) === "indeterminate" ||
+            typeof repositoryDeletes.get(repository) === "object")),
     );
     if (ownedRegistryRepositories.length > 0) {
       checks.push(
@@ -5845,13 +5914,13 @@ async function runEveDestroyLocked(
             "passed",
             snapshotTagsKept.length === 0
               ? "Every registry image tag recorded for this exact target was deleted or proven absent."
-              : "Every registry image tag Eden pushed for this exact target was deleted or proven absent. Cloudflare keeps the target's snapshot tags until they expire; see EVE_SNAPSHOTS_RETAINED.",
+              : `Every other registry image tag recorded for this exact target was deleted or proven absent. Cloudflare's registry refused to delete ${snapshotTagsKept.length} snapshot tag(s); see EVE_SNAPSHOTS_RETAINED.`,
           )
           : check(
             "VAL-LIFE-006-REGISTRY",
             "failed",
             `The exact target's registry image tag(s) remain after destroy: ${retainedRepositories.join(", ")}.`,
-            "Retry eden destroy with the same selectors, or remove only the listed repositories' tags with wrangler containers images delete. Cloudflare refuses to delete rootfs-snapshot-* and rootfs-set-* tags and removes them itself within 30 days.",
+            "Retry eden destroy with the same selectors, or remove only the listed repositories' tags with wrangler containers images delete. A tag that Cloudflare's registry refuses to delete as a snapshot is reported as EVE_SNAPSHOTS_RETAINED and does not count here.",
           ),
       );
     }
@@ -5901,7 +5970,7 @@ async function runEveDestroyLocked(
       ...(keptSnapshots === undefined ? {} : {
         warnings: [keptSnapshots.warning],
         retainedSnapshotTags: snapshotTagsKept,
-        retainedSnapshotsExpireBy: keptSnapshots.expireBy,
+        retainedSnapshotsExpiryEstimate: keptSnapshots.expiryEstimate,
       }),
     });
 }
