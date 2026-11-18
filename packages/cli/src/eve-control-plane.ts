@@ -4554,9 +4554,12 @@ async function collectEvePreflight(
 }
 
 export async function runEveControlPlane(
-  request: EveCliExecutionRequest,
-  options: EvePreflightOptions = {},
+  callerRequest: EveCliExecutionRequest,
+  callerOptions: EvePreflightOptions = {},
 ): Promise<void> {
+  // The caller's callbacks run while Eden awaits and can change these objects.
+  const request = Object.freeze({ ...callerRequest });
+  const options = Object.freeze({ ...callerOptions });
   const startedAt = Date.now();
   if (humanOutput(options)) {
     emitLine(
@@ -5849,9 +5852,12 @@ async function collectEveDestroyRegistryRepositories(
 }
 
 export async function runEveDestroy(
-  request: EveCliExecutionRequest,
-  options: EvePreflightOptions = {},
+  callerRequest: EveCliExecutionRequest,
+  callerOptions: EvePreflightOptions = {},
 ): Promise<void> {
+  // The caller's callbacks run while Eden awaits and can change these objects.
+  const request = Object.freeze({ ...callerRequest });
+  const options = Object.freeze({ ...callerOptions });
   const startedAt = Date.now();
   if (humanOutput(options)) {
     emitLine(
