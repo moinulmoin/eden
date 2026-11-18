@@ -45,8 +45,7 @@ with an empty `image`, and `wrangler containers info` showed an empty
 `configuration`. The configuration of a snapshot in the target's registry
 repository named the application's ID as `application_id`.
 
-Two earlier runs the same day did not pass. Neither failure came from the
-change.
+Two earlier runs the same day did not pass.
 
 - Target `eden-live-20261118-a43120e3`, `13:27:59Z` to `13:44:58Z`, with
   an earlier draft of the change. The first 17 steps passed. `eden destroy`

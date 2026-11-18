@@ -138,9 +138,11 @@ credential the registry answers with `401`. The request uses a connection
 of its own: no proxy, certificate verification always on, no redirect
 followed, 30 seconds at most, and at most 4 KiB of response read. Requests
 that get no answer may take 60 seconds in total in one command. After that
-Eden sends no more of them. The command then fails only if a tag that was
-not confirmed is still in the final inventory. Eden does not store or print
-the credential.
+Eden sends no more of them. `eden destroy` then fails only if a tag that
+was not confirmed is still in its final inventory, or if it cannot read
+that inventory. `eden deploy` fails `VAL-LIFE-007` when it cannot prove
+that every other tag of the repository is gone, which includes a list it
+cannot read after the deletes. Eden does not store or print the credential.
 Wrangler runs in a fresh, private Eden-owned temporary directory outside the
 project, with its configuration file and account cache pinned inside it.
 Project `.env` files and configuration or cache files planted in a shared

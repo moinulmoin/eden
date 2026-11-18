@@ -1234,8 +1234,9 @@ commands `eden destroy` itself runs.
    npx wrangler@4.147.0 delete --name <name>
    ```
 
-3. Delete the Container application. Its whole name is `<name>-container`
-   (truncated to 63 characters); `<name>-other-container` belongs to another
+3. Delete the Container application. Its whole name is `<name>-container`.
+   When that is longer than 63 characters, it is cut to 63 and any hyphens
+   left at the end are removed. `<name>-other-container` belongs to another
    target. Find its ID in the list and write the ID down, because step 4
    needs it. Then delete by ID:
 
@@ -1243,6 +1244,12 @@ commands `eden destroy` itself runs.
    npx wrangler@4.147.0 containers list
    npx wrangler@4.147.0 containers delete <application-id>
    ```
+
+   If the Container application is already gone, the list cannot give you
+   its ID. Use the ID only if you have it from a record made while the
+   application existed, such as saved output of `containers list`. Without
+   it, skip step 4 and leave the registry alone: a repository's name is not
+   proof that it belongs to this target.
 
 4. Delete the registry images, but only in repositories you can prove belong
    to this target. A repository of this target is named
