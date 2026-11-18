@@ -716,6 +716,19 @@ reported as [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept). Eden read
 direct requests to `registry.cloudflare.com` and never uses a proxy for
 them. Where the registry cannot be reached directly, the check fails.
 
+Cleanup deletes everything the registry lists in a repository, so Eden
+never runs it on a repository that holds a deployed image:
+
+- `The superseded generation's registry repository <repository> also holds
+  the promoted image, so nothing in it was deleted.` The check is
+  `skipped` and the deploy succeeds. The Eden CLI pushes each generation to
+  a repository of its own, so this happens only when a programmatic caller
+  supplies an image in the previous generation's repository.
+- `Repository <repository> holds an image that is still deployed; nothing
+  in it was deleted.` The check fails, and the retirement stays recorded as
+  pending. This happens when the image of a version that is still kept is
+  in the repository of a version being retired.
+
 ## Updates
 
 Run `eden deploy` again with the same project, environment, and name to
@@ -1114,6 +1127,11 @@ uses the name-filtered Container applications API and follows its page tokens.
 A full response without pagination metadata or a failed page read is
 indeterminate, never proof that the named application is absent.
 
+Destroy also fails with this code after its deletes when Wrangler is signed
+in to another account by the time destroy verifies. A read of another
+account proves nothing about the recorded one, so the `CURRENT` pointer is
+left unchanged.
+
 ### `EVE_DESTROY_ABSENCE_UNPROVEN`
 
 `The exact target could not be proven absent after deletion.` The `CURRENT`
@@ -1150,6 +1168,19 @@ An entry that appears in the listing while destroy runs gets its own
 delete. Destroy makes at most three such passes over a repository and fails
 with this code if new entries still appear after them.
 
+Destroy treats a listing as unreadable, never as empty, when:
+
+- a page fails or is not the expected JSON;
+- the answer names another account or another repository;
+- an entry is repeated, or is neither a tag nor a `sha256:` digest;
+- a page's `Link` header is not one next page, or names a cursor that the
+  page does not end with;
+- the listing has not ended after 100 pages.
+
+Destroy reads the listing once more after its deletes. When that final
+listing is unreadable, destroy fails with this code and leaves the
+`CURRENT` pointer unchanged, whatever the deletes answered.
+
 ### `EVE_REGISTRY_OBJECTS_KEPT`
 
 A warning, not a failure. `eden destroy` still ends with `destroyed` and
@@ -1170,15 +1201,20 @@ Cloudflare's registry lists every tag of a repository, and one `sha256:`
 entry for every manifest, with or without a tag.
 `wrangler containers images list` shows only the tags. Eden reads the
 registry's own listing, asks Wrangler to delete each tag, and sends its own
-delete for each `sha256:` entry. An object is listed here only on the
-registry's own answer for that exact object; its name is never enough. All
-three answers were observed on 2026-11-18:
+delete for each `sha256:` entry. It does not check which manifests have a
+tag. An object is listed here only on the registry's own answer to the
+delete of that exact object; its name is never enough. The class says what
+the registry answered, not what the object is. All three answers were
+observed on 2026-11-18:
 
-| `class` | The registry's answer to the delete | What the object is |
+| `class` | The registry's answer to the delete | Where it was seen |
 | --- | --- | --- |
-| `refused-snapshot` | `403` with `snapshot manifests cannot be deleted through this API` | A container snapshot: its tags, seen so far as `rootfs-snapshot-*` and `rootfs-set-*`, and its manifest. A target has them once it has slept or moved to a new Eve version. |
-| `refused-singleton-artifact` | `409` with the code `SINGLETON_ARTIFACT_EXISTS` | An artifact of type `application/vnd.cloudchamber.btrfs-chain.v1`. Cloudflare makes one for each pushed image. |
-| `accepted-still-listed` | A `2xx` status, and the registry still lists the manifest 30 seconds later | An image manifest that has no tag. Seen for the earlier image of a repository that got a second push. |
+| `refused-snapshot` | `403` with one error: code `DENIED`, message `snapshot manifests cannot be deleted through this API` | A container snapshot: its tags, seen so far as `rootfs-snapshot-*` and `rootfs-set-*`, and its manifest. A target has them once it has slept or moved to a new Eve version. |
+| `refused-singleton-artifact` | `409` with the code `SINGLETON_ARTIFACT_EXISTS`, the artifact type `application/vnd.cloudchamber.btrfs-chain.v1` and two digests | The chain artifact that Cloudflare makes for each pushed image. Eden does not know whether either digest in the answer is the one it asked to delete. |
+| `accepted-still-listed` | `202` or `204`, and a listing that Eden began at least 30 seconds after that answer still has the entry | The earlier image of a repository that got a second push. It had no tag. |
+
+Each accepted delete gets its own 30 seconds, so cleanup of a repository
+can take that long after its last accepted delete.
 
 When the registry answers Wrangler's delete of a tag with `403`, Eden
 repeats the delete for that same tag against the registry and reads the
@@ -1190,18 +1226,22 @@ proxy. Where the registry cannot be reached that way, destroy fails with
 that code too.
 
 The Worker, its secrets and Durable Object data, and the Container
-application are gone. There is nothing to retry. What is known about the
-kept objects:
+application are gone. Eden sent each kept object one delete. It does not
+know whether a later delete would get another answer. What is known about
+the kept objects:
 
 - A kept snapshot still holds the container's disk, including the agent's
   files. Cloudflare documents that it removes a snapshot 30 days after it
   was created or last restored, and nothing restores the snapshots of a
   destroyed target. Eden cannot see when Cloudflare removes one.
-- `accepted-still-listed` says that Cloudflare accepted the delete and had
-  not removed the manifest when Eden stopped waiting. It does not say that
-  Cloudflare keeps the manifest for good. An image that still had its tag
-  left the listing about 15 seconds after the tag was deleted. An untagged
-  one was still listed 18 minutes after its delete was accepted.
+- `accepted-still-listed` says that the registry accepted the delete and
+  still listed the entry when Eden stopped waiting. It does not say that
+  the manifest was deleted, or that Cloudflare keeps it for good, and Eden
+  does not check whether the manifest can still be read. An image that
+  still had its tag left the listing about 15 seconds after the tag was
+  deleted. An untagged one was still listed, and the registry still
+  answered a request for it by digest, 18 minutes after its delete was
+  accepted.
 - An image manifest names the layers that hold the project's built code.
   Cloudflare does not document what a chain artifact holds.
 - Not known: when Cloudflare removes chain artifacts and untagged

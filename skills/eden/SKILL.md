@@ -184,10 +184,11 @@ npx @moinulmoin/eden destroy --name <name> --json
   `{ ref, class }` per object. `refused-snapshot`: a container snapshot,
   which still holds the agent's files; Cloudflare documents that it removes
   one 30 days after it was created or last restored. `refused-singleton-artifact`:
-  an artifact Cloudflare makes for each image. `accepted-still-listed`: an
-  untagged image manifest whose delete Cloudflare accepted and has not
-  carried out yet. Tell the user what is listed and that Eden does not know
-  when Cloudflare removes the last two kinds. There is nothing to retry.
+  an artifact Cloudflare makes for each image. `accepted-still-listed`: a
+  manifest whose delete Cloudflare's registry accepted and which it still
+  listed at least 30 seconds later. Tell the user what is listed and that
+  Eden does not know when Cloudflare removes the last two kinds. Destroy
+  has finished; do not rerun it for these.
   `deploy` can carry the same warning and field after it removes a
   superseded version.
 

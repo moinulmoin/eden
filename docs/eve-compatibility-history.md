@@ -18,6 +18,13 @@ deletes entries by digest.
   `n` and `last`, in sorted order, and a page after the last entry is
   empty. A repository the registry does not know lists as `200` with no
   entries.
+- Each `tags/list` page answered `{"name":"<account>/<repository>","tags":[…]}`,
+  for an unknown repository too. Each carried a `Link` header that ended in
+  `&last=<cursor>; rel=next`. The cursor was the page's last entry, and
+  empty on an empty page. The header's URL was the request's URL with
+  `?n=<n>&last=<cursor>` appended, even when the request already had a
+  query. A 29-entry repository read with `n=7` and with `n=1000` gave the
+  same 29 entries as the catalog.
 - The two live-check targets destroyed earlier that day each still listed
   twelve entries in the repository of their Eve `0.91.0` version: six
   snapshot tags, three snapshot manifests, two artifacts of type
@@ -57,7 +64,9 @@ Not run on Cloudflare yet: destroy with this change. It was checked with a
 stand-in for Wrangler and the registry: each of the three kept answers, an
 accepted delete that leaves the listing, any other answer, an entry that
 appears during cleanup, entries that keep appearing, a listing in several
-pages, and a listing that cannot be read.
+pages, a listing that cannot be read at the start or at the end, an answer
+for another account or repository, a second accepted delete late in the
+wait, and a repository that holds a deployed image.
 
 ## Destroy with a bounded wait on the registry (2026-11-18)
 

@@ -132,8 +132,9 @@ repository, Eden:
 
 - reads the registry's listing of the repository, because Wrangler lists
   tags only;
-- deletes each listed manifest that has no tag, by digest, because Wrangler
-  deletes tags only;
+- deletes each `sha256:` entry of the listing by digest, because Wrangler
+  deletes tags only. The registry lists one such entry for every manifest,
+  with or without a tag;
 - repeats the delete of a tag when the registry answered Wrangler's delete
   of that tag with `403`, to read the registry's answer, because Wrangler
   prints only the status. Eden repeats no tag delete after any other
@@ -141,8 +142,9 @@ repository, Eden:
 
 For these, Eden asks Wrangler for a registry credential
 (push and pull on your account's registry, valid for five minutes), checks
-that it names the account in the deployment record, and reuses it within
-one command until four minutes have passed since it asked. It drops a
+that it names the account in the deployment record, and reuses it for that
+account only, within one command, until four minutes have passed since it
+asked. It drops a
 credential the registry answers with `401`. Each request uses a connection
 of its own: no proxy, certificate verification always on, no redirect
 followed, 30 seconds at most. Eden reads at most 4 KiB of the answer to a
@@ -152,7 +154,11 @@ them. `eden destroy` then fails if anything without
 one of the registry's kept answers is still in its final listing, or if it
 cannot read that listing. `eden deploy` fails `VAL-LIFE-007` when it cannot
 prove that everything else in the repository is gone, which includes a
-listing it cannot read. Eden does not store or print the credential.
+listing it cannot read. A listing counts as read only when every page
+names the recorded account and the repository asked for, repeats no entry,
+and carries a `Link` header that matches the page, within 100 pages. Eden
+cannot tell a stale answer from a current one when both pass these checks.
+Eden does not store or print the credential.
 Wrangler runs in a fresh, private Eden-owned temporary directory outside the
 project, with its configuration file and account cache pinned inside it.
 Project `.env` files and configuration or cache files planted in a shared
@@ -176,6 +182,15 @@ temporary directory cannot redirect account operations or secret uploads.
   records and name reuse, not a malicious project carrying a forged `.eden`
   record with a known account and release ID. Do not trust `.eden` state from
   an untrusted project.
+- **Registry cleanup deletes whole repositories.** It deletes every tag and
+  manifest the registry lists in a repository that the record proves this
+  target owns, including one that appears while it runs. Eden never runs it
+  on a repository that holds the image it just promoted or the image of a
+  version it still keeps. `eden deploy` and `eden destroy` take one lock in
+  the project's `.eden` folder, which stops two runs from the same folder
+  only. It does not stop a copy of the project on another machine, or any
+  other push to the registry: an image pushed to an owned repository while
+  cleanup runs can be deleted.
 - **Some registry objects outlive destroy.** Destroy deletes everything
   Cloudflare's registry lists for the target, and Cloudflare keeps three
   kinds of object. `destroy` lists each one, with the registry's answer, in
@@ -185,10 +200,10 @@ temporary directory cannot redirect account operations or secret uploads.
     its workflow state. Cloudflare's registry refuses to delete one.
     Cloudflare documents that it removes a snapshot 30 days after it was
     created or last restored; Eden cannot confirm when that happens.
-  - An untagged image manifest names the layers of an earlier image. They
-    hold the project's built code and no `--env-file` value. The registry
-    accepts the delete and can still list the manifest: one was still
-    listed 18 minutes later.
+  - The registry can accept the delete of a manifest and still list it.
+    The one seen was an earlier image with no tag, still listed 18 minutes
+    later. An image manifest names the layers of an image. They hold the
+    project's built code and no `--env-file` value.
   - Cloudflare makes a chain artifact for each pushed image, and its
     registry refuses to delete it. Cloudflare does not document what it
     holds.

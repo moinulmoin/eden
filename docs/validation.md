@@ -104,8 +104,10 @@ What it does, in order:
    there.
 10. Runs `eden destroy`, then confirms the URL returns 404 and that no Worker,
     secret, Container application, or registry image with the target's name
-    is left. The step reads the registry's own listing, which also shows
-    manifests that have no tag. The only registry objects that may remain
+    is left. The step reads the registry's catalog, which also shows
+    manifests that have no tag. It uses a credential that can only pull,
+    for the account the deploy result named, and fails unless it reads the
+    catalog to its end. The only registry objects that may remain
     are the exact ones destroy reported in `EVE_REGISTRY_OBJECTS_KEPT`. The
     destroy step lists them, and the final JSON object has them in
     `registryObjectsKept`.

@@ -568,8 +568,8 @@ export interface EveDestroyTargetRead {
    * repositories: `repository:tag` for a tag, including the
    * `rootfs-snapshot-*`/`rootfs-set-*` tags container snapshots create, and
    * `repository@sha256:…` for each manifest's own entry. `undefined` means
-   * the reader could not read the listing; destroy then relies on the exact
-   * delete outcomes only.
+   * the reader could not read the listing in full; destroy then fails, because
+   * no delete outcome proves that nothing is left.
    */
   readonly registryTagsPresent?: readonly string[];
 }
@@ -3708,6 +3708,15 @@ async function runEveDeployment(
   await options.afterPromotion?.();
   let supersededImageCleanup: EvePreflightCheck | undefined;
   const registryObjectsKept: EveRegistryObjectKept[] = [];
+  // Cleanup deletes every manifest of a repository, so it must never run on
+  // a repository that the promoted image, or a version still kept, lives in.
+  const holdsLiveImage = (repository: string): boolean =>
+    [identity.containerImage, ...Object.values(identity.retainedDeployments ?? {}).map((kept) => kept.image)]
+      .some((image) =>
+        [":", "@"].some((separator) =>
+          image.startsWith(`${CLOUDFLARE_REGISTRY_HOST}/${accountId}/${repository}${separator}`)
+        )
+      );
   if (affinityEnabled && Object.keys(retiringDeployments).length > 0) {
     const ids = Object.keys(retiringDeployments);
     const completedRetirements: string[] = [];
@@ -3725,6 +3734,9 @@ async function runEveDeployment(
           ...identity, deploymentId: id, containerImage: retained.image, generationId: retained.generationId,
         }, request.environment, request.name, accountId);
         if (repository !== undefined) {
+          if (holdsLiveImage(repository)) {
+            throw new Error(`Repository ${repository} holds an image that is still deployed; nothing in it was deleted.`);
+          }
           const deleted = await deleteRegistryRepository({ repository, accountId });
           if (typeof deleted === "object") registryObjectsKept.push(...deleted.kept);
           if (deleted === "indeterminate" || (typeof deleted === "object" && deleted.unproven === true)) {
@@ -3760,7 +3772,13 @@ async function runEveDeployment(
         request.name,
         accountId,
       );
-    if (previousRepository !== undefined) {
+    if (previousRepository !== undefined && holdsLiveImage(previousRepository)) {
+      supersededImageCleanup = check(
+        "VAL-LIFE-007",
+        "skipped",
+        `The superseded generation's registry repository ${previousRepository} also holds the promoted image, so nothing in it was deleted.`,
+      );
+    } else if (previousRepository !== undefined) {
       eveProgress(
         options,
         `deleting superseded registry repository ${previousRepository}`,
@@ -5246,7 +5264,7 @@ function registryObjectsKeptWarning(kept: readonly EveRegistryObjectKept[]): Eve
   const counted = ([
     ["refused-snapshot", "it refused to delete as snapshots"],
     ["refused-singleton-artifact", "it refused to delete with SINGLETON_ARTIFACT_EXISTS"],
-    ["accepted-still-listed", `whose delete it accepted and which it still listed ${REGISTRY_REMOVAL_WAIT_MS / 1_000} seconds later`],
+    ["accepted-still-listed", `whose delete it accepted and which it still listed at least ${REGISTRY_REMOVAL_WAIT_MS / 1_000} seconds later`],
   ] as const).flatMap(([name, answer]) => {
     const count = kept.filter((object) => object.class === name).length;
     return count === 0 ? [] : [`${count} ${answer} (${name})`];
@@ -5254,7 +5272,7 @@ function registryObjectsKeptWarning(kept: readonly EveRegistryObjectKept[]): Eve
   return {
     id: "EVE_REGISTRY_OBJECTS_KEPT",
     message: `Cloudflare's registry still lists ${kept.length} object(s) that Eden tried to delete: ${counted.join("; ")}. Cloudflare documents that it removes a snapshot ${SNAPSHOT_RETENTION_DAYS} days after it was created or last restored. Eden does not know when Cloudflare removes the other objects, or whether any of them counts toward the account's image storage limit.`,
-    remediation: "Nothing to retry. A kept snapshot still holds the container's files until Cloudflare removes it. To see what the registry lists later, follow the EVE_REGISTRY_OBJECTS_KEPT entry in docs/troubleshooting.md.",
+    remediation: "Eden sent each of these objects one delete and reports the registry's answer; it does not know whether a later delete would be answered differently. A kept snapshot still holds the container's files until Cloudflare removes it. To see what the registry lists later, follow the EVE_REGISTRY_OBJECTS_KEPT entry in docs/troubleshooting.md.",
   };
 }
 
@@ -5277,8 +5295,10 @@ function isSnapshotDeleteRefusal(status: number, body: string): boolean {
 }
 
 /**
- * True only for the registry's structured refusal to delete the chain
- * artifact it made for a pushed image, observed on 2026-11-18.
+ * True only for the registry's structured refusal to delete a chain
+ * artifact, observed on 2026-11-18. The answer names the artifact type and
+ * two digests. Neither digest is known to be the one in the request, so
+ * this ties the refusal to the request it answered and to nothing else.
  */
 function isSingletonArtifactRefusal(status: number, body: string): boolean {
   if (status !== 409) return false;
@@ -5288,8 +5308,13 @@ function isSingletonArtifactRefusal(status: number, body: string): boolean {
   } catch {
     return false;
   }
-  return typeof parsed === "object" && parsed !== null &&
-    (parsed as { readonly code?: unknown }).code === "SINGLETON_ARTIFACT_EXISTS";
+  if (typeof parsed !== "object" || parsed === null) return false;
+  const refusal = parsed as Record<string, unknown>;
+  return refusal.code === "SINGLETON_ARTIFACT_EXISTS" &&
+    refusal.artifactType === "application/vnd.cloudchamber.btrfs-chain.v1" &&
+    [refusal.subjectDigest, refusal.committedDigest].every((digest) =>
+      typeof digest === "string" && /^sha256:[0-9a-f]{64}$/u.test(digest)
+    );
 }
 
 /**
@@ -5307,7 +5332,7 @@ function registryRequest(
   timeoutMs: number,
   bodyFor: readonly number[],
   maxBytes: number,
-): Promise<{ readonly status: number; readonly body: string } | undefined> {
+): Promise<{ readonly status: number; readonly body: string; readonly link?: string } | undefined> {
   return new Promise((resolve) => {
     const request = httpsRequest({
       host: CLOUDFLARE_REGISTRY_HOST,
@@ -5336,7 +5361,11 @@ function registryRequest(
         }
         chunks.push(chunk);
       });
-      response.on("end", () => resolve({ status, body: Buffer.concat(chunks).toString("utf8") }));
+      response.on("end", () => resolve({
+        status,
+        body: Buffer.concat(chunks).toString("utf8"),
+        ...(typeof response.headers.link === "string" ? { link: response.headers.link } : {}),
+      }));
       response.on("close", () => resolve(undefined));
     });
     request.on("error", () => resolve(undefined));
@@ -5349,7 +5378,9 @@ interface CloudflareRegistry {
    * Every entry the registry lists for one repository: its tags, and one
    * `sha256:` entry per manifest, which Wrangler's image list leaves out.
    * Empty for a repository the registry does not know. Undefined when the
-   * listing could not be read in full.
+   * listing could not be read in full: a failed page, an answer that names
+   * another repository, a repeated entry, or a page whose continuation
+   * contradicts it.
    */
   readonly list: (accountId: string, repository: string) => Promise<readonly string[] | undefined>;
   /**
@@ -5367,15 +5398,21 @@ interface CloudflareRegistry {
 /**
  * Eden's own requests to Cloudflare's registry for one command.
  *
- * It reuses one registry credential until four minutes have passed since it
- * asked for it; the credential lives five. It drops a credential the
+ * It reuses one registry credential, for the account it was checked
+ * against, until four minutes have passed since it asked for it; the
+ * credential lives five. It drops a credential the
  * registry answers with 401, and asks for no other when that was the
  * credential's first use. Requests that get no answer may take
  * REGISTRY_UNANSWERED_BUDGET_MS in total; after that it sends none, so what
  * is left is unproven and the caller fails.
  */
 function cloudflareRegistry(): CloudflareRegistry {
-  let credential: { readonly authorization: string; readonly requestedAt: number; used: boolean } | undefined;
+  let credential: {
+    readonly accountId: string;
+    readonly authorization: string;
+    readonly requestedAt: number;
+    used: boolean;
+  } | undefined;
   let credentialUnavailable = false;
   let unansweredMs = 0;
   const send = async (
@@ -5385,14 +5422,17 @@ function cloudflareRegistry(): CloudflareRegistry {
     rest: string,
     bodyFor: readonly number[],
     maxBytes: number,
-  ): Promise<{ readonly status: number; readonly body: string } | undefined> => {
+  ): Promise<{ readonly status: number; readonly body: string; readonly link?: string } | undefined> => {
     if (
       credentialUnavailable ||
       Math.floor(REGISTRY_UNANSWERED_BUDGET_MS - unansweredMs) < 1 ||
       !/^[A-Za-z0-9_-]{1,64}$/u.test(accountId) ||
       !/^[a-z0-9]+(?:[._-]+[a-z0-9]+)*$/u.test(repository)
     ) return undefined;
-    if (credential === undefined || performance.now() - credential.requestedAt >= 4 * 60_000) {
+    if (
+      credential === undefined || credential.accountId !== accountId ||
+      performance.now() - credential.requestedAt >= 4 * 60_000
+    ) {
       const requestedAt = performance.now();
       const minted = await readWranglerJson([
         "containers", "registries", "credentials", CLOUDFLARE_REGISTRY_HOST,
@@ -5409,6 +5449,7 @@ function cloudflareRegistry(): CloudflareRegistry {
         return undefined;
       }
       credential = {
+        accountId,
         authorization: `Basic ${Buffer.from(`${value.username}:${value.password}`).toString("base64")}`,
         requestedAt,
         used: false,
@@ -5447,19 +5488,32 @@ function cloudflareRegistry(): CloudflareRegistry {
           [200], 1_048_576,
         );
         if (response?.status !== 200) return undefined;
-        let tags: unknown;
+        let listing: { readonly name?: unknown; readonly tags?: unknown } | null;
         try {
-          tags = (JSON.parse(response.body) as { readonly tags?: unknown } | null)?.tags;
+          listing = JSON.parse(response.body) as typeof listing;
         } catch {
           return undefined;
         }
-        if (!Array.isArray(tags)) return undefined;
-        if (tags.length === 0) return [...entries];
+        const tags = listing?.tags;
+        // An answer for another repository says nothing about this one.
+        if (listing?.name !== `${accountId}/${repository}` || !Array.isArray(tags)) return undefined;
         for (const tag of tags as readonly unknown[]) {
           if (typeof tag !== "string" || !REGISTRY_ENTRY.test(tag) || entries.has(tag)) return undefined;
           entries.add(tag);
           last = tag;
         }
+        // The registry's Link header ends with the cursor of the next page:
+        // this page's last entry, or nothing after an empty page. A page
+        // that says anything else about what follows is not the listing.
+        if (response.link !== undefined) {
+          const target = /^\s*<?([^<>;,]*)>?\s*;\s*rel="?next"?\s*$/u.exec(response.link)?.[1];
+          const cursor = target === undefined ? undefined : /.*[?&]last=([^&]*)/u.exec(target)?.[1];
+          if (cursor === undefined) return undefined;
+          if (cursor !== "" && (tags.length === 0 || (cursor !== last && cursor !== encodeURIComponent(last ?? "")))) {
+            return undefined;
+          }
+        }
+        if (tags.length === 0) return [...entries];
       }
       return undefined;
     },
@@ -5469,7 +5523,8 @@ function cloudflareRegistry(): CloudflareRegistry {
         "DELETE", accountId, repository, `manifests/${entry}`, [403, 409], 4_096,
       );
       if (response === undefined) return undefined;
-      if (response.status >= 200 && response.status < 300) return "accepted";
+      // 204 is what the registry answered; 202 is what the OCI specification names.
+      if (response.status === 202 || response.status === 204) return "accepted";
       if (isSnapshotDeleteRefusal(response.status, response.body)) return "refused-snapshot";
       return isSingletonArtifactRefusal(response.status, response.body)
         ? "refused-singleton-artifact"
@@ -5480,24 +5535,26 @@ function cloudflareRegistry(): CloudflareRegistry {
 
 /**
  * Returns a runner that deletes everything Cloudflare's registry lists for
- * an owned repository: the `candidate` tag Eden pushed, the tags Cloudflare
- * added for container snapshots, and the manifests that have no tag. A tag
- * gets its own Wrangler delete, which also collects unreferenced layers. A
- * manifest's own entry gets Eden's delete by digest, because Wrangler lists
- * and deletes tags only.
+ * an owned repository: every tag (the `candidate` tag Eden pushed, and the
+ * tags Cloudflare added for container snapshots) and every `sha256:` entry,
+ * which the registry lists for each manifest, tagged or not. A tag gets its
+ * own Wrangler delete, which also collects unreferenced layers. A `sha256:`
+ * entry gets Eden's delete by digest, because Wrangler lists and deletes
+ * tags only.
  *
  * Cloudflare keeps some objects (observed on 2026-11-18), and each is kept
- * only on the registry's own answer for that object; a name is never
- * evidence:
+ * only on the registry's own answer to the delete of that object; a name is
+ * never evidence:
  * - `refused-snapshot`: the registry refuses to delete a snapshot. Wrangler
  *   prints only `403 Forbidden` for a tag, so when the registry answered
  *   Wrangler's DELETE with 403, the runner repeats the delete for that tag
  *   against the registry and reads the answer. Any other Wrangler failure
  *   gets no request of Eden's own.
- * - `refused-singleton-artifact`: the registry refuses to delete the chain
- *   artifact Cloudflare makes for each pushed image.
- * - `accepted-still-listed`: the registry accepted the delete of a manifest
- *   by digest and still lists it after REGISTRY_REMOVAL_WAIT_MS.
+ * - `refused-singleton-artifact`: the registry refuses the delete by digest
+ *   with `SINGLETON_ARTIFACT_EXISTS` for a chain artifact.
+ * - `accepted-still-listed`: the registry accepted the delete by digest, and
+ *   a listing begun at least REGISTRY_REMOVAL_WAIT_MS after that answer still
+ *   has the entry. Every accepted delete gets that wait of its own.
  *
  * An entry that shows up in a later listing gets its own delete, for
  * REGISTRY_DELETE_PASSES passes in all. Whatever is listed at the end with
@@ -5507,68 +5564,96 @@ function registryRepositoryDeleter(
   registry: CloudflareRegistry = cloudflareRegistry(),
 ): EveRegistryRepositoryDeleteRunner {
   return async ({ repository, accountId }) => {
-    let listed = await registry.list(accountId, repository);
-    if (listed === undefined) return "indeterminate";
-    if (listed.length === 0) return "absent";
-    const attempted = new Set<string>();
-    const accepted = new Set<string>();
-    const classes = new Map<string, EveRegistryObjectKept["class"]>();
+    const list = async (): Promise<{ readonly at: number; readonly entries: readonly string[] | undefined }> => ({
+      at: performance.now(),
+      entries: await registry.list(accountId, repository),
+    });
+    let listing = await list();
+    if (listing.entries === undefined) return "indeterminate";
+    if (listing.entries.length === 0) return "absent";
+    // One answer per attempted entry: a refusal, the time its delete was accepted, or none.
+    const answers = new Map<
+      string,
+      | "refused-snapshot"
+      | "refused-singleton-artifact"
+      | { readonly acceptedAt: number; readonly byDigest: boolean }
+      | undefined
+    >();
+    const untagged = (entry: string): boolean => entry.startsWith("sha256:");
     let passes = 0;
-    let waitUntil: number | undefined;
-    while (listed !== undefined) {
-      const fresh = listed.filter((entry) => !attempted.has(entry));
-      if (fresh.length > 0) {
+    while (listing.entries !== undefined) {
+      const { at, entries } = listing;
+      if (entries.some((entry) => !answers.has(entry))) {
         if (passes === REGISTRY_DELETE_PASSES) break;
         passes += 1;
-        const untagged = (entry: string): boolean => entry.startsWith("sha256:");
         // Tags first, in the listing's order, then the manifests' own entries.
-        for (const entry of [...fresh].sort((a, b) => Number(untagged(a)) - Number(untagged(b)))) {
-          attempted.add(entry);
+        for (
+          const entry of entries.filter((listed) => !answers.has(listed))
+            .sort((a, b) => Number(untagged(a)) - Number(untagged(b)))
+        ) {
           // Whatever goes wrong while asking, the entry is unproven and the loop goes on.
           const ask = () => registry.delete(accountId, repository, entry).catch(() => undefined);
-          if (untagged(entry)) {
-            const answer = await ask();
-            if (answer === "accepted") accepted.add(entry);
-            if (answer !== undefined) classes.set(entry, answer === "accepted" ? "accepted-still-listed" : answer);
-            continue;
-          }
-          const result = await runWranglerWithInput(
+          const wrangler = untagged(entry) ? undefined : await runWranglerWithInput(
             ["containers", "images", "delete", `${repository}:${entry}`, "--skip-confirmation"],
           );
-          if (result.exitCode === 0) {
-            accepted.add(entry);
-          } else if (
+          const answer = wrangler === undefined
+            ? await ask()
+            : wrangler.exitCode === 0
+            ? "accepted"
             // Wrangler 4.147.0 prints this only when the registry answered its own DELETE with 403.
-            /^[^)\s]+\): 403 /u.test(
-              result.stderr.split(`Failed to delete ${repository}:${entry} (digest: `)[1] ?? "",
-            ) &&
-            await ask() === "refused-snapshot"
-          ) {
-            classes.set(entry, "refused-snapshot");
-          }
+            : /^[^)\s]+\): 403 /u.test(
+                wrangler.stderr.split(`Failed to delete ${repository}:${entry} (digest: `)[1] ?? "",
+              )
+            ? await ask()
+            : undefined;
+          answers.set(
+            entry,
+            answer === "accepted"
+              ? { acceptedAt: performance.now(), byDigest: untagged(entry) }
+              // The singleton refusal was only ever seen for a digest.
+              : answer === "refused-singleton-artifact" && !untagged(entry)
+              ? undefined
+              : answer,
+          );
         }
-      } else if (!listed.some((entry) => accepted.has(entry))) {
-        break;
-      } else {
+      } else if (
         // A tagged image left the listing about 15 seconds after its tag was deleted.
-        waitUntil ??= performance.now() + REGISTRY_REMOVAL_WAIT_MS;
-        if (performance.now() >= waitUntil) break;
+        entries.some((entry) => {
+          const answer = answers.get(entry);
+          return typeof answer === "object" && at - answer.acceptedAt < REGISTRY_REMOVAL_WAIT_MS;
+        })
+      ) {
         await waitForActivation(5_000);
+      } else {
+        break;
       }
-      listed = await registry.list(accountId, repository);
+      listing = await list();
     }
-    if (listed?.length === 0) return accepted.size > 0 ? "deleted" : "absent";
+    const { at, entries } = listing;
+    if (entries?.length === 0) {
+      return [...answers.values()].some((answer) => typeof answer === "object") ? "deleted" : "absent";
+    }
     // A refusal is reported even when the last listing could not be read or
-    // holds something unproven, so the caller's own final listing can clear it.
-    const kept = [...classes]
-      .filter(([entry, answer]) =>
-        listed === undefined ? answer !== "accepted-still-listed" : listed.includes(entry)
-      )
-      .map(([entry, answer]) => ({ ref: registryRef(repository, entry), class: answer }));
+    // holds something unproven, so the caller's own final listing can clear
+    // it. An accepted delete counts only with a listing that still has the
+    // entry after the entry's own full wait.
+    const classOf = (entry: string): EveRegistryObjectKept["class"] | undefined => {
+      const answer = answers.get(entry);
+      if (typeof answer !== "object") return answer;
+      return answer.byDigest && entries !== undefined && at - answer.acceptedAt >= REGISTRY_REMOVAL_WAIT_MS
+        ? "accepted-still-listed"
+        : undefined;
+    };
+    const kept = [...answers.keys()].flatMap((entry) => {
+      const answer = classOf(entry);
+      return answer === undefined || entries?.includes(entry) === false
+        ? []
+        : [{ ref: registryRef(repository, entry), class: answer }];
+    });
     if (kept.length === 0) return "indeterminate";
     return {
       kept,
-      ...(listed?.every((entry) => classes.has(entry)) === true ? {} : { unproven: true as const }),
+      ...(entries?.every((entry) => classOf(entry) !== undefined) === true ? {} : { unproven: true as const }),
     };
   };
 }
@@ -5970,29 +6055,17 @@ async function runEveDestroyLocked(
     if (ownedRegistryRepositories.length > 0) {
       const deleteRegistryRepository =
         options.deleteRegistryRepository ?? registryRepositoryDeleter(registry);
-      // Everything the registry lists inside an owned repository is deleted
-      // (the candidate tag, snapshot tags, and manifests with no tag). When
-      // the listing could not be read, still attempt the exact owned
-      // repositories; absence verification below reads the listing again.
-      const presentRepositories = new Set(
-        (before.registryTagsPresent ?? []).map(
-          (ref) => ref.split(/[:@]/u)[0] ?? "",
-        ),
+      // Everything the registry lists inside an owned repository is deleted:
+      // every tag and every manifest's own entry. Each repository is listed
+      // again here, so an entry that appeared after the first read is not
+      // skipped; absence verification below reads the listing once more.
+      eveProgress(
+        options,
+        `deleting ${ownedRegistryRepositories.length} registry repositor${
+          ownedRegistryRepositories.length === 1 ? "y" : "ies"
+        }`,
       );
-      const deletable = before.registryTagsPresent === undefined
-        ? ownedRegistryRepositories
-        : ownedRegistryRepositories.filter(
-          (repository) => presentRepositories.has(repository),
-        );
-      if (deletable.length > 0) {
-        eveProgress(
-          options,
-          `deleting ${deletable.length} registry repositor${
-            deletable.length === 1 ? "y" : "ies"
-          }`,
-        );
-      }
-      for (const repository of deletable) {
+      for (const repository of ownedRegistryRepositories) {
         repositoryDeletes.set(
           repository,
           await deleteRegistryRepository({ repository, accountId: record.identity.accountId }),
@@ -6002,7 +6075,7 @@ async function runEveDestroyLocked(
 
     eveProgress(options, "verifying the exact target is absent");
     const after = await readTarget();
-    if (after.inventoryComplete === false) {
+    if (after.inventoryComplete === false || after.accountId !== record.identity.accountId) {
       fail("EVE_DESTROY_INDETERMINATE", "The exact remote inventory could not be read completely after deletion; absence is unproven.");
     }
     if (after.workerExists || after.containerApplicationId !== undefined) {
@@ -6026,24 +6099,24 @@ async function runEveDestroyLocked(
         "The exact target could not be proven absent after deletion.",
       );
     }
-    const presentAfter = after.registryTagsPresent ?? [];
+    const presentAfter = after.registryTagsPresent;
     // Only the exact objects for which the registry gave one of the kept
     // answers may remain. Anything else that is still listed fails the
-    // destroy, whatever its name and whenever it appeared.
+    // destroy, whatever its name and whenever it appeared. Without a
+    // complete final listing nothing is proven absent, whatever the deletes
+    // answered.
     const answered = new Map(
       [...repositoryDeletes.values()].flatMap((outcome) =>
         typeof outcome === "object" ? outcome.kept.map((object) => [object.ref, object] as const) : []
       ),
     );
-    const registryObjectsKept = presentAfter.flatMap((ref) => answered.get(ref) ?? []);
+    const registryObjectsKept = (presentAfter ?? []).flatMap((ref) => answered.get(ref) ?? []);
     const retainedRepositories = ownedRegistryRepositories.filter(
       (repository) =>
+        presentAfter === undefined ||
         presentAfter.some((ref) =>
           (ref.startsWith(`${repository}:`) || ref.startsWith(`${repository}@`)) && !answered.has(ref)
-        ) ||
-        (after.registryTagsPresent === undefined &&
-          (repositoryDeletes.get(repository) === "indeterminate" ||
-            typeof repositoryDeletes.get(repository) === "object")),
+        ),
     );
     if (ownedRegistryRepositories.length > 0) {
       checks.push(

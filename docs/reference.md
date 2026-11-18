@@ -147,13 +147,14 @@ target pushed. It proves absence before clearing the target's `CURRENT`
 pointer, and never deletes by prefix or a broad account search.
 
 Destroy deletes everything Cloudflare's registry lists for those
-repositories: every tag, and every manifest that has no tag. Cloudflare's
-registry keeps some objects. It refuses to delete container snapshots and
-the chain artifact it makes for each pushed image, and it can accept the
-delete of an untagged image manifest and still list it. When such objects
-are all that is left, destroy still succeeds and adds the warning
-`EVE_REGISTRY_OBJECTS_KEPT` with each object and the registry's answer for
-it. Anything else left behind fails destroy with
+repositories: every tag, and every `sha256:` entry, which the registry
+lists for each manifest. Cloudflare's registry keeps some objects. It
+refuses to delete container snapshots and the chain artifact it makes for
+each pushed image, and it can accept the delete of a manifest and still
+list it at least 30 seconds later. When such objects are all that is left,
+destroy still succeeds and adds the warning `EVE_REGISTRY_OBJECTS_KEPT`
+with each object and the registry's answer for it. Anything else left
+behind, and a final listing that cannot be read in full, fails destroy with
 `EVE_DESTROY_IMAGES_RETAINED`.
 
 Destroy reads the local deployment records and the Cloudflare account, and

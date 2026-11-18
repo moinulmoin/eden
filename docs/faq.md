@@ -162,7 +162,8 @@ Cloudflare's registry keeps some objects after that. It refuses to delete
 container snapshots, which still hold the agent's files, and documents that
 it removes one 30 days after it was created or last restored. It refuses to
 delete an artifact it makes for each pushed image. And it can accept the
-delete of an earlier, untagged image and still list it. Destroy succeeds and
+delete of a manifest and still list it, which was seen for an earlier image
+with no tag. Destroy succeeds and
 lists each of these in the warning `EVE_REGISTRY_OBJECTS_KEPT`. It is not
 known when Cloudflare removes the last two kinds, or whether kept objects
 count toward the 50 GB of image storage per account. See

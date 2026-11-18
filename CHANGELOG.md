@@ -8,7 +8,8 @@ needed no change.
 ### Fixed
 
 - `eden destroy` succeeds again on a target that has container snapshots,
-  and it now deletes registry entries that have no tag. On 2026-11-18
+  and it now deletes the registry entries that Wrangler does not list. On
+  2026-11-18
   Cloudflare's registry was observed refusing to delete snapshot tags, so
   destroy removed everything else and then failed with
   `EVE_DESTROY_IMAGES_RETAINED` on every retry. The registry also lists one
@@ -18,15 +19,20 @@ needed no change.
   registry's own listing, asks Wrangler to delete every tag, and deletes
   every other entry by digest with a request of its own. An entry that
   appears while it runs gets its own delete, for at most three passes over
-  a repository.
+  a repository. Destroy clears the target's `CURRENT` pointer only after a
+  final listing that it read in full. A listing that fails midway, names
+  another account or repository, repeats an entry, or carries a `Link`
+  header that does not match the page is unreadable, never empty.
 - Cloudflare keeps three kinds of registry object, and destroy reports each
   one in the new warning `EVE_REGISTRY_OBJECTS_KEPT`, only on the
   registry's own answer for that object: a container snapshot
   (`refused-snapshot`, `403`), the chain artifact Cloudflare makes for each
   pushed image (`refused-singleton-artifact`, `409` with
-  `SINGLETON_ARTIFACT_EXISTS`), and an untagged image manifest whose delete
-  the registry accepted and which it still lists 30 seconds later
-  (`accepted-still-listed`). Destroy ends with `destroyed` when such
+  `SINGLETON_ARTIFACT_EXISTS`), and a manifest whose delete the registry
+  accepted with `202` or `204` and which it still lists at least 30 seconds
+  later (`accepted-still-listed`, seen for an earlier image with no tag).
+  Each accepted delete gets its own 30 seconds. Destroy ends with
+  `destroyed` when such
   objects are all that is left, and `eden destroy --json` then adds
   `warnings` and `registryObjectsKept`. A kept snapshot still holds the
   agent's files until Cloudflare removes it, which Cloudflare documents as
@@ -43,7 +49,10 @@ needed no change.
   same way: `VAL-LIFE-007` passes, and the result adds
   `EVE_REGISTRY_OBJECTS_KEPT` and `registryObjectsKept`. When something
   else is left as well, `VAL-LIFE-007` fails and the result still lists the
-  objects the registry kept.
+  objects the registry kept. Deploy deletes nothing from a repository that
+  holds an image that is still deployed: the check is `skipped` when the
+  promoted image is in the superseded repository, and a retirement stays
+  pending when a kept version's image is in the retiring one.
 - Two Eden builds can run at the same time on one Docker host. Before, both
   picked local port 4310 for the boot check. The second failed with
   `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.

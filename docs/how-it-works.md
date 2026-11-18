@@ -228,18 +228,22 @@ World) is deleted with the Worker; your Postgres database is not touched.
 
 Some registry objects are the exception. Destroy deletes everything
 Cloudflare's registry lists for the target's repositories: every tag, and
-every manifest that has no tag. Cloudflare keeps three kinds of object
-(observed on 2026-11-18). Its registry refuses to delete a container
-snapshot. It refuses to delete the chain artifact that Cloudflare makes for
-each pushed image. And it accepts the delete of an untagged image manifest
-and can still list it afterwards. Destroy lists each kept object, with the
-registry's answer, in the warning `EVE_REGISTRY_OBJECTS_KEPT`. Cloudflare
+every `sha256:` entry, which the registry lists for each manifest.
+Cloudflare keeps three kinds of object (observed on 2026-11-18). Its
+registry refuses to delete a container snapshot. It refuses to delete the
+chain artifact that Cloudflare makes for each pushed image. And it can
+accept the delete of a manifest and still list it at least 30 seconds
+later, which was seen for an earlier image with no tag. Destroy lists each
+kept object, with the registry's answer, in the warning
+`EVE_REGISTRY_OBJECTS_KEPT`. It clears the target's local pointer only
+after a final listing, read in full, shows nothing else. Cloudflare
 documents that it removes a snapshot 30 days after it was created or last
 restored. Until then the snapshot still holds the container's disk,
 including the agent's files and the default local World's state. When
 Cloudflare removes the other two kinds is not known. A deploy that removes
 a superseded version's registry repository cleans up the same way and
-reports the same warning.
+reports the same warning. It deletes nothing from a repository that holds
+an image that is still deployed.
 
 Because ownership comes from the records in `.eden/eve-deploy/`, a different
 clone or machine without those records cannot update or destroy the target;

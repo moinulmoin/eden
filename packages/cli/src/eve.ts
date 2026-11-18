@@ -204,8 +204,8 @@ Options:
 
 Destroy deletes everything Cloudflare's registry lists for the target. The
 registry keeps some objects: it refuses to delete container snapshots and
-its own chain artifacts, and it can accept the delete of an untagged image
-and still list it. When those are all that is left, destroy succeeds with
+its own chain artifacts, and it can accept the delete of a manifest and
+still list it. When those are all that is left, destroy succeeds with
 the warning EVE_REGISTRY_OBJECTS_KEPT. With --json the result then adds
 warnings and registryObjectsKept: one { ref, class } per object, where class
 is the registry's answer (refused-snapshot, refused-singleton-artifact, or
