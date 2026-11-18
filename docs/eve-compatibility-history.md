@@ -73,6 +73,27 @@ repositories holding 18 `rootfs-snapshot-*` and `rootfs-set-*` tags and no
 other tag: the eight above, eight of `eden-live-20261118-aea2c928`, and two
 of `eden-live-20261118-58beade5`.
 
+Destroy then changed to ask about one snapshot tag only. Wrangler prints
+`403 Forbidden` without the registry's message, so Eden repeats that one
+delete against the registry with a five-minute credential from Wrangler.
+When the answer is `snapshot manifests cannot be deleted`, it asks for no
+other snapshot tag of the target.
+
+- A real `wrangler containers images delete` of a snapshot tag took 1.8 to
+  2.2 seconds (three calls).
+- On a stubbed target with 200 snapshot tags and one `candidate` tag, where
+  each stubbed Wrangler call took 50 ms: before the change destroy made 201
+  delete calls and took 10.9 seconds; after it, 2 delete calls, 1 credential
+  call, and 1 registry request, in 0.3 seconds. Both ended `destroyed` with
+  200 tags reported. With a different 403 answer from the stubbed registry,
+  destroy tried all 201 deletes and ended `EVE_DESTROY_IMAGES_RETAINED`.
+- A second full run of `pnpm run check:live` with that code, target
+  `eden-live-20261118-4224c172`, `12:01:36Z` to `12:19:08Z`, passed all 18
+  steps. `eden destroy` took 91 seconds and reported eight snapshot tags in
+  two repositories; the last step found no other tag. Afterwards the account
+  had no Container application, and seven `eden-live-20261118-*`
+  repositories with 26 snapshot tags and no other tag.
+
 Not run live: a deploy that removes a version no longer needed while
 Cloudflare keeps that version's snapshot tags. The live check has no such
 step.

@@ -1131,7 +1131,8 @@ npx wrangler@4.147.0 containers images delete <repository:tag>
 Never filter by prefix. Cloudflare refuses to delete `rootfs-snapshot-*` and
 `rootfs-set-*` tags and removes them itself; see
 [`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained). Destroy fails with this
-code only for other tags, or when it could not list what is left.
+code only for other tags, when the registry refuses a snapshot tag with a
+different answer, or when it could not list what is left.
 
 ### `EVE_SNAPSHOTS_RETAINED`
 
@@ -1151,6 +1152,10 @@ way to delete a snapshot. The Worker, its secrets and Durable Object data,
 the Container application, and every image tag Eden pushed are gone. Only
 these tags are left, and nothing restores them once the target is gone, so
 their 30 days are not renewed.
+
+Eden asks Cloudflare to delete one snapshot tag. When the registry gives that
+answer, Eden does not ask for the target's other snapshot tags and reports
+them all.
 
 With `--json`, `retainedSnapshotTags` lists them and
 `retainedSnapshotsExpireBy` is the date. There is nothing to do. To confirm

@@ -16,7 +16,10 @@ needed no change.
   date by which it removes them (30 days after each was created or last
   restored). `eden destroy --json` adds `warnings`, `retainedSnapshotTags`,
   and `retainedSnapshotsExpireBy` in that case. Any other tag left behind
-  still fails with `EVE_DESTROY_IMAGES_RETAINED`.
+  still fails with `EVE_DESTROY_IMAGES_RETAINED`. Destroy asks Cloudflare
+  about one snapshot tag and, once the registry says snapshots cannot be
+  deleted, skips the rest, so a target with many snapshots is not slow to
+  destroy.
 - `eden deploy` no longer fails `VAL-LIFE-007` when it removes a version that
   is no longer needed and Cloudflare keeps that version's snapshot tags. It
   prints `EVE_SNAPSHOTS_RETAINED` instead.

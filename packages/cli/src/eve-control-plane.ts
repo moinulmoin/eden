@@ -3692,13 +3692,13 @@ async function runEveDeployment(
       if (typeof result !== "object" || result === null ||
           !("retired" in result) || !Array.isArray(result.retired) ||
           ids.some((id) => !(result.retired as unknown[]).includes(id))) throw new Error("Retirement was not proven.");
+      const deleteRegistryRepository = options.deleteRegistryRepository ?? registryRepositoryDeleter();
       for (const [id, retained] of Object.entries(retiringDeployments)) {
         const repository = ownedRegistryRepository({
           ...identity, deploymentId: id, containerImage: retained.image, generationId: retained.generationId,
         }, request.environment, request.name, accountId);
         if (repository !== undefined) {
-          const deleted = await (options.deleteRegistryRepository ??
-            defaultRegistryRepositoryDelete)({ repository });
+          const deleted = await deleteRegistryRepository({ repository });
           if (deleted === "indeterminate") throw new Error(`Repository deletion was not proven: ${repository}`);
           if (deleted === "snapshots-retained") snapshotRepositoriesKept.push(repository);
         }
@@ -3739,7 +3739,7 @@ async function runEveDeployment(
       let deleted: EveRegistryRepositoryDeleteOutcome = "indeterminate";
       try {
         deleted = await (options.deleteRegistryRepository ??
-          defaultRegistryRepositoryDelete)({ repository: previousRepository });
+          registryRepositoryDeleter())({ repository: previousRepository });
       } catch {
         deleted = "indeterminate";
       }
@@ -5250,17 +5250,60 @@ function retainedSnapshots(kept: readonly string[], unit: "tags" | "repositories
   };
 }
 
+const CLOUDFLARE_REGISTRY_HOST = "registry.cloudflare.com";
+
 /**
- * Deletes every tag in an owned registry repository — the `candidate` tag
- * Eden pushed plus any `rootfs-snapshot-*`/`rootfs-set-*` tags container
- * snapshots created under the source image repository. Each tag in the
- * repository is deleted individually. Since 2026-11-18 Cloudflare's registry
- * answers 403 to deleting a snapshot tag; when those are all that is left,
- * the outcome is `snapshots-retained`.
+ * Wrangler prints only `403 Forbidden` for a refused delete. This repeats the
+ * delete against Cloudflare's registry, with a five-minute credential from
+ * Wrangler, to read the reason. True only for the registry's own
+ * `snapshot manifests cannot be deleted` answer.
  */
-async function defaultRegistryRepositoryDelete(
-  request: { readonly repository: string },
-): Promise<EveRegistryRepositoryDeleteOutcome> {
+async function registryRefusesSnapshotDeletes(
+  repository: string,
+  tag: string,
+): Promise<boolean> {
+  const credentials = await readWranglerJson([
+    "containers", "registries", "credentials", CLOUDFLARE_REGISTRY_HOST,
+    "--push", "--pull", "--expiration-minutes", "5", "--json",
+  ]);
+  if (credentials.failed || typeof credentials.value !== "object" || credentials.value === null) {
+    return false;
+  }
+  const { account_id: accountId, registry_host: host, username, password } =
+    credentials.value as Record<string, unknown>;
+  if (
+    host !== CLOUDFLARE_REGISTRY_HOST || typeof accountId !== "string" ||
+    typeof username !== "string" || typeof password !== "string"
+  ) return false;
+  try {
+    const response = await fetch(
+      `https://${CLOUDFLARE_REGISTRY_HOST}/v2/${accountId}/${repository}/manifests/${tag}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}` },
+        redirect: "error",
+        signal: AbortSignal.timeout(30_000),
+      },
+    );
+    return response.status === 403 &&
+      (await response.text()).includes("snapshot manifests cannot be deleted");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns a runner that deletes every tag in an owned registry repository —
+ * the `candidate` tag Eden pushed plus any `rootfs-snapshot-*`/`rootfs-set-*`
+ * tags container snapshots created under the source image repository. Each
+ * tag is deleted individually. Since 2026-11-18 Cloudflare's registry refuses
+ * to delete a snapshot tag; when those are all that is left, the outcome is
+ * `snapshots-retained`. After the registry gives that answer once, the runner
+ * asks for no other snapshot tag, in this or a later repository.
+ */
+function registryRepositoryDeleter(): EveRegistryRepositoryDeleteRunner {
+  let snapshotDeletesRefused = false;
+  return async (request) => {
   // Catalog reads include Cloudflare snapshot tags and can exceed 30 seconds.
   const images = await readWranglerJson([
     "containers",
@@ -5284,6 +5327,11 @@ async function defaultRegistryRepositoryDelete(
   let deletedAny = false;
   const refusedSnapshotTags = new Set<string>();
   for (const tag of tags) {
+    const snapshot = SNAPSHOT_TAG_PATTERN.test(tag);
+    if (snapshot && snapshotDeletesRefused) {
+      refusedSnapshotTags.add(tag);
+      continue;
+    }
     const result = await runWranglerWithInput(
       [
         "containers",
@@ -5293,8 +5341,11 @@ async function defaultRegistryRepositoryDelete(
         "--skip-confirmation",
       ],
     );
-    if (SNAPSHOT_TAG_PATTERN.test(tag) && /\b403 Forbidden\b/u.test(result.stdout + result.stderr)) {
-      refusedSnapshotTags.add(tag);
+    if (snapshot && /\b403 Forbidden\b/u.test(result.stdout + result.stderr)) {
+      if (await registryRefusesSnapshotDeletes(request.repository, tag)) {
+        snapshotDeletesRefused = true;
+        refusedSnapshotTags.add(tag);
+      }
     } else if (result.exitCode === 0) {
       deletedAny = true;
     }
@@ -5308,6 +5359,7 @@ async function defaultRegistryRepositoryDelete(
   const remaining = tagsAfter.get(request.repository) ?? [];
   if (remaining.length === 0) return deletedAny ? "deleted" : "absent";
   return remaining.every((tag) => refusedSnapshotTags.has(tag)) ? "snapshots-retained" : "indeterminate";
+  };
 }
 
 /**
@@ -5704,7 +5756,7 @@ async function runEveDestroyLocked(
     const repositoryDeletes = new Map<string, EveRegistryRepositoryDeleteOutcome>();
     if (ownedRegistryRepositories.length > 0) {
       const deleteRegistryRepository =
-        options.deleteRegistryRepository ?? defaultRegistryRepositoryDelete;
+        options.deleteRegistryRepository ?? registryRepositoryDeleter();
       // Every tag inside an owned repository is deleted (candidate plus
       // snapshot tags). When the registry could not be enumerated, still
       // attempt the exact owned repositories; absence verification below

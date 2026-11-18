@@ -124,6 +124,12 @@ never switches accounts silently. For each target it creates one Worker, one
 Container application, its Durable Objects, registry images, and, only when
 your project has schedules, one Cron Trigger. The exact names are listed in
 the [reference](./reference.md).
+One request does not go through Wrangler. When Cloudflare's registry refuses
+to delete a snapshot tag, Wrangler prints only `403 Forbidden`. Eden then
+asks Wrangler for a registry credential that is valid for five minutes and
+repeats that one delete against `registry.cloudflare.com` to read the
+reason. The credential is used for that request only; Eden does not store or
+print it.
 Wrangler runs in a fresh, private Eden-owned temporary directory outside the
 project, with its configuration file and account cache pinned inside it.
 Project `.env` files and configuration or cache files planted in a shared
