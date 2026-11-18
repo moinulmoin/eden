@@ -28,7 +28,13 @@ needed no change.
   preflight.
 - `docs/troubleshooting.md` explains `node: <path>: not found` (exit 9): with
   `npx`, a missing `--env-file` path stops npm's own Node process before
-  Eden starts.
+  Eden starts. It names the placement that lets Eden report the mistake
+  itself, `npx -- @moinulmoin/eden …`, and says that a `NODE_OPTIONS` line in
+  the env file is applied to npm's own Node process. That process does not
+  load the file's other values.
+- The check of native modules runs the system `file` tool with the same
+  minimal environment as Docker. Before, `file` received every variable of
+  the shell that started Eden. No env-file value was involved.
 - `docs/troubleshooting.md` has a new entry, "The `.eden/` folder is lost",
   with the manual removal steps for the Worker, Container application, and
   registry images. `docs/deploy.md` and `docs/faq.md` link to it.

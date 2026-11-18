@@ -37,7 +37,8 @@ How Eden handles it:
   install or `eve build` output still contains one of those files, or a
   symbolic link that points outside the project, the deploy stops with
   `SECRET_EXCLUSION_FAILED`.
-- **Not from your shell.** Eden runs Docker with a minimal environment
+- **Not from your shell.** Eden runs Docker, and the `file` tool that checks
+  native modules, with a minimal environment
   (`PATH`, `HOME`, `TMPDIR`, locale, and Docker settings) and starts the local
   boot check with a private environment bound to `127.0.0.1` only, so
   unrelated credentials in your terminal do not reach the build and the

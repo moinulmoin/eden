@@ -242,6 +242,11 @@ the agent sleeps takes about 10–15 seconds.
   `npx wrangler@4.147.0 whoami`).
 - `node: <path>: not found` with exit status 9 and no JSON: the `--env-file`
   path does not exist. `npx` stopped before Eden started. Correct the path.
+  With `--` before the package name (`npx -- @moinulmoin/eden preflight
+  --env-file <path> --json`), Eden runs and reports `EVE_ENV_FILE_NOT_FOUND`
+  in the JSON instead. Under `npx`, a `NODE_OPTIONS` line in the env file is
+  also applied to npm's own Node process; one that only works in the
+  container stops `npx` with `Cannot find module` unless `--` is used.
 - `DEPLOY_INDETERMINATE`: Eden could not prove the result; the old version
   usually keeps serving. Check the URL's health, then retry with the exact
   same `--project`, `--env`, and `--name`. Never switch to a new name to get
