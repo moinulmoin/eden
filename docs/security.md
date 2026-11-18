@@ -158,7 +158,8 @@ listing it cannot read. A listing counts as read only when every page is
 exactly in the form the registry sent on 2026-11-18: the recorded account
 and the repository asked for, entries in ascending order, and a `Link`
 header that continues from the page's last entry and is empty only after
-an empty page, within 100 pages. Eden cannot tell a stale answer from a
+an empty page, within 100 pages. An answer that names a field twice is
+refused, for a listing and for a refusal alike. Eden cannot tell a stale answer from a
 current one when both pass these checks.
 Eden does not store or print the credential.
 Wrangler runs in a fresh, private Eden-owned temporary directory outside the
@@ -190,7 +191,7 @@ temporary directory cannot redirect account operations or secret uploads.
   on a repository that holds the image it just promoted or the image of a
   version it still keeps. Eden works with one spelling of an image,
   `registry.cloudflare.com/<account>/<repository>@sha256:<digest>`, and
-  refuses any other reference before it publishes. A recorded image that is
+  refuses any other reference before it changes anything on the target. A recorded image that is
   not in that form cannot be placed in a repository, so it stops every
   sweep of that deploy. `eden deploy` and `eden destroy` take one lock in
   the project's `.eden` folder, which stops two runs from the same folder

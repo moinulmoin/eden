@@ -3086,6 +3086,22 @@ async function runEveDeployment(
       "The deploy candidate did not provide an immutable runtime image digest.",
     );
   }
+  // A supplied image reference is refused here, before anything on the target changes.
+  if (options.containerImageReference !== undefined) {
+    const supplied = managedImage(options.containerImageReference, accountId);
+    if (supplied === undefined) {
+      throw deploymentFailure(
+        "EVE_IMAGE_IDENTITY_MISMATCH",
+        "The Container image reference is not registry.cloudflare.com/<account>/<repository>@sha256:<digest> for the authenticated account.",
+      );
+    }
+    if (supplied.digest !== imageDigest) {
+      throw deploymentFailure(
+        "EVE_IMAGE_IDENTITY_MISMATCH",
+        "The exact Container image reference did not match the verified local image digest.",
+      );
+    }
+  }
 
   const targetKey = stableDeploymentKey(
     collected.projectId,
@@ -3187,20 +3203,7 @@ async function runEveDeployment(
     }
   }
   let imageReference = options.containerImageReference;
-  if (imageReference !== undefined) {
-    if (managedImage(imageReference, accountId) === undefined) {
-      throw deploymentFailure(
-        "EVE_IMAGE_IDENTITY_MISMATCH",
-        "The Container image reference is not registry.cloudflare.com/<account>/<repository>@sha256:<digest> for the authenticated account.",
-      );
-    }
-    if (imageDigestFromReference(imageReference) !== imageDigest) {
-      throw deploymentFailure(
-        "EVE_IMAGE_IDENTITY_MISMATCH",
-        "The exact Container image reference did not match the verified local image digest.",
-      );
-    }
-  } else {
+  if (imageReference === undefined) {
     eveProgress(options, "pushing container image to the Cloudflare registry");
     const localImageReference = runtimeEvidence.imageReference;
     if (localImageReference === undefined || localImageReference.length === 0) {
@@ -5282,12 +5285,28 @@ const REGISTRY_PAGE_ENTRIES = 1_000;
 const REGISTRY_ENTRY = /^(?:sha256:[0-9a-f]{64}|[A-Za-z0-9_][A-Za-z0-9._-]{0,127})$/u;
 
 /**
+ * The value of a JSON text from the registry, or undefined when the text is
+ * not that value written out again, spacing aside. `JSON.parse` keeps only
+ * the last of two fields with one name, so a text that says a thing twice
+ * would otherwise be read as saying it once.
+ */
+function registryJson(text: string): unknown {
+  const squeezed = (value: string): string => value.replace(/\s/gu, "");
+  try {
+    const value: unknown = JSON.parse(text);
+    return squeezed(JSON.stringify(value)) === squeezed(text) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * The entries of one page of the registry's listing of a repository, read
  * from the answer to a GET of `path`. Empty for the page that ends the
  * listing. Undefined unless the answer is exactly what Cloudflare's registry
  * was seen to send on 2026-11-18:
  * - status 200 and the body `{"name":"<account>/<repository>","tags":[…]}`,
- *   with nothing else in it;
+ *   with nothing else in it and neither field twice;
  * - each entry a tag or a `sha256:` digest, in ascending order, and after
  *   `after`, the last entry of the page before;
  * - a Link header that is the request's own URL with `?n=<n>&last=<cursor>`
@@ -5303,12 +5322,7 @@ function registryListingPage(
   after: string | undefined,
 ): readonly string[] | undefined {
   if (response?.status !== 200) return undefined;
-  let listing: unknown;
-  try {
-    listing = JSON.parse(response.body);
-  } catch {
-    return undefined;
-  }
+  const listing = registryJson(response.body);
   if (typeof listing !== "object" || listing === null || Object.keys(listing).sort().join() !== "name,tags") {
     return undefined;
   }
@@ -5355,12 +5369,7 @@ function registryObjectsKeptWarning(kept: readonly EveRegistryObjectKept[]): Eve
 /** True only for the registry's structured refusal to delete a snapshot manifest. */
 function isSnapshotDeleteRefusal(status: number, body: string): boolean {
   if (status !== 403) return false;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return false;
-  }
+  const parsed = registryJson(body);
   const errors = typeof parsed === "object" && parsed !== null
     ? (parsed as { readonly errors?: unknown }).errors
     : undefined;
@@ -5378,12 +5387,7 @@ function isSnapshotDeleteRefusal(status: number, body: string): boolean {
  */
 function isSingletonArtifactRefusal(status: number, body: string): boolean {
   if (status !== 409) return false;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return false;
-  }
+  const parsed = registryJson(body);
   if (typeof parsed !== "object" || parsed === null) return false;
   const refusal = parsed as Record<string, unknown>;
   return refusal.code === "SINGLETON_ARTIFACT_EXISTS" &&

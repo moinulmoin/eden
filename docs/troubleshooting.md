@@ -630,7 +630,8 @@ again.
 registry.cloudflare.com/<account>/<repository>@sha256:<digest> for the
 authenticated account.` Only a programmatic caller can supply an image
 reference. Eden accepts that one spelling and nothing else, so that cleanup
-never sees two names for one repository. Nothing was published.
+never sees two names for one repository. Eden refuses the reference before
+it changes anything on the target.
 
 ### `EVE_IMAGE_IDENTITY_UNAVAILABLE`
 
@@ -1185,7 +1186,8 @@ Destroy reads a listing only in the form Cloudflare's registry sent on
 page:
 
 - answers `200` with exactly `{"name":"<account>/<repository>","tags":[…]}`
-  for the account and repository asked;
+  for the account and repository asked, with no other field and neither
+  field twice;
 - lists only tags and `sha256:` digests, in ascending order, each after the
   last entry of the page before;
 - has a `Link` header that is the request's own URL followed by

@@ -54,8 +54,8 @@ function registryGet(path, authorization) {
  * `repository:tag` and `repository@sha256:…`. `credential` is the JSON that
  * `wrangler containers registries credentials` printed. It throws unless the
  * credential is for `account` and the catalog is read to its end: at most 50
- * pages, each naming only `account`, no repository twice, and each Link
- * header one next page with a cursor that moves.
+ * pages, each naming only `account`, no repository or field twice, and each
+ * Link header one next page with a cursor that moves.
  */
 export async function registryCatalogRefs({ account, repositoryPrefix, credential, get = registryGet }) {
   if (
@@ -74,12 +74,16 @@ export async function registryCatalogRefs({ account, repositoryPrefix, credentia
     );
     let repositories;
     try {
-      repositories = JSON.parse(body)?.repositories;
+      const catalog = JSON.parse(body);
+      // JSON.parse keeps the last of two fields with one name, so a body that
+      // lists a repository twice must not be read as listing it once.
+      const squeezed = (text) => text.replace(/\s/gu, "");
+      repositories = squeezed(JSON.stringify(catalog)) === squeezed(body) ? catalog?.repositories : undefined;
     } catch {
       repositories = undefined;
     }
     if (typeof repositories !== "object" || repositories === null || Array.isArray(repositories)) {
-      throw new Error("the registry catalog has no repositories object");
+      throw new Error("the registry catalog has no repositories object, or names a field twice");
     }
     for (const [name, entries] of Object.entries(repositories)) {
       if (
