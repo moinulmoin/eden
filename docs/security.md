@@ -42,7 +42,9 @@ How Eden handles it:
   (`PATH`, `HOME`, `TMPDIR`, locale, and Docker settings) and starts the local
   boot check with a private environment bound to `127.0.0.1` only, so
   unrelated credentials in your terminal do not reach the build and the
-  boot-check port is not exposed to other machines.
+  boot-check port is not exposed to other machines. If Eve exits during the
+  boot check, the failure shows the last lines Eve printed, with env-file
+  values redacted.
 - **Uploaded as Worker secrets.** Each value is uploaded with
   `wrangler secret put`, passing the value on standard input rather than as a
   command argument. Values are not written to command arguments, image

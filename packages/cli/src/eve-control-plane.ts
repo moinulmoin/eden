@@ -28,9 +28,6 @@ import {
   tmpdir,
 } from "node:os";
 import {
-  createServer,
-} from "node:net";
-import {
   execFile,
   spawn,
 } from "node:child_process";
@@ -293,7 +290,6 @@ export interface EvePreflightRuntimeEvidence {
 export interface EvePreflightRuntimeRunnerRequest {
   readonly candidate: EveProjectBuildCandidate;
   readonly nodeImage: EveNodeImage;
-  readonly healthPort: number;
   readonly hostRequirements: EveHostRequirements;
   readonly publicOrigin?: string;
   readonly runtimeInjection?: EveRuntimeInjection;
@@ -515,7 +511,6 @@ export interface EvePreflightOptions {
   readonly builder?: EveProjectBuilder;
   readonly nodeImage?: EveNodeImage;
   readonly artifactRoot?: string;
-  readonly healthPort?: number;
   readonly hostRequirements?:
     | EveHostRequirements
     | ((
@@ -2043,26 +2038,6 @@ async function resolvedCloudflareOrigin(
   }
 }
 
-async function findAvailableEveHealthPort(): Promise<number> {
-  for (let port = 4310; port <= 4399; port += 1) {
-    const available = await new Promise<boolean>((resolveResult) => {
-      const server = createServer();
-      const finish = (value: boolean): void => {
-        server.removeAllListeners();
-        server.close(() => resolveResult(value));
-      };
-      server.once("error", () => finish(false));
-      server.listen({ host: "127.0.0.1", port }, () => finish(true));
-    });
-    if (available) return port;
-  }
-  throw new EveCliError({
-    code: "EVE_HEALTH_PORT_UNAVAILABLE",
-    message:
-      "No task-owned Eve health port was available in the allowed 4310-4399 range.",
-  });
-}
-
 async function defaultRuntimeRunner(
   request: EvePreflightRuntimeRunnerRequest,
 ): Promise<EvePreflightRuntimeEvidence> {
@@ -2071,7 +2046,6 @@ async function defaultRuntimeRunner(
     const imageRequest: EveRuntimeImageRequest = {
       candidate: request.candidate,
       nodeImage: request.nodeImage,
-      healthPort: request.healthPort,
       hostRequirements: request.hostRequirements,
       ...(request.publicOrigin === undefined
         ? {}
@@ -4277,7 +4251,6 @@ async function collectEvePreflight(
       runtimeEvidence = await runtimeRunner({
         candidate,
         nodeImage,
-        healthPort: options.healthPort ?? await findAvailableEveHealthPort(),
         hostRequirements,
         ...(publicOrigin === undefined ? {} : { publicOrigin }),
         retainImage: request.command === "deploy",

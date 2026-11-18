@@ -5,6 +5,21 @@
 Eve `1.0.2`, the first stable Eve 1.0, is now a tested version. Eden itself
 needed no change.
 
+### Fixed
+
+- Two Eden builds can run at the same time on one Docker host. Before, both
+  picked local port 4310 for the boot check. The second failed with
+  `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.
+  Docker now picks a free port, and the boot container is removed on every
+  failure. `EVE_HEALTH_PORT_UNAVAILABLE` no longer exists.
+- When Eve exits during the local boot check, `EVE_HEALTH_FAILED` says so,
+  with Eve's exit code and its last output (env-file values redacted).
+  Before, it reported a missed health deadline with no cause, and a crash
+  right after start could be reported as `DOCKER_PLATFORM_BLOCKED`.
+- `DOCKER_PLATFORM_BLOCKED` now ends with the underlying error, usually
+  Docker's own, and its remediation says to fix that error. Before, the
+  echoed command line could use up the message and cut the error off.
+
 ### Changed
 
 - `eden preflight` and `eden deploy` check the Cloudflare login before the
@@ -62,6 +77,8 @@ needed no change.
 
 ### Maintainers
 
+- `buildEveRuntimeImage` and the preflight options no longer take
+  `healthPort`.
 - The live check on Cloudflare is now one command, `pnpm run check:live`. It
   deploys a fresh project to a temporary target, runs bash in a session,
   updates in place, upgrades Eve, lets the container sleep and wakes it, then

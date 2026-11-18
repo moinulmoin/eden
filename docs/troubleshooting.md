@@ -551,21 +551,35 @@ the unsupported capability:
 | `requires an unknown or unsupported Container network capability.` | Use only bounded outbound networking. Eden does not provide a network adapter. |
 | `requires durable local Container filesystem state.` | Configure a project-owned durable Eve-compatible World or external service. Container-local disk is disposable. |
 
+### `DOCKER_PLATFORM_BLOCKED` — the image could not be built or started
+
+`The Linux/amd64 Eve runtime image could not be built or inspected safely:
+<error>.` The message ends with the underlying error: the last lines Docker
+printed, or a local error such as a full disk. Fix that error and retry.
+Docker or OrbStack must be able to build and run `linux/amd64` images.
+
+Eden lets Docker pick a free local port for the boot check and removes the
+boot container on every failure. Several `eden preflight` or `eden deploy`
+runs can share one Docker host.
+
 ### `EVE_HEALTH_FAILED` — Eve never reported ready locally
 
+`Eve exited with code <code> before it reported ready. Its last output:
+<output>.` Eve stopped during startup in the local boot check. The message
+ends with the last lines Eve printed, with env-file values redacted. Fix that
+error and retry. If the project reads a variable at startup, add it to
+`--env-file`.
+
 `The real Eve health route did not report ready before the bounded deadline
-(last status: <status>).` Inspect the project-local `eve start` supervisor,
-the Nitro child, the sandbox prewarm, and the Workflow World startup. Eden
-does not replace them with a synthetic listener.
+(last status: <status>).` Eve kept running but did not report ready within
+30 seconds. Inspect the project-local `eve start` supervisor, the Nitro
+child, the sandbox prewarm, and the Workflow World startup. Eden does not
+replace them with a synthetic listener. If the machine was under heavy load,
+retry.
 
 If health never reaches ready on a live deployment either, check the Eve
 project's provider, Workflow World, and startup requirements. Eden deploys
 the project; it does not replace those services.
-
-### `EVE_HEALTH_PORT_UNAVAILABLE`
-
-`No task-owned Eve health port was available in the allowed 4310-4399
-range.` Free a local port in that range and retry.
 
 ### `CLEANUP_UNVERIFIED` — owned local resources were not proven absent
 

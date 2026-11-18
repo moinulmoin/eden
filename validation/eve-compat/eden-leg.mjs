@@ -255,7 +255,6 @@ export async function runEdenLeg(fixture) {
     image = await cli.buildEveRuntimeImage({
       candidate: packaging.candidate,
       nodeImage: cli.DEFAULT_EVE_NODE_IMAGE,
-      healthPort: 4399,
       hostRequirements: cli.DEFAULT_EVE_HOST_REQUIREMENTS,
       workflowWorld: worldName,
       retainImage: true,

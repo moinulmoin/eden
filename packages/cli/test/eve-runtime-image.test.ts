@@ -231,7 +231,6 @@ async function writeCandidate(
 async function writeFakeDocker(root: string, options: {
   readonly imageId?: string;
   readonly suppressImageIdentity?: boolean;
-  readonly healthPort?: number;
   readonly healthReady?: boolean;
 } = {}): Promise<{ readonly command: string; readonly log: string }> {
   const command = join(root, "fake-docker.cjs");
@@ -279,8 +278,10 @@ if (args[0] === "version") {
   if (!suppressImageIdentity && !fs.existsSync(removedImage)) process.stdout.write(imageId + "\\n");
 } else if (args[0] === "image" && args[1] === "rm") {
   fs.writeFileSync(removedImage, "removed\\n");
-} else if (args[0] === "run") {
+} else if (args[0] === "create") {
   process.stdout.write("boot-container-1\\n");
+} else if (args[0] === "port") {
+  process.stdout.write("127.0.0.1:49321\\n");
 } else if (args[0] === "inspect") {
   const format = args[args.indexOf("--format") + 1] ?? "";
   if (fs.existsSync(removedContainer)) {
@@ -414,7 +415,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4310,
       healthTimeoutMs: 200,
       fetchHealth: async (url) => {
         healthUrls.push(url);
@@ -465,7 +465,7 @@ describe("Eve runtime image boundary", () => {
         verified: true,
       },
     });
-    expect(healthUrls).toEqual(["http://127.0.0.1:4310/eve/v1/health", "http://127.0.0.1:4310/eve/v1/health"]);
+    expect(healthUrls).toEqual(["http://127.0.0.1:49321/eve/v1/health", "http://127.0.0.1:49321/eve/v1/health"]);
     const dockerArgs = (await readFile(fakeDocker.log, "utf8"))
       .trim()
       .split("\n")
@@ -473,8 +473,8 @@ describe("Eve runtime image boundary", () => {
     expect(dockerArgs.find((args) => args[0] === "build")).toEqual(
       expect.arrayContaining(["--platform=linux/amd64", "--iidfile"]),
     );
-    expect(dockerArgs.find((args) => args[0] === "run")).toEqual(
-      expect.arrayContaining(["--publish", "127.0.0.1:4310:8080"]),
+    expect(dockerArgs.find((args) => args[0] === "create")).toEqual(
+      expect.arrayContaining(["--publish", "127.0.0.1::8080"]),
     );
     expect(dockerArgs).toContainEqual(
       expect.arrayContaining(["top", "boot-container-1"]),
@@ -496,7 +496,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4313,
       retainImage: false,
       fetchHealth: async () => new Response(
         JSON.stringify({ status: "ready" }),
@@ -621,7 +620,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4312,
       healthTimeoutMs: 20,
       healthPollIntervalMs: 1,
       fetchHealth: async () => new Response("tcp-listener-only", { status: 200 }),
@@ -665,7 +663,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4311,
       hostRequirements: {
         architecture: "linux/amd64",
         world: "supported",
@@ -721,7 +718,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4314,
       retainImage: false,
       fetchHealth: async () => new Response(
         JSON.stringify({ status: "ready" }),
@@ -767,7 +763,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4317,
       retainImage: false,
       fetchHealth: async () => new Response(
         JSON.stringify({ status: "ready" }),
@@ -860,7 +855,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4318,
       hostRequirements: {
         architecture: "linux/amd64",
         world: "supported",
@@ -902,7 +896,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4319,
       hostRequirements: {
         architecture: "linux/amd64",
         world: "supported",
@@ -942,7 +935,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4320,
       hostRequirements: {
         architecture: "linux/amd64",
         world: "supported",
@@ -975,7 +967,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4316,
       retainImage: false,
       fetchHealth: async () => new Response(
         JSON.stringify({ status: "ready" }),
@@ -1024,7 +1015,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: fakeDocker.command,
-      healthPort: 4317,
       retainImage: false,
       workflowWorld: "@workflow/world-postgres",
       fetchHealth: async () => new Response(
@@ -1097,7 +1087,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: command,
-      healthPort: 4317,
       retainImage: false,
       runtimeInjection,
       fetchHealth: async () => new Response(
@@ -1125,7 +1114,7 @@ describe("Eve runtime image boundary", () => {
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string | null);
-    const bootIndex = dockerArgs.findIndex((args) => args[0] === "run");
+    const bootIndex = dockerArgs.findIndex((args) => args[0] === "create");
     expect(dockerArgs[bootIndex]).toEqual(
       expect.arrayContaining(["--env", "OPAQUE_RUNTIME"]),
     );
@@ -1157,7 +1146,6 @@ describe("Eve runtime image boundary", () => {
         digest: `sha256:${"0".repeat(64)}`,
       },
       dockerCommand: command,
-      healthPort: 4318,
       retainImage: false,
       workflowWorld: "@workflow/world-postgres",
       fetchHealth: async () => new Response(
