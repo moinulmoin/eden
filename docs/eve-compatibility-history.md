@@ -4,6 +4,68 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Destroy with a bounded wait on the registry (2026-11-18)
+
+Run on macOS with Docker, against the maintainer's Cloudflare account, with
+the CLI built from main at `c325eec` plus the follow-up change: Eden's own
+registry request follows only a delete that the registry refused Wrangler
+with `403`, requests that get no answer share 60 seconds per command, and
+only a `403` answer has its body read.
+
+Full run of `pnpm run check:live` with the final code, target
+`eden-live-20261118-0150f230`, `14:05:47Z` to `14:23:41Z`, all 18 steps
+passed. The project came from `npx eve@0.91.0 init`, converted to pnpm, with
+`just-bash` `3.6.1` and the World `0.12.0` packed from
+`packages/world-cloudflare`. The idle window was 90 seconds.
+
+- `eden preflight` passed 14 checks with no warnings in 98 seconds. The
+  fresh deploy took 189 seconds.
+- Session `wrun_01M7QFY71MFQHSSPKZMJPQQ2QA` started on Eve `0.91.0`, and
+  bash wrote a file. It answered again after the same-version update (140
+  seconds), after the deploy on Eve `1.0.2` (206 seconds), and after the
+  sleep, each time with its earlier turns in its stream and the file intact.
+  New sessions ran bash after the update and on Eve `1.0.2`.
+- After 165 seconds with no requests, the first health request took 5.6
+  seconds. The server process was 10 seconds old when the session asked.
+- `eden destroy` took 121 seconds and succeeded. Wrangler was asked to
+  delete every tag. For each of the eight that the registry refused it,
+  Eden's own request got the snapshot refusal. Destroy reported those eight
+  tags, six in the repository of the Eve `0.91.0` version and two in the
+  repository of the Eve `1.0.2` version, with the estimated removal date
+  2026-12-18.
+- The last step found no Worker, no secret, no Container application, and
+  no registry tag except those eight.
+
+Two earlier runs the same day did not pass. Neither failure came from the
+change.
+
+- Target `eden-live-20261118-a43120e3`, `13:27:59Z` to `13:44:58Z`, with
+  an earlier draft of the change. The first 17 steps passed. `eden destroy`
+  started at about `13:42:52Z` and failed with
+  `EVE_DESTROY_IMAGES_RETAINED` for the repository of the Eve `0.91.0`
+  version. That repository then held five snapshots. The newest one's
+  config says it was created at `13:44:20Z`, during the destroy and about
+  90 seconds after the last request, so its two tags appeared after destroy
+  had listed the repository. Destroy fails on a tag it did not attempt, as
+  designed. `eden destroy` run again with the final code, `13:51:05Z` to
+  `13:52:51Z`, succeeded and reported all 12 tags, each one refused by the
+  registry itself.
+- Target `eden-live-20261118-f567b159`, `13:55:51Z` to `14:05:21Z`, with
+  the final code. After the same-version update the old session answered,
+  then the request that starts a new session got `HTTP 500` with
+  Cloudflare's "Worker threw exception" page, and the run stopped there.
+  `eden destroy` took 76 seconds, succeeded, and reported two snapshot
+  tags. The same step passed in the run before this one and in the run
+  above; the cause was not found.
+
+Not run on Cloudflare: a registry that does not answer, a rejected
+credential, and a deploy that retires a version with snapshot tags. Those
+were checked with a stand-in for Wrangler and the registry.
+
+Left in the account after these runs: 22 snapshot tags from the three
+targets (12, 2, and 8), and no other tag, Worker, secret, or Container
+application of theirs.
+
 ## Destroy when Cloudflare's registry refuses snapshot tags (2026-11-18)
 
 Run on macOS with Docker, against the maintainer's Cloudflare account, with
