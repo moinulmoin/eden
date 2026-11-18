@@ -137,9 +137,10 @@ one command until four minutes have passed since it asked. It drops a
 credential the registry answers with `401`. The request uses a connection
 of its own: no proxy, certificate verification always on, no redirect
 followed, 30 seconds at most, and at most 4 KiB of response read. Requests
-that get no answer may take 60 seconds in total in one command; after that
-Eden sends no more and the command fails. Eden does not store or print the
-credential.
+that get no answer may take 60 seconds in total in one command. After that
+Eden sends no more of them. The command then fails only if a tag that was
+not confirmed is still in the final inventory. Eden does not store or print
+the credential.
 Wrangler runs in a fresh, private Eden-owned temporary directory outside the
 project, with its configuration file and account cache pinned inside it.
 Project `.env` files and configuration or cache files planted in a shared

@@ -3711,10 +3711,10 @@ async function runEveDeployment(
         }, request.environment, request.name, accountId);
         if (repository !== undefined) {
           const deleted = await deleteRegistryRepository({ repository, accountId });
+          if (typeof deleted === "object") snapshotTagsKept.push(...deleted.retainedSnapshotTags);
           if (deleted === "indeterminate" || (typeof deleted === "object" && deleted.unproven === true)) {
             throw new Error(`Repository deletion was not proven: ${repository}`);
           }
-          if (typeof deleted === "object") snapshotTagsKept.push(...deleted.retainedSnapshotTags);
         }
         completedRetirements.push(id);
       }
@@ -3757,8 +3757,10 @@ async function runEveDeployment(
       } catch {
         deleted = "indeterminate";
       }
-      if (typeof deleted === "object" && deleted.unproven === true) deleted = "indeterminate";
-      if (typeof deleted === "object") snapshotTagsKept.push(...deleted.retainedSnapshotTags);
+      if (typeof deleted === "object") {
+        snapshotTagsKept.push(...deleted.retainedSnapshotTags);
+        if (deleted.unproven === true) deleted = "indeterminate";
+      }
       supersededImageCleanup = deleted === "indeterminate"
         ? check(
           "VAL-LIFE-007",

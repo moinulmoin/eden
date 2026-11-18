@@ -28,7 +28,9 @@ needed no change.
 - `eden deploy` handles the same refusal when it removes a superseded
   version's registry repository: `VAL-LIFE-007` passes, and the result adds
   `EVE_SNAPSHOTS_RETAINED`, `retainedSnapshotTags`, and
-  `retainedSnapshotsExpiryEstimate`.
+  `retainedSnapshotsExpiryEstimate`. When another tag is left as well,
+  `VAL-LIFE-007` fails and the result still lists the snapshot tags the
+  registry refused.
 - Two Eden builds can run at the same time on one Docker host. Before, both
   picked local port 4310 for the boot check. The second failed with
   `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.

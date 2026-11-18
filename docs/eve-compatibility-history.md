@@ -36,6 +36,15 @@ passed. The project came from `npx eve@0.91.0 init`, converted to pnpm, with
 - The last step found no Worker, no secret, no Container application, and
   no registry tag except those eight.
 
+A later commit changed only what a failed deploy reports: it now lists the
+snapshot tags it confirmed. A full run on that code, target
+`eden-live-20261118-17bac346`, `14:33:34Z` to `14:50:03Z`, passed all 18
+steps. Destroy took 109 seconds and reported eight snapshot tags. During
+that run `wrangler containers list --json` showed the Container application
+with an empty `image`, and `wrangler containers info` showed an empty
+`configuration`. The configuration of a snapshot in the target's registry
+repository named the application's ID as `application_id`.
+
 Two earlier runs the same day did not pass. Neither failure came from the
 change.
 
@@ -62,8 +71,8 @@ Not run on Cloudflare: a registry that does not answer, a rejected
 credential, and a deploy that retires a version with snapshot tags. Those
 were checked with a stand-in for Wrangler and the registry.
 
-Left in the account after these runs: 22 snapshot tags from the three
-targets (12, 2, and 8), and no other tag, Worker, secret, or Container
+Left in the account after these runs: 30 snapshot tags from the four
+targets (12, 2, 8, and 8), and no other tag, Worker, secret, or Container
 application of theirs.
 
 ## Destroy when Cloudflare's registry refuses snapshot tags (2026-11-18)

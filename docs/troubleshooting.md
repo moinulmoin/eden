@@ -1234,20 +1234,55 @@ commands `eden destroy` itself runs.
    npx wrangler@4.147.0 delete --name <name>
    ```
 
-3. Delete the Container application. It is named `<name>-container`
-   (truncated to 63 characters). Find its ID in the list, then delete by ID:
+3. Delete the Container application. Its whole name is `<name>-container`
+   (truncated to 63 characters); `<name>-other-container` belongs to another
+   target. Find its ID in the list and write the ID down, because step 4
+   needs it. Then delete by ID:
 
    ```sh
    npx wrangler@4.147.0 containers list
    npx wrangler@4.147.0 containers delete <application-id>
    ```
 
-4. Delete the registry images. Eden's repositories for the target start with
-   `eden-eve-<environment>-<name>-`. Delete every tag of each one, whatever
-   its name. Wrangler asks you to confirm each deletion.
+4. Delete the registry images, but only in repositories you can prove belong
+   to this target. A repository of this target is named
+   `eden-eve-<environment>-<name>-<24 hexadecimal characters>-<rest>`. Do not
+   pick repositories by how their names start: with a target named `foo`,
+   `eden-eve-preview-foo-` also starts the repositories of a target named
+   `foo-bar`. Without `.eden` the 24 characters cannot be worked out, and
+   the Container application does not name its repository (its `image` is
+   empty in `containers list --json`).
+
+   The proof Cloudflare keeps is in a snapshot. A repository with a tag named
+   `rootfs-snapshot-*` holds a snapshot whose configuration names the
+   Container application it was taken from. Get a registry credential (valid
+   for five minutes) and read it with the `account_id` and `username` the
+   credential command prints. Leave the password out of the commands: curl
+   asks for it, and you paste the `password` value at its prompt, so it
+   stays out of your shell history and the process list. `--noproxy '*'`
+   makes curl connect to the registry directly, as Eden does.
 
    ```sh
    npx wrangler@4.147.0 containers images list
+   npx wrangler@4.147.0 containers registries credentials registry.cloudflare.com --push --pull --expiration-minutes 5 --json
+   curl --noproxy '*' -u '<username>' -H 'Accept: application/vnd.oci.image.manifest.v1+json' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<rootfs-snapshot-tag>
+   curl --noproxy '*' -L -u '<username>' https://registry.cloudflare.com/v2/<account_id>/<repository>/blobs/<config digest>
+   ```
+
+   The first curl prints the snapshot's manifest; take the `digest` inside
+   its `config`. The second prints the configuration. The repository belongs
+   to this target only when its `application_id` is the ID you wrote down in
+   step 3 (the same 32 hexadecimal characters, written with hyphens).
+
+   If a repository has no snapshot tag, or the IDs differ, you have no proof.
+   Stop there and leave that repository alone; do not delete by name. Nothing
+   runs from a repository once the Worker and the Container application are
+   gone.
+
+   In each repository you proved, delete every tag, whatever its name.
+   Wrangler asks you to confirm each deletion.
+
+   ```sh
    npx wrangler@4.147.0 containers images delete <repository>:<tag>
    ```
 
@@ -1256,15 +1291,10 @@ commands `eden destroy` itself runs.
    prints only `403 Forbidden`. That line does not say why: a missing
    permission prints the same. A tag's name does not say why either. Treat
    every tag Wrangler refuses as unresolved until the registry itself gives
-   the snapshot answer for that tag. To read it, get a registry credential
-   (valid for five minutes) and repeat the delete with the `account_id` and
-   `username` it prints. Leave the password out of the command: curl asks
-   for it, and you paste the `password` value at its prompt, so it stays out
-   of your shell history and the process list. `--noproxy '*'` makes curl
-   connect to the registry directly, as Eden does.
+   the snapshot answer for that tag. To read it, repeat the delete with the
+   same credential, again without the password in the command:
 
    ```sh
-   npx wrangler@4.147.0 containers registries credentials registry.cloudflare.com --push --pull --expiration-minutes 5 --json
    curl --noproxy '*' -X DELETE -u '<username>' -w '\nHTTP %{http_code}\n' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<tag>
    ```
 
@@ -1276,14 +1306,16 @@ commands `eden destroy` itself runs.
    ```
 
    Cloudflare documents that it removes a snapshot 30 days after it was
-   created or last restored. With any other answer the tag is still yours to
-   remove: check that the Wrangler login can delete registry images, then
-   delete it again.
+   created or last restored. If curl prints a status from `HTTP 200` to
+   `HTTP 299`, that request deleted the tag; do not delete it again, and let
+   step 5 confirm it is gone. With any other answer the tag is unresolved:
+   check that the Wrangler login can delete registry images.
 
-5. Run the two list commands again and confirm nothing with the target name
-   is left, apart from the tags that got the snapshot answer in step 4. A
-   tag that Wrangler refused without that answer is not cleaned up. Delete
-   any other tag the list shows for the target, whatever its name. Confirm
+5. Run the two list commands again. Confirm the Container application is
+   gone, and that the repositories you proved in step 4 hold no tag apart
+   from the ones that got the snapshot answer. A tag that Wrangler refused
+   without that answer is not cleaned up. Delete any other tag the list
+   shows in those repositories, whatever its name. Confirm
    the Worker is gone too; this command must fail with
    `This Worker does not exist on your account. [code: 10007]`:
 
