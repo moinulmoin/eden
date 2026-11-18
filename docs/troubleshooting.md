@@ -392,6 +392,12 @@ Inspect the Worker at its `workers.dev` origin and the recorded deployment
 history before redeploying. If it is not Eden's, deploy under a different
 `--name` or delete it yourself.
 
+If the message ends with `Worker deployment stamp differs from recorded
+identities` and the last successful update warned
+`EVE_UNAUTHENTICATED_VERSIONS_RETIRED`, the record may be one that Eden
+`0.11.2` through `0.12.0` could not read back; see
+[`EVE_DESTROY_RECORD_UNPROVEN`](#eve_destroy_record_unproven).
+
 **The target is Eden's but its record is incomplete** (updates only):
 
 > The exact target is Eden-owned, but its immutable deployment record does
@@ -1082,6 +1088,13 @@ guess or broaden cleanup.` Eden keeps its deployment records under
 `<project>/.eden/eve-deploy`. Deploy from this project root, or point
 `--project` at the project you deployed, and retry. If the folder no longer
 exists anywhere, see [The `.eden/` folder is lost](#the-eden-folder-is-lost).
+
+Eden `0.11.2` through `0.12.0` could write a record that they could not read
+back. It happened when an update kept the Eve version and retired a kept
+version whose World had no RPC authentication; that update warned
+`EVE_UNAUTHENTICATED_VERSIONS_RETIRED`. After it, `eden destroy` stops here
+and `eden deploy` stops with `VAL-CLI-007-TARGET-CONFLICT`. The record is
+intact. Update `@moinulmoin/eden` to a later release and rerun the command.
 
 ### `EVE_DESTROY_RECORD_MISMATCH`
 
