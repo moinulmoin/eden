@@ -4876,7 +4876,7 @@ async function parseEveDestroyRecord(
     if (value === undefined) continue;
     if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
     for (const [id, deployment] of Object.entries(value)) {
-      if (!/^(?:eden-cloudflare|eden-affinity-[a-f0-9]{24})$/u.test(id) ||
+      if (!/^(?:eden-cloudflare|eden-affinity-[a-f0-9]{24}(?:-[a-f0-9]{8})?)$/u.test(id) ||
           typeof deployment !== "object" || deployment === null ||
           typeof deployment.image !== "string" || imageDigestFromReference(deployment.image) === undefined ||
           typeof deployment.generationId !== "string" ||

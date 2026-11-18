@@ -54,6 +54,14 @@ needed no change.
   holds an image that is still deployed: the check is `skipped` when the
   promoted image is in the superseded repository, and a retirement stays
   pending when a kept version's image is in the retiring one.
+- `eden deploy` and `eden destroy` can read the deployment record again after
+  an update that kept the Eve version and retired a kept version whose World
+  had no RPC authentication. Since `0.11.2` such an update gave the new
+  version an id with an extra suffix, and Eden could not read its own record
+  back: the next `eden deploy` failed with `VAL-CLI-007-TARGET-CONFLICT` and
+  `eden destroy` failed with `EVE_DESTROY_RECORD_UNPROVEN`. Records already
+  written that way are read as they are, so update Eden and rerun the
+  command.
 - Two Eden builds can run at the same time on one Docker host. Before, both
   picked local port 4310 for the boot check. The second failed with
   `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.
