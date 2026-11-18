@@ -124,6 +124,20 @@ Create the file or correct the path. A globally installed `eden` reports the
 same mistake as `EVE_ENV_FILE_NOT_FOUND` under
 [`VAL-SEC-001`](#val-sec-001--the---env-file-could-not-be-read).
 
+To get Eden's own report through `npx`, put `--` before the package name:
+`npx -- @moinulmoin/eden preflight --env-file <path>`. Node then leaves the
+flag alone and Eden prints `EVE_ENV_FILE_NOT_FOUND`, in the JSON object too.
+`pnpm dlx -- @moinulmoin/eden …` does the same on pnpm `11.21.0` and
+`12.22.0`. On pnpm `10.6.1` it fails with a 404 for a package named `--`.
+A `--` after the command (`preflight -- --env-file`) fails with
+`EVE_OPTION_UNKNOWN`.
+
+That Node process does not load the values in the file, with one exception:
+it applies a `NODE_OPTIONS` line to itself. A value that only works inside
+the container, such as `NODE_OPTIONS=--require /app/instrument.cjs`, stops
+`npx` and `pnpm dlx` with `Cannot find module` before Eden starts. The
+`--` placement avoids that as well.
+
 ### `EVE_NAME_REQUIRED`
 
 `An explicit --name is required for destroy and for production targets.`

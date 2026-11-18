@@ -554,6 +554,7 @@ async function captureRuntimeTree(
       });
       if (entry.name.endsWith(".node")) {
         const fileResult = await execFileAsync("file", [candidate], {
+          env: safeDockerEnvironment(),
           maxBuffer: 1024 * 1024,
         }).catch(() => undefined);
         if (
