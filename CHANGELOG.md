@@ -158,8 +158,7 @@ needed no change.
   with the HTTP 500 that release fixed.
 - The latest compatibility fixture pins Eve `1.0.2`,
   `@workflow/world-postgres` `5.2.1`, `just-bash` `3.6.1`, and `ai` `7.0.173`
-  (Eve `1.0.2` needs `ai` `^7.0.172`). Its `pnpm-workspace.yaml` exempts the
-  releases published in the last day from pnpm's release-age check.
+  (Eve `1.0.2` needs `ai` `^7.0.172`).
 - The compatibility gate waits for the Eve server to exit. Eve `1.0.2` takes
   about five seconds to stop after a session has started, and the gate
   reported that as a failed cleanup.
