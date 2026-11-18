@@ -104,7 +104,10 @@ What it does, in order:
    there.
 10. Runs `eden destroy`, then confirms the URL returns 404 and that no Worker,
     secret, Container application, or registry image with the target's name
-    is left.
+    is left. The only registry tags that may remain are the snapshot tags
+    destroy reported in `EVE_SNAPSHOTS_RETAINED`: Cloudflare refuses to delete
+    them. The step lists them, and the final JSON object has them in
+    `retainedSnapshotTags` with `retainedSnapshotsExpireBy`.
 
 Each step prints `✓` or `✗` with its time. The last output is one JSON
 object with `ok`, the target, and every step. The exit code is `0` only when

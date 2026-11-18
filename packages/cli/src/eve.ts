@@ -148,7 +148,7 @@ function eveErrorRemediation(code: string): string {
     case "EVE_DESTROY_ABSENCE_UNPROVEN":
       return "Wait a minute for Cloudflare to settle, then rerun eden destroy with the same --project, --env, and --name. Keep the .eden folder; never delete resources by name prefix.";
     case "EVE_DESTROY_IMAGES_RETAINED":
-      return "Rerun eden destroy with the same --project, --env, and --name, or delete only the listed repository tags with npx wrangler@4.147.0 containers images delete <repository:tag>.";
+      return "Rerun eden destroy with the same --project, --env, and --name, or delete only the listed repository tags with npx wrangler@4.147.0 containers images delete <repository:tag>. Cloudflare refuses to delete rootfs-snapshot-* and rootfs-set-* tags and removes them itself within 30 days.";
     case "EVE_DESTROY_POINTER_UNCLEARED":
       return "The Cloudflare resources are gone; only the local .eden/eve-deploy/targets/<env>-<name>/CURRENT pointer is left. Check that the .eden folder is writable, then rerun eden destroy with the same --project, --env, and --name.";
     case "EVE_EXECUTION_FAILED":

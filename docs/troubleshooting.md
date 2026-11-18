@@ -711,6 +711,8 @@ and boot container. Never use broad Docker cleanup.
 `The update is healthy and promoted, but the superseded registry repository
 <repository> could not be proven deleted.` Remove only that repository's
 tags. Do not retry the deployment and do not run broad registry cleanup.
+Snapshot tags that Cloudflare refuses to delete do not fail this check; they
+are reported as [`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained).
 
 ## Updates
 
@@ -1057,7 +1059,8 @@ project's World: `@moinulmoin/eden-world-cloudflare` to `0.11.2` or later, or
 `eden destroy` removes exactly one target, including **all** kept images,
 container instances, and registry repositories, even with sessions still
 running. Use the same project, environment, and Worker name you deployed
-with. Destroy refuses `--env-file`.
+with. Destroy refuses `--env-file`. The one thing destroy cannot remove is a
+container snapshot; see [`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained).
 
 Destroy reports one check per step:
 
@@ -1066,7 +1069,7 @@ Destroy reports one check per step:
 | `VAL-LIFE-006-RECORD` | The immutable deployment record matched the exact target selectors. |
 | `VAL-LIFE-006-WORKER` | The exact owned Worker was deleted, or it was already absent. |
 | `VAL-LIFE-006-CONTAINER` | The exact owned Container application was deleted, or it was already absent. |
-| `VAL-LIFE-006-REGISTRY` | Every registry image tag recorded for this exact target was deleted or proven absent. |
+| `VAL-LIFE-006-REGISTRY` | Every registry image tag Eden pushed for this exact target was deleted or proven absent. Snapshot tags that Cloudflare keeps are listed in the `EVE_SNAPSHOTS_RETAINED` warning. |
 | `VAL-LIFE-006` | Exact absence was verified and only this target's `CURRENT` pointer was cleared. |
 
 ### `EVE_DESTROY_RECORD_UNPROVEN`
@@ -1125,7 +1128,41 @@ with the same selectors, or remove only the listed repositories' tags:
 npx wrangler@4.147.0 containers images delete <repository:tag>
 ```
 
-Never filter by prefix.
+Never filter by prefix. Cloudflare refuses to delete `rootfs-snapshot-*` and
+`rootfs-set-*` tags and removes them itself; see
+[`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained). Destroy fails with this
+code only for other tags, or when it could not list what is left.
+
+### `EVE_SNAPSHOTS_RETAINED`
+
+A warning, not a failure. `eden destroy` still ends with `destroyed` and
+exit code `0`:
+
+> Cloudflare keeps <n> container snapshot tag(s): <repository:tag>, …
+> Cloudflare does not allow deleting snapshots. It removes each one 30 days
+> after it was created or last restored, so by <date> at the latest.
+
+Cloudflare stores a container's disk snapshot as `rootfs-snapshot-*` and
+`rootfs-set-*` tags in the image's registry repository. A target has them
+once it has slept or moved to a new Eve version. Since 2026-11-18
+Cloudflare's registry answers `403 Forbidden` (`snapshot manifests cannot be
+deleted through this API`) to deleting one, and Cloudflare offers no other
+way to delete a snapshot. The Worker, its secrets and Durable Object data,
+the Container application, and every image tag Eden pushed are gone. Only
+these tags are left, and nothing restores them once the target is gone, so
+their 30 days are not renewed.
+
+With `--json`, `retainedSnapshotTags` lists them and
+`retainedSnapshotsExpireBy` is the date. There is nothing to do. To confirm
+after that date:
+
+```sh
+npx wrangler@4.147.0 containers images list
+```
+
+`eden deploy` prints the same warning, with repository names, when it
+removes a version that is no longer needed and Cloudflare keeps that
+version's snapshot tags.
 
 ### `EVE_DESTROY_POINTER_UNCLEARED`
 
@@ -1178,11 +1215,11 @@ commands `eden destroy` itself runs.
    ```
 
 4. Delete the registry images. Eden's repositories for the target start with
-   `eden-eve-<environment>-<name>-`. Delete every tag of each one: the
-   `candidate` tag and any `rootfs-snapshot-*` or `rootfs-set-*` tags.
-   Wrangler asks you to confirm each deletion. Only a target that has slept
-   has the `rootfs-*` tags; deleting them was not exercised in the live run
-   of these steps.
+   `eden-eve-<environment>-<name>-`. Delete the `candidate` tag of each one.
+   Wrangler asks you to confirm each deletion. A target that has slept or
+   moved to a new Eve version also has `rootfs-snapshot-*` and `rootfs-set-*`
+   tags. Leave those: Cloudflare answers `403 Forbidden` to deleting them
+   and removes them itself within 30 days.
 
    ```sh
    npx wrangler@4.147.0 containers images list
@@ -1190,7 +1227,7 @@ commands `eden destroy` itself runs.
    ```
 
 5. Run the two list commands again and confirm nothing with the target name
-   is left. Confirm the Worker is gone too; this command must fail with
+   is left, apart from `rootfs-*` tags. Confirm the Worker is gone too; this command must fail with
    `This Worker does not exist on your account. [code: 10007]`:
 
    ```sh

@@ -178,6 +178,10 @@ npx @moinulmoin/eden destroy --name <name> --json
   a request that already says to tear the agent down counts. Destroy deletes
   the agent immediately, even mid-conversation, and with the Cloudflare World
   also its stored sessions. An external Postgres database is not touched.
+- A successful `destroy` may carry the warning `EVE_SNAPSHOTS_RETAINED`.
+  Cloudflare does not allow deleting container snapshots, so their registry
+  tags stay until the date in `retainedSnapshotsExpireBy` (at most 30 days).
+  Tell the user what `retainedSnapshotTags` lists; there is nothing to retry.
 
 ## Verify
 

@@ -146,6 +146,11 @@ instance and image (including legacy), and the registry repositories this
 target pushed. It proves absence before clearing the target's `CURRENT`
 pointer, and never deletes by prefix or a broad account search.
 
+Cloudflare does not allow deleting container snapshots. When the target has
+any, destroy still succeeds and adds the warning `EVE_SNAPSHOTS_RETAINED`,
+which lists the snapshot tags left in the registry and the date by which
+Cloudflare removes them.
+
 Destroy reads the local deployment records and the Cloudflare account, and
 changes both: it deletes the owned resources even when sessions have not
 drained, and removes the local `CURRENT` pointer. Local deployment records
@@ -439,6 +444,10 @@ projects with the same name in different accounts do not share a repository.
 The published image reference is the repository pinned to an immutable
 `sha256:` digest.
 
+Cloudflare adds `rootfs-snapshot-*` and `rootfs-set-*` tags to a repository
+when it stores a snapshot of the container's disk. Eden cannot delete them;
+Cloudflare removes each one 30 days after it was created or last restored.
+
 The Worker is published with `compatibility_date` `2026-04-01`, the
 `enable_ctx_exports` compatibility flag, and `workers_dev` enabled. The
 Container runs on the `standard-1` instance type (1/2 vCPU, 4 GiB) with the
@@ -618,6 +627,9 @@ A successful destroy ends with:
   retained: local deployment records under .eden/eve-deploy
 ```
 
+When Cloudflare keeps the target's snapshot tags, a
+`! EVE_SNAPSHOTS_RETAINED — <message>` warning line comes before it.
+
 A target that was already absent prints `✓ <name> (<environment>) is already
 absent — nothing removed`, followed by the same `  retained: local deployment
 records under .eden/eve-deploy` line.
@@ -675,5 +687,8 @@ the command produced them.
 | `environment` | `"preview"` or `"production"` | |
 | `name` | string | The exact target name |
 | `checks` | array | Same shape as the preflight and deploy checks |
+| `warnings` | array, when Cloudflare keeps snapshot tags | One `EVE_SNAPSHOTS_RETAINED` entry with `id`, `message`, and `remediation` |
+| `retainedSnapshotTags` | array of strings, with that warning | Each kept tag as `<repository>:<tag>` |
+| `retainedSnapshotsExpireBy` | string, with that warning | The UTC date (`YYYY-MM-DD`) by which Cloudflare removes them |
 
 Return to the [documentation index](./README.md).

@@ -7,6 +7,19 @@ needed no change.
 
 ### Fixed
 
+- `eden destroy` succeeds again on a target that has slept or moved to a new
+  Eve version. Since 2026-11-18 Cloudflare's registry refuses to delete
+  container snapshot tags (`rootfs-snapshot-*`, `rootfs-set-*`), so destroy
+  removed everything else and then failed with `EVE_DESTROY_IMAGES_RETAINED`
+  on every retry. Destroy now ends with `destroyed` and the new warning
+  `EVE_SNAPSHOTS_RETAINED`, which lists the tags Cloudflare keeps and the
+  date by which it removes them (30 days after each was created or last
+  restored). `eden destroy --json` adds `warnings`, `retainedSnapshotTags`,
+  and `retainedSnapshotsExpireBy` in that case. Any other tag left behind
+  still fails with `EVE_DESTROY_IMAGES_RETAINED`.
+- `eden deploy` no longer fails `VAL-LIFE-007` when it removes a version that
+  is no longer needed and Cloudflare keeps that version's snapshot tags. It
+  prints `EVE_SNAPSHOTS_RETAINED` instead.
 - Two Eden builds can run at the same time on one Docker host. Before, both
   picked local port 4310 for the boot check. The second failed with
   `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.

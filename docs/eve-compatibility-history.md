@@ -4,6 +4,79 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Destroy when Cloudflare keeps snapshot tags (2026-11-18)
+
+Run on macOS with Docker, against the maintainer's Cloudflare account, with
+the CLI built from main at `47e94c7` plus the change that makes
+`eden destroy` report snapshot tags Cloudflare keeps.
+
+Why the tags stay. Checked at `11:15Z` with the registry credentials
+Wrangler uses:
+
+- `DELETE` of a `rootfs-set-*` tag answered `403` with
+  `snapshot manifests cannot be deleted through this API`, as it had since
+  `10:24Z`. `OPTIONS` on the same manifest allowed `GET, HEAD, OPTIONS`.
+  The same credentials had deleted `candidate` tags.
+- The registry has no route that deletes a repository: `DELETE` on the
+  repository, with and without a trailing slash, and on `tags/<tag>` and
+  `tags/list`, answered `404`.
+- Cloudflare's API answered `No route for that URI` for
+  `/accounts/<id>/containers/snapshots` and `/containers/images`. Its
+  reference lists no snapshot or image method, and Wrangler `4.147.0` has no
+  snapshot command.
+- Cloudflare's snapshot guide says the Container binding "does not provide
+  methods to list or delete them", and that a snapshot has a 30-day
+  time-to-live that each restore refreshes. Its Containers changelog had no
+  entry about the refusal; the newest entry was dated 2026-09-30.
+
+So this is a rule of Cloudflare's registry, not an incident and not a
+missing permission. It is new since the run on 2026-11-17, which ended with
+no registry image after an upgrade and a sleep.
+
+`eden destroy` on the two targets the earlier runs left behind:
+
+- `eden-live-20261118-58beade5`, with `--json`, at `11:09Z`: exit code 0,
+  `"ok":true`, `"status":"destroyed"`, `VAL-LIFE-006-REGISTRY` passed, one
+  `EVE_SNAPSHOTS_RETAINED` warning, two entries in `retainedSnapshotTags`,
+  and `"retainedSnapshotsExpireBy":"2026-12-18"`.
+- `eden-live-20261118-aea2c928`, without `--json`, `11:23:28Z` to
+  `11:24:54Z`: exit code 0. It printed
+  `! EVE_SNAPSHOTS_RETAINED — Cloudflare keeps 8 container snapshot tag(s): …`
+  with the eight tags and the date 2026-12-18, then
+  `✓ destroyed eden-live-20261118-aea2c928 (preview) in 86s`.
+
+Full run of `pnpm run check:live`, target `eden-live-20261118-09054fc8`,
+`11:25:14Z` to `11:43:15Z`, all 18 steps passed. The project came from
+`npx eve@0.91.0 init`, converted to pnpm, with `just-bash` `3.6.1` and the
+World `0.12.0` packed from `packages/world-cloudflare`. The idle window was
+90 seconds.
+
+- `eden preflight` passed 14 checks with no warnings in 136 seconds. The
+  fresh deploy took 213 seconds.
+- Session `wrun_01M7Q6T5RCNTB2ZC8GWJNKTKRW` started on Eve `0.91.0`, and
+  bash wrote a file. It answered again after the same-version update (136
+  seconds), after the deploy on Eve `1.0.2` (210 seconds), and after the
+  sleep, each time with its earlier turns in its stream and the file intact.
+  A new session reported Eve `1.0.2` and ran bash.
+- After 165 seconds with no requests, the first health request took 4.3
+  seconds. The server process was 6 seconds old when the session asked.
+- `eden destroy` took 109 seconds and succeeded. It reported eight snapshot
+  tags that Cloudflare keeps until 2026-12-18 at the latest: six in the
+  repository of the Eve `0.91.0` version and two in the repository of the
+  Eve `1.0.2` version.
+- The last step found the URL returning 404, no Worker, no secrets, no
+  Container application, and no registry tag other than those eight.
+
+Afterwards `wrangler containers list` showed no Container application.
+`wrangler containers images list` showed five `eden-live-20261118-*`
+repositories holding 18 `rootfs-snapshot-*` and `rootfs-set-*` tags and no
+other tag: the eight above, eight of `eden-live-20261118-aea2c928`, and two
+of `eden-live-20261118-58beade5`.
+
+Not run live: a deploy that removes a version no longer needed while
+Cloudflare keeps that version's snapshot tags. The live check has no such
+step.
+
 ## Live check with the workspace World (2026-11-18)
 
 Runs of `pnpm run check:live` on macOS with Docker, against the

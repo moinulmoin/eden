@@ -143,6 +143,13 @@ temporary directory cannot redirect account operations or secret uploads.
   are indeterminate, not proof of absence. Eden deletes only that target and
   the registry images its records identify, then verifies they are gone.
   It never deletes by name prefix.
+- **Snapshots outlive destroy.** A snapshot holds the container's whole disk
+  from the moment it was taken, including the agent's files. Cloudflare does
+  not allow deleting one and removes it 30 days after it was created or last
+  restored. Until then its tags stay in your account's Cloudflare registry,
+  and a registry read with your account's credentials still returns the
+  snapshot's manifest. `destroy` lists the tags and the date in
+  `EVE_SNAPSHOTS_RETAINED`.
   Deployment and release IDs are public: these checks protect against stale
   records and name reuse, not a malicious project carrying a forged `.eden`
   record with a known account and release ID. Do not trust `.eden` state from

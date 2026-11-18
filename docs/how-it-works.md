@@ -205,7 +205,7 @@ the same in-place compatibility requirement.
 
 | Data | Where | Survives sleep | Survives update | Survives destroy |
 | --- | --- | --- | --- | --- |
-| Agent files in the container (`/workspace`) | Container disk, saved in Cloudflare snapshots | Yes (snapshot expires after 30 idle days) | Only conversation sandbox files, up to 1 GiB compressed | No |
+| Agent files in the container (`/workspace`) | Container disk, saved in Cloudflare snapshots | Yes (snapshot expires after 30 idle days) | Only conversation sandbox files, up to 1 GiB compressed | No; Cloudflare keeps the snapshots up to 30 more days |
 | Workflow state, default local World | Container disk | Yes | No: it resets, and deploy warns | No |
 | Workflow state, Postgres World | Your Postgres database | Yes | Yes | Yes |
 | Workflow state, Eden Cloudflare World (experimental) | A Durable Object on your account | Yes | Yes | No |
@@ -225,6 +225,14 @@ deployments and does not wait for sessions to drain. It never matches by name
 prefix or searches your account, so similarly named resources are never
 touched. Data in the Durable Object (including the experimental Cloudflare
 World) is deleted with the Worker; your Postgres database is not touched.
+
+Container snapshots are the exception. Cloudflare stores them as
+`rootfs-snapshot-*` and `rootfs-set-*` tags in the image's registry
+repository and does not allow deleting them. Destroy deletes everything
+else, then reports those tags and the date by which Cloudflare removes them
+(30 days after each was created or last restored) in the warning
+`EVE_SNAPSHOTS_RETAINED`. A deploy that removes a version no longer needed
+reports the same warning.
 
 Because ownership comes from the records in `.eden/eve-deploy/`, a different
 clone or machine without those records cannot update or destroy the target;
