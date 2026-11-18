@@ -286,7 +286,7 @@ async function createProject() {
     // dependencies, but a pnpm lockfile may name a tarball URL. So the
     // workspace World makes this a pnpm project, as in the gate's Eden leg.
     // The URL stays up until the last build of this run.
-    worldTarball = await serveWorldTarball(workRoot);
+    worldTarball = await serveWorldTarball(workRoot, interrupt.signal);
     rmSync(join(project, "package-lock.json"));
     rmSync(join(project, "node_modules"), { recursive: true, force: true });
     sets.push("packageManager=" + JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).packageManager);
@@ -598,7 +598,7 @@ try {
   });
   await step("Workflow queue routes are closed to the internet", async () => {
     for (const route of ["flow", "step"]) {
-      const response = await request("/.well-known/workflow/v1/" + route, { method: "POST", headers: authorized, body: "{}" });
+      const response = await request("/.well-known/workflow/v1/" + route, { method: "POST", headers: authorized, body: "{}", redirect: "manual" });
       if (response.status !== 404) throw new Error("Expected HTTP 404 from /.well-known/workflow/v1/" + route + ", got " + response.status + ".");
     }
     return "POST /.well-known/workflow/v1/flow and /step with the bearer token: HTTP 404";

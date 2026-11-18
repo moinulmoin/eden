@@ -135,9 +135,10 @@ Safety:
   project only from the public npm registry. A pnpm lockfile may name a
   tarball URL. So with the workspace World the project is converted to pnpm,
   pinned to this repository's pnpm version, with the floor fixture's
-  `pnpm-workspace.yaml` and `minimumReleaseAge: 0`. The tarball URL is on
-  this machine. Only the local Docker build reads it; Cloudflare receives
-  the built image.
+  `pnpm-workspace.yaml` and `minimumReleaseAge: 0`. The tarball server is
+  on this machine. pnpm downloads the tarball from its host URL when it
+  writes the lockfile, and Eden's local Docker build downloads it from the
+  URL that Docker can reach. Cloudflare receives the built image.
 - With `--world latest` or an exact version the project stays an npm
   project, as `eve init` makes it and as the README's steps do. Use it to
   check the npm path, for example after a release.

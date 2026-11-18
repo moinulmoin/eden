@@ -55,16 +55,17 @@ const pnpm = (cwd, ...args) => command("corepack", ["pnpm", ...args], { cwd });
  * Eden installs a project from its lockfile inside a Docker build, so the
  * workspace World has to come from a URL that build can reach: the host's
  * loopback through OrbStack or Docker Desktop on macOS, the bridge gateway on
- * Linux. The live Cloudflare check uses this too.
+ * Linux. The live Cloudflare check uses this too, with a signal that stops
+ * the two commands when the check is interrupted.
  */
-export async function serveWorldTarball(directory) {
-  await pnpm(worldRoot, "pack", "--pack-destination", directory);
+export async function serveWorldTarball(directory, signal) {
+  await command("corepack", ["pnpm", "pack", "--pack-destination", directory], { cwd: worldRoot, signal });
   const [tarball] = readdirSync(directory).filter((name) => name.endsWith(".tgz"));
   assert(tarball !== undefined, "pnpm pack did not write the Cloudflare World tarball.");
   const bytes = readFileSync(join(directory, tarball));
   const linux = process.platform === "linux";
   const bind = linux
-    ? (await docker("network", "inspect", "bridge", "--format", "{{(index .IPAM.Config 0).Gateway}}")).stdout.trim()
+    ? (await command("docker", ["network", "inspect", "bridge", "--format", "{{(index .IPAM.Config 0).Gateway}}"], { signal })).stdout.trim()
     : "127.0.0.1";
   assert(bind.length > 0, "Could not read the Docker bridge gateway address.");
   const server = createServer((request, response) => {

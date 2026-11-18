@@ -54,7 +54,8 @@ the warning on Cloudflare when it is there. `eden destroy` took 67 seconds
 and left nothing: the URL returned 404, and Wrangler showed no Worker, no
 secrets, no Container application, and no registry image.
 
-What was left behind. Cloudflare's registry answered `403 Forbidden` to
+What was left behind. Cloudflare's registry answered `403 Forbidden`, with
+the message `snapshot manifests cannot be deleted through this API`, to
 every delete of a `rootfs-snapshot-*` or `rootfs-set-*` tag, from
 `eden destroy`, from a second `eden destroy`, and from
 `wrangler containers images delete` with Wrangler `4.147.0` and `4.164.0`,
