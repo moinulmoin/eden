@@ -1257,15 +1257,19 @@ commands `eden destroy` itself runs.
    permission prints the same. A tag's name does not say why either. Treat
    every tag Wrangler refuses as unresolved until the registry itself gives
    the snapshot answer for that tag. To read it, get a registry credential
-   (valid for five minutes) and repeat the delete with the `account_id`,
-   `username`, and `password` it prints:
+   (valid for five minutes) and repeat the delete with the `account_id` and
+   `username` it prints. Leave the password out of the command: curl asks
+   for it, and you paste the `password` value at its prompt, so it stays out
+   of your shell history and the process list. `--noproxy '*'` makes curl
+   connect to the registry directly, as Eden does.
 
    ```sh
    npx wrangler@4.147.0 containers registries credentials registry.cloudflare.com --push --pull --expiration-minutes 5 --json
-   curl -X DELETE -u '<username>:<password>' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<tag>
+   curl --noproxy '*' -X DELETE -u '<username>' -w '\nHTTP %{http_code}\n' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<tag>
    ```
 
-   Only this answer means Cloudflare keeps the tag as a snapshot:
+   Cloudflare keeps the tag as a snapshot only when curl prints both this
+   body and `HTTP 403`:
 
    ```json
    {"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}

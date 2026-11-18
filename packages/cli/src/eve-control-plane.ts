@@ -5292,9 +5292,11 @@ function isSnapshotDeleteRefusal(status: number, body: string): boolean {
 
 /**
  * One DELETE to Cloudflare's registry on a connection of its own: no proxy,
- * certificate verification on, no redirect followed, `timeoutMs` for the
- * whole exchange, and at most 4 KiB of response. Whatever the process-wide
- * proxy or TLS settings are, the credential goes only to the registry.
+ * certificate verification on, no redirect followed, `timeoutMs` (a whole
+ * number) for the whole exchange, and at most 4 KiB of response. Whatever
+ * the process-wide proxy or TLS settings are, the credential goes only to
+ * the registry. Only a 403 can be a refusal, so the body of any other
+ * answer is not read.
  */
 function registryDelete(
   path: string,
@@ -5312,6 +5314,11 @@ function registryDelete(
       rejectUnauthorized: true,
       signal: AbortSignal.timeout(timeoutMs),
     }, (response) => {
+      if (response.statusCode !== 403) {
+        resolve({ status: response.statusCode ?? 0, body: "" });
+        request.destroy();
+        return;
+      }
       const chunks: Buffer[] = [];
       let size = 0;
       response.on("data", (chunk: Buffer) => {
@@ -5365,7 +5372,7 @@ function registryRepositoryDeleter(): EveRegistryRepositoryDeleteRunner {
   ): Promise<boolean> => {
     if (
       credentialUnavailable ||
-      unansweredMs >= REGISTRY_UNANSWERED_BUDGET_MS ||
+      Math.floor(REGISTRY_UNANSWERED_BUDGET_MS - unansweredMs) < 1 ||
       !/^[A-Za-z0-9_-]{1,64}$/u.test(accountId) ||
       !/^[a-z0-9]+(?:[._-]+[a-z0-9]+)*$/u.test(repository) ||
       !/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/u.test(tag)
@@ -5396,7 +5403,7 @@ function registryRepositoryDeleter(): EveRegistryRepositoryDeleteRunner {
     const response = await registryDelete(
       `/v2/${encodeURIComponent(accountId)}/${encodeURIComponent(repository)}/manifests/${encodeURIComponent(tag)}`,
       credential.authorization,
-      Math.min(30_000, REGISTRY_UNANSWERED_BUDGET_MS - unansweredMs),
+      Math.floor(Math.min(30_000, REGISTRY_UNANSWERED_BUDGET_MS - unansweredMs)),
     );
     if (response === undefined) {
       unansweredMs += performance.now() - sentAt;
@@ -5450,7 +5457,8 @@ function registryRepositoryDeleter(): EveRegistryRepositoryDeleteRunner {
         /^[^)\s]+\): 403 /u.test(
           result.stderr.split(`Failed to delete ${request.repository}:${tag} (digest: `)[1] ?? "",
         ) &&
-        await refusedAsSnapshot(request.accountId, request.repository, tag)
+        // Whatever goes wrong while asking, the tag is unproven and the loop goes on.
+        await refusedAsSnapshot(request.accountId, request.repository, tag).catch(() => false)
       ) {
         refused.add(tag);
       }
