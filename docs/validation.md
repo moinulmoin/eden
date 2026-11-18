@@ -38,7 +38,8 @@ workspace (`pnpm run build`), and no Cloudflare account:
    `agent/agent.ts`, and installs that package from a tarball packed from
    `packages/world-cloudflare`. The tarball is served over local HTTP because
    Eden installs a project from its lockfile inside a Docker build. The
-   lockfile is resolved at run time, as a user's `npm install` would.
+   lockfile is resolved at run time, as a user's `npm install` would. The
+   live check below installs the World the same way, with the same code.
 2. It runs the built `eden preflight --json` in-process with a Cloudflare read
    that reports no access. `VAL-BUILD-001` to `VAL-BUILD-007` and every other
    check must pass; only the two `VAL-CLI-007` Cloudflare checks may not. The
@@ -81,7 +82,10 @@ What it does, in order:
 1. Builds the local CLI.
 2. Makes a fresh project with `npx eve@<version> init` and the steps from
    `eden skill`: `just-bash`, the sandbox module, a bearer-token authenticator, and
-   the Cloudflare World from npm.
+   the Cloudflare World. The World is packed from `packages/world-cloudflare`
+   and served over local HTTP until the run ends, as in the gate's Eden leg,
+   so the run checks the World in this checkout, published or not. This
+   makes the project a pnpm project; see Safety below.
 3. Runs `eden preflight`, then `eden deploy`, and waits for health.
 4. Starts a session whose turn runs bash and writes a file.
 5. Deploys again on the same Eve version. The URL must not change. The same
@@ -106,7 +110,7 @@ Defaults and options:
 | --- | --- | --- |
 | `--eve <version>` | The floor fixture's Eve | Eve version the project starts on |
 | `--upgrade-to <version>` | The latest fixture's Eve | Eve version for step 6; the step is skipped when it equals `--eve` |
-| `--world <version>` | `latest` | `@moinulmoin/eden-world-cloudflare` version from npm |
+| `--world <source>` | `workspace` | `workspace` packs `packages/world-cloudflare` into a pnpm project; `latest` or an exact version installs the published `@moinulmoin/eden-world-cloudflare` into an npm project |
 | `--model <id>` | The fixtures' model and fallbacks | AI Gateway model |
 | `--sleep-after <time>` | `90s` | Idle window for step 7, set with `EDEN_EVE_CONTAINER_SLEEP_AFTER` |
 | `--skip-sleep` | off | Skip step 7 and keep the 1 hour default |
@@ -121,8 +125,16 @@ Safety:
   Ctrl-C. If destroy itself fails, the script prints the retry command and
   keeps the project folder, because destroy needs its `.eden` records. A
   killed process (SIGKILL) cleans up nothing.
-- Eden rejects `file:` dependencies, so the project installs the Cloudflare
-  World from npm. A World change is checked live only after it is published.
+- Eden rejects `file:` dependencies, and takes the packages of an npm
+  project only from the public npm registry. A pnpm lockfile may name a
+  tarball URL. So with the workspace World the project is converted to pnpm,
+  pinned to this repository's pnpm version, with the floor fixture's
+  `pnpm-workspace.yaml` and `minimumReleaseAge: 0`. The tarball URL is on
+  this machine. Only the local Docker build reads it; Cloudflare receives
+  the built image.
+- With `--world latest` or an exact version the project stays an npm
+  project, as `eve init` makes it and as the README's steps do. Use it to
+  check the npm path, for example after a release.
 - The proof of each bash step is the tool's own output in the session
   stream, not the model's wording. A model that ignores the request gets two
   more tries.

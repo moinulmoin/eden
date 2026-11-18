@@ -86,6 +86,12 @@ needed no change.
   when a step fails and on Ctrl-C; if destroy itself fails, the script prints
   the retry command. Three attempts failed before the first passing run,
   from Eve `0.91.0` to `1.0.2`; see `docs/eve-compatibility-history.md`.
+- The live check installs the Cloudflare World packed from this repository
+  by default, through the same local tarball server as the gate's Eden leg.
+  A World change can now be checked on Cloudflare before it is published.
+  That project uses pnpm, because Eden takes npm packages only from the
+  public registry. `--world latest` or an exact version installs the
+  published package into an npm project, as before.
 - CI runs the gate's Eden leg in one parallel job per fixture, so a push
   waits for the slowest job instead of their sum. Publish still runs the
   whole gate in one step.

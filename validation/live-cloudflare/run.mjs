@@ -23,10 +23,13 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { serveWorldTarball } from "../eve-compat/eden-leg.mjs";
+
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const edenCli = join(repoRoot, "packages/cli/dist/index.js");
 const wranglerCli = join(repoRoot, "node_modules/.bin/wrangler");
 const TARGET_PATTERN = /^eden-live-\d{8}-[0-9a-f]{8}$/u;
+const WORLD = "@moinulmoin/eden-world-cloudflare";
 const MODEL_KEY = "AI_GATEWAY_API_KEY";
 const PROOF_FILE = "/workspace/live-check.txt";
 // The compatibility fixtures' models: a free one first, then fallbacks for when it is unavailable.
@@ -36,15 +39,19 @@ const usage = [
   "Usage: pnpm run check:live -- --env-file <path> [options]",
   "",
   "Deploys a fresh Eve project to a temporary Cloudflare target with the locally",
-  "built CLI, checks sessions across an update, an Eve upgrade, and a sleep, then",
-  "destroys the target. Uses this machine's Wrangler login and Docker.",
+  "built CLI and the Cloudflare World packed from this workspace, checks sessions",
+  "across an update, an Eve upgrade, and a sleep, then destroys the target. Uses",
+  "this machine's Wrangler login and Docker.",
   "",
   "Options:",
   "  --env-file <path>     File holding " + MODEL_KEY + "=<key> (required)",
   "  --eve <version>       Eve version to start on (default: the floor fixture's)",
   "  --upgrade-to <version> Eve version to upgrade to (default: the latest fixture's);",
   "                        the upgrade step is skipped when it equals --eve",
-  "  --world <version>     @moinulmoin/eden-world-cloudflare version from npm (default: latest)",
+  "  --world <source>      " + WORLD + ": workspace packs",
+  "                        packages/world-cloudflare into a pnpm project (default);",
+  "                        latest or an exact version installs the published",
+  "                        package into an npm project",
   "  --model <id>          AI Gateway model (default: " + DEFAULT_MODELS[0] + ", falling back to",
   "                        " + DEFAULT_MODELS.slice(1).join(" and ") + ")",
   "  --sleep-after <time>  Idle window for the sleep step (default: 90s)",
@@ -61,7 +68,7 @@ function parseArguments(argv) {
   const options = {
     eve: fixtureEve("floor"),
     upgradeTo: fixtureEve("latest"),
-    world: "latest",
+    world: "workspace",
     model: undefined,
     sleepAfter: "90s",
     skipSleep: false,
@@ -84,7 +91,7 @@ function parseArguments(argv) {
   for (const version of [options.eve, options.upgradeTo]) {
     if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) throw new Error("Eve versions must be exact, for example 1.0.2; got " + version + ".");
   }
-  if (!/^(?:latest|\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/u.test(options.world)) throw new Error("--world must be latest or an exact version.");
+  if (!/^(?:workspace|latest|\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/u.test(options.world)) throw new Error("--world must be workspace, latest, or an exact version.");
   if (options.model !== undefined && !/^[A-Za-z0-9._/:-]+$/u.test(options.model)) throw new Error("--model is not a plain model id.");
   const sleep = /^(\d+)(s|m)$/u.exec(options.sleepAfter);
   if (sleep === null) throw new Error("--sleep-after takes seconds or minutes, for example 90s or 3m.");
@@ -193,6 +200,7 @@ const workRoot = realpathSync(mkdtempSync(join(tmpdir(), "eden-live-")));
 const project = join(workRoot, target);
 const envFile = join(workRoot, "live.env");
 const nonce = "eden-live-" + randomBytes(6).toString("hex");
+let worldTarball;
 const edenEnvironment = options.skipSleep ? baseEnvironment : { ...baseEnvironment, EDEN_EVE_CONTAINER_SLEEP_AFTER: options.sleepAfter };
 
 const summary = {
@@ -202,6 +210,7 @@ const summary = {
   eve: options.eve,
   upgradedTo: options.upgradeTo === options.eve ? null : options.upgradeTo,
   world: null,
+  worldSource: options.world === "workspace" ? "workspace" : "npm",
   model: options.model ?? DEFAULT_MODELS.join(", then "),
   sleepAfter: options.skipSleep ? null : options.sleepAfter,
   startedAt: new Date().toISOString(),
@@ -254,10 +263,39 @@ function installedVersion(name) {
   return JSON.parse(readFileSync(join(project, "node_modules", name, "package.json"), "utf8")).version;
 }
 
+// npm for a published World. pnpm for the workspace World: the manifest and
+// lockfile name the tarball's host URL while pnpm runs and its Docker URL
+// while Eden builds.
+async function install(...packages) {
+  if (worldTarball === undefined) {
+    await runOrThrow("npm install", "npm", ["install", ...packages], { cwd: project });
+    return;
+  }
+  const files = [join(project, "package.json"), join(project, "pnpm-lock.yaml")];
+  worldTarball.pointAt("host", ...files.filter((file) => existsSync(file)));
+  const command = packages.length === 0 ? ["install", "--no-frozen-lockfile"] : ["add", ...packages];
+  await runOrThrow("pnpm " + command[0], "corepack", ["pnpm", ...command], { cwd: project });
+  worldTarball.pointAt("docker", ...files);
+}
+
 async function createProject() {
   await runOrThrow("eve init", "npx", ["-y", "eve@" + options.eve, "init", target, "--non-interactive"], { cwd: workRoot });
-  await runOrThrow("npm pkg set", "npm", ["pkg", "set", "dependencies.eve=" + options.eve], { cwd: project });
-  await runOrThrow("npm install", "npm", ["install", "just-bash", "@moinulmoin/eden-world-cloudflare@" + options.world], { cwd: project });
+  const sets = ["dependencies.eve=" + options.eve];
+  if (options.world === "workspace") {
+    // Eden takes npm packages only from the public registry and rejects file:
+    // dependencies, but a pnpm lockfile may name a tarball URL. So the
+    // workspace World makes this a pnpm project, as in the gate's Eden leg.
+    // The URL stays up until the last build of this run.
+    worldTarball = await serveWorldTarball(workRoot);
+    rmSync(join(project, "package-lock.json"));
+    rmSync(join(project, "node_modules"), { recursive: true, force: true });
+    sets.push("packageManager=" + JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).packageManager);
+    // The floor fixture's pnpm policy for build scripts. pnpm also waits one
+    // day before it installs a release, and a check may need a newer one.
+    writeFileSync(join(project, "pnpm-workspace.yaml"), readFileSync(join(repoRoot, "validation/eve-compat/floor/pnpm-workspace.yaml"), "utf8") + "minimumReleaseAge: 0\n");
+  }
+  await runOrThrow("npm pkg set", "npm", ["pkg", "set", ...sets], { cwd: project });
+  await install("just-bash", worldTarball?.hostUrl ?? WORLD + "@" + options.world);
   writeFileSync(join(project, "agent/sandbox.ts"), [
     "import { defineSandbox } from 'eve/sandbox';",
     "import { JustBashSandbox } from 'eve/sandbox/just-bash';",
@@ -290,7 +328,7 @@ async function createProject() {
     'import { defineAgent } from "eve";',
     "",
     "export default defineAgent({",
-    '  experimental: { workflow: { world: "@moinulmoin/eden-world-cloudflare" } },',
+    '  experimental: { workflow: { world: ' + JSON.stringify(WORLD) + " } },",
     "  model: " + JSON.stringify(options.model ?? DEFAULT_MODELS[0]) + ",",
     "  modelContextWindowTokens: 32_000,",
     ...(options.model === undefined
@@ -319,9 +357,9 @@ async function createProject() {
   writeFileSync(envFile, MODEL_KEY + "=" + modelKey + "\nAGENT_AUTH_TOKEN=" + authToken + "\n", { mode: 0o600 });
   chmodSync(envFile, 0o600);
   const eve = installedVersion("eve");
-  if (eve !== options.eve) throw new Error("Expected Eve " + options.eve + " but npm installed " + eve + ".");
-  summary.world = installedVersion("@moinulmoin/eden-world-cloudflare");
-  return "Eve " + eve + ", Cloudflare World " + summary.world + " from npm, just-bash " + installedVersion("just-bash");
+  if (eve !== options.eve) throw new Error("Expected Eve " + options.eve + " but found " + eve + " installed.");
+  summary.world = installedVersion(WORLD);
+  return "Eve " + eve + ", Cloudflare World " + summary.world + " from " + (worldTarball === undefined ? "npm" : "this workspace, pnpm project") + ", just-bash " + installedVersion("just-bash");
 }
 
 async function upgradeEve() {
@@ -334,9 +372,9 @@ async function upgradeEve() {
     if (major < 2 || (major === 2 && minor < 7)) sets.push("dependencies.@vercel/connect=2.7.0");
   }
   await runOrThrow("npm pkg set", "npm", ["pkg", "set", ...sets], { cwd: project });
-  await runOrThrow("npm install", "npm", ["install"], { cwd: project });
+  await install();
   const eve = installedVersion("eve");
-  if (eve !== options.upgradeTo) throw new Error("Expected Eve " + options.upgradeTo + " but npm installed " + eve + ".");
+  if (eve !== options.upgradeTo) throw new Error("Expected Eve " + options.upgradeTo + " but found " + eve + " installed.");
 }
 
 async function request(path, init = {}, timeoutMs = 120_000) {
@@ -606,6 +644,7 @@ try {
       log("\nCLEANUP FAILED for " + target + ". Retry: node " + edenCli + " destroy --project " + project + " --name " + target + "\nThe project folder is kept because destroy needs its .eden records.");
     }
   }
+  await worldTarball?.close();
   if (cleaned && !options.keepWork) rmSync(workRoot, { recursive: true, force: true });
   else log("Work folder kept: " + workRoot);
   summary.ok = failure === undefined && summary.steps.every((entry) => entry.status !== "failed");

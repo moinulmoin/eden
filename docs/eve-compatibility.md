@@ -76,9 +76,10 @@ all three.
   age, which the fixture's frozen install enforces.
 - **A live check on Cloudflare** runs before any release that changes deploy,
   runtime, or World code. One command, `pnpm run check:live`, deploys a fresh
-  project to a temporary target, runs bash in a session, updates in place,
-  upgrades Eve, lets the container sleep and wakes it, then destroys the
-  target. It needs the maintainer's Wrangler login, so it does not run in CI.
+  project to a temporary target with the Cloudflare World built from this
+  repository, runs bash in a session, updates in place, upgrades Eve, lets
+  the container sleep and wakes it, then destroys the target. It needs the
+  maintainer's Wrangler login, so it does not run in CI.
   See [validation](./validation.md#live-check-on-cloudflare).
 
 ## Session behavior across Eve upgrades
