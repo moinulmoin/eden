@@ -4,6 +4,79 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check with the workspace World (2026-11-18)
+
+Runs of `pnpm run check:live` on macOS with Docker, against the
+maintainer's Cloudflare account. The CLI and the Cloudflare World were
+built from main at `59d388f` plus the change that makes the World declare
+`queueAuthMode: "skip"`. No run ended clean: the checks of Eden's behavior
+passed, and `eden destroy` could not remove snapshot tags from Cloudflare's
+registry.
+
+Full run, target `eden-live-20261118-aea2c928`, `10:02:35Z` to `10:21:40Z`.
+The project came from `npx eve@0.91.0 init`, converted to pnpm `11.21.0`,
+with `just-bash` `3.6.1` and the World packed from `packages/world-cloudflare`
+(version `0.12.0` plus the change). The idle window was 90 seconds.
+
+- `eden preflight` passed 14 checks with no warnings in 109 seconds.
+- The fresh deploy took 310 seconds. An unauthenticated session request
+  returned HTTP 401. `POST /.well-known/workflow/v1/flow` and `/step` with
+  the bearer token returned HTTP 404.
+- Session `wrun_01M7Q24X947WQPK5TV2F5BYFX3` started on Eve `0.91.0`. Bash
+  wrote a file and read it back with exit code 0.
+- The same-version update took 167 seconds, on the same URL. The same
+  session answered and bash read the file back. A new session ran bash.
+- After the project moved to Eve `1.0.2`, the deploy took 183 seconds, on
+  the same URL. The same session answered with the same ID, its two earlier
+  turns were still in its stream, and bash read the file back. A new session
+  reported Eve `1.0.2` and ran bash.
+- The server process, 39 seconds old, had written no line about
+  `queueAuthMode` since 0.7 seconds after its start.
+- After 165 seconds with no requests, the first health request took 4.7
+  seconds. The server process was 8 seconds old when the session asked. Bash
+  read the file back again.
+- `eden destroy` removed the Worker and the Container application, then
+  failed with `EVE_DESTROY_IMAGES_RETAINED` after 113 seconds.
+
+A second run, target `eden-live-20261118-58beade5`, `10:39:20Z` to
+`10:52:18Z`, used the final script and no sleep step. Every step up to
+destroy passed again, from Eve `0.91.0` to `1.0.2`. For the `queueAuthMode`
+step a new session that reported Eve `1.0.2` asked its server process: it
+was 27 seconds old and had written no such line since 1.1 seconds after its
+start. `eden destroy` failed the same way after 88 seconds.
+
+A control run on the published World `0.12.0` from npm, started on Eve
+`1.0.2` with no upgrade and no sleep step (target
+`eden-live-20261118-387497fe`, `09:43:47Z` to `09:55:33Z`), failed the
+`queueAuthMode` step as intended. The server process had written
+`[workflow-sdk] This World declares no queueAuthMode, …`. So the step sees
+the warning on Cloudflare when it is there. `eden destroy` took 67 seconds
+and left nothing: the URL returned 404, and Wrangler showed no Worker, no
+secrets, no Container application, and no registry image.
+
+What was left behind. Cloudflare's registry answered `403 Forbidden` to
+every delete of a `rootfs-snapshot-*` or `rootfs-set-*` tag, from
+`eden destroy`, from a second `eden destroy`, and from
+`wrangler containers images delete` with Wrangler `4.147.0` and `4.164.0`,
+for 30 minutes after the first run. No `candidate` tag was left. The run
+on 2026-11-17 ended with no registry image after an upgrade and a sleep, so
+this is new since then. Three repositories with ten such tags stayed in the
+account: two from the first target and one from the second. The second
+target had the default one hour idle window; its two tags are in the
+repository of its Eve `0.91.0` version. Cloudflare's snapshot guide says
+snapshots expire 30 days after their last restore and that the Container
+binding has no method to delete them.
+
+Two attempts before these runs stopped at `eden preflight`, before any
+deploy:
+
+- With the workspace World in an npm project, `VAL-BUILD-001` rejected the
+  lockfile. Eden takes npm packages only from the public registry, so the
+  script now makes a pnpm project for the workspace World.
+- The pnpm project had no policy for dependency build scripts
+  (`ERR_PNPM_IGNORED_BUILDS`). The script now writes the floor fixture's
+  `pnpm-workspace.yaml`.
+
 ## Scripted live check, Eve 0.91.0 to 1.0.2 (2026-11-17)
 
 The first passing run of `pnpm run check:live`, on macOS with Docker,

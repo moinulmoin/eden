@@ -32,10 +32,14 @@ New Eve `1.0.2` projects pin `engines.node` to `26.x`. Eden builds and runs
 every project on Node.js `24.17.0`, which Eve still supports, so the pin needs
 no change.
 
-With the Cloudflare World, Eve `1.0.2` logs that the World declares no
-`queueAuthMode` and that the workflow route should be protected. Eden's Worker
-already answers `404` for that route from the internet. The log line is
-harmless.
+The Cloudflare World declares `queueAuthMode: "skip"`, which Workflow SDK 6
+will require. It means Eve does not check queue deliveries itself. That is
+accurate on Eden: the Worker answers `404` for the workflow queue routes from
+the internet, and Eden delivers queued work to the container itself. Eve
+`0.91.0` does not read the setting. Cloudflare World `0.12.0` and older
+declare nothing, so Eve `1.0.2` logs there that the World declares no
+`queueAuthMode` and that the route should be protected. That log line is
+harmless; update the World package to remove it.
 
 ## What every project needs
 

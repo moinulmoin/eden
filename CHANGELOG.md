@@ -22,6 +22,11 @@ needed no change.
 
 ### Changed
 
+- The Cloudflare World declares `queueAuthMode: "skip"`. With the updated
+  World package, Eve `1.0.2` no longer logs that the World declares no
+  `queueAuthMode`. Nothing else changes: Eve never checked queue deliveries
+  on this World, and Eden's Worker still answers `404` for the workflow
+  queue routes.
 - `eden preflight` and `eden deploy` check the Cloudflare login before the
   build. Without a login they now stop in about 5 seconds instead of after the
   full build (299 seconds in the same test), and the remediation names the
@@ -91,7 +96,9 @@ needed no change.
   A World change can now be checked on Cloudflare before it is published.
   That project uses pnpm, because Eden takes npm packages only from the
   public registry. `--world latest` or an exact version installs the
-  published package into an npm project, as before.
+  published package into an npm project, as before. The check also requires
+  `404` from the two workflow queue routes and asks the server process
+  whether Eve logged the `queueAuthMode` warning.
 - CI runs the gate's Eden leg in one parallel job per fixture, so a push
   waits for the slowest job instead of their sum. Publish still runs the
   whole gate in one step.

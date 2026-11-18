@@ -338,18 +338,31 @@ async function createProject() {
     "",
   ].join("\n"));
   writeFileSync(join(project, "agent/instructions.md"), "You are Eden's live check agent. When asked to call a named tool, call it exactly as requested. Keep replies short.\n");
-  // The only addition a user's guide does not ask for: it lets the sleep step
-  // prove the server process restarted.
+  // The only addition a user's guide does not ask for. Its uptime lets the
+  // sleep step prove the server process restarted. Eden gives no access to
+  // Eve's log on Cloudflare, so the tool also watches what the process writes,
+  // from the moment Eve loads its tools at start, for the Workflow SDK's
+  // queueAuthMode warning.
   mkdirSync(join(project, "agent/tools"), { recursive: true });
-  writeFileSync(join(project, "agent/tools/process_uptime.ts"), [
+  writeFileSync(join(project, "agent/tools/server_state.ts"), [
     'import { defineTool } from "eve/tools";',
     'import { z } from "zod";',
     "",
+    "const watchedFromSeconds = process.uptime();",
+    "const queueAuthLines: string[] = [];",
+    "for (const stream of [process.stdout, process.stderr]) {",
+    "  const write = stream.write;",
+    "  stream.write = function (...args: unknown[]) {",
+    '    if (String(args[0]).includes("queueAuthMode")) queueAuthLines.push(String(args[0]).slice(0, 200));',
+    "    return Reflect.apply(write, stream, args);",
+    "  } as typeof stream.write;",
+    "}",
+    "",
     "export default defineTool({",
-    '  description: "Report how long this server process has been running.",',
+    '  description: "Report how long this server process has been running and what it logged about queueAuthMode.",',
     "  inputSchema: z.object({}),",
     "  async execute() {",
-    "    return { uptimeSeconds: process.uptime() };",
+    "    return { uptimeSeconds: process.uptime(), watchedFromSeconds, queueAuthLines };",
     "  },",
     "});",
     "",
@@ -502,6 +515,7 @@ async function toolTurn(sessionId, message, accept) {
   throw new Error("No turn produced the expected tool result. Last: " + last);
 }
 
+const serverState = (sessionId) => toolTurn(sessionId, "Call the server_state tool. Then reply with its result.", (call) => typeof call.uptimeSeconds === "number" && Array.isArray(call.queueAuthLines) ? call : undefined);
 const bashPrints = (text) => (call) => call.exitCode === 0 && typeof call.stdout === "string" && call.stdout.includes(text) ? text : undefined;
 const writeFile = "Use the bash tool to run exactly this command: echo " + nonce + " > " + PROOF_FILE + " && cat " + PROOF_FILE + "\nThen reply with the file content.";
 const readFile = "Use the bash tool to run exactly this command: cat " + PROOF_FILE + "\nThen reply with the file content.";
@@ -582,6 +596,13 @@ try {
     if (response.status !== 401) throw new Error("Expected HTTP 401, got " + response.status + ".");
     return "HTTP 401";
   });
+  await step("Workflow queue routes are closed to the internet", async () => {
+    for (const route of ["flow", "step"]) {
+      const response = await request("/.well-known/workflow/v1/" + route, { method: "POST", headers: authorized, body: "{}" });
+      if (response.status !== 404) throw new Error("Expected HTTP 404 from /.well-known/workflow/v1/" + route + ", got " + response.status + ".");
+    }
+    return "POST /.well-known/workflow/v1/flow and /step with the bearer token: HTTP 404";
+  });
   let session;
   const settledBefore = [];
   await step("Session runs bash and writes a file", async () => {
@@ -611,6 +632,15 @@ try {
     await step("Same session continues after the Eve upgrade", sameSession);
     await step("New session starts on Eve " + options.upgradeTo, () => newSession("upgrade", options.upgradeTo));
   }
+  // The Cloudflare World declares queueAuthMode "skip", which the step above
+  // makes true. Workflow SDK 5.2 and later (Eve 1.0) warn when it is missing.
+  await step("Eve logged no queueAuthMode warning", async () => {
+    const expected = summary.upgradedTo ?? options.eve;
+    const turn = await serverState(undefined);
+    if (turn.eveVersion !== expected) throw new Error("The session that asked reports Eve " + turn.eveVersion + ", expected " + expected + ".");
+    if (turn.proof.queueAuthLines.length > 0) throw new Error("Eve logged: " + turn.proof.queueAuthLines.join(" | "));
+    return "a new session on Eve " + turn.eveVersion + " asked its server process: up " + Math.round(turn.proof.uptimeSeconds) + " s, output watched from " + seconds(turn.proof.watchedFromSeconds * 1000) + " s after start, no queueAuthMode line";
+  });
   if (options.skipSleep) {
     await step("Sleep and wake", async () => "skipped");
   } else {
@@ -620,11 +650,11 @@ try {
       await wait(options.sleepAfterMs + 75_000, interrupt.signal);
       const wakeStarted = Date.now();
       const wake = seconds(await waitForHealth() * 1000);
-      const uptime = await toolTurn(session, "Call the process_uptime tool. Then reply with its result.", (call) => typeof call.uptimeSeconds === "number" ? call.uptimeSeconds : undefined);
+      const uptime = (await serverState(session)).proof.uptimeSeconds;
       const idleSeconds = seconds(wakeStarted - idleFrom);
-      if (uptime.proof >= idleSeconds) throw new Error("The server process has been up " + Math.round(uptime.proof) + " s, longer than the " + idleSeconds + " s idle wait, so the container did not sleep.");
+      if (uptime >= idleSeconds) throw new Error("The server process has been up " + Math.round(uptime) + " s, longer than the " + idleSeconds + " s idle wait, so the container did not sleep.");
       const file = await sameSession();
-      return "idle " + idleSeconds + " s with a " + options.sleepAfter + " window; first health after wake took " + wake + " s; server process up " + Math.round(uptime.proof) + " s when asked, so it restarted; " + file;
+      return "idle " + idleSeconds + " s with a " + options.sleepAfter + " window; first health after wake took " + wake + " s; server process up " + Math.round(uptime) + " s when asked, so it restarted; " + file;
     });
   }
 } catch (error) {

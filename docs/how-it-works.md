@@ -117,7 +117,9 @@ safely return `404`.
 
 With the Cloudflare World, queued work goes to the version that needs to run
 it, even after an upgrade. Deliveries run independently, so a long task does
-not block another session.
+not block another session. Eve does not authenticate these deliveries; the
+World says so with `queueAuthMode: "skip"`, because the Worker keeps the
+queue routes closed to the internet.
 
 ## Sleep and wake
 
