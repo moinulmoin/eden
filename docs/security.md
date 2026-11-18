@@ -154,10 +154,12 @@ them. `eden destroy` then fails if anything without
 one of the registry's kept answers is still in its final listing, or if it
 cannot read that listing. `eden deploy` fails `VAL-LIFE-007` when it cannot
 prove that everything else in the repository is gone, which includes a
-listing it cannot read. A listing counts as read only when every page
-names the recorded account and the repository asked for, repeats no entry,
-and carries a `Link` header that matches the page, within 100 pages. Eden
-cannot tell a stale answer from a current one when both pass these checks.
+listing it cannot read. A listing counts as read only when every page is
+exactly in the form the registry sent on 2026-11-18: the recorded account
+and the repository asked for, entries in ascending order, and a `Link`
+header that continues from the page's last entry and is empty only after
+an empty page, within 100 pages. Eden cannot tell a stale answer from a
+current one when both pass these checks.
 Eden does not store or print the credential.
 Wrangler runs in a fresh, private Eden-owned temporary directory outside the
 project, with its configuration file and account cache pinned inside it.
@@ -186,7 +188,11 @@ temporary directory cannot redirect account operations or secret uploads.
   manifest the registry lists in a repository that the record proves this
   target owns, including one that appears while it runs. Eden never runs it
   on a repository that holds the image it just promoted or the image of a
-  version it still keeps. `eden deploy` and `eden destroy` take one lock in
+  version it still keeps. Eden works with one spelling of an image,
+  `registry.cloudflare.com/<account>/<repository>@sha256:<digest>`, and
+  refuses any other reference before it publishes. A recorded image that is
+  not in that form cannot be placed in a repository, so it stops every
+  sweep of that deploy. `eden deploy` and `eden destroy` take one lock in
   the project's `.eden` folder, which stops two runs from the same folder
   only. It does not stop a copy of the project on another machine, or any
   other push to the registry: an image pushed to an owned repository while

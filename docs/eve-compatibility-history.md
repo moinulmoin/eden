@@ -65,8 +65,9 @@ stand-in for Wrangler and the registry: each of the three kept answers, an
 accepted delete that leaves the listing, any other answer, an entry that
 appears during cleanup, entries that keep appearing, a listing in several
 pages, a listing that cannot be read at the start or at the end, an answer
-for another account or repository, a second accepted delete late in the
-wait, and a repository that holds a deployed image.
+for another account or repository, a page whose cursor contradicts it, a
+second accepted delete late in the wait, a repository that holds a deployed
+image, and an image reference in another spelling.
 
 ## Destroy with a bounded wait on the registry (2026-11-18)
 

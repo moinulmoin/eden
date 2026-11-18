@@ -626,6 +626,12 @@ digest.` The image reference does not belong to the candidate you built.
 Retry the deploy so Eden resolves the reference from the verified local image
 again.
 
+`The Container image reference is not
+registry.cloudflare.com/<account>/<repository>@sha256:<digest> for the
+authenticated account.` Only a programmatic caller can supply an image
+reference. Eden accepts that one spelling and nothing else, so that cleanup
+never sees two names for one repository. Nothing was published.
+
 ### `EVE_IMAGE_IDENTITY_UNAVAILABLE`
 
 `The deploy candidate did not resolve an immutable registry image
@@ -1174,14 +1180,20 @@ An entry that appears in the listing while destroy runs gets its own
 delete. Destroy makes at most three such passes over a repository and fails
 with this code if new entries still appear after them.
 
-Destroy treats a listing as unreadable, never as empty, when:
+Destroy reads a listing only in the form Cloudflare's registry sent on
+2026-11-18. It treats a listing as unreadable, never as empty, unless every
+page:
 
-- a page fails or is not the expected JSON;
-- the answer names another account or another repository;
-- an entry is repeated, or is neither a tag nor a `sha256:` digest;
-- a page's `Link` header is not one next page, or names a cursor that the
-  page does not end with;
-- the listing has not ended after 100 pages.
+- answers `200` with exactly `{"name":"<account>/<repository>","tags":[…]}`
+  for the account and repository asked;
+- lists only tags and `sha256:` digests, in ascending order, each after the
+  last entry of the page before;
+- has a `Link` header that is the request's own URL followed by
+  `?n=1000&last=<cursor>; rel=next`, where the cursor is the page's last
+  entry, and empty only on an empty page.
+
+The listing must end with an empty page within 100 pages. If the registry
+changes any of this, cleanup fails with this code until Eden is updated.
 
 Destroy reads the listing once more after its deletes. When that final
 listing is unreadable, destroy fails with this code and leaves the

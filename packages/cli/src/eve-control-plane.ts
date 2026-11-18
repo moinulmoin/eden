@@ -2224,6 +2224,23 @@ function boundedResourceName(
   return value.length <= 63 ? value : value.slice(0, 63).replace(/-+$/u, "");
 }
 
+/**
+ * The one spelling of an image that Eden pushes, deploys and cleans up:
+ * `registry.cloudflare.com/<account>/<repository>@sha256:<digest>` for the
+ * proved account. Anything else is undefined, including another spelling of
+ * the same host, so no comparison ever sees two names for one repository.
+ */
+function managedImage(
+  reference: string | undefined,
+  accountId: string,
+): { readonly repository: string; readonly digest: string } | undefined {
+  const match = /^registry\.cloudflare\.com\/([A-Za-z0-9_-]{1,64})\/([a-z0-9]+(?:[._-]+[a-z0-9]+)*)@(sha256:[0-9a-f]{64})$/u
+    .exec(reference ?? "");
+  return match === null || match[1] !== accountId
+    ? undefined
+    : { repository: match[2] as string, digest: match[3] as string };
+}
+
 function imageDigestFromReference(value: string): string | undefined {
   const match = /@sha256:([0-9a-f]{64})$/u.exec(value);
   return match === null ? undefined : `sha256:${match[1]}`;
@@ -3171,6 +3188,12 @@ async function runEveDeployment(
   }
   let imageReference = options.containerImageReference;
   if (imageReference !== undefined) {
+    if (managedImage(imageReference, accountId) === undefined) {
+      throw deploymentFailure(
+        "EVE_IMAGE_IDENTITY_MISMATCH",
+        "The Container image reference is not registry.cloudflare.com/<account>/<repository>@sha256:<digest> for the authenticated account.",
+      );
+    }
     if (imageDigestFromReference(imageReference) !== imageDigest) {
       throw deploymentFailure(
         "EVE_IMAGE_IDENTITY_MISMATCH",
@@ -3710,13 +3733,10 @@ async function runEveDeployment(
   const registryObjectsKept: EveRegistryObjectKept[] = [];
   // Cleanup deletes every manifest of a repository, so it must never run on
   // a repository that the promoted image, or a version still kept, lives in.
+  // An image that Eden cannot place in a repository protects them all.
   const holdsLiveImage = (repository: string): boolean =>
     [identity.containerImage, ...Object.values(identity.retainedDeployments ?? {}).map((kept) => kept.image)]
-      .some((image) =>
-        [":", "@"].some((separator) =>
-          image.startsWith(`${CLOUDFLARE_REGISTRY_HOST}/${accountId}/${repository}${separator}`)
-        )
-      );
+      .some((image) => (managedImage(image, accountId)?.repository ?? repository) === repository);
   if (affinityEnabled && Object.keys(retiringDeployments).length > 0) {
     const ids = Object.keys(retiringDeployments);
     const completedRetirements: string[] = [];
@@ -5252,12 +5272,60 @@ const CLOUDFLARE_REGISTRY_HOST = "registry.cloudflare.com";
 const SNAPSHOT_DELETE_REFUSAL = "snapshot manifests cannot be deleted through this API";
 /** The longest one command waits, in total, on registry requests that get no answer. */
 const REGISTRY_UNANSWERED_BUDGET_MS = 60_000;
-/** The longest one repository's cleanup waits for the registry to stop listing what it agreed to delete. */
+/** How long each accepted delete is given to leave the listing; a repository's cleanup can take longer. */
 const REGISTRY_REMOVAL_WAIT_MS = 30_000;
 /** How many times one repository's cleanup deletes entries it has not tried yet. */
 const REGISTRY_DELETE_PASSES = 3;
+/** How many entries Eden asks for in one page of a listing. */
+const REGISTRY_PAGE_ENTRIES = 1_000;
 /** A tag, or the `sha256:` entry the registry lists for each manifest. */
 const REGISTRY_ENTRY = /^(?:sha256:[0-9a-f]{64}|[A-Za-z0-9_][A-Za-z0-9._-]{0,127})$/u;
+
+/**
+ * The entries of one page of the registry's listing of a repository, read
+ * from the answer to a GET of `path`. Empty for the page that ends the
+ * listing. Undefined unless the answer is exactly what Cloudflare's registry
+ * was seen to send on 2026-11-18:
+ * - status 200 and the body `{"name":"<account>/<repository>","tags":[…]}`,
+ *   with nothing else in it;
+ * - each entry a tag or a `sha256:` digest, in ascending order, and after
+ *   `after`, the last entry of the page before;
+ * - a Link header that is the request's own URL with `?n=<n>&last=<cursor>`
+ *   appended and `; rel=next`, where the cursor is this page's last entry,
+ *   and empty exactly when the page is empty.
+ * Every reader of the listing goes through this, so an answer that says
+ * anything else, or contradicts itself, is never taken as a listing.
+ */
+function registryListingPage(
+  response: { readonly status: number; readonly body: string; readonly link?: string } | undefined,
+  path: string,
+  name: string,
+  after: string | undefined,
+): readonly string[] | undefined {
+  if (response?.status !== 200) return undefined;
+  let listing: unknown;
+  try {
+    listing = JSON.parse(response.body);
+  } catch {
+    return undefined;
+  }
+  if (typeof listing !== "object" || listing === null || Object.keys(listing).sort().join() !== "name,tags") {
+    return undefined;
+  }
+  const { name: listed, tags } = listing as { readonly name: unknown; readonly tags: unknown };
+  if (listed !== name || !Array.isArray(tags)) return undefined;
+  let previous = after;
+  for (const tag of tags as readonly unknown[]) {
+    if (typeof tag !== "string" || !REGISTRY_ENTRY.test(tag) || (previous !== undefined && tag <= previous)) {
+      return undefined;
+    }
+    previous = tag;
+  }
+  const next = `${path}?n=${REGISTRY_PAGE_ENTRIES}&last=${tags.length === 0 ? "" : previous}; rel=next`;
+  return response.link === next || response.link === `https://${CLOUDFLARE_REGISTRY_HOST}${next}`
+    ? tags as readonly string[]
+    : undefined;
+}
 
 /** `repository:tag`, or `repository@sha256:…` for a manifest's own entry. */
 function registryRef(repository: string, entry: string): string {
@@ -5386,9 +5454,8 @@ interface CloudflareRegistry {
    * Every entry the registry lists for one repository: its tags, and one
    * `sha256:` entry per manifest, which Wrangler's image list leaves out.
    * Empty for a repository the registry does not know. Undefined when the
-   * listing could not be read in full: a failed page, an answer that names
-   * another repository, a repeated entry, or a page whose continuation
-   * contradicts it.
+   * listing could not be read in full: any page that is not exactly what
+   * `registryListingPage` accepts, or no end within 100 pages.
    */
   readonly list: (accountId: string, repository: string) => Promise<readonly string[] | undefined>;
   /**
@@ -5486,42 +5553,20 @@ function cloudflareRegistry(): CloudflareRegistry {
   };
   return {
     list: async (accountId, repository) => {
-      const entries = new Set<string>();
-      let last: string | undefined;
+      const entries: string[] = [];
       // The registry pages by the last entry of the page before and ends with an empty page.
       for (let page = 0; page < 100; page += 1) {
-        const response = await send(
-          "GET", accountId, repository,
-          `tags/list?n=1000${last === undefined ? "" : `&last=${encodeURIComponent(last)}`}`,
-          [200], 1_048_576,
+        const last = entries.at(-1);
+        const rest = `tags/list?n=${REGISTRY_PAGE_ENTRIES}${last === undefined ? "" : `&last=${encodeURIComponent(last)}`}`;
+        const read = registryListingPage(
+          await send("GET", accountId, repository, rest, [200], 1_048_576),
+          `/v2/${accountId}/${repository}/${rest}`,
+          `${accountId}/${repository}`,
+          last,
         );
-        if (response?.status !== 200) return undefined;
-        let listing: { readonly name?: unknown; readonly tags?: unknown } | null;
-        try {
-          listing = JSON.parse(response.body) as typeof listing;
-        } catch {
-          return undefined;
-        }
-        const tags = listing?.tags;
-        // An answer for another repository says nothing about this one.
-        if (listing?.name !== `${accountId}/${repository}` || !Array.isArray(tags)) return undefined;
-        for (const tag of tags as readonly unknown[]) {
-          if (typeof tag !== "string" || !REGISTRY_ENTRY.test(tag) || entries.has(tag)) return undefined;
-          entries.add(tag);
-          last = tag;
-        }
-        // The registry's Link header ends with the cursor of the next page:
-        // this page's last entry, or nothing after an empty page. A page
-        // that says anything else about what follows is not the listing.
-        if (response.link !== undefined) {
-          const target = /^\s*<?([^<>;,]*)>?\s*;\s*rel="?next"?\s*$/u.exec(response.link)?.[1];
-          const cursor = target === undefined ? undefined : /.*[?&]last=([^&]*)/u.exec(target)?.[1];
-          if (cursor === undefined) return undefined;
-          if (cursor !== "" && (tags.length === 0 || (cursor !== last && cursor !== encodeURIComponent(last ?? "")))) {
-            return undefined;
-          }
-        }
-        if (tags.length === 0) return [...entries];
+        if (read === undefined) return undefined;
+        if (read.length === 0) return entries;
+        entries.push(...read);
       }
       return undefined;
     },
@@ -5690,10 +5735,8 @@ function ownedRegistryRepository(
   const prefix = `eden-eve-${stableDeploymentKey(identity.projectId, identity.accountId, environment, name)}-`;
   const suffixes = [identity.generationId];
   if (identity.retainedDeployments !== undefined && identity.deploymentId !== undefined) suffixes.push(identity.deploymentId);
-  if (imageDigestFromReference(identity.containerImage) === undefined) return undefined;
-  return suffixes.map((suffix) => `${prefix}${suffix}`).find((repository) =>
-    identity.containerImage!.startsWith(`registry.cloudflare.com/${identity.accountId}/${repository}@`)
-  );
+  const repository = managedImage(identity.containerImage, accountId)?.repository;
+  return suffixes.map((suffix) => `${prefix}${suffix}`).find((owned) => owned === repository);
 }
 
 /**
@@ -5724,17 +5767,10 @@ async function attemptRegistryRepository(
       parsed.accountId === accountId) {
     return parsed.imageRepository;
   }
-  if ("imageReference" in parsed &&
-      typeof parsed.imageReference === "string" &&
-      imageDigestFromReference(parsed.imageReference) !== undefined) {
-    const repository = parsed.imageReference.split("@")[0];
-    const expected = `registry.cloudflare.com/${accountId}/${prefix}`;
-    if (
-      repository !== undefined &&
-      repository.startsWith(expected) &&
-      (!("targetKey" in parsed) || parsed.targetKey === targetKey)
-    ) {
-      return repository.slice(`registry.cloudflare.com/${accountId}/`.length);
+  if ("imageReference" in parsed && typeof parsed.imageReference === "string") {
+    const repository = managedImage(parsed.imageReference, accountId)?.repository;
+    if (repository?.startsWith(prefix) === true && (!("targetKey" in parsed) || parsed.targetKey === targetKey)) {
+      return repository;
     }
   }
   return undefined;

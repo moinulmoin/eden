@@ -20,9 +20,10 @@ needed no change.
   every other entry by digest with a request of its own. An entry that
   appears while it runs gets its own delete, for at most three passes over
   a repository. Destroy clears the target's `CURRENT` pointer only after a
-  final listing that it read in full. A listing that fails midway, names
-  another account or repository, repeats an entry, or carries a `Link`
-  header that does not match the page is unreadable, never empty.
+  final listing that it read in full. A listing page that is not exactly
+  in the form the registry was seen to send is unreadable, never empty:
+  another account or repository, entries out of order, or a `Link` header
+  that does not continue from the page's last entry.
 - Cloudflare keeps three kinds of registry object, and destroy reports each
   one in the new warning `EVE_REGISTRY_OBJECTS_KEPT`, only on the
   registry's own answer for that object: a container snapshot
