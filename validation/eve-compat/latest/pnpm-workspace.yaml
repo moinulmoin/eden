@@ -3,9 +3,3 @@ ignoredOptionalDependencies:
   - node-liblzma
 allowBuilds:
   cbor-extract: false
-minimumReleaseAgeExclude:
-  - '@workflow/errors@5.1.2'
-  - '@workflow/world-local@5.4.0'
-  - '@workflow/world-postgres@5.2.1'
-  - '@workflow/world@5.2.1'
-  - eve@1.0.2
