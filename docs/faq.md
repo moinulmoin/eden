@@ -158,6 +158,16 @@ for that target, including legacy deployments, then checks they are gone.
 Destroy also removes sessions still running. Your Postgres database, if you
 use one, is not touched.
 
+Cloudflare's registry keeps some objects after that. It refuses to delete
+container snapshots, which still hold the agent's files, and documents that
+it removes one 30 days after it was created or last restored. It refuses to
+delete an artifact it makes for each pushed image. And it can accept the
+delete of an earlier, untagged image and still list it. Destroy succeeds and
+lists each of these in the warning `EVE_REGISTRY_OBJECTS_KEPT`. It is not
+known when Cloudflare removes the last two kinds, or whether kept objects
+count toward the 50 GB of image storage per account. See
+[`EVE_REGISTRY_OBJECTS_KEPT`](./troubleshooting.md#eve_registry_objects_kept).
+
 ## Compared to other setups
 
 ### Why no real Linux sandbox with python and git?

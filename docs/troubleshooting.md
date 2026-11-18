@@ -711,11 +711,10 @@ and boot container. Never use broad Docker cleanup.
 `The update is healthy and promoted, but the superseded registry repository
 <repository> could not be proven deleted.` Remove only that repository's
 tags. Do not retry the deployment and do not run broad registry cleanup.
-A tag that Cloudflare's registry refuses to delete as a snapshot does not
-fail this check; it is reported as
-[`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained). Eden confirms that
-refusal with a direct request to `registry.cloudflare.com` and never uses a
-proxy for it. Where the registry cannot be reached directly, the check fails.
+An object that Cloudflare's registry keeps does not fail this check; it is
+reported as [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept). Eden reads the registry's listing and each answer with
+direct requests to `registry.cloudflare.com` and never uses a proxy for
+them. Where the registry cannot be reached directly, the check fails.
 
 ## Updates
 
@@ -1062,8 +1061,8 @@ project's World: `@moinulmoin/eden-world-cloudflare` to `0.11.2` or later, or
 `eden destroy` removes exactly one target, including **all** kept images,
 container instances, and registry repositories, even with sessions still
 running. Use the same project, environment, and Worker name you deployed
-with. Destroy refuses `--env-file`. The one thing destroy cannot remove is a
-container snapshot; see [`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained).
+with. Destroy refuses `--env-file`. Destroy cannot remove what Cloudflare's
+registry keeps; see [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept).
 
 Destroy reports one check per step:
 
@@ -1072,7 +1071,7 @@ Destroy reports one check per step:
 | `VAL-LIFE-006-RECORD` | The immutable deployment record matched the exact target selectors. |
 | `VAL-LIFE-006-WORKER` | The exact owned Worker was deleted, or it was already absent. |
 | `VAL-LIFE-006-CONTAINER` | The exact owned Container application was deleted, or it was already absent. |
-| `VAL-LIFE-006-REGISTRY` | Every registry image tag recorded for this exact target was deleted or proven absent, apart from tags Cloudflare's registry refused to delete as snapshots. Those are listed in the `EVE_SNAPSHOTS_RETAINED` warning. |
+| `VAL-LIFE-006-REGISTRY` | Everything the registry listed for this exact target was deleted or proven absent, apart from objects Cloudflare's registry keeps. Those are listed in the `EVE_REGISTRY_OBJECTS_KEPT` warning. |
 | `VAL-LIFE-006` | Exact absence was verified and only this target's `CURRENT` pointer was cleared. |
 
 ### `EVE_DESTROY_RECORD_UNPROVEN`
@@ -1123,73 +1122,104 @@ destroy once the provider state settles.
 
 ### `EVE_DESTROY_IMAGES_RETAINED`
 
-`The exact Worker and Container are absent, but registry image tag(s) remain
-in: <repositories>.` The message lists every repository. Retry `eden destroy`
-with the same selectors, or remove only the listed repositories' tags:
+`The exact Worker and Container are absent, but registry objects remain, or
+could not be listed, in: <repositories>.` The message lists every
+repository. Retry `eden destroy` with the same selectors, or remove only the
+listed repositories' tags:
 
 ```sh
 npx wrangler@4.147.0 containers images delete <repository:tag>
 ```
 
-Never filter by prefix. A tag that Cloudflare's registry refuses to delete
-as a snapshot is not counted here; see
-[`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained). Destroy fails with this
-code for any other tag that is left, for a tag whose delete failed with any
-other answer, and when it could not list what is left.
+Never filter by prefix. An object that Cloudflare's registry keeps is not
+counted here; see [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept). Destroy fails with this code for anything else
+the registry still lists, for an object whose delete got any other answer,
+and when it could not read the registry's listing.
 
-Destroy also fails with this code when it cannot confirm a snapshot refusal.
-To confirm one, Eden sends its own request straight to
-`registry.cloudflare.com` and never uses a proxy for it. If this machine
+Eden reads the listing and sends its own deletes straight to
+`registry.cloudflare.com` and never uses a proxy for them. If this machine
 reaches the internet only through a proxy, or the registry does not answer,
-the snapshot tags stay unconfirmed. Destroy still asks Wrangler to delete
-every tag, and waits at most 60 seconds in total for registry requests that
-get no answer. Run `eden destroy` again, with the same selectors and the
-same `.eden` folder, from a machine that can reach
-`registry.cloudflare.com` directly.
+destroy cannot read the listing. It then deletes the Worker and the
+Container application, deletes nothing in the registry, and fails with this
+code. It waits at most 60 seconds in total for registry requests that get
+no answer. Run `eden destroy` again, with the same selectors and the same
+`.eden` folder, from a machine that can reach `registry.cloudflare.com`
+directly.
 
-### `EVE_SNAPSHOTS_RETAINED`
+An entry that appears in the listing while destroy runs gets its own
+delete. Destroy makes at most three such passes over a repository and fails
+with this code if new entries still appear after them.
+
+### `EVE_REGISTRY_OBJECTS_KEPT`
 
 A warning, not a failure. `eden destroy` still ends with `destroyed` and
 exit code `0`:
 
-> Cloudflare's registry refused to delete <n> container snapshot tag(s).
-> Cloudflare documents that it removes a snapshot 30 days after it was
-> created or last restored. Eden estimates that as <date> if nothing
-> restores them; it cannot confirm the removal.
+> Cloudflare's registry still lists <n> object(s) that Eden tried to
+> delete: <how many got each answer>. Cloudflare documents that it removes
+> a snapshot 30 days after it was created or last restored. Eden does not
+> know when Cloudflare removes the other objects, or whether any of them
+> counts toward the account's image storage limit.
 
-The text output then lists every kept tag on its own `kept: <repository:tag>`
-line. With `--json`, `retainedSnapshotTags` lists them and
-`retainedSnapshotsExpiryEstimate` is the date.
+The text output then lists every kept object on its own
+`kept: <ref> (<class>)` line. With `--json`, `registryObjectsKept` lists
+each one as `{ "ref", "class" }`. A `ref` is `<repository>:<tag>`, or
+`<repository>@sha256:<digest>` for a manifest's own entry.
 
-Cloudflare stores a container's disk snapshot as tags in the image's
-registry repository. The ones seen so far are named `rootfs-snapshot-*` and
-`rootfs-set-*`. A target has them once it has slept or moved to a new Eve
-version. On 2026-11-18 Cloudflare's registry was observed answering `403`
-with `snapshot manifests cannot be deleted through this API` to deleting
-one. Cloudflare documents no way to delete a snapshot.
+Cloudflare's registry lists every tag of a repository, and one `sha256:`
+entry for every manifest, with or without a tag.
+`wrangler containers images list` shows only the tags. Eden reads the
+registry's own listing, asks Wrangler to delete each tag, and sends its own
+delete for each `sha256:` entry. An object is listed here only on the
+registry's own answer for that exact object; its name is never enough. All
+three answers were observed on 2026-11-18:
 
-Eden asks Wrangler to delete every tag of the target. When the registry
-answers Wrangler's delete with `403`, Eden repeats the delete for that same
-tag against the registry and reads the answer. Only a tag that gets exactly
-that answer is listed here.
-A tag with any other answer, and any other tag that is still there, fails
-destroy with [`EVE_DESTROY_IMAGES_RETAINED`](#eve_destroy_images_retained).
-That request goes straight to `registry.cloudflare.com` and never through a
+| `class` | The registry's answer to the delete | What the object is |
+| --- | --- | --- |
+| `refused-snapshot` | `403` with `snapshot manifests cannot be deleted through this API` | A container snapshot: its tags, seen so far as `rootfs-snapshot-*` and `rootfs-set-*`, and its manifest. A target has them once it has slept or moved to a new Eve version. |
+| `refused-singleton-artifact` | `409` with the code `SINGLETON_ARTIFACT_EXISTS` | An artifact of type `application/vnd.cloudchamber.btrfs-chain.v1`. Cloudflare makes one for each pushed image. |
+| `accepted-still-listed` | A `2xx` status, and the registry still lists the manifest 30 seconds later | An image manifest that has no tag. Seen for the earlier image of a repository that got a second push. |
+
+When the registry answers Wrangler's delete of a tag with `403`, Eden
+repeats the delete for that same tag against the registry and reads the
+answer. An object with any other answer, and anything else that is still
+listed, fails destroy with
+[`EVE_DESTROY_IMAGES_RETAINED`](#eve_destroy_images_retained). Eden's
+requests go straight to `registry.cloudflare.com` and never through a
 proxy. Where the registry cannot be reached that way, destroy fails with
 that code too.
 
-The Worker, its secrets and Durable Object data, the Container application,
-and every other tag are gone. A kept snapshot still holds the container's
-disk, including the agent's files. The date is an estimate: the day of the
-run plus 30 days. It holds when nothing restores the snapshot later, and
-nothing restores the snapshots of a destroyed target. Eden cannot see when
-Cloudflare removes one. To check after that date:
+The Worker, its secrets and Durable Object data, and the Container
+application are gone. There is nothing to retry. What is known about the
+kept objects:
+
+- A kept snapshot still holds the container's disk, including the agent's
+  files. Cloudflare documents that it removes a snapshot 30 days after it
+  was created or last restored, and nothing restores the snapshots of a
+  destroyed target. Eden cannot see when Cloudflare removes one.
+- `accepted-still-listed` says that Cloudflare accepted the delete and had
+  not removed the manifest when Eden stopped waiting. It does not say that
+  Cloudflare keeps the manifest for good. An image that still had its tag
+  left the listing about 15 seconds after the tag was deleted. An untagged
+  one was still listed 18 minutes after its delete was accepted.
+- An image manifest names the layers that hold the project's built code.
+  Cloudflare does not document what a chain artifact holds.
+- Not known: when Cloudflare removes chain artifacts and untagged
+  manifests, and whether kept objects count toward the 50 GB of image
+  storage per account in Cloudflare's Containers limits.
+
+To see what the registry lists for a repository, get a registry credential
+(valid for five minutes) and ask the registry with the `account_id` and
+`username` the credential command prints. Leave the password out of the
+command: curl asks for it, and you paste the `password` value at its
+prompt.
 
 ```sh
-npx wrangler@4.147.0 containers images list
+npx wrangler@4.147.0 containers registries credentials registry.cloudflare.com --push --pull --expiration-minutes 5 --json
+curl --noproxy '*' -u '<username>' 'https://registry.cloudflare.com/v2/<account_id>/<repository>/tags/list?n=1000'
 ```
 
-`eden deploy` reports the same warning, tags, and date when it removes a
+`eden deploy` reports the same warning and objects when it removes a
 superseded version's registry repository.
 
 ### `EVE_DESTROY_POINTER_UNCLEARED`
@@ -1318,6 +1348,12 @@ commands `eden destroy` itself runs.
    step 5 confirm it is gone. With any other answer the tag is unresolved:
    check that the Wrangler login can delete registry images.
 
+   Wrangler lists and deletes tags only. The registry also lists one
+   `sha256:` entry for each manifest; the `tags/list` command under
+   [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept) prints them. To delete one, send the same `DELETE` with
+   `sha256:<digest>` in place of the tag. That entry also names the three
+   answers with which Cloudflare keeps an object.
+
 5. Run the two list commands again. Confirm the Container application is
    gone, and that the repositories you proved in step 4 hold no tag apart
    from the ones that got the snapshot answer. A tag that Wrangler refused
@@ -1343,7 +1379,8 @@ npx wrangler@4.147.0 containers images list
 
 Require zero new Worker, Container, or managed-registry image residue
 associated with your target name. An unreachable URL alone is not sufficient
-cleanup evidence.
+cleanup evidence. `containers images list` shows tags only; the `tags/list`
+command under [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept) shows everything the registry lists for a repository.
 
 ## Indeterminate outcomes
 

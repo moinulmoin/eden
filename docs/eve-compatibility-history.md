@@ -4,6 +4,61 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## What the registry lists after destroy (2026-11-18)
+
+Read on macOS against the maintainer's Cloudflare account, with a registry
+credential from Wrangler `4.147.0`, between `14:33Z` and `15:13Z`. These
+observations are why destroy now reads the registry's own listing and
+deletes entries by digest.
+
+- `GET /v2/_catalog?tags=true` and `GET /v2/<account>/<repository>/tags/list`
+  list each tag and one `sha256:<digest>` entry for each manifest.
+  `wrangler containers images list` leaves the `sha256:` entries out: the
+  catalog had 142 repositories, Wrangler listed 15. `tags/list` pages with
+  `n` and `last`, in sorted order, and a page after the last entry is
+  empty. A repository the registry does not know lists as `200` with no
+  entries.
+- The two live-check targets destroyed earlier that day each still listed
+  twelve entries in the repository of their Eve `0.91.0` version: six
+  snapshot tags, three snapshot manifests, two artifacts of type
+  `application/vnd.cloudchamber.btrfs-chain.v1`, and one image manifest
+  with no tag. The untagged image was the first one pushed to a repository
+  that later got a second push.
+- `DELETE` of a snapshot manifest by digest answered `403` with
+  `{"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}`,
+  as for a snapshot tag.
+- `DELETE` of a chain artifact by digest answered `409` with
+  `{"code":"SINGLETON_ARTIFACT_EXISTS","subjectDigest":"sha256:…","artifactType":"application/vnd.cloudchamber.btrfs-chain.v1","committedDigest":"sha256:…"}`.
+  The answer was the same right after the registry accepted the delete of
+  the image the artifact names as its subject.
+- `DELETE` of an untagged image manifest by digest answered `204`, and the
+  manifest stayed. One was deleted at `14:55:23Z`; at `15:13:19Z` `HEAD` on
+  its digest still answered `200` and the listing still had it. A second
+  one, deleted at `15:11:56Z`, was still listed at `15:13:19Z`.
+  `PUT /v2/gc/layers` afterwards answered `200` with an empty `deleted`
+  list. Putting a new tag on such a manifest and deleting that tag with
+  `wrangler containers images delete` printed `Deleted` and left the
+  manifest listed.
+- During the run on target `eden-live-20261118-17bac346`, the image that
+  held the `candidate` tag left the listing about 15 seconds after destroy
+  deleted the tag.
+- Dated from their configs at `14:58Z`, the account's untagged entries were
+  34 image manifests (oldest 2026-10-07), 188 chain artifacts (oldest
+  2026-10-06), and 99 snapshot manifests (oldest 2026-10-06). 18 of the
+  snapshot manifests were created more than 30 days earlier; when a
+  snapshot was last restored cannot be read.
+
+Not known: when Cloudflare removes chain artifacts and untagged manifests,
+and whether kept objects count toward the 50 GB of image storage per
+account in Cloudflare's limits. Cloudflare's image-management and limits
+pages do not say.
+
+Not run on Cloudflare yet: destroy with this change. It was checked with a
+stand-in for Wrangler and the registry: each of the three kept answers, an
+accepted delete that leaves the listing, any other answer, an entry that
+appears during cleanup, entries that keep appearing, a listing in several
+pages, and a listing that cannot be read.
+
 ## Destroy with a bounded wait on the registry (2026-11-18)
 
 Run on macOS with Docker, against the maintainer's Cloudflare account, with

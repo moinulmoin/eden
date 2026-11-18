@@ -178,13 +178,18 @@ npx @moinulmoin/eden destroy --name <name> --json
   a request that already says to tear the agent down counts. Destroy deletes
   the agent immediately, even mid-conversation, and with the Cloudflare World
   also its stored sessions. An external Postgres database is not touched.
-- A successful `destroy` may carry `warnings` with `EVE_SNAPSHOTS_RETAINED`.
-  Cloudflare's registry refuses to delete container snapshots, so those
-  registry tags stay, and they still hold the agent's files. Tell the user
-  what `retainedSnapshotTags` lists and that
-  `retainedSnapshotsExpiryEstimate` is an estimate (the run's date plus 30
-  days), not a confirmation. There is nothing to retry. `deploy` can carry
-  the same warning and fields after it removes a superseded version.
+- A successful `destroy` may carry `warnings` with
+  `EVE_REGISTRY_OBJECTS_KEPT`. Cloudflare's registry keeps some objects
+  after Eden deletes everything it lists. `registryObjectsKept` has one
+  `{ ref, class }` per object. `refused-snapshot`: a container snapshot,
+  which still holds the agent's files; Cloudflare documents that it removes
+  one 30 days after it was created or last restored. `refused-singleton-artifact`:
+  an artifact Cloudflare makes for each image. `accepted-still-listed`: an
+  untagged image manifest whose delete Cloudflare accepted and has not
+  carried out yet. Tell the user what is listed and that Eden does not know
+  when Cloudflare removes the last two kinds. There is nothing to retry.
+  `deploy` can carry the same warning and field after it removes a
+  superseded version.
 
 ## Verify
 

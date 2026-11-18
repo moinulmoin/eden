@@ -7,6 +7,7 @@
 // target stays. A killed process (SIGKILL) cleans up nothing. See
 // docs/validation.md.
 
+import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
@@ -545,6 +546,30 @@ async function wrangler(args) {
   return run(wranglerCli, args, { timeoutMs: 120_000, interruptible: false });
 }
 
+// What Cloudflare's registry itself lists for this run's repositories: each
+// tag, and one sha256 entry per manifest. Wrangler's image list leaves the
+// sha256 entries out.
+async function registryRefs() {
+  const minted = await wrangler(["containers", "registries", "credentials", "registry.cloudflare.com", "--push", "--pull", "--expiration-minutes", "5", "--json"]);
+  if (minted.code !== 0) throw new Error("wrangler containers registries credentials failed: " + tail(minted.stderr, 3));
+  const credential = JSON.parse(minted.stdout);
+  secrets.push(credential.password);
+  const headers = { authorization: "Basic " + Buffer.from(credential.username + ":" + credential.password).toString("base64") };
+  const refs = [];
+  let last = "";
+  for (let page = 0; page < 50; page += 1) {
+    const response = await fetch("https://registry.cloudflare.com/v2/_catalog?tags=true" + (last === "" ? "" : "&last=" + encodeURIComponent(last)), { headers });
+    if (!response.ok) throw new Error("the registry catalog answered HTTP " + response.status);
+    for (const [name, entries] of Object.entries((await response.json()).repositories)) {
+      const repository = name.slice(name.indexOf("/") + 1);
+      if (repository.includes(target)) refs.push(...entries.map((entry) => repository + (entry.startsWith("sha256:") ? "@" : ":") + entry));
+    }
+    last = decodeURIComponent(/[?&]last=([^&>;\s]*)[^,]*;\s*rel="?next/u.exec(response.headers.get("link") ?? "")?.[1] ?? "");
+    if (last === "") return refs;
+  }
+  throw new Error("the registry catalog did not end after 50 pages");
+}
+
 // Read-only checks, each filtered to this run's exact temporary name.
 async function verifyGone() {
   const problems = [];
@@ -564,22 +589,21 @@ async function verifyGone() {
   if (containers.code !== 0) problems.push("wrangler containers list failed: " + tail(containers.stderr, 3));
   else if (containers.stdout.includes(target)) problems.push("a Container application for " + target + " remains");
   else notes.push("no Container application");
-  const images = await wrangler(["containers", "images", "list", "--json"]);
-  if (images.code !== 0) problems.push("wrangler containers images list failed: " + tail(images.stderr, 3));
+  // Only the exact objects destroy reported as kept may remain.
+  const refs = await registryRefs().catch((error) => String(error.message ?? error));
+  if (typeof refs === "string") problems.push("the registry's listing could not be read: " + refs);
   else {
-    // Only the exact tags destroy reported as refused snapshots may remain.
-    // This sees tags, not untagged registry entries.
-    const refs = JSON.parse(images.stdout).flatMap((image) => image.name.includes(target) ? image.tags.map((tag) => image.name + ":" + tag) : []);
-    const unexpected = refs.filter((ref) => !retainedSnapshotTags.includes(ref));
-    if (unexpected.length > 0) problems.push("registry tag(s) remain that destroy did not report as refused snapshots: " + unexpected.join(", "));
-    else notes.push(refs.length === 0 ? "no registry tag" : "no registry tag except the " + refs.length + " snapshot tag(s) destroy reported");
+    const reported = registryObjectsKept.map((object) => object.ref);
+    const unexpected = refs.filter((ref) => !reported.includes(ref));
+    if (unexpected.length > 0) problems.push("the registry still lists object(s) that destroy did not report as kept: " + unexpected.join(", "));
+    else notes.push(refs.length === 0 ? "nothing in the registry's listing" : "nothing in the registry's listing except the " + refs.length + " object(s) destroy reported as kept");
   }
   if (problems.length > 0) throw new Error(problems.join("; "));
   return notes.join(", ");
 }
 
 let deployStarted = false;
-let retainedSnapshotTags = [];
+let registryObjectsKept = [];
 let failure;
 log("Live Cloudflare check: target " + target + ", Eve " + options.eve + (summary.upgradedTo === null ? "" : " -> " + options.upgradeTo) + ", work folder " + workRoot);
 
@@ -673,11 +697,10 @@ try {
     try {
       await step("eden destroy", async () => {
         const output = await eden("destroy", { withEnvFile: false, interruptible: false });
-        retainedSnapshotTags = output.retainedSnapshotTags ?? [];
-        if (retainedSnapshotTags.length === 0) return undefined;
-        summary.retainedSnapshotTags = retainedSnapshotTags;
-        summary.retainedSnapshotsExpiryEstimate = output.retainedSnapshotsExpiryEstimate;
-        return "Cloudflare's registry refused to delete " + retainedSnapshotTags.length + " snapshot tag(s); estimated removal by " + output.retainedSnapshotsExpiryEstimate + " if nothing restores them:\n" + retainedSnapshotTags.join("\n");
+        registryObjectsKept = output.registryObjectsKept ?? [];
+        if (registryObjectsKept.length === 0) return undefined;
+        summary.registryObjectsKept = registryObjectsKept;
+        return "Cloudflare's registry still lists " + registryObjectsKept.length + " object(s) that destroy tried to delete:\n" + registryObjectsKept.map((object) => object.ref + " (" + object.class + ")").join("\n");
       });
       await step("Nothing of the target remains", verifyGone);
       cleaned = true;

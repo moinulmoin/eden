@@ -7,30 +7,43 @@ needed no change.
 
 ### Fixed
 
-- `eden destroy` succeeds again on a target that has container snapshots.
-  On 2026-11-18 Cloudflare's registry was observed refusing to delete
-  snapshot tags, so destroy removed everything else and then failed with
-  `EVE_DESTROY_IMAGES_RETAINED` on every retry. Destroy still asks Wrangler
-  to delete every tag. When the registry answers a delete with `403`, it
-  repeats that delete against the registry and reads the answer. That
-  request never uses a proxy, and requests that get no answer may take 60
-  seconds in total; the failure's remediation says to rerun from a machine
-  that reaches `registry.cloudflare.com` directly. A tag whose answer is
-  the registry's
-  snapshot refusal is listed in the new warning `EVE_SNAPSHOTS_RETAINED`,
-  and destroy ends with `destroyed` when such tags are all that is left.
-  `eden destroy --json` then adds `warnings`, `retainedSnapshotTags`, and
-  `retainedSnapshotsExpiryEstimate`. The date is Eden's estimate, the day of
-  the run plus the 30 days Cloudflare documents, and not a confirmation. A
-  kept snapshot still holds the agent's files until Cloudflare removes it.
-  Any other tag left behind, and any other answer, still fails with
-  `EVE_DESTROY_IMAGES_RETAINED`.
-- `eden deploy` handles the same refusal when it removes a superseded
-  version's registry repository: `VAL-LIFE-007` passes, and the result adds
-  `EVE_SNAPSHOTS_RETAINED`, `retainedSnapshotTags`, and
-  `retainedSnapshotsExpiryEstimate`. When another tag is left as well,
-  `VAL-LIFE-007` fails and the result still lists the snapshot tags the
-  registry refused.
+- `eden destroy` succeeds again on a target that has container snapshots,
+  and it now deletes registry entries that have no tag. On 2026-11-18
+  Cloudflare's registry was observed refusing to delete snapshot tags, so
+  destroy removed everything else and then failed with
+  `EVE_DESTROY_IMAGES_RETAINED` on every retry. The registry also lists one
+  entry for each manifest, with or without a tag, and
+  `wrangler containers images list` does not show those, so destroy left
+  untagged manifests behind without saying so. Destroy now reads the
+  registry's own listing, asks Wrangler to delete every tag, and deletes
+  every other entry by digest with a request of its own. An entry that
+  appears while it runs gets its own delete, for at most three passes over
+  a repository.
+- Cloudflare keeps three kinds of registry object, and destroy reports each
+  one in the new warning `EVE_REGISTRY_OBJECTS_KEPT`, only on the
+  registry's own answer for that object: a container snapshot
+  (`refused-snapshot`, `403`), the chain artifact Cloudflare makes for each
+  pushed image (`refused-singleton-artifact`, `409` with
+  `SINGLETON_ARTIFACT_EXISTS`), and an untagged image manifest whose delete
+  the registry accepted and which it still lists 30 seconds later
+  (`accepted-still-listed`). Destroy ends with `destroyed` when such
+  objects are all that is left, and `eden destroy --json` then adds
+  `warnings` and `registryObjectsKept`. A kept snapshot still holds the
+  agent's files until Cloudflare removes it, which Cloudflare documents as
+  30 days after it was created or last restored. When Cloudflare removes
+  the other two kinds is not known. Anything else left behind, and any
+  other answer, still fails with `EVE_DESTROY_IMAGES_RETAINED`.
+- Eden's registry requests never use a proxy, and requests that get no
+  answer may take 60 seconds in total. Where this machine cannot reach
+  `registry.cloudflare.com` directly, destroy cannot read the listing: it
+  deletes the Worker and the Container application and fails with
+  `EVE_DESTROY_IMAGES_RETAINED`, whose remediation says to rerun from a
+  machine that can.
+- `eden deploy` cleans up a superseded version's registry repository the
+  same way: `VAL-LIFE-007` passes, and the result adds
+  `EVE_REGISTRY_OBJECTS_KEPT` and `registryObjectsKept`. When something
+  else is left as well, `VAL-LIFE-007` fails and the result still lists the
+  objects the registry kept.
 - Two Eden builds can run at the same time on one Docker host. Before, both
   picked local port 4310 for the boot check. The second failed with
   `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.
