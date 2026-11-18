@@ -55,16 +55,17 @@ const pnpm = (cwd, ...args) => command("corepack", ["pnpm", ...args], { cwd });
  * Eden installs a project from its lockfile inside a Docker build, so the
  * workspace World has to come from a URL that build can reach: the host's
  * loopback through OrbStack or Docker Desktop on macOS, the bridge gateway on
- * Linux.
+ * Linux. The live Cloudflare check uses this too, with a signal that stops
+ * the two commands when the check is interrupted.
  */
-async function serveWorldTarball(directory) {
-  await pnpm(worldRoot, "pack", "--pack-destination", directory);
+export async function serveWorldTarball(directory, signal) {
+  await command("corepack", ["pnpm", "pack", "--pack-destination", directory], { cwd: worldRoot, signal });
   const [tarball] = readdirSync(directory).filter((name) => name.endsWith(".tgz"));
   assert(tarball !== undefined, "pnpm pack did not write the Cloudflare World tarball.");
   const bytes = readFileSync(join(directory, tarball));
   const linux = process.platform === "linux";
   const bind = linux
-    ? (await docker("network", "inspect", "bridge", "--format", "{{(index .IPAM.Config 0).Gateway}}")).stdout.trim()
+    ? (await command("docker", ["network", "inspect", "bridge", "--format", "{{(index .IPAM.Config 0).Gateway}}"], { signal })).stdout.trim()
     : "127.0.0.1";
   assert(bind.length > 0, "Could not read the Docker bridge gateway address.");
   const server = createServer((request, response) => {
@@ -79,10 +80,16 @@ async function serveWorldTarball(directory) {
     server.listen(0, bind, resolvePromise);
   });
   const { port } = server.address();
+  const hostUrl = "http://" + bind + ":" + port + "/" + tarball;
+  const dockerUrl = "http://" + (linux ? bind : "host.docker.internal") + ":" + port + "/" + tarball;
   return {
-    // pnpm writes the lockfile on the host; Eden's build reads it in Docker.
-    hostUrl: "http://" + bind + ":" + port + "/" + tarball,
-    dockerUrl: "http://" + (linux ? bind : "host.docker.internal") + ":" + port + "/" + tarball,
+    hostUrl,
+    // The package manager writes the manifest and lockfile on the host;
+    // Eden's build reads them in Docker. Rewrites them for the given reader.
+    pointAt(reader, ...paths) {
+      const [from, to] = reader === "docker" ? [hostUrl, dockerUrl] : [dockerUrl, hostUrl];
+      for (const path of paths) writeFileSync(path, readFileSync(path, "utf8").replaceAll(from, to));
+    },
     close: () => new Promise((resolvePromise) => server.close(resolvePromise)),
   };
 }
@@ -106,9 +113,7 @@ async function installWorld(project, tarball) {
   manifest.dependencies[worldName] = tarball.hostUrl;
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
   await pnpm(project, "install", "--lockfile-only");
-  for (const path of [manifestPath, join(project, "pnpm-lock.yaml")]) {
-    writeFileSync(path, readFileSync(path, "utf8").replaceAll(tarball.hostUrl, tarball.dockerUrl));
-  }
+  tarball.pointAt("docker", manifestPath, join(project, "pnpm-lock.yaml"));
 }
 
 async function preflight(cli, fixture, project, envFile) {

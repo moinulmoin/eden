@@ -76,7 +76,9 @@ What the Worker does for you:
 - Returns `404` for Eve's internal workflow queue routes
   (`/.well-known/workflow/v1/flow` and `/step`) and for `/__eden/world/*`.
   Eve's own queue deliveries reach the container through an internal path
-  instead, so the public routes are never needed.
+  instead, so the public routes are never needed. The Cloudflare World
+  relies on this: it declares `queueAuthMode: "skip"`, so Eve does not
+  authenticate queue deliveries itself.
 - Still forwards token-bearing `webhook/<token>` routes and `manifest.json`,
   which Eve protects itself.
 - Removes headers a client could spoof: `forwarded`, `x-real-ip`,

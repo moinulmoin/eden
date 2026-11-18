@@ -14,7 +14,7 @@ type RpcResult = { ok: true; result: unknown } | {
 };
 
 /** A Node-side World whose durable state lives in Eden's SQLite Durable Object. */
-export function createWorld(options: CloudflareWorldOptions = {}): World {
+export function createWorld(options: CloudflareWorldOptions = {}): World & { queueAuthMode: "skip" } {
   const url = options.url ?? process.env.EDEN_WORLD_URL;
   if (!url) throw new Error("EDEN_WORLD_URL must be set to the Eden World RPC URL");
   const endpoint = new URL(url).toString();
@@ -98,6 +98,10 @@ export function createWorld(options: CloudflareWorldOptions = {}): World {
     hooks: methods<World["hooks"]>("hooks", ["get", "getByToken", "list"]),
     streams,
     getDeploymentId: async () => deploymentId(),
+    // Read by Workflow SDK 5.2 and later. Eve has no delivery key to check:
+    // Eden's Worker closes the workflow routes to the internet and Eden's
+    // Durable Objects deliver queue messages to the container themselves.
+    queueAuthMode: "skip",
     queue: (queueName, message, opts) => {
       const sourceDeploymentId = deploymentId();
       // Run invocations resolve their durable pin in World. Control messages
