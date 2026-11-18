@@ -11,8 +11,12 @@ needed no change.
   On 2026-11-18 Cloudflare's registry was observed refusing to delete
   snapshot tags, so destroy removed everything else and then failed with
   `EVE_DESTROY_IMAGES_RETAINED` on every retry. Destroy still asks Wrangler
-  to delete every tag. When a delete fails, it repeats that delete against
-  the registry and reads the answer. A tag whose answer is the registry's
+  to delete every tag. When the registry answers a delete with `403`, it
+  repeats that delete against the registry and reads the answer. That
+  request never uses a proxy, and requests that get no answer may take 60
+  seconds in total; the failure's remediation says to rerun from a machine
+  that reaches `registry.cloudflare.com` directly. A tag whose answer is
+  the registry's
   snapshot refusal is listed in the new warning `EVE_SNAPSHOTS_RETAINED`,
   and destroy ends with `destroyed` when such tags are all that is left.
   `eden destroy --json` then adds `warnings`, `retainedSnapshotTags`, and

@@ -713,7 +713,9 @@ and boot container. Never use broad Docker cleanup.
 tags. Do not retry the deployment and do not run broad registry cleanup.
 A tag that Cloudflare's registry refuses to delete as a snapshot does not
 fail this check; it is reported as
-[`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained).
+[`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained). Eden confirms that
+refusal with a direct request to `registry.cloudflare.com` and never uses a
+proxy for it. Where the registry cannot be reached directly, the check fails.
 
 ## Updates
 
@@ -1135,6 +1137,16 @@ as a snapshot is not counted here; see
 code for any other tag that is left, for a tag whose delete failed with any
 other answer, and when it could not list what is left.
 
+Destroy also fails with this code when it cannot confirm a snapshot refusal.
+To confirm one, Eden sends its own request straight to
+`registry.cloudflare.com` and never uses a proxy for it. If this machine
+reaches the internet only through a proxy, or the registry does not answer,
+the snapshot tags stay unconfirmed. Destroy still asks Wrangler to delete
+every tag, and waits at most 60 seconds in total for registry requests that
+get no answer. Run `eden destroy` again, with the same selectors and the
+same `.eden` folder, from a machine that can reach
+`registry.cloudflare.com` directly.
+
 ### `EVE_SNAPSHOTS_RETAINED`
 
 A warning, not a failure. `eden destroy` still ends with `destroyed` and
@@ -1156,9 +1168,10 @@ version. On 2026-11-18 Cloudflare's registry was observed answering `403`
 with `snapshot manifests cannot be deleted through this API` to deleting
 one. Cloudflare documents no way to delete a snapshot.
 
-Eden asks Wrangler to delete every tag of the target. For each delete that
-fails, it repeats the delete for that same tag against the registry and
-reads the answer. Only a tag that gets exactly that answer is listed here.
+Eden asks Wrangler to delete every tag of the target. When the registry
+answers Wrangler's delete with `403`, Eden repeats the delete for that same
+tag against the registry and reads the answer. Only a tag that gets exactly
+that answer is listed here.
 A tag with any other answer, and any other tag that is still there, fails
 destroy with [`EVE_DESTROY_IMAGES_RETAINED`](#eve_destroy_images_retained).
 That request goes straight to `registry.cloudflare.com` and never through a
@@ -1231,19 +1244,41 @@ commands `eden destroy` itself runs.
 
 4. Delete the registry images. Eden's repositories for the target start with
    `eden-eve-<environment>-<name>-`. Delete every tag of each one, whatever
-   its name. Wrangler asks you to confirm each deletion. Cloudflare's
-   registry refuses to delete a container snapshot: for a snapshot tag (seen
-   so far as `rootfs-snapshot-*` and `rootfs-set-*`) Wrangler prints
-   `403 Forbidden`. Note the tags it refuses. Cloudflare documents that it
-   removes a snapshot 30 days after it was created or last restored.
+   its name. Wrangler asks you to confirm each deletion.
 
    ```sh
    npx wrangler@4.147.0 containers images list
    npx wrangler@4.147.0 containers images delete <repository>:<tag>
    ```
 
+   Cloudflare's registry refuses to delete a container snapshot (seen so far
+   as tags named `rootfs-snapshot-*` and `rootfs-set-*`), and Wrangler then
+   prints only `403 Forbidden`. That line does not say why: a missing
+   permission prints the same. A tag's name does not say why either. Treat
+   every tag Wrangler refuses as unresolved until the registry itself gives
+   the snapshot answer for that tag. To read it, get a registry credential
+   (valid for five minutes) and repeat the delete with the `account_id`,
+   `username`, and `password` it prints:
+
+   ```sh
+   npx wrangler@4.147.0 containers registries credentials registry.cloudflare.com --push --pull --expiration-minutes 5 --json
+   curl -X DELETE -u '<username>:<password>' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<tag>
+   ```
+
+   Only this answer means Cloudflare keeps the tag as a snapshot:
+
+   ```json
+   {"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}
+   ```
+
+   Cloudflare documents that it removes a snapshot 30 days after it was
+   created or last restored. With any other answer the tag is still yours to
+   remove: check that the Wrangler login can delete registry images, then
+   delete it again.
+
 5. Run the two list commands again and confirm nothing with the target name
-   is left, apart from the snapshot tags Wrangler refused in step 4. Delete
+   is left, apart from the tags that got the snapshot answer in step 4. A
+   tag that Wrangler refused without that answer is not cleaned up. Delete
    any other tag the list shows for the target, whatever its name. Confirm
    the Worker is gone too; this command must fail with
    `This Worker does not exist on your account. [code: 10007]`:
