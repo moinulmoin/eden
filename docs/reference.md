@@ -146,10 +146,11 @@ instance and image (including legacy), and the registry repositories this
 target pushed. It proves absence before clearing the target's `CURRENT`
 pointer, and never deletes by prefix or a broad account search.
 
-Cloudflare does not allow deleting container snapshots. When the target has
-any, destroy still succeeds and adds the warning `EVE_SNAPSHOTS_RETAINED`,
-which lists the snapshot tags left in the registry and the date by which
-Cloudflare removes them.
+Cloudflare does not allow deleting container snapshots. When the only tags
+left in the registry are snapshot tags that Cloudflare refused to delete,
+destroy still succeeds and adds the warning `EVE_SNAPSHOTS_RETAINED`, with
+those tags and the date by which Cloudflare removes them. Any other tag left
+behind fails destroy with `EVE_DESTROY_IMAGES_RETAINED`.
 
 Destroy reads the local deployment records and the Cloudflare account, and
 changes both: it deletes the owned resources even when sessions have not
@@ -628,7 +629,8 @@ A successful destroy ends with:
 ```
 
 When Cloudflare keeps the target's snapshot tags, a
-`! EVE_SNAPSHOTS_RETAINED — <message>` warning line comes before it.
+`! EVE_SNAPSHOTS_RETAINED — <message>` warning line and one
+`  kept: <repository>:<tag>` line per tag come before it.
 
 A target that was already absent prints `✓ <name> (<environment>) is already
 absent — nothing removed`, followed by the same `  retained: local deployment
@@ -687,7 +689,7 @@ the command produced them.
 | `environment` | `"preview"` or `"production"` | |
 | `name` | string | The exact target name |
 | `checks` | array | Same shape as the preflight and deploy checks |
-| `warnings` | array, when Cloudflare keeps snapshot tags | One `EVE_SNAPSHOTS_RETAINED` entry with `id`, `message`, and `remediation` |
+| `warnings` | array, on a successful destroy when Cloudflare keeps snapshot tags | One `EVE_SNAPSHOTS_RETAINED` entry with `id`, `message`, and `remediation` |
 | `retainedSnapshotTags` | array of strings, with that warning | Each kept tag as `<repository>:<tag>` |
 | `retainedSnapshotsExpireBy` | string, with that warning | The UTC date (`YYYY-MM-DD`) by which Cloudflare removes them |
 

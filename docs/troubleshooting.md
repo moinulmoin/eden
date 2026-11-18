@@ -1139,13 +1139,16 @@ different answer, or when it could not list what is left.
 A warning, not a failure. `eden destroy` still ends with `destroyed` and
 exit code `0`:
 
-> Cloudflare keeps <n> container snapshot tag(s): <repository:tag>, …
-> Cloudflare does not allow deleting snapshots. It removes each one 30 days
-> after it was created or last restored, so by <date> at the latest.
+> Cloudflare keeps <n> container snapshot tag(s) of this target. Cloudflare
+> does not allow deleting snapshots. It removes each one 30 days after it
+> was created or last restored, so by <date> at the latest.
+
+The text output then lists every kept tag on its own `kept: <repository:tag>`
+line.
 
 Cloudflare stores a container's disk snapshot as `rootfs-snapshot-*` and
 `rootfs-set-*` tags in the image's registry repository. A target has them
-once it has slept or moved to a new Eve version. Since 2026-11-18
+once it has slept or moved to a new Eve version. As of 2026-11-18
 Cloudflare's registry answers `403 Forbidden` (`snapshot manifests cannot be
 deleted through this API`) to deleting one, and Cloudflare offers no other
 way to delete a snapshot. The Worker, its secrets and Durable Object data,
@@ -1232,7 +1235,9 @@ commands `eden destroy` itself runs.
    ```
 
 5. Run the two list commands again and confirm nothing with the target name
-   is left, apart from `rootfs-*` tags. Confirm the Worker is gone too; this command must fail with
+   is left, apart from `rootfs-snapshot-*` and `rootfs-set-*` tags. Delete
+   any other tag the list shows for the target. Confirm the Worker is gone
+   too; this command must fail with
    `This Worker does not exist on your account. [code: 10007]`:
 
    ```sh

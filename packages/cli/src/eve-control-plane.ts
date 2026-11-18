@@ -1323,6 +1323,9 @@ function humanEveDestroyLines(
       lines.push(`  → ${safeText(warning.remediation)}`);
     }
   }
+  for (const ref of outcome.retainedSnapshotTags ?? []) {
+    lines.push(`  kept: ${safeText(ref)}`);
+  }
   const elapsed = formatEveElapsed(startedAt);
   if (outcome.ok) {
     lines.push(
@@ -5238,7 +5241,7 @@ function retainedSnapshots(kept: readonly string[], unit: "tags" | "repositories
 } {
   const expireBy = new Date(Date.now() + SNAPSHOT_RETENTION_DAYS * 86_400_000).toISOString().slice(0, 10);
   const what = unit === "tags"
-    ? `${kept.length} container snapshot tag(s): ${kept.join(", ")}`
+    ? `${kept.length} container snapshot tag(s) of this target`
     : `the container snapshot tags of ${kept.length} superseded image repository(ies): ${kept.join(", ")}`;
   return {
     warning: {
@@ -5296,7 +5299,7 @@ async function registryRefusesSnapshotDeletes(
  * Returns a runner that deletes every tag in an owned registry repository —
  * the `candidate` tag Eden pushed plus any `rootfs-snapshot-*`/`rootfs-set-*`
  * tags container snapshots created under the source image repository. Each
- * tag is deleted individually. Since 2026-11-18 Cloudflare's registry refuses
+ * tag is deleted individually. As of 2026-11-18 Cloudflare's registry refuses
  * to delete a snapshot tag; when those are all that is left, the outcome is
  * `snapshots-retained`. After the registry gives that answer once, the runner
  * asks for no other snapshot tag, in this or a later repository.

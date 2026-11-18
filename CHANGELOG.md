@@ -8,7 +8,7 @@ needed no change.
 ### Fixed
 
 - `eden destroy` succeeds again on a target that has slept or moved to a new
-  Eve version. Since 2026-11-18 Cloudflare's registry refuses to delete
+  Eve version. As of 2026-11-18 Cloudflare's registry refuses to delete
   container snapshot tags (`rootfs-snapshot-*`, `rootfs-set-*`), so destroy
   removed everything else and then failed with `EVE_DESTROY_IMAGES_RETAINED`
   on every retry. Destroy now ends with `destroyed` and the new warning

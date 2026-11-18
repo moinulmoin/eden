@@ -29,9 +29,12 @@ Wrangler uses:
   time-to-live that each restore refreshes. Its Containers changelog had no
   entry about the refusal; the newest entry was dated 2026-09-30.
 
-So this is a rule of Cloudflare's registry, not an incident and not a
-missing permission. It is new since the run on 2026-11-17, which ended with
-no registry image after an upgrade and a sleep.
+The answer names snapshot manifests, it was the same for every snapshot tag
+tried over these hours, and the same credentials deleted other tags. That
+points to a rule of Cloudflare's registry and not to a missing permission.
+Cloudflare has not announced one, and these checks cannot rule out a fault
+on its side. The run on 2026-11-17, with an upgrade and a sleep, ended with
+no registry tag for its target.
 
 `eden destroy` on the two targets the earlier runs left behind:
 
@@ -42,7 +45,8 @@ no registry image after an upgrade and a sleep.
 - `eden-live-20261118-aea2c928`, without `--json`, `11:23:28Z` to
   `11:24:54Z`: exit code 0. It printed
   `! EVE_SNAPSHOTS_RETAINED — Cloudflare keeps 8 container snapshot tag(s): …`
-  with the eight tags and the date 2026-12-18, then
+  with the eight tags and the date 2026-12-18 (the text output has since
+  changed to one `kept:` line per tag), then
   `✓ destroyed eden-live-20261118-aea2c928 (preview) in 86s`.
 
 Full run of `pnpm run check:live`, target `eden-live-20261118-09054fc8`,
@@ -155,7 +159,7 @@ every delete of a `rootfs-snapshot-*` or `rootfs-set-*` tag, from
 `wrangler containers images delete` with Wrangler `4.147.0` and `4.164.0`,
 for 30 minutes after the first run. No `candidate` tag was left. The run
 on 2026-11-17 ended with no registry image after an upgrade and a sleep, so
-this is new since then. Three repositories with ten such tags stayed in the
+this was not seen then. Three repositories with ten such tags stayed in the
 account: two from the first target and one from the second. The second
 target had the default one hour idle window; its two tags are in the
 repository of its Eve `0.91.0` version. Cloudflare's snapshot guide says
