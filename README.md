@@ -284,7 +284,9 @@ eden destroy --name my-eve-preview
 
 Destroy always requires an explicit `--name` and Eden's ownership record. It
 verifies the remote identity first and never touches similarly named
-resources.
+resources. Cloudflare's registry refuses to delete container snapshots;
+destroy lists any that remain and estimates when Cloudflare removes them
+(about 30 days). Until then they still hold the agent's files.
 
 **Troubleshoot** with `eden preflight`, which builds and boots the agent
 locally and checks Cloudflare access without changing anything on Cloudflare.

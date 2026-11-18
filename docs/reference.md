@@ -146,6 +146,13 @@ instance and image (including legacy), and the registry repositories this
 target pushed. It proves absence before clearing the target's `CURRENT`
 pointer, and never deletes by prefix or a broad account search.
 
+Cloudflare's registry refuses to delete container snapshots. Destroy asks
+for every tag to be deleted. When the only tags left are ones the registry
+refused as snapshots, destroy still succeeds and adds the warning
+`EVE_SNAPSHOTS_RETAINED` with those exact tags and an estimated removal
+date. Any other tag left behind fails destroy with
+`EVE_DESTROY_IMAGES_RETAINED`.
+
 Destroy reads the local deployment records and the Cloudflare account, and
 changes both: it deletes the owned resources even when sessions have not
 drained, and removes the local `CURRENT` pointer. Local deployment records
@@ -439,6 +446,11 @@ projects with the same name in different accounts do not share a repository.
 The published image reference is the repository pinned to an immutable
 `sha256:` digest.
 
+Cloudflare adds tags to a repository when it stores a snapshot of the
+container's disk. The ones seen so far are named `rootfs-snapshot-*` and
+`rootfs-set-*`. Its registry refuses to delete them. Cloudflare documents
+that it removes a snapshot 30 days after it was created or last restored.
+
 The Worker is published with `compatibility_date` `2026-04-01`, the
 `enable_ctx_exports` compatibility flag, and `workers_dev` enabled. The
 Container runs on the `standard-1` instance type (1/2 vCPU, 4 GiB) with the
@@ -618,6 +630,11 @@ A successful destroy ends with:
   retained: local deployment records under .eden/eve-deploy
 ```
 
+When Cloudflare's registry refused to delete snapshot tags, a
+`! EVE_SNAPSHOTS_RETAINED — <message>` warning line and one
+`  kept: <repository>:<tag>` line per tag come before it. A deploy that
+removes a superseded version's registry repository prints the same lines.
+
 A target that was already absent prints `✓ <name> (<environment>) is already
 absent — nothing removed`, followed by the same `  retained: local deployment
 records under .eden/eve-deploy` line.
@@ -663,6 +680,8 @@ the command produced them.
 | `name` | string | The exact target name |
 | `checks` | array | `id`, `status` (`passed`, `failed`, `blocked`, `skipped`), `message`, and `remediation` when present |
 | `warnings` | array | `id`, `message`, and `remediation` when present |
+| `retainedSnapshotTags` | array of strings, on deploy with the warning `EVE_SNAPSHOTS_RETAINED` | Each tag of a superseded version's repository that the registry refused to delete as a snapshot, as `<repository>:<tag>` |
+| `retainedSnapshotsExpiryEstimate` | string, with those tags | The same estimated date as on destroy |
 | `candidate` | object or `null` | `generationId`, `sourceDigest`, `outputDigest`, and `imageDigest` when the image was built |
 | `deployment` | object, on deploy | `status`, `operation` (`create` or `update`), `targetKey`, `deploymentId`, `workerName`, `containerApplicationName`, `stableContainerInstanceName`, `stableWorkersDevOrigin`, `imageReference`, `supersededGenerationId` and `supersededImageReference` on an update, `runtimeVariableNames`, and `evidenceRetained` |
 
@@ -675,5 +694,8 @@ the command produced them.
 | `environment` | `"preview"` or `"production"` | |
 | `name` | string | The exact target name |
 | `checks` | array | Same shape as the preflight and deploy checks |
+| `warnings` | array, only on a successful destroy that leaves snapshot tags | One `EVE_SNAPSHOTS_RETAINED` entry with `id`, `message`, and `remediation` |
+| `retainedSnapshotTags` | array of strings, with that warning | Each tag the registry refused to delete as a snapshot, as `<repository>:<tag>`. No other tag is left |
+| `retainedSnapshotsExpiryEstimate` | string, with that warning | A UTC date (`YYYY-MM-DD`): the day of the run plus 30 days. An estimate that assumes nothing restores a snapshot later, not a confirmation that Cloudflare removed anything |
 
 Return to the [documentation index](./README.md).

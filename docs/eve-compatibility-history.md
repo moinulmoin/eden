@@ -4,6 +4,115 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Destroy when Cloudflare's registry refuses snapshot tags (2026-11-18)
+
+Run on macOS with Docker, against the maintainer's Cloudflare account, with
+the CLI built from main at `47e94c7` plus the change that makes
+`eden destroy` report the snapshot tags Cloudflare's registry refuses to
+delete.
+
+What the registry did. Checked at `11:15Z` with the registry credentials
+Wrangler uses:
+
+- `DELETE` of a `rootfs-set-*` tag answered `403` with
+  `{"errors":[{"code":"DENIED","message":"snapshot manifests cannot be
+  deleted through this API","detail":null}]}`, as it had since `10:24Z`.
+  `OPTIONS` on the same manifest allowed `GET, HEAD, OPTIONS`. The same
+  credentials had deleted `candidate` tags.
+- The registry has no route that deletes a repository: `DELETE` on the
+  repository, with and without a trailing slash, and on `tags/<tag>` and
+  `tags/list`, answered `404`.
+- Cloudflare's API answered `No route for that URI` for
+  `/accounts/<id>/containers/snapshots` and `/containers/images`. Its
+  reference lists no snapshot or image method, and Wrangler `4.147.0` has no
+  snapshot command. Wrangler prints only `403 Forbidden` for the refused
+  delete; its source drops the response body.
+- Cloudflare's snapshot guide says the Container binding "does not provide
+  methods to list or delete them", and that a snapshot has a 30-day
+  time-to-live that each restore refreshes. Its Containers changelog had no
+  entry about the refusal; the newest entry was dated 2026-09-30.
+
+The answer names snapshot manifests, it was the same for every snapshot tag
+tried over these hours, and the same credentials deleted other tags. That
+points to a rule of Cloudflare's registry and not to a missing permission.
+Cloudflare has not announced one, and these checks cannot rule out a fault
+on its side. The run on 2026-11-17, with an upgrade and a sleep, ended with
+no registry tag for its target.
+
+Full run of `pnpm run check:live` with the final code, target
+`eden-live-20261118-cde8001a`, `12:49:13Z` to `13:04:54Z`, all 18 steps
+passed. The project came from `npx eve@0.91.0 init`, converted to pnpm, with
+`just-bash` `3.6.1` and the World `0.12.0` packed from
+`packages/world-cloudflare`. The idle window was 90 seconds.
+
+- `eden preflight` passed 14 checks with no warnings in 86 seconds. The
+  fresh deploy took 164 seconds.
+- Session `wrun_01M7QBGVDP3B7R54W12QR5Y4JE` started on Eve `0.91.0`, and
+  bash wrote a file. It answered again after the same-version update (118
+  seconds), after the deploy on Eve `1.0.2` (200 seconds), and after the
+  sleep, each time with its earlier turns in its stream and the file intact.
+  A new session reported Eve `1.0.2` and ran bash.
+- After 165 seconds with no requests, the first health request took 2.7
+  seconds. The server process was 3 seconds old when the session asked.
+- `eden destroy` took 122 seconds and succeeded. Wrangler was asked to
+  delete every tag. For each of the ten that it could not delete, Eden's own
+  request to the registry got the snapshot refusal. Destroy reported those
+  ten tags, eight in the repository of the Eve `0.91.0` version and two in
+  the repository of the Eve `1.0.2` version, with the estimated removal date
+  2026-12-18.
+- The last step found the URL returning 404, no Worker, no secrets, no
+  Container application, and no registry tag other than those ten.
+
+Afterwards `wrangler containers list` showed no Container application.
+`wrangler containers images list` showed nine `eden-live-20261118-*`
+repositories holding 36 `rootfs-snapshot-*` and `rootfs-set-*` tags and no
+other tag, from this target and the four earlier ones below.
+
+Checked with a stubbed Wrangler and a stubbed registry, through the destroy
+and deploy commands:
+
+- Two repositories, where the registry refused one tag as a snapshot and
+  the other repository held a deletable tag named `rootfs-set-custom`:
+  every tag was attempted, the deletable tag was deleted, and only the
+  refused tag was reported. When that other tag got a different `403`,
+  destroy ended `EVE_DESTROY_IMAGES_RETAINED`.
+- A tag that appeared after cleanup, named like a snapshot: destroy ended
+  `EVE_DESTROY_IMAGES_RETAINED`.
+- Only the exact refusal counted. A `403` page containing the message, a
+  longer message, another code, a second error, a `401`, a `500`, a `307`,
+  a body over 4 KiB, a failed connection, and a credential for another
+  account each ended `EVE_DESTROY_IMAGES_RETAINED`.
+- 200 refused tags in text output: 200 `kept:` lines, 201 Wrangler deletes,
+  200 registry requests, one credential.
+- A deploy that removed a superseded repository: `VAL-LIFE-007` passed with
+  the warning when the registry refused its snapshot tag, and failed when
+  another tag got a different `403`.
+
+A real `wrangler containers images delete` of a snapshot tag took 1.8 to
+2.2 seconds (three calls). With process-wide proxy settings and certificate
+verification turned off in the environment, a request on the registry
+check's own connection still went straight to the registry and still
+rejected a self-signed certificate.
+
+Earlier drafts of the change, same day. Each of these runs passed and left
+snapshot tags, and its code differed from the final code:
+
+- `eden destroy` on the two targets the runs below had left behind:
+  `eden-live-20261118-58beade5` at `11:09Z` (two tags reported) and
+  `eden-live-20261118-aea2c928` at `11:23Z` (eight tags reported), both
+  exit code 0. That draft took Wrangler's `403 Forbidden` on a tag named
+  like a snapshot as enough.
+- A full run with that draft, target `eden-live-20261118-09054fc8`,
+  `11:25:14Z` to `11:43:15Z`: 18 steps passed, eight tags reported.
+- A full run with a draft that stopped asking after the first refusal,
+  target `eden-live-20261118-4224c172`, `12:01:36Z` to `12:19:08Z`: 18
+  steps passed, eight tags reported. That shortcut was removed: it reported
+  tags that were never tried.
+
+Not run live: a deploy that removes a superseded version's registry
+repository, in either of its two code paths. The live check has no such
+step. The stubbed deploy check above covers the in-place path only.
+
 ## Live check with the workspace World (2026-11-18)
 
 Runs of `pnpm run check:live` on macOS with Docker, against the
@@ -61,7 +170,7 @@ every delete of a `rootfs-snapshot-*` or `rootfs-set-*` tag, from
 `wrangler containers images delete` with Wrangler `4.147.0` and `4.164.0`,
 for 30 minutes after the first run. No `candidate` tag was left. The run
 on 2026-11-17 ended with no registry image after an upgrade and a sleep, so
-this is new since then. Three repositories with ten such tags stayed in the
+this was not seen then. Three repositories with ten such tags stayed in the
 account: two from the first target and one from the second. The second
 target had the default one hour idle window; its two tags are in the
 repository of its Eve `0.91.0` version. Cloudflare's snapshot guide says

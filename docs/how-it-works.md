@@ -205,8 +205,8 @@ the same in-place compatibility requirement.
 
 | Data | Where | Survives sleep | Survives update | Survives destroy |
 | --- | --- | --- | --- | --- |
-| Agent files in the container (`/workspace`) | Container disk, saved in Cloudflare snapshots | Yes (snapshot expires after 30 idle days) | Only conversation sandbox files, up to 1 GiB compressed | No |
-| Workflow state, default local World | Container disk | Yes | No: it resets, and deploy warns | No |
+| Agent files in the container (`/workspace`) | Container disk, saved in Cloudflare snapshots | Yes (snapshot expires after 30 idle days) | Only conversation sandbox files, up to 1 GiB compressed | Not in the container. A snapshot that Cloudflare keeps still holds them for about 30 days |
+| Workflow state, default local World | Container disk | Yes | No: it resets, and deploy warns | Not in the container. A snapshot that Cloudflare keeps still holds it for about 30 days |
 | Workflow state, Postgres World | Your Postgres database | Yes | Yes | Yes |
 | Workflow state, Eden Cloudflare World (experimental) | A Durable Object on your account | Yes | Yes | No |
 | Runtime variables | Worker secrets on your account | Yes | Only the names in this deploy's `--env-file` reach the new container | No |
@@ -225,6 +225,16 @@ deployments and does not wait for sessions to drain. It never matches by name
 prefix or searches your account, so similarly named resources are never
 touched. Data in the Durable Object (including the experimental Cloudflare
 World) is deleted with the Worker; your Postgres database is not touched.
+
+Container snapshots are the exception. Cloudflare stores them as tags in
+the image's registry repository, and its registry refuses to delete them
+(observed on 2026-11-18). Destroy asks for every tag to be deleted. A tag
+that the registry refuses as a snapshot stays, and destroy lists it in the
+warning `EVE_SNAPSHOTS_RETAINED` with an estimated removal date:
+Cloudflare documents 30 days after a snapshot was created or last restored.
+Until then the snapshot still holds the container's disk, including the
+agent's files and the default local World's state. A deploy that removes a
+superseded version's registry repository reports the same warning.
 
 Because ownership comes from the records in `.eden/eve-deploy/`, a different
 clone or machine without those records cannot update or destroy the target;
