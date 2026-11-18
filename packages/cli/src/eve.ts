@@ -113,8 +113,6 @@ function eveErrorRemediation(code: string): string {
       return "Read the last check and .eden/eve-deploy/generations/<generation>/deployment.json, resolve the cause, then rerun eden deploy for the same target.";
     case "EVE_RUNTIME_IMAGE_CLEANUP_FAILED":
       return "The deployment is live; do not redeploy. Remove only the recorded local runtime image or superseded registry tag.";
-    case "EVE_HEALTH_PORT_UNAVAILABLE":
-      return "Free a local port in the 4310-4399 range, then retry.";
     case "EVE_IMAGE_IDENTITY_MISMATCH":
       return "Rerun eden deploy so Eden resolves the image reference from the verified local image again.";
     case "EVE_IMAGE_IDENTITY_UNAVAILABLE":

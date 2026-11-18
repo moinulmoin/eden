@@ -63,7 +63,9 @@ until the checks in steps 1–4 have passed.
    or already owned by Eden (then this deploy is an update).
 4. **Build and boot-check the image** (`building linux/amd64 runtime image,
    booting eve, checking health`). Eden builds the runtime image, starts it on
-   your machine, and waits for Eve's `/eve/v1/health` to report ready.
+   your machine on a free local port that Docker picks, and waits for Eve's
+   `/eve/v1/health` to report ready. The boot container is removed whether
+   the check passes or fails.
    `eden preflight` runs the same checks and stops here, changing nothing on
    Cloudflare.
 5. **Push the image** to your account's Cloudflare registry.

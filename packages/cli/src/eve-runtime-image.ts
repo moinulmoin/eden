@@ -152,7 +152,6 @@ export interface EveRuntimeImageRequest {
   readonly candidate: EveProjectBuildCandidate;
   readonly nodeImage: EveNodeImage;
   readonly dockerCommand?: string;
-  readonly healthPort: number;
   readonly healthTimeoutMs?: number;
   readonly healthPollIntervalMs?: number;
   readonly fetchHealth?: (
@@ -1268,17 +1267,6 @@ async function eveSandboxTemplateBootPaths(
   return [...paths].sort();
 }
 
-function validateHealthPort(port: number): void {
-  if (!Number.isInteger(port) || port < 4310 || port > 4399) {
-    throw packagingError(
-      "DOCKER_PLATFORM_BLOCKED",
-      "health port",
-      "The local Eve health probe must use a task-owned host port in 4310-4399.",
-      "Choose an unused task-owned host port between 4310 and 4399.",
-    );
-  }
-}
-
 function validateHealthTiming(timeoutMs: number, pollIntervalMs: number): void {
   if (
     !Number.isFinite(timeoutMs) ||
@@ -1443,6 +1431,31 @@ async function removeOwnedContainer(
     verified = false;
   }
   return verified;
+}
+
+/**
+ * When the boot container has exited, that is the cause of whichever Docker
+ * command or health poll failed next, so it is reported instead.
+ */
+async function exitedBootContainer(
+  state: DockerState,
+): Promise<EvePackagingError | undefined> {
+  if (state.containerId === undefined) return undefined;
+  const [status, exitCode] = await docker(state, [
+    "inspect",
+    state.containerId,
+    "--format",
+    "{{.State.Status}} {{.State.ExitCode}}",
+  ]).then((result) => result.stdout.trim().split(" "), () => []);
+  if (status !== "exited") return undefined;
+  const output = await docker(state, ["logs", "--tail", "20", state.containerId])
+    .then((result) => `${result.stdout}${result.stderr}`.trim().slice(-600), () => "");
+  return packagingError(
+    "EVE_HEALTH_FAILED",
+    "eve start",
+    `Eve exited with code ${exitCode} before it reported ready.${output.length === 0 ? "" : ` Its last output: ${output}`}`,
+    "Fix the startup error in Eve's output, then retry. A variable the project reads at startup must be in --env-file.",
+  );
 }
 
 async function removeOwnedImage(
@@ -1621,7 +1634,6 @@ export async function buildEveRuntimeImage(
   request: EveRuntimeImageRequest,
 ): Promise<EveRuntimeImageResult> {
   const dockerCommand = request.dockerCommand ?? "docker";
-  const healthPort = request.healthPort;
   const timeoutMs = request.healthTimeoutMs ?? 30_000;
   const pollIntervalMs = request.healthPollIntervalMs ?? 100;
   const retainImage = request.retainImage ?? true;
@@ -1644,7 +1656,6 @@ export async function buildEveRuntimeImage(
     imageRetained: false,
   };
   try {
-    validateHealthPort(healthPort);
     validateHealthTiming(timeoutMs, pollIntervalMs);
     if (request.hostRequirements === undefined) {
       throw packagingError(
@@ -1738,38 +1749,51 @@ export async function buildEveRuntimeImage(
         );
       }
     }
-    const bootArgs = [
-      "run",
-      "--detach",
-      "--name",
-      containerName,
-      "--label",
-      state.imageLabel,
-      "--publish",
-      `127.0.0.1:${healthPort}:${INTERNAL_PORT}`,
-      ...(request.runtimeInjection === undefined
-        ? Object.entries(runtimeEnvironment).flatMap(([name, value]) => [
-          "--env",
-          `${name}=${value}`,
-        ])
-        : Object.keys(runtimeEnvironment).flatMap((name) => ["--env", name])),
-      state.imageId,
-    ] as const;
-    const boot = await docker(
+    // Create, then start: the container ID is recorded before anything can
+    // fail to start, so every failure path removes it. Docker picks the free
+    // host port, so concurrent builds on one Docker host never collide.
+    const created = await docker(
       state,
-      bootArgs,
+      [
+        "create",
+        "--name",
+        containerName,
+        "--label",
+        state.imageLabel,
+        "--publish",
+        `127.0.0.1::${INTERNAL_PORT}`,
+        ...(request.runtimeInjection === undefined
+          ? Object.entries(runtimeEnvironment).flatMap(([name, value]) => [
+            "--env",
+            `${name}=${value}`,
+          ])
+          : Object.keys(runtimeEnvironment).flatMap((name) => ["--env", name])),
+        state.imageId,
+      ],
       request.runtimeInjection === undefined
         ? {}
         : { environment: runtimeEnvironment },
     );
-    state.containerId = boot.stdout.trim();
-    bootContainerId = state.containerId;
-    if (state.containerId.length === 0) {
+    if (created.stdout.trim().length === 0) {
       throw packagingError(
         "DOCKER_PLATFORM_BLOCKED",
         "boot container identity",
         "The Docker runtime did not return an owned boot-container identity.",
         "Use a Docker/OrbStack runtime that returns a stable container ID for exact lifecycle cleanup.",
+      );
+    }
+    state.containerId = created.stdout.trim();
+    bootContainerId = state.containerId;
+    await docker(state, ["start", state.containerId]);
+    const healthPort = /^127\.0\.0\.1:(\d+)$/mu.exec(
+      (await docker(state, ["port", state.containerId, `${INTERNAL_PORT}/tcp`])).stdout,
+    )?.[1];
+    if (healthPort === undefined) {
+      throw packagingError(
+        "DOCKER_PLATFORM_BLOCKED",
+        "boot container port",
+        "The Docker runtime did not report the local port it published for the Eve health check.",
+        "Use a local Docker or OrbStack runtime that publishes container ports on 127.0.0.1, then retry.",
       );
     }
     const processTree = await docker(state, ["top", state.containerId]);
@@ -1844,7 +1868,7 @@ export async function buildEveRuntimeImage(
       }
     }
     await pollEveHealth(
-      healthPort,
+      Number(healthPort),
       timeoutMs,
       pollIntervalMs,
       request.fetchHealth ?? fetch,
@@ -2011,7 +2035,8 @@ export async function buildEveRuntimeImage(
       writtenPaths,
       error: null,
     };
-  } catch (error: unknown) {
+  } catch (thrown: unknown) {
+    const error = (await exitedBootContainer(state)) ?? thrown;
     if (runtimeContextPath !== undefined) {
       const contextRemoved = await removeOwnedRuntimeContext(
         runtimeContextPath,
@@ -2070,9 +2095,9 @@ export async function buildEveRuntimeImage(
       "DOCKER_PLATFORM_BLOCKED",
       "runtime image",
       error instanceof Error && error.message.length > 0
-        ? `The Linux/amd64 Eve runtime image could not be built or inspected safely: ${[error.message, stderrText].join(" ").trim().slice(0, 600)}`
+        ? `The Linux/amd64 Eve runtime image could not be built or inspected safely: ${(stderrText.trim() || error.message).slice(-600)}`
         : "The Linux/amd64 Eve runtime image could not be built or inspected safely.",
-      "Retry with Docker/OrbStack BuildKit and preserve the exact candidate inputs.",
+      "Fix the error at the end of this message, then retry. Docker or OrbStack must be able to build and run linux/amd64 images.",
     );
     return blockedResult(request.candidate, fallback, cleanup, writtenPaths);
   }
