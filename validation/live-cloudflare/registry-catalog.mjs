@@ -59,6 +59,7 @@ function registryGet(path, authorization) {
  */
 export async function registryCatalogRefs({ account, repositoryPrefix, credential, get = registryGet }) {
   if (
+    typeof account !== "string" ||
     credential?.account_id !== account || credential.registry_host !== REGISTRY_HOST ||
     typeof credential.username !== "string" || typeof credential.password !== "string"
   ) throw new Error("the registry credential is not for this run's account on " + REGISTRY_HOST);

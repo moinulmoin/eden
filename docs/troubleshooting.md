@@ -725,9 +725,10 @@ never runs it on a repository that holds a deployed image:
   a repository of its own, so this happens only when a programmatic caller
   supplies an image in the previous generation's repository.
 - `Repository <repository> holds an image that is still deployed; nothing
-  in it was deleted.` The check fails, and the retirement stays recorded as
-  pending. This happens when the image of a version that is still kept is
-  in the repository of a version being retired.
+  in it was deleted.` The check fails, and that retirement stays recorded
+  as pending. Other retirements in the same deploy still get their cleanup.
+  This happens when the image of a version that is still kept is in the
+  repository of a version being retired.
 
 ## Updates
 
@@ -1142,17 +1143,22 @@ destroy once the provider state settles.
 
 `The exact Worker and Container are absent, but registry objects remain, or
 could not be listed, in: <repositories>.` The message lists every
-repository. Retry `eden destroy` with the same selectors, or remove only the
-listed repositories' tags:
+repository. Retry `eden destroy` with the same selectors: it deletes what
+the registry still lists, verifies the registry, and clears the record.
+
+You can delete a listed tag by hand first:
 
 ```sh
 npx wrangler@4.147.0 containers images delete <repository:tag>
 ```
 
-Never filter by prefix. An object that Cloudflare's registry keeps is not
-counted here; see [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept). Destroy fails with this code for anything else
-the registry still lists, for an object whose delete got any other answer,
-and when it could not read the registry's listing.
+That removes no `sha256:` entry and does not clear the record, so run
+`eden destroy` again afterwards. Never filter by prefix. An object with one
+of the three kept answers is not counted here; see
+[`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept). Destroy fails
+with this code for anything else the registry still lists, including a tag
+that is still listed after Wrangler deleted it and an object whose delete
+got any other answer, and when it could not read the registry's listing.
 
 Eden reads the listing and sends its own deletes straight to
 `registry.cloudflare.com` and never uses a proxy for them. If this machine
@@ -1258,6 +1264,10 @@ prompt.
 npx wrangler@4.147.0 containers registries credentials registry.cloudflare.com --push --pull --expiration-minutes 5 --json
 curl --noproxy '*' -u '<username>' 'https://registry.cloudflare.com/v2/<account_id>/<repository>/tags/list?n=1000'
 ```
+
+One answer holds at most the `n` entries asked for and is not the whole
+listing. Ask again with `&last=<the last entry of the answer>` added to the
+URL until an answer has no entries.
 
 `eden deploy` reports the same warning and objects when it removes a
 superseded version's registry repository.
@@ -1420,7 +1430,8 @@ npx wrangler@4.147.0 containers images list
 Require zero new Worker, Container, or managed-registry image residue
 associated with your target name. An unreachable URL alone is not sufficient
 cleanup evidence. `containers images list` shows tags only; the `tags/list`
-command under [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept) shows everything the registry lists for a repository.
+command under [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept) also shows the `sha256:` entries of a repository, once
+you have read its listing to the end.
 
 ## Indeterminate outcomes
 

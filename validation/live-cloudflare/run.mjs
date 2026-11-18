@@ -253,6 +253,8 @@ async function eden(command, { withEnvFile = true, interruptible = true } = {}) 
   } catch {
     throw new Error("eden " + command + " did not print one JSON object (exit " + result.code + ").\n" + tail(result.stdout + "\n" + result.stderr));
   }
+  // A deploy names the account it pushed to, also when it fails after publishing.
+  registryAccount = /^registry\.cloudflare\.com\/([A-Za-z0-9_-]+)\/eden-eve-/u.exec(output.deployment?.imageReference ?? "")?.[1] ?? registryAccount;
   if (result.code !== 0 || output.ok !== true) {
     const failed = (output.checks ?? []).filter((check) => check.status === "failed").map((check) => check.id + ": " + check.message);
     throw new Error(["eden " + command + " failed (exit " + result.code + "): " + (output.error?.code ?? "no error code") + " " + (output.error?.message ?? ""), ...failed, tail(result.stderr, 15)].filter(Boolean).join("\n"));
@@ -534,10 +536,7 @@ async function deploy(expectUpdate) {
   const origin = output.deployment?.stableWorkersDevOrigin;
   if (typeof origin !== "string" || !origin.startsWith("https://")) throw new Error("The deploy result has no deployment.stableWorkersDevOrigin.");
   if (output.name !== target) throw new Error("The deploy result names " + output.name + ", not " + target + ".");
-  const [, account] = /^registry\.cloudflare\.com\/([A-Za-z0-9_-]+)\/eden-eve-/u.exec(output.deployment?.imageReference ?? "") ?? [];
-  const targetKey = output.deployment?.targetKey;
-  if (account === undefined || typeof targetKey !== "string" || !targetKey.includes(target)) throw new Error("The deploy result does not name the registry account and this target's key.");
-  registryScope = { account, repositoryPrefix: "eden-eve-" + targetKey + "-" };
+  if (registryAccount === undefined) throw new Error("The deploy result does not name the registry account in deployment.imageReference.");
   if (expectUpdate && origin !== summary.origin) throw new Error("The URL changed from " + summary.origin + " to " + origin + ".");
   summary.origin = origin;
   const deployed = seconds(Date.now() - started);
@@ -553,10 +552,10 @@ async function wrangler(args) {
 // What Cloudflare's registry itself lists for this run's repositories: each
 // tag, and one sha256 entry per manifest. Wrangler's image list leaves the
 // sha256 entries out.
-// The account and the repository names come from the deploy result, and the
-// credential can only read.
+// Every repository of this target starts with the same name. The credential
+// can only read, and must be for the account a deploy result named; when no
+// deploy got far enough to name one, the credential's own account is read.
 async function registryRefs() {
-  if (registryScope === undefined) throw new Error("no deploy result named this run's registry account and repositories");
   const minted = await wrangler(["containers", "registries", "credentials", "registry.cloudflare.com", "--pull", "--expiration-minutes", "5", "--json"]);
   if (minted.code !== 0) throw new Error("wrangler containers registries credentials exited with code " + minted.code);
   let credential;
@@ -566,7 +565,11 @@ async function registryRefs() {
     throw new Error("wrangler containers registries credentials did not print JSON");
   }
   if (typeof credential?.password === "string") secrets.push(credential.password);
-  return registryCatalogRefs({ ...registryScope, credential });
+  return registryCatalogRefs({
+    account: registryAccount ?? credential?.account_id,
+    repositoryPrefix: "eden-eve-preview-" + target + "-",
+    credential,
+  });
 }
 
 // Read-only checks, each filtered to this run's exact temporary name.
@@ -603,8 +606,8 @@ async function verifyGone() {
 
 let deployStarted = false;
 let registryObjectsKept = [];
-// Set by the first deploy: the account and the name every repository of this target starts with.
-let registryScope;
+// The account in a deploy result's image reference.
+let registryAccount;
 let failure;
 log("Live Cloudflare check: target " + target + ", Eve " + options.eve + (summary.upgradedTo === null ? "" : " -> " + options.upgradeTo) + ", work folder " + workRoot);
 

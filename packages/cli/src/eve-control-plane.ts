@@ -3729,13 +3729,16 @@ async function runEveDeployment(
           !("retired" in result) || !Array.isArray(result.retired) ||
           ids.some((id) => !(result.retired as unknown[]).includes(id))) throw new Error("Retirement was not proven.");
       const deleteRegistryRepository = options.deleteRegistryRepository ?? registryRepositoryDeleter();
+      const held: string[] = [];
       for (const [id, retained] of Object.entries(retiringDeployments)) {
         const repository = ownedRegistryRepository({
           ...identity, deploymentId: id, containerImage: retained.image, generationId: retained.generationId,
         }, request.environment, request.name, accountId);
         if (repository !== undefined) {
           if (holdsLiveImage(repository)) {
-            throw new Error(`Repository ${repository} holds an image that is still deployed; nothing in it was deleted.`);
+            // This retirement stays pending; the others still get their cleanup.
+            held.push(repository);
+            continue;
           }
           const deleted = await deleteRegistryRepository({ repository, accountId });
           if (typeof deleted === "object") registryObjectsKept.push(...deleted.kept);
@@ -3744,6 +3747,11 @@ async function runEveDeployment(
           }
         }
         completedRetirements.push(id);
+      }
+      if (held.length > 0) {
+        throw new Error(held.map((repository) =>
+          `Repository ${repository} holds an image that is still deployed; nothing in it was deleted.`
+        ).join(" "));
       }
       supersededImageCleanup = check("VAL-LIFE-007", "passed", registryObjectsKept.length === 0
         ? "Retired deployment instances and their owned registry repositories were removed."
@@ -6132,7 +6140,7 @@ async function runEveDestroyLocked(
             "VAL-LIFE-006-REGISTRY",
             "failed",
             `The registry still lists objects of the exact target that it gave no kept answer for, or its listing could not be read: ${retainedRepositories.join(", ")}.`,
-            "Retry eden destroy with the same selectors, or remove only the listed repositories' tags with wrangler containers images delete. An object that Cloudflare's registry refuses to delete, or still lists after accepting the delete, is reported as EVE_REGISTRY_OBJECTS_KEPT and does not count here. Eden reads the registry's listing and each answer with direct requests to registry.cloudflare.com and never uses a proxy for them; if this machine cannot reach the registry directly, retry from one that can.",
+            "Retry eden destroy with the same selectors: it deletes what the registry still lists, verifies the registry, and clears the record. Deleting tags by hand with wrangler containers images delete removes no sha256: entry and does not clear the record, so retry eden destroy afterwards. An object with one of the three kept answers (refused-snapshot, refused-singleton-artifact, accepted-still-listed) is reported as EVE_REGISTRY_OBJECTS_KEPT and does not count here. Eden reads the registry's listing and each answer with direct requests to registry.cloudflare.com and never uses a proxy for them; if this machine cannot reach the registry directly, retry from one that can.",
           ),
       );
     }
