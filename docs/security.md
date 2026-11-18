@@ -126,16 +126,23 @@ your project has schedules, one Cron Trigger. The exact names are listed in
 the [reference](./reference.md).
 Eden also reads the target's state from Cloudflare's API with requests of
 its own. One of its own requests can change something, and it is Eden's
-first direct registry mutation: when a Wrangler registry delete fails, Eden
-repeats that delete for the same tag against `registry.cloudflare.com` to
-read the registry's answer, because Wrangler prints only the status. For
-this, Eden asks Wrangler for a registry credential (push and pull on your
-account's registry, valid for five minutes), checks that it names the
-account in the deployment record, and reuses it for at most four minutes
-within one command. The request uses a connection of its own: no proxy,
-certificate verification always on, no redirect followed, 30 seconds at
-most, and at most 4 KiB of response read. Eden does not store or print the
-credential.
+first direct registry mutation: when the registry answers Wrangler's delete
+of a tag with `403`, Eden repeats that delete for the same tag against
+`registry.cloudflare.com` to read the registry's answer, because Wrangler
+prints only the status. Eden sends no request of its own after any other
+Wrangler failure. For this, Eden asks Wrangler for a registry credential
+(push and pull on your account's registry, valid for five minutes), checks
+that it names the account in the deployment record, and reuses it within
+one command until four minutes have passed since it asked. It drops a
+credential the registry answers with `401`. The request uses a connection
+of its own: no proxy, certificate verification always on, no redirect
+followed, 30 seconds at most, and at most 4 KiB of response read. Requests
+that get no answer may take 60 seconds in total in one command. After that
+Eden sends no more of them. `eden destroy` then fails only if a tag that
+was not confirmed is still in its final inventory, or if it cannot read
+that inventory. `eden deploy` fails `VAL-LIFE-007` when it cannot prove
+that every other tag of the repository is gone, which includes a list it
+cannot read after the deletes. Eden does not store or print the credential.
 Wrangler runs in a fresh, private Eden-owned temporary directory outside the
 project, with its configuration file and account cache pinned inside it.
 Project `.env` files and configuration or cache files planted in a shared

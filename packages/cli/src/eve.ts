@@ -148,7 +148,7 @@ function eveErrorRemediation(code: string): string {
     case "EVE_DESTROY_ABSENCE_UNPROVEN":
       return "Wait a minute for Cloudflare to settle, then rerun eden destroy with the same --project, --env, and --name. Keep the .eden folder; never delete resources by name prefix.";
     case "EVE_DESTROY_IMAGES_RETAINED":
-      return "Rerun eden destroy with the same --project, --env, and --name, or delete only the listed repository tags with npx wrangler@4.147.0 containers images delete <repository:tag>. A tag that Cloudflare's registry refuses to delete as a snapshot is reported as EVE_SNAPSHOTS_RETAINED and does not count here.";
+      return "Rerun eden destroy with the same --project, --env, and --name, or delete only the listed repository tags with npx wrangler@4.147.0 containers images delete <repository:tag>. A tag that Cloudflare's registry refuses to delete as a snapshot is reported as EVE_SNAPSHOTS_RETAINED and does not count here. Eden confirms that refusal with a direct request to registry.cloudflare.com and never uses a proxy for it; if this machine cannot reach the registry directly, rerun eden destroy from one that can.";
     case "EVE_DESTROY_POINTER_UNCLEARED":
       return "The Cloudflare resources are gone; only the local .eden/eve-deploy/targets/<env>-<name>/CURRENT pointer is left. Check that the .eden folder is writable, then rerun eden destroy with the same --project, --env, and --name.";
     case "EVE_EXECUTION_FAILED":
@@ -187,8 +187,9 @@ Options:
 
 When an update removes a superseded version and Cloudflare's registry refuses
 to delete its container snapshot tags, deploy adds the warning
-EVE_SNAPSHOTS_RETAINED. With --json the result then adds retainedSnapshotTags
-and retainedSnapshotsExpiryEstimate (an estimated date, not a confirmation).
+EVE_SNAPSHOTS_RETAINED. With --json the result then lists it in warnings and
+adds retainedSnapshotTags and retainedSnapshotsExpiryEstimate (an estimated
+date, not a confirmation).
 `,
   destroy: `Usage: eden destroy --name <name> [--project <path>] [--env <preview|production>] [--json]
 

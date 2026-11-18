@@ -713,7 +713,9 @@ and boot container. Never use broad Docker cleanup.
 tags. Do not retry the deployment and do not run broad registry cleanup.
 A tag that Cloudflare's registry refuses to delete as a snapshot does not
 fail this check; it is reported as
-[`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained).
+[`EVE_SNAPSHOTS_RETAINED`](#eve_snapshots_retained). Eden confirms that
+refusal with a direct request to `registry.cloudflare.com` and never uses a
+proxy for it. Where the registry cannot be reached directly, the check fails.
 
 ## Updates
 
@@ -1135,6 +1137,16 @@ as a snapshot is not counted here; see
 code for any other tag that is left, for a tag whose delete failed with any
 other answer, and when it could not list what is left.
 
+Destroy also fails with this code when it cannot confirm a snapshot refusal.
+To confirm one, Eden sends its own request straight to
+`registry.cloudflare.com` and never uses a proxy for it. If this machine
+reaches the internet only through a proxy, or the registry does not answer,
+the snapshot tags stay unconfirmed. Destroy still asks Wrangler to delete
+every tag, and waits at most 60 seconds in total for registry requests that
+get no answer. Run `eden destroy` again, with the same selectors and the
+same `.eden` folder, from a machine that can reach
+`registry.cloudflare.com` directly.
+
 ### `EVE_SNAPSHOTS_RETAINED`
 
 A warning, not a failure. `eden destroy` still ends with `destroyed` and
@@ -1156,9 +1168,10 @@ version. On 2026-11-18 Cloudflare's registry was observed answering `403`
 with `snapshot manifests cannot be deleted through this API` to deleting
 one. Cloudflare documents no way to delete a snapshot.
 
-Eden asks Wrangler to delete every tag of the target. For each delete that
-fails, it repeats the delete for that same tag against the registry and
-reads the answer. Only a tag that gets exactly that answer is listed here.
+Eden asks Wrangler to delete every tag of the target. When the registry
+answers Wrangler's delete with `403`, Eden repeats the delete for that same
+tag against the registry and reads the answer. Only a tag that gets exactly
+that answer is listed here.
 A tag with any other answer, and any other tag that is still there, fails
 destroy with [`EVE_DESTROY_IMAGES_RETAINED`](#eve_destroy_images_retained).
 That request goes straight to `registry.cloudflare.com` and never through a
@@ -1221,30 +1234,95 @@ commands `eden destroy` itself runs.
    npx wrangler@4.147.0 delete --name <name>
    ```
 
-3. Delete the Container application. It is named `<name>-container`
-   (truncated to 63 characters). Find its ID in the list, then delete by ID:
+3. Delete the Container application. Its whole name is `<name>-container`.
+   When that is longer than 63 characters, it is cut to 63 and any hyphens
+   left at the end are removed. `<name>-other-container` belongs to another
+   target. Find its ID in the list and write the ID down, because step 4
+   needs it. Then delete by ID:
 
    ```sh
    npx wrangler@4.147.0 containers list
    npx wrangler@4.147.0 containers delete <application-id>
    ```
 
-4. Delete the registry images. Eden's repositories for the target start with
-   `eden-eve-<environment>-<name>-`. Delete every tag of each one, whatever
-   its name. Wrangler asks you to confirm each deletion. Cloudflare's
-   registry refuses to delete a container snapshot: for a snapshot tag (seen
-   so far as `rootfs-snapshot-*` and `rootfs-set-*`) Wrangler prints
-   `403 Forbidden`. Note the tags it refuses. Cloudflare documents that it
-   removes a snapshot 30 days after it was created or last restored.
+   If the Container application is already gone, the list cannot give you
+   its ID. Use the ID only if you have it from a record made while the
+   application existed, such as saved output of `containers list`. Without
+   it, skip step 4 and leave the registry alone: a repository's name is not
+   proof that it belongs to this target.
+
+4. Delete the registry images, but only in repositories you can prove belong
+   to this target. A repository of this target is named
+   `eden-eve-<environment>-<name>-<24 hexadecimal characters>-<rest>`. Do not
+   pick repositories by how their names start: with a target named `foo`,
+   `eden-eve-preview-foo-` also starts the repositories of a target named
+   `foo-bar`. Without `.eden` the 24 characters cannot be worked out, and
+   the Container application does not name its repository (its `image` is
+   empty in `containers list --json`).
+
+   The proof Cloudflare keeps is in a snapshot. A repository with a tag named
+   `rootfs-snapshot-*` holds a snapshot whose configuration names the
+   Container application it was taken from. Get a registry credential (valid
+   for five minutes) and read it with the `account_id` and `username` the
+   credential command prints. Leave the password out of the commands: curl
+   asks for it, and you paste the `password` value at its prompt, so it
+   stays out of your shell history and the process list. `--noproxy '*'`
+   makes curl connect to the registry directly, as Eden does.
 
    ```sh
    npx wrangler@4.147.0 containers images list
+   npx wrangler@4.147.0 containers registries credentials registry.cloudflare.com --push --pull --expiration-minutes 5 --json
+   curl --noproxy '*' -u '<username>' -H 'Accept: application/vnd.oci.image.manifest.v1+json' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<rootfs-snapshot-tag>
+   curl --noproxy '*' -L -u '<username>' https://registry.cloudflare.com/v2/<account_id>/<repository>/blobs/<config digest>
+   ```
+
+   The first curl prints the snapshot's manifest; take the `digest` inside
+   its `config`. The second prints the configuration. The repository belongs
+   to this target only when its `application_id` is the ID you wrote down in
+   step 3 (the same 32 hexadecimal characters, written with hyphens).
+
+   If a repository has no snapshot tag, or the IDs differ, you have no proof.
+   Stop there and leave that repository alone; do not delete by name. Nothing
+   runs from a repository once the Worker and the Container application are
+   gone.
+
+   In each repository you proved, delete every tag, whatever its name.
+   Wrangler asks you to confirm each deletion.
+
+   ```sh
    npx wrangler@4.147.0 containers images delete <repository>:<tag>
    ```
 
-5. Run the two list commands again and confirm nothing with the target name
-   is left, apart from the snapshot tags Wrangler refused in step 4. Delete
-   any other tag the list shows for the target, whatever its name. Confirm
+   Cloudflare's registry refuses to delete a container snapshot (seen so far
+   as tags named `rootfs-snapshot-*` and `rootfs-set-*`), and Wrangler then
+   prints only `403 Forbidden`. That line does not say why: a missing
+   permission prints the same. A tag's name does not say why either. Treat
+   every tag Wrangler refuses as unresolved until the registry itself gives
+   the snapshot answer for that tag. To read it, repeat the delete with the
+   same credential, again without the password in the command:
+
+   ```sh
+   curl --noproxy '*' -X DELETE -u '<username>' -w '\nHTTP %{http_code}\n' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<tag>
+   ```
+
+   Cloudflare keeps the tag as a snapshot only when curl prints both this
+   body and `HTTP 403`:
+
+   ```json
+   {"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}
+   ```
+
+   Cloudflare documents that it removes a snapshot 30 days after it was
+   created or last restored. If curl prints a status from `HTTP 200` to
+   `HTTP 299`, that request deleted the tag; do not delete it again, and let
+   step 5 confirm it is gone. With any other answer the tag is unresolved:
+   check that the Wrangler login can delete registry images.
+
+5. Run the two list commands again. Confirm the Container application is
+   gone, and that the repositories you proved in step 4 hold no tag apart
+   from the ones that got the snapshot answer. A tag that Wrangler refused
+   without that answer is not cleaned up. Delete any other tag the list
+   shows in those repositories, whatever its name. Confirm
    the Worker is gone too; this command must fail with
    `This Worker does not exist on your account. [code: 10007]`:
 
