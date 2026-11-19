@@ -4,6 +4,39 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for release 0.13.0 (2026-11-19)
+
+Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
+account, with Wrangler `4.147.0`, on main at `bd8ae1f`. The `0.13.0` release
+commit differs from `bd8ae1f` only by version numbers, the lockfile, the
+changelog, and docs.
+
+Full run of `pnpm run check:live`, target `eden-live-20261119-235b3b7b`,
+`10:24:17Z` to `10:42:01Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+this workspace (version `0.12.0`), a 90-second idle window. All 18 steps
+passed.
+
+- `eden preflight` passed 14 checks with no warnings in 108 seconds. The
+  fresh deploy took 198 seconds, the same-version update 126 seconds, and
+  the deploy on Eve `1.0.2` 253 seconds, all on the same URL.
+- Session `wrun_01M7SNP1NGQVV0T6SZRR6DHVWE` answered after each deploy and
+  after the sleep, with its earlier turns in its stream and its file
+  intact. After 165 seconds with no requests the first health request took
+  2.8 seconds, and the server process was 4 seconds old.
+- A session on Eve `1.0.2` asked its server process: no `queueAuthMode`
+  line. An unauthenticated session request got `401`, and the two workflow
+  queue routes answered `404`.
+- `eden destroy` ended with `destroyed` in 117 seconds and reported 19
+  objects in `EVE_REGISTRY_OBJECTS_KEPT`. In the repository of the Eve
+  `0.91.0` version: eight snapshot tags, four snapshot manifests, two chain
+  artifacts, and the first image, which lost its tag to the second push
+  (`accepted-still-listed`). In the repository of the Eve `1.0.2` version:
+  two snapshot tags, one snapshot manifest, and one chain artifact.
+- The check's catalog read found those 19 refs and no others. The URL
+  returned 404, and Wrangler showed no Worker, no secrets, and no Container
+  application. `wrangler containers images list` showed the ten snapshot
+  tags and nothing else for the target.
+
 ## Registry cleanup, run on Cloudflare (2026-11-19)
 
 Run on macOS with Docker, against the maintainer's Cloudflare account, with

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 — 2026-11-19
 
 Eve `1.0.2` is now a tested version, and Eve `0.91.0` stays the oldest
 supported one. `eden destroy` works again on a target whose container has
@@ -176,8 +176,8 @@ three bugs in released versions are fixed. Update `@moinulmoin/eden`, and
   and reads the registry's catalog for anything destroy did not report.
   Once a deploy has started, `eden destroy` also runs when a step fails and
   on Ctrl-C; if destroy itself fails, the script prints the retry command.
-  The run of 2026-11-19, from Eve `0.91.0` to `1.0.2`, passed all 18 steps;
-  see `docs/eve-compatibility-history.md`.
+  The run for this release, on 2026-11-19 from Eve `0.91.0` to `1.0.2`,
+  passed all 18 steps; see `docs/eve-compatibility-history.md`.
 - The live check installs the Cloudflare World packed from this repository
   by default, through the same local tarball server as the gate's Eden leg,
   so a World change can be checked on Cloudflare before it is published.
