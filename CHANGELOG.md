@@ -31,6 +31,11 @@ needed no change.
   `retainedSnapshotsExpiryEstimate`. When another tag is left as well,
   `VAL-LIFE-007` fails and the result still lists the snapshot tags the
   registry refused.
+- `eden deploy` waits ten minutes for the image push instead of two. On
+  2026-11-18 Cloudflare's registry was slow, the push of a new image took
+  longer than two minutes, and two deploys in a row ended with
+  `DEPLOY_INDETERMINATE` and `The exact Cloudflare Container image push did
+  not complete.` The Worker publication that follows already had ten minutes.
 - `eden deploy` and `eden destroy` can read the deployment record again after
   an update that kept the Eve version and retired a kept version whose World
   had no RPC authentication. Since `0.11.2` such an update gave the new
