@@ -28,8 +28,9 @@ fixture.
 
 - Keep it simple. Prefer deleting code to adding it; no shims for removed
   behavior.
-- Tests check what a user or agent sees (output, exit code, files, HTTP).
-  No new permanent tests without the maintainer's approval.
+- A fix or behavior change comes with a test of what a user or agent sees
+  (output, exit code, files, HTTP). No tests of internals. Keep the suite
+  fast.
 - Every failure has a stable `code` and a `remediation` that names the next
   command or action. With `--json`, every run prints exactly one JSON object.
 - Docs use short, plain sentences and claim only what was run.

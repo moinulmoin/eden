@@ -1,4 +1,6 @@
 import type * as ChildProcess from "node:child_process";
+import type * as Https from "node:https";
+import type * as TimersPromises from "node:timers/promises";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -15,6 +17,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { promisify } from "node:util";
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -48,11 +51,216 @@ const fakeWrangler = vi.hoisted(() => ({
   calls: [] as { readonly args: readonly string[]; readonly timeoutMs: unknown }[],
 }));
 
-vi.mock("node:child_process", async (importOriginal) => {
-  const actual = await importOriginal<typeof ChildProcess>();
+/**
+ * A stand-in for Cloudflare's registry. While `active`, a request to the
+ * registry lists `entries` or gets `answer(ref)` for a delete, and Wrangler's
+ * `containers images delete` and `containers registries credentials` run
+ * against the same state. `whoami` names `whoamiAccountId()`, and the exact
+ * Worker is reported absent. Any other Wrangler read is refused.
+ */
+const fakeRegistry = vi.hoisted(() => {
+  type Answer =
+    | { readonly status: number; readonly body: string; readonly link?: string; readonly leavesAfterMs?: number }
+    | "error"
+    | "stall";
+  const state = {
+    active: false,
+    /** What the registry lists per repository: tags, and one `sha256:` entry per manifest. */
+    entries: new Map<string, string[]>(),
+    pageSize: 1_000,
+    /** Whether Wrangler's delete of a tag succeeds; the tag then leaves the listing. */
+    deletable: (() => true) as (ref: string) => boolean,
+    /** The registry's answer to Eden's own delete; `leavesAfterMs` takes the entry out of the listing that much later. */
+    answer: (() => ({ status: 404, body: "" })) as (ref: string) => Answer,
+    /**
+     * Called for each page of a listing, with the listing's number from 0
+     * and the cursor (`null` on the first page). It may change `entries`, or
+     * return the page itself.
+     */
+    listing: (() => undefined) as (repository: string, nth: number, last: string | null) => Answer | undefined,
+    whoamiAccountId: (() => "account-test") as () => string,
+    /** Called when destroy reads the target, with the read's number from 0. */
+    onRead: (() => undefined) as (nth: number) => void,
+    reads: 0,
+    wranglerFailure: ((ref) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 403 Forbidden`) as (
+      ref: string,
+    ) => string,
+    credentialAccountId: "account-test",
+    /** What `performance.now()` returns while a command runs against the fake registry. */
+    clock: 0,
+    leaving: [] as { readonly repository: string; readonly entry: string; readonly at: number }[],
+    wranglerDeletes: [] as string[],
+    credentialCalls: 0,
+    listings: 0,
+    registryRequests: [] as {
+      readonly ref: string;
+      readonly host: unknown;
+      readonly method: unknown;
+      readonly ownAgent: boolean;
+      readonly verifiesPeer: boolean;
+      readonly authorized: boolean;
+    }[],
+    ref: (repository: string, entry: string): string =>
+      `${repository}${entry.startsWith("sha256:") ? "@" : ":"}${entry}`,
+    /** What the registry lists for a repository now, in the registry's order. */
+    listed: (repository: string): string[] => {
+      for (const leave of state.leaving.filter((item) => state.clock >= item.at)) {
+        state.entries.set(
+          leave.repository,
+          (state.entries.get(leave.repository) ?? []).filter((entry) => entry !== leave.entry),
+        );
+      }
+      state.leaving = state.leaving.filter((item) => state.clock < item.at);
+      return [...(state.entries.get(repository) ?? [])].sort();
+    },
+  };
+  return state;
+});
+
+vi.mock("node:timers/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof TimersPromises>();
   return {
     ...actual,
+    // While the fake registry runs, a wait only moves its clock.
+    setTimeout: ((...waitArgs: Parameters<typeof actual.setTimeout>) => {
+      if (!fakeRegistry.active) return actual.setTimeout(...waitArgs);
+      fakeRegistry.clock += waitArgs[0] ?? 0;
+      return Promise.resolve();
+    }) as typeof actual.setTimeout,
+  };
+});
+
+vi.mock("node:https", async (importOriginal) => {
+  const actual = await importOriginal<typeof Https>();
+  return {
+    ...actual,
+    request: ((options: Https.RequestOptions, onResponse: (response: EventEmitter) => void) => {
+      if (!fakeRegistry.active) {
+        return actual.request(options, onResponse as Parameters<typeof actual.request>[1]);
+      }
+      const url = new URL(String(options.path), "https://registry.cloudflare.com");
+      const [, , account = "", repository = "", kind = "", entry = ""] = url.pathname.split("/");
+      const ref = kind === "tags" ? repository : fakeRegistry.ref(repository, entry);
+      fakeRegistry.registryRequests.push({
+        ref,
+        host: options.host,
+        method: options.method,
+        ownAgent: options.agent instanceof actual.Agent && options.agent !== actual.globalAgent,
+        verifiesPeer: options.rejectUnauthorized === true,
+        authorized: typeof (options.headers as Record<string, unknown>).Authorization === "string",
+      });
+      const request = Object.assign(new EventEmitter(), {
+        destroy: () => undefined,
+        end: () => setImmediate(() => {
+          const last = url.searchParams.get("last");
+          if (kind === "tags" && last === null) fakeRegistry.listings += 1;
+          let answer = kind === "tags"
+            ? fakeRegistry.listing(repository, fakeRegistry.listings - 1, last)
+            : fakeRegistry.answer(ref);
+          if (answer === undefined) {
+            const tags = fakeRegistry.listed(repository)
+              .filter((listed) => last === null || listed > last)
+              .slice(0, Math.min(Number(url.searchParams.get("n")), fakeRegistry.pageSize));
+            answer = {
+              status: 200,
+              body: JSON.stringify({ name: `${account}/${repository}`, tags }),
+              // The form observed on 2026-11-18: the request's URL, then a second query.
+              link: `https://registry.cloudflare.com${String(options.path)}?n=1000&last=${tags.at(-1) ?? ""}; rel=next`,
+            };
+          }
+          if (answer === "error" || answer === "stall") {
+            // A wait that ends on the deadline; the monotonic clock is not a whole number.
+            if (answer === "stall") fakeRegistry.clock += 30_000.25;
+            request.emit("error", new Error("The connection failed."));
+            return;
+          }
+          if (answer.leavesAfterMs !== undefined) {
+            fakeRegistry.leaving.push({ repository, entry, at: fakeRegistry.clock + answer.leavesAfterMs });
+          }
+          const response = Object.assign(new EventEmitter(), {
+            statusCode: answer.status,
+            headers: answer.link === undefined ? {} : { link: answer.link },
+          });
+          onResponse(response);
+          response.emit("data", Buffer.from(answer.body));
+          response.emit("end");
+          response.emit("close");
+        }),
+      });
+      return request;
+    }) as unknown as typeof actual.request,
+  };
+});
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof ChildProcess>();
+  const execFile = ((...execArgs: Parameters<typeof actual.execFile>) =>
+    actual.execFile(...execArgs)) as typeof actual.execFile;
+  Object.defineProperty(execFile, promisify.custom, {
+    value: (file: string, argv: readonly string[], options: object) => {
+      const args = argv.slice(1);
+      if (!fakeRegistry.active || !/wrangler/u.test(argv[0] ?? "")) {
+        return promisify(actual.execFile)(file, argv, options);
+      }
+      if (args[0] === "whoami") {
+        return Promise.resolve({
+          stdout: JSON.stringify({ loggedIn: true, accounts: [{ id: fakeRegistry.whoamiAccountId() }] }),
+          stderr: "",
+        });
+      }
+      if (args[0] === "deployments" && args[1] === "list") {
+        fakeRegistry.onRead(fakeRegistry.reads++);
+        return Promise.reject(Object.assign(new Error("Wrangler failed."), {
+          stderr: "This Worker does not exist on your account. [code: 10007]",
+        }));
+      }
+      if (args[1] === "registries" && args[2] === "credentials") {
+        fakeRegistry.credentialCalls += 1;
+        return Promise.resolve({
+          stdout: JSON.stringify({
+            account_id: fakeRegistry.credentialAccountId,
+            registry_host: "registry.cloudflare.com",
+            username: "v1",
+            password: "registry-password",
+          }),
+          stderr: "",
+        });
+      }
+      return Promise.reject(new Error(`Unexpected Wrangler call: ${args.join(" ")}`));
+    },
+  });
+  return {
+    ...actual,
+    execFile,
     spawn: ((...spawnArgs: Parameters<typeof actual.spawn>) => {
+      if (fakeRegistry.active && (spawnArgs[1] as readonly string[])[3] === "delete") {
+        const ref = (spawnArgs[1] as readonly string[])[4] ?? "";
+        const [repository = "", tag = ""] = ref.split(":");
+        fakeRegistry.wranglerDeletes.push(ref);
+        const deleted = fakeRegistry.deletable(ref);
+        if (deleted) {
+          fakeRegistry.entries.set(
+            repository,
+            (fakeRegistry.entries.get(repository) ?? []).filter((present) => present !== tag),
+          );
+        }
+        const child = Object.assign(new EventEmitter(), {
+          stdout: new EventEmitter(),
+          stderr: new EventEmitter(),
+          stdin: { end: () => undefined },
+          kill: () => true,
+        });
+        setImmediate(() => {
+          if (!deleted) {
+            // Wrangler 4.147.0 prints its error on stderr in this form.
+            child.stderr.emit("data", Buffer.from(
+              `\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1m${fakeRegistry.wranglerFailure(ref)}\u001b[0m\n\n`,
+            ));
+          }
+          child.emit("close", deleted ? 0 : 1);
+        });
+        return child;
+      }
       if (!fakeWrangler.intercept) return actual.spawn(...spawnArgs);
       const argv = spawnArgs[1] as readonly string[];
       fakeWrangler.pending = argv.slice(1);
@@ -67,6 +275,58 @@ vi.mock("node:child_process", async (importOriginal) => {
     }) as unknown as typeof actual.spawn,
   };
 });
+
+const snapshotRefusal = JSON.stringify({
+  errors: [{
+    code: "DENIED",
+    message: "snapshot manifests cannot be deleted through this API",
+    detail: null,
+  }],
+});
+const manifest = (letter: string): string => `sha256:${letter.repeat(64)}`;
+const singletonRefusal = JSON.stringify({
+  code: "SINGLETON_ARTIFACT_EXISTS",
+  subjectDigest: manifest("1"),
+  artifactType: "application/vnd.cloudchamber.btrfs-chain.v1",
+  committedDigest: manifest("2"),
+});
+const registryDeletes = (): readonly string[] =>
+  fakeRegistry.registryRequests.filter((request) => request.method === "DELETE").map((request) => request.ref);
+
+type FakeRegistrySetup = {
+  readonly entries: Readonly<Record<string, readonly string[]>>;
+  readonly pageSize?: number;
+  readonly deletable?: typeof fakeRegistry.deletable;
+  readonly answer?: typeof fakeRegistry.answer;
+  readonly listing?: typeof fakeRegistry.listing;
+  readonly whoamiAccountId?: typeof fakeRegistry.whoamiAccountId;
+  readonly onRead?: typeof fakeRegistry.onRead;
+  readonly wranglerFailure?: typeof fakeRegistry.wranglerFailure;
+  readonly credentialAccountId?: string;
+};
+
+function startFakeRegistry(setup: FakeRegistrySetup): void {
+  Object.assign(fakeRegistry, {
+    active: true,
+    entries: new Map(Object.entries(setup.entries).map(([name, entries]) => [name, [...entries]])),
+    pageSize: setup.pageSize ?? 1_000,
+    deletable: setup.deletable ?? (() => true),
+    answer: setup.answer ?? (() => ({ status: 404, body: "" })),
+    listing: setup.listing ?? (() => undefined),
+    whoamiAccountId: setup.whoamiAccountId ?? (() => "account-test"),
+    onRead: setup.onRead ?? (() => undefined),
+    reads: 0,
+    wranglerFailure: setup.wranglerFailure ??
+      ((ref: string) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 403 Forbidden`),
+    credentialAccountId: setup.credentialAccountId ?? "account-test",
+    clock: 0,
+    leaving: [],
+    wranglerDeletes: [],
+    credentialCalls: 0,
+    listings: 0,
+    registryRequests: [],
+  });
+}
 
 async function withFakeWrangler(
   run: () => Promise<void>,
@@ -1885,6 +2145,671 @@ describe("eden destroy", () => {
     ).resolves.toBeDefined();
   });
 
+  const secondRepository = `eden-eve-${destroyTargetKey}-gen-destroy-0`;
+
+  /** Records an aborted push, so the target owns a second registry repository. */
+  async function addSecondRepository(root: string): Promise<void> {
+    const abortedRoot = join(root, ".eden", "eve-deploy", "generations", "gen-destroy-0");
+    await mkdir(abortedRoot, { recursive: true });
+    await writeFile(
+      join(abortedRoot, "deployment-attempt.json"),
+      JSON.stringify({
+        version: 1,
+        status: "indeterminate",
+        generationId: "gen-destroy-0",
+        accountId: "account-test",
+        targetKey: destroyTargetKey,
+        imageRepository: secondRepository,
+        imageDigest: `sha256:${"c".repeat(64)}`,
+      }),
+      "utf8",
+    );
+  }
+
+  const currentPointer = (root: string): string =>
+    join(root, ".eden", "eve-deploy", "targets", "preview-eve-destroy-fixture", "CURRENT");
+  /**
+   * A page of the registry's listing as the registry sends it, in answer to
+   * the request after `after` (null for the first page). `change` replaces the
+   * name, or the cursor, which is otherwise the page's last entry.
+   */
+  const page = (
+    tags: readonly string[] | null,
+    after: string | null = null,
+    change: { readonly name?: string | null; readonly cursor?: string } = {},
+  ) => {
+    const name = change.name === undefined ? `account-test/${destroyRegistryRepository}` : change.name;
+    const asked = `/v2/account-test/${destroyRegistryRepository}/tags/list?n=1000${after === null ? "" : `&last=${encodeURIComponent(after)}`}`;
+    return {
+      status: 200,
+      body: JSON.stringify({ ...(name === null ? {} : { name }), tags }),
+      link: `${asked}?n=1000&last=${change.cursor ?? tags?.at(-1) ?? ""}; rel=next`,
+    };
+  };
+
+  /** Runs destroy with the default registry cleanup against the fake registry. */
+  async function destroyAgainstFakeRegistry(
+    root: string,
+    setup: FakeRegistrySetup & {
+      readonly appearsAfterCleanup?: readonly string[];
+      readonly goneAfterCleanup?: readonly string[];
+      readonly json?: boolean;
+    },
+  ): Promise<{ readonly exitCode: number; readonly output: readonly string[] }> {
+    startFakeRegistry({
+      ...setup,
+      // Destroy reads the target twice with its own reader: before it deletes, and at the end.
+      onRead: (nth) => {
+        setup.onRead?.(nth);
+        if (nth !== 1) return;
+        for (const [name, entries] of fakeRegistry.entries) {
+          fakeRegistry.entries.set(name, [
+            ...entries.filter((entry) => setup.goneAfterCleanup?.includes(fakeRegistry.ref(name, entry)) !== true),
+            ...(setup.appearsAfterCleanup ?? []).flatMap((ref) =>
+              [":", "@"].some((separator) => ref.startsWith(name + separator)) ? [ref.slice(name.length + 1)] : []
+            ),
+          ]);
+        }
+      },
+    });
+    const output: string[] = [];
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => fakeRegistry.clock);
+    // The Container application read goes to Cloudflare's API with a token; it finds none.
+    vi.stubEnv("CLOUDFLARE_API_TOKEN", "test-token");
+    vi.stubGlobal("fetch", () => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({ success: true, result: [], result_info: {} }),
+    }));
+    try {
+      const exitCode = await runEdenCli(
+        ["destroy", "--project", root, "--env", "preview", "--name", "eve-destroy-fixture",
+        ...(setup.json === false ? [] : ["--json"])],
+        { cwd: root, stdout: (line) => output.push(line), stderr: (line) => output.push(line) },
+      );
+      return { exitCode, output };
+    } finally {
+      fakeRegistry.active = false;
+      clock.mockRestore();
+      vi.unstubAllEnvs();
+      vi.unstubAllGlobals();
+    }
+  }
+
+  test("attempts every entry of every repository and reports what the registry keeps, each with its own answer", async () => {
+    const { root } = await createDeployedFixture();
+    await addSecondRepository(root);
+    const snapshot = `${destroyRegistryRepository}:rootfs-snapshot-aaa`;
+    const [image, snapshotManifest, chain, earlierImage] = ["a", "b", "c", "d"].map((letter) =>
+      `${destroyRegistryRepository}@${manifest(letter)}`
+    ) as [string, string, string, string];
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: {
+        [destroyRegistryRepository]: [
+          "candidate", "rootfs-snapshot-aaa", manifest("a"), manifest("b"), manifest("c"), manifest("d"),
+        ],
+        [secondRepository]: ["candidate", "rootfs-set-custom"],
+      },
+      deletable: (ref) => ref !== snapshot,
+      answer: (ref) => ref === snapshot || ref === snapshotManifest
+        ? { status: 403, body: snapshotRefusal }
+        : ref === chain
+        ? { status: 409, body: singletonRefusal }
+        // The image that held the tag leaves after 15 seconds; the earlier image stays.
+        : { status: 204, body: "", ...(ref === image ? { leavesAfterMs: 15_000 } : {}) },
+    });
+    expect(exitCode).toBe(0);
+    expect(output).toHaveLength(1);
+    expect(new Set(fakeRegistry.wranglerDeletes)).toEqual(new Set([
+      destroyRegistryImage,
+      snapshot,
+      `${secondRepository}:candidate`,
+      `${secondRepository}:rootfs-set-custom`,
+    ]));
+    expect(fakeRegistry.credentialCalls).toBe(1);
+    expect(registryDeletes()).toEqual([snapshot, image, snapshotManifest, chain, earlierImage]);
+    for (const request of fakeRegistry.registryRequests) {
+      expect(request).toMatchObject({
+        host: "registry.cloudflare.com",
+        ownAgent: true,
+        verifiesPeer: true,
+        authorized: true,
+      });
+    }
+    // The wait for accepted deletes ends after 30 seconds.
+    expect(fakeRegistry.clock).toBe(30_000);
+    const result = JSON.parse(output[0] as string) as {
+      readonly warnings: readonly { readonly id: string; readonly message: string }[];
+      readonly registryObjectsKept: readonly unknown[];
+    };
+    expect(result).toMatchObject({ ok: true, status: "destroyed" });
+    expect(result.registryObjectsKept).toHaveLength(4);
+    expect(result.registryObjectsKept).toEqual(expect.arrayContaining([
+      { ref: snapshot, class: "refused-snapshot" },
+      { ref: snapshotManifest, class: "refused-snapshot" },
+      { ref: chain, class: "refused-singleton-artifact" },
+      { ref: earlierImage, class: "accepted-still-listed" },
+    ]));
+    expect(result.warnings.map((warning) => warning.id)).toEqual(["EVE_REGISTRY_OBJECTS_KEPT"]);
+    expect(result.warnings[0]?.message).toContain("still lists 4 object(s)");
+    expect(result.warnings[0]?.message).toContain("2 it refused to delete as snapshots (refused-snapshot)");
+    expect(result.warnings[0]?.message).toContain("1 it refused to delete with SINGLETON_ARTIFACT_EXISTS (refused-singleton-artifact)");
+    expect(result.warnings[0]?.message).toContain("1 whose delete it accepted and which it still listed at least 30 seconds later (accepted-still-listed)");
+    expect(output[0]).not.toContain("retainedSnapshot");
+    expect(output[0]).not.toContain("registry-password");
+  });
+
+  test("reports nothing for a manifest that leaves the listing after its delete was accepted", async () => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", manifest("a")] },
+      answer: () => ({ status: 204, body: "", leavesAfterMs: 15_000 }),
+    });
+    expect(exitCode).toBe(0);
+    expect(fakeRegistry.clock).toBe(15_000);
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({ ok: true, status: "destroyed" });
+    expect(result).not.toHaveProperty("warnings");
+    expect(result).not.toHaveProperty("registryObjectsKept");
+  });
+
+  test.each([
+    ["a 409 with another code", { status: 409, body: JSON.stringify({ code: "MANIFEST_REFERENCED" }) }],
+    ["a 409 page that only contains the code", { status: 409, body: "<p>SINGLETON_ARTIFACT_EXISTS</p>" }],
+    ["a 403 with the body of the 409", { status: 403, body: singletonRefusal }],
+    ["a 500 with the body of the 409", { status: 500, body: singletonRefusal }],
+    ["a 409 with the code for another artifact type", { status: 409, body: JSON.stringify({ ...(JSON.parse(singletonRefusal) as object), artifactType: "application/vnd.example.other.v1" }) }],
+    ["a 409 with the code and no digests", { status: 409, body: JSON.stringify({ code: "SINGLETON_ARTIFACT_EXISTS", artifactType: "application/vnd.cloudchamber.btrfs-chain.v1" }) }],
+    ["a 409 with the code and a digest that is not one", { status: 409, body: JSON.stringify({ ...(JSON.parse(singletonRefusal) as object), committedDigest: "sha256:abc" }) }],
+    ["a 409 that says another code before the refusal's", { status: 409, body: singletonRefusal.replace("{", "{\"code\":\"MANIFEST_REFERENCED\",") }],
+    ["a 200 for a manifest that is still listed", { status: 200, body: "" }],
+    ["a 404 for a manifest that is still listed", { status: 404, body: "" }],
+    ["a failed or timed-out connection", "error"],
+  ] as const)("does not keep a manifest on %s", async (_name, answer) => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", manifest("c")] },
+      answer: () => answer,
+    });
+    expect(exitCode).toBe(1);
+    expect(registryDeletes()).toEqual([`${destroyRegistryRepository}@${manifest("c")}`]);
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+    expect(result).not.toHaveProperty("registryObjectsKept");
+  });
+
+  test("gives an entry that appears during cleanup its own delete and its own answer", async () => {
+    const { root } = await createDeployedFixture();
+    const late = `${destroyRegistryRepository}:rootfs-snapshot-late`;
+    const lateManifest = `${destroyRegistryRepository}@${manifest("e")}`;
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate"] },
+      deletable: (ref) => ref !== late,
+      answer: () => ({ status: 403, body: snapshotRefusal }),
+      // A snapshot lands after the first pass has deleted what was listed.
+      // Listing 0 is destroy's first read, and listing 1 starts the cleanup.
+      listing: (repository, nth, last) => {
+        if (nth === 2 && last === null) fakeRegistry.entries.get(repository)?.push("rootfs-snapshot-late", manifest("e"));
+        return undefined;
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(fakeRegistry.wranglerDeletes).toEqual([destroyRegistryImage, late]);
+    expect(registryDeletes()).toEqual([late, lateManifest]);
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      ok: true,
+      status: "destroyed",
+      registryObjectsKept: [
+        { ref: late, class: "refused-snapshot" },
+        { ref: lateManifest, class: "refused-snapshot" },
+      ],
+    });
+  });
+
+  test("fails when new entries still appear after three passes", async () => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate"] },
+      // Every listing after the one that starts the cleanup has one more tag.
+      listing: (repository, nth, last) => {
+        if (nth > 1 && last === null) fakeRegistry.entries.get(repository)?.push(`late-${nth - 1}`);
+        return undefined;
+      },
+    });
+    expect(exitCode).toBe(1);
+    expect(fakeRegistry.wranglerDeletes).toEqual([
+      destroyRegistryImage,
+      `${destroyRegistryRepository}:late-1`,
+      `${destroyRegistryRepository}:late-2`,
+    ]);
+    await expect(lstat(currentPointer(root))).resolves.toBeDefined();
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      status: "failed",
+      error: { code: "EVE_DESTROY_IMAGES_RETAINED" },
+    });
+  });
+
+  test.each([
+    ["answers 500", { status: 500, body: "" }],
+    ["does not answer", "error"],
+    ["answers with a page that is not JSON", { status: 200, body: "<html>" }],
+    ["answers without a tags array", page(null)],
+    ["lists an entry that is neither a tag nor a digest", page(["candidate", "../other/manifests/x"])],
+    ["lists an entry twice", page(["candidate", "candidate"])],
+    ["lists entries out of order", page(["rootfs-set-a", "candidate"])],
+    ["is empty and has no name", page([], null, { name: null })],
+    ["is empty and names another repository", page([], null, { name: `account-test/${secondRepository}` })],
+    ["is empty and names another account", page([], null, { name: `another-account/${destroyRegistryRepository}` })],
+    ["says its name twice, the first for another repository", { ...page([]), body: `{"name":"account-test/${secondRepository}","name":"account-test/${destroyRegistryRepository}","tags":[]}` }],
+    ["lists a tag and then says tags a second time, empty", { ...page([]), body: `{"name":"account-test/${destroyRegistryRepository}","tags":["candidate"],"tags":[]}` }],
+    ["is empty and has another field", { ...page([]), body: JSON.stringify({ ...(JSON.parse(page([]).body) as object), next: "" }) }],
+    ["is empty and says another page follows an entry", page([], null, { cursor: manifest("f") })],
+    ["has entries and says that no page follows", page(["candidate"], null, { cursor: "" })],
+    ["has no Link header", { status: 200, body: page([]).body }],
+    ["has a Link header in a form the registry was not seen to send", { ...page([]), link: `<${page([]).link.replace("; rel=next", "")}>; rel="next"` }],
+    ["has a Link header for another repository", { ...page([]), link: page([]).link.replace(destroyRegistryRepository, secondRepository) }],
+    ["has a Link header that is not one next page", { ...page([]), link: page([]).link.replace("rel=next", "rel=prev") }],
+    ["has a Link header without a cursor", { ...page([]), link: page([]).link.replace("&last=; rel=next", "; rel=next") }],
+  ] as const)("deletes nothing and fails when the registry's listing %s", async (_name, listing) => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate"] },
+      listing: () => listing,
+    });
+    expect(exitCode).toBe(1);
+    expect(fakeRegistry.wranglerDeletes).toEqual([]);
+    expect(registryDeletes()).toEqual([]);
+    const result = JSON.parse(output[0] as string) as { readonly error: { readonly remediation: string } };
+    expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+    expect(result.error.remediation).toContain("direct requests to registry.cloudflare.com");
+    await expect(lstat(currentPointer(root))).resolves.toBeDefined();
+  });
+
+  test.each([
+    ["names a cursor that is not its last entry", (last: string | null) => last === null ? page(["candidate"], null, { cursor: "rootfs-set-a" }) : undefined, 3],
+    // The registry still holds a manifest that this listing leaves out.
+    ["has entries, says that no page follows, and then ends", (last: string | null) => last === null ? page(["candidate"], null, { cursor: "" }) : page([], last), 3],
+    ["goes backwards on its second page", (last: string | null) => last === null ? page(["rootfs-set-a"]) : page(["candidate"], last), 6],
+    ["fails on its second page", (last: string | null) => last === null ? undefined : { status: 500, body: "" }, 6],
+    ["repeats its first page", (last: string | null) => page(["candidate"], last), 6],
+    // Each page has one more tag, so the listing stops at its limit of 100 pages.
+    ["never ends", (last: string | null) => page([`tag-${String(Number(last?.slice(4) ?? 0) + 1).padStart(4, "0")}`], last), 300],
+  ] as const)("deletes nothing and fails when a listing %s", async (_name, answer, requests) => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate"] },
+      listing: (_repository, _nth, last) => answer(last),
+    });
+    expect(exitCode).toBe(1);
+    expect(fakeRegistry.wranglerDeletes).toEqual([]);
+    // Destroy's first read, the cleanup and the final read each give up on their own listing.
+    expect(fakeRegistry.registryRequests.map((request) => request.method)).toEqual(Array(requests).fill("GET"));
+    expect(JSON.parse(output[0] as string)).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+    await expect(lstat(currentPointer(root))).resolves.toBeDefined();
+  });
+
+  test.each([
+    ["answers 500", () => ({ status: 500, body: "" })],
+    ["is empty and names another account", () => page([], null, { name: `another-account/${destroyRegistryRepository}` })],
+    ["repeats an entry on its second page", (last: string | null) => last === null ? undefined : page([manifest("f")], last)],
+  ] as const)("keeps the record and fails when the final listing %s", async (_name, answer) => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate"] },
+      // The cleanup deletes the tag and reads an empty listing. A manifest
+      // lands before the final read, whose listing cannot be read.
+      onRead: (nth) => {
+        if (nth === 1) fakeRegistry.entries.get(destroyRegistryRepository)?.push(manifest("f"));
+      },
+      listing: (_repository, _nth, last) => fakeRegistry.reads === 2 ? answer(last) : undefined,
+    });
+    expect(exitCode).toBe(1);
+    expect(fakeRegistry.wranglerDeletes).toEqual([destroyRegistryImage]);
+    expect(registryDeletes()).toEqual([]);
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      ok: false,
+      status: "failed",
+      error: { code: "EVE_DESTROY_IMAGES_RETAINED" },
+    });
+    await expect(lstat(currentPointer(root))).resolves.toBeDefined();
+  });
+
+  test("keeps the record and fails when the final read is for another account", async () => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate"] },
+      // Wrangler is signed in to another account by the time destroy verifies.
+      whoamiAccountId: () => fakeRegistry.reads === 0 ? "account-test" : "another-account",
+    });
+    expect(exitCode).toBe(1);
+    expect(fakeRegistry.wranglerDeletes).toEqual([destroyRegistryImage]);
+    // The credential for the first account is not used to list the other one.
+    expect(fakeRegistry.credentialCalls).toBe(2);
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      ok: false,
+      status: "indeterminate",
+      error: { code: "EVE_DESTROY_INDETERMINATE" },
+    });
+    await expect(lstat(currentPointer(root))).resolves.toBeDefined();
+  });
+
+  test("gives a manifest whose delete was accepted late its own 30 seconds before reporting it", async () => {
+    const { root } = await createDeployedFixture();
+    const [early, late] = [manifest("a"), manifest("b")].map((entry) => `${destroyRegistryRepository}@${entry}`) as [string, string];
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", manifest("a")] },
+      answer: () => ({ status: 204, body: "" }),
+      // A second manifest lands 25 seconds into the wait for the first.
+      listing: (repository, _nth, last) => {
+        const entries = fakeRegistry.entries.get(repository) ?? [];
+        if (last === null && fakeRegistry.clock === 25_000 && !entries.includes(manifest("b"))) entries.push(manifest("b"));
+        return undefined;
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(registryDeletes()).toEqual([early, late]);
+    // The second delete was accepted at 25 seconds, so its wait ends at 55.
+    expect(fakeRegistry.clock).toBe(55_000);
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      ok: true,
+      status: "destroyed",
+      registryObjectsKept: [
+        { ref: early, class: "accepted-still-listed" },
+        { ref: late, class: "accepted-still-listed" },
+      ],
+    });
+  });
+
+  test("does not report an accepted delete that never got its wait when the passes run out", async () => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: [manifest("a")] },
+      answer: () => ({ status: 204, body: "" }),
+      // Every listing of the cleanup after its first has one more tag, so the
+      // cleanup stops at its third pass with no time passed.
+      listing: (repository, nth, last) => {
+        if (nth > 1 && last === null && fakeRegistry.reads === 1) fakeRegistry.entries.get(repository)?.push(`late-${nth - 1}`);
+        return undefined;
+      },
+      // The tag that got no delete is gone by the final read; the manifest is not.
+      goneAfterCleanup: [`${destroyRegistryRepository}:late-3`],
+    });
+    expect(fakeRegistry.clock).toBe(0);
+    expect(exitCode).toBe(1);
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+    expect(result).not.toHaveProperty("registryObjectsKept");
+    await expect(lstat(currentPointer(root))).resolves.toBeDefined();
+  });
+
+  test.each([
+    ["fails when the other answer is not a kept one", { status: 500, body: "" }, 1],
+    ["reports only the refused one when the other leaves", { status: 204, body: "", leavesAfterMs: 0 }, 0],
+  ] as const)("a digest in two repositories gets a delete and an answer in each: %s", async (_name, otherAnswer, expectedExit) => {
+    const { root } = await createDeployedFixture();
+    await addSecondRepository(root);
+    const [first, second] = [destroyRegistryRepository, secondRepository].map((repository) => `${repository}@${manifest("a")}`) as [string, string];
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: [manifest("a")], [secondRepository]: [manifest("a")] },
+      answer: (ref) => ref === first ? { status: 409, body: singletonRefusal } : otherAnswer,
+    });
+    expect(exitCode).toBe(expectedExit);
+    expect(new Set(registryDeletes())).toEqual(new Set([first, second]));
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    if (expectedExit === 0) {
+      expect(result).toMatchObject({
+        status: "destroyed",
+        registryObjectsKept: [{ ref: first, class: "refused-singleton-artifact" }],
+      });
+    } else {
+      expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+      expect(JSON.stringify(result.error)).toContain(secondRepository);
+      expect(JSON.stringify(result.error)).not.toContain(destroyRegistryRepository);
+      expect(result).not.toHaveProperty("registryObjectsKept");
+    }
+  });
+
+  test("reads a listing whose 100th page is the empty one that ends it", async () => {
+    const { root } = await createDeployedFixture();
+    const tags = Array.from({ length: 99 }, (_unused, index) => `rootfs-set-${String(index).padStart(2, "0")}`);
+    const { exitCode } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: tags },
+      pageSize: 1,
+    });
+    expect(exitCode).toBe(0);
+    expect(fakeRegistry.wranglerDeletes).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
+  });
+
+  test("reads a listing that takes several pages", async () => {
+    const { root } = await createDeployedFixture();
+    const tags = ["candidate", "rootfs-set-a", "rootfs-set-b", "rootfs-set-c", "rootfs-set-d"];
+    const { exitCode } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: tags },
+      pageSize: 2,
+    });
+    expect(exitCode).toBe(0);
+    expect(fakeRegistry.wranglerDeletes).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
+    // Three pages and the empty one that ends a listing, for destroy's first
+    // read and again for the cleanup; then one empty listing after the
+    // deletes and one for the final read.
+    expect(fakeRegistry.registryRequests.map((request) => request.method)).toEqual(Array(10).fill("GET"));
+  });
+
+  test("fails when another repository's tag is refused with a different answer", async () => {
+    const { root } = await createDeployedFixture();
+    await addSecondRepository(root);
+    const snapshot = `${destroyRegistryRepository}:rootfs-snapshot-aaa`;
+    const other = `${secondRepository}:rootfs-set-custom`;
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: {
+        [destroyRegistryRepository]: ["candidate", "rootfs-snapshot-aaa"],
+        [secondRepository]: ["candidate", "rootfs-set-custom"],
+      },
+      deletable: (ref) => ref !== snapshot && ref !== other,
+      answer: (ref) => ref === snapshot
+        ? { status: 403, body: snapshotRefusal }
+        : { status: 403, body: JSON.stringify({ errors: [{ code: "DENIED", message: "access denied" }] }) },
+    });
+    expect(exitCode).toBe(1);
+    expect(fakeRegistry.wranglerDeletes).toContain(other);
+    expect(new Set(registryDeletes())).toEqual(new Set([snapshot, other]));
+    expect(fakeRegistry.credentialCalls).toBe(1);
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      status: "failed",
+      error: { code: "EVE_DESTROY_IMAGES_RETAINED" },
+    });
+    expect(JSON.stringify(result.error)).toContain(secondRepository);
+    expect(result).not.toHaveProperty("registryObjectsKept");
+  });
+
+  test("fails on a tag that appears after cleanup, whatever its name", async () => {
+    const { root } = await createDeployedFixture();
+    const snapshot = `${destroyRegistryRepository}:rootfs-snapshot-aaa`;
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", "rootfs-snapshot-aaa"] },
+      deletable: (ref) => ref !== snapshot,
+      answer: () => ({ status: 403, body: snapshotRefusal }),
+      appearsAfterCleanup: [`${destroyRegistryRepository}:rootfs-snapshot-new`],
+    });
+    expect(exitCode).toBe(1);
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      status: "failed",
+      error: { code: "EVE_DESTROY_IMAGES_RETAINED" },
+    });
+    expect(result).not.toHaveProperty("registryObjectsKept");
+  });
+
+  test.each([
+    ["a 403 page that only contains the message", { status: 403, body: "<p>snapshot manifests cannot be deleted through this API</p>" }, undefined],
+    ["a 403 with DENIED and a longer message", { status: 403, body: snapshotRefusal.replace("this API", "this API today") }, undefined],
+    ["a 403 with the message under another code", { status: 403, body: snapshotRefusal.replace("DENIED", "UNAUTHORIZED") }, undefined],
+    ["a 403 with a second error beside the refusal", { status: 403, body: JSON.stringify({ errors: [...(JSON.parse(snapshotRefusal) as { errors: unknown[] }).errors, { code: "UNKNOWN", message: "other" }] }) }, undefined],
+    ["a 403 that says errors twice, the refusal last", { status: 403, body: snapshotRefusal.replace("{", "{\"errors\":[],") }, undefined],
+    ["a 401 with the refusal body", { status: 401, body: snapshotRefusal }, undefined],
+    ["a 500 with the refusal body", { status: 500, body: snapshotRefusal }, undefined],
+    ["a 307 redirect with the refusal body", { status: 307, body: snapshotRefusal }, undefined],
+    ["a refusal padded past 4 KiB", { status: 403, body: snapshotRefusal + " ".repeat(5_000) }, undefined],
+    ["a failed or timed-out connection", "error", undefined],
+    ["a credential for another account", { status: 403, body: snapshotRefusal }, "another-account"],
+  ] as const)("does not treat %s as the snapshot refusal", async (_name, answer, credentialAccountId) => {
+    const { root } = await createDeployedFixture();
+    const snapshot = `${destroyRegistryRepository}:rootfs-snapshot-aaa`;
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", "rootfs-snapshot-aaa"] },
+      deletable: (ref) => ref !== snapshot,
+      answer: () => answer,
+      ...(credentialAccountId === undefined ? {} : { credentialAccountId }),
+    });
+    expect(exitCode).toBe(1);
+    // Without a credential for this account nothing is listed, so nothing is deleted.
+    expect(fakeRegistry.wranglerDeletes).toEqual(credentialAccountId === undefined ? [destroyRegistryImage, snapshot] : []);
+    expect(fakeRegistry.registryRequests.map((request) => request.method)).toEqual(
+      // A listing is a page and the empty page that ends it: destroy's first
+      // read and the cleanup's, then after the delete the cleanup's and the final read's.
+      credentialAccountId === undefined
+        ? ["GET", "GET", "GET", "GET", "DELETE", "GET", "GET", "GET", "GET"]
+        : [],
+    );
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+    expect(result).not.toHaveProperty("registryObjectsKept");
+  });
+
+  test("sends no delete of its own when Wrangler deletes every tag", async () => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", "rootfs-set-custom"] },
+    });
+    expect(exitCode).toBe(0);
+    expect(fakeRegistry.wranglerDeletes).toHaveLength(2);
+    expect(fakeRegistry.credentialCalls).toBe(1);
+    expect(registryDeletes()).toEqual([]);
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({ ok: true, status: "destroyed" });
+    expect(result).not.toHaveProperty("warnings");
+  });
+
+  test.each([
+    ["Wrangler could not read the tag", (ref: string) => `Failed to retrieve info for ${ref}: 403 Forbidden`],
+    ["the registry answered Wrangler's delete with 500", (ref: string) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 500 Internal Server Error`],
+    ["Wrangler named another tag", () => `Failed to delete ${destroyRegistryRepository}:other (digest: sha256:${"0".repeat(64)}): 403 Forbidden`],
+  ] as const)("sends no delete of its own when %s", async (_name, wranglerFailure) => {
+    const { root } = await createDeployedFixture();
+    const snapshot = `${destroyRegistryRepository}:rootfs-snapshot-aaa`;
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", "rootfs-snapshot-aaa"] },
+      deletable: (ref) => ref !== snapshot,
+      wranglerFailure,
+      answer: () => ({ status: 403, body: snapshotRefusal }),
+    });
+    expect(exitCode).toBe(1);
+    expect(fakeRegistry.wranglerDeletes).toContain(snapshot);
+    expect(registryDeletes()).toEqual([]);
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      status: "failed",
+      error: { code: "EVE_DESTROY_IMAGES_RETAINED" },
+    });
+  });
+
+  test("stops asking the registry after 60 seconds without an answer, and still asks Wrangler to delete every tag", async () => {
+    const { root } = await createDeployedFixture();
+    const snapshotTags = ["rootfs-snapshot-a", "rootfs-snapshot-b", "rootfs-snapshot-c", "rootfs-snapshot-d"];
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["a-first", ...snapshotTags, "z-last"] },
+      deletable: (ref) => !ref.includes(":rootfs-snapshot-"),
+      answer: () => "stall",
+    });
+    expect(exitCode).toBe(1);
+    // The second wait starts with 29,999.75 ms left; the tags after it are still deleted.
+    expect(fakeRegistry.wranglerDeletes).toHaveLength(6);
+    expect(fakeRegistry.wranglerDeletes.at(-1)).toBe(`${destroyRegistryRepository}:z-last`);
+    expect(registryDeletes()).toHaveLength(2);
+    expect(fakeRegistry.entries.get(destroyRegistryRepository)).toEqual(snapshotTags);
+    const result = JSON.parse(output[0] as string) as { readonly error: { readonly remediation: string } };
+    expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+    expect(result.error.remediation).toContain("direct requests to registry.cloudflare.com");
+    expect(result).not.toHaveProperty("registryObjectsKept");
+  });
+
+  test("fails when the registry stops answering after it confirmed one snapshot tag", async () => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["rootfs-snapshot-a-ok", "rootfs-snapshot-b", "rootfs-snapshot-c", "rootfs-snapshot-d"] },
+      deletable: () => false,
+      answer: (ref) => ref.endsWith("-ok") ? { status: 403, body: snapshotRefusal } : "stall",
+    });
+    expect(exitCode).toBe(1);
+    expect(fakeRegistry.wranglerDeletes).toHaveLength(4);
+    expect(registryDeletes()).toHaveLength(3);
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+    expect(result).not.toHaveProperty("registryObjectsKept");
+  });
+
+  test("keeps the confirmed snapshot tag when another tag left by cleanup is gone from the final list", async () => {
+    const { root } = await createDeployedFixture();
+    const snapshot = `${destroyRegistryRepository}:rootfs-snapshot-aaa`;
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", "rootfs-snapshot-aaa"] },
+      deletable: () => false,
+      answer: (ref) => ref === snapshot
+        ? { status: 403, body: snapshotRefusal }
+        : { status: 500, body: "" },
+      goneAfterCleanup: [destroyRegistryImage],
+    });
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      ok: true,
+      status: "destroyed",
+      registryObjectsKept: [{ ref: snapshot, class: "refused-snapshot" }],
+    });
+  });
+
+  test("fails when a tag left by cleanup beside a confirmed snapshot tag is still in the final list", async () => {
+    const { root } = await createDeployedFixture();
+    const snapshot = `${destroyRegistryRepository}:rootfs-snapshot-aaa`;
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", "rootfs-snapshot-aaa"] },
+      deletable: () => false,
+      answer: (ref) => ref === snapshot
+        ? { status: 403, body: snapshotRefusal }
+        : { status: 500, body: "" },
+    });
+    expect(exitCode).toBe(1);
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+    expect(result).not.toHaveProperty("registryObjectsKept");
+  });
+
+  test("prints every kept object on its own line when a target has 200 of them", async () => {
+    const { root } = await createDeployedFixture();
+    const snapshotTags = Array.from(
+      { length: 200 },
+      (_, index) => `rootfs-snapshot-${String(index).padStart(64, "0")}`,
+    );
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate", ...snapshotTags] },
+      deletable: (ref) => ref === destroyRegistryImage,
+      answer: () => ({ status: 403, body: snapshotRefusal }),
+      json: false,
+    });
+    expect(exitCode).toBe(0);
+    expect(fakeRegistry.wranglerDeletes).toHaveLength(201);
+    expect(registryDeletes()).toHaveLength(200);
+    expect(fakeRegistry.credentialCalls).toBe(1);
+    const lines = output.join("\n").split("\n");
+    for (const tag of snapshotTags) {
+      expect(lines).toContain(`  kept: ${destroyRegistryRepository}:${tag} (refused-snapshot)`);
+    }
+    const warning = lines.find((line) => line.startsWith("! EVE_REGISTRY_OBJECTS_KEPT")) ?? "";
+    expect(warning).toContain("still lists 200 object(s)");
+    expect(warning.length).toBeLessThan(2_000);
+    expect(lines.some((line) => line.startsWith("✓ destroyed eve-destroy-fixture (preview)"))).toBe(true);
+  });
+
   test("returns indeterminate without clearing CURRENT when the Worker deletion is ambiguous", async () => {
     const { root } = await createDeployedFixture();
     const output: string[] = [];
@@ -3035,6 +3960,428 @@ describe("eden deploy in-place update", () => {
       ),
     );
     expect(current).toContain("generation-two");
+  });
+
+  test.each([
+    ["deletes the rest and warns about what the registry keeps", true, 0],
+    ["fails VAL-LIFE-007 when another tag is refused with a different answer", false, 1],
+  ] as const)("after an update, cleanup of the superseded repository %s", async (_name, otherTagDeletable, expectedExit) => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root);
+    const repository = priorImage.slice(0, -":candidate".length);
+    const snapshot = `${repository}:rootfs-snapshot-aaa`;
+    const other = `${repository}:rootfs-set-custom`;
+    const chain = `${repository}@${manifest("c")}`;
+    const controlPlane = updateControlPlane(root, []);
+    Reflect.deleteProperty(controlPlane, "deleteRegistryRepository");
+    startFakeRegistry({
+      entries: { [repository]: ["candidate", "rootfs-snapshot-aaa", "rootfs-set-custom", manifest("c")] },
+      deletable: (ref) => ref !== snapshot && (otherTagDeletable || ref !== other),
+      answer: (ref) => ref === snapshot
+        ? { status: 403, body: snapshotRefusal }
+        : ref === chain
+        ? { status: 409, body: singletonRefusal }
+        : { status: 403, body: JSON.stringify({ errors: [{ code: "DENIED", message: "access denied" }] }) },
+    });
+    const output: string[] = [];
+    try {
+      await expect(
+        runEdenCli(
+          ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+          { cwd: root, stdout: (line) => output.push(line), eveControlPlane: controlPlane },
+        ),
+      ).resolves.toBe(expectedExit);
+    } finally {
+      fakeRegistry.active = false;
+    }
+    expect(new Set(fakeRegistry.wranglerDeletes)).toEqual(new Set([priorImage, snapshot, other]));
+    const result = JSON.parse(output[0] as string) as {
+      readonly checks: readonly { readonly id: string; readonly status: string }[];
+      readonly warnings: readonly { readonly id: string }[];
+      readonly registryObjectsKept?: readonly unknown[];
+    };
+    // What the registry gave a kept answer for is reported either way; only the check differs.
+    expect(result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status)
+      .toBe(otherTagDeletable ? "passed" : "failed");
+    expect(result.warnings.some((warning) => warning.id === "EVE_REGISTRY_OBJECTS_KEPT")).toBe(true);
+    expect(result.registryObjectsKept).toEqual([
+      { ref: snapshot, class: "refused-snapshot" },
+      { ref: chain, class: "refused-singleton-artifact" },
+    ]);
+  });
+
+  test.each([
+    ["a trailing dot on the registry's name", "registry.cloudflare.com./account-test/REPOSITORY@DIGEST"],
+    ["a port on the registry's name", "registry.cloudflare.com:443/account-test/REPOSITORY@DIGEST"],
+    ["the registry's name in upper case", "REGISTRY.CLOUDFLARE.COM/account-test/REPOSITORY@DIGEST"],
+    ["no registry name", "account-test/REPOSITORY@DIGEST"],
+    ["another registry", "registry.example/account-test/REPOSITORY@DIGEST"],
+    ["another account", "registry.cloudflare.com/another-account/REPOSITORY@DIGEST"],
+    ["the account in upper case", "registry.cloudflare.com/ACCOUNT-TEST/REPOSITORY@DIGEST"],
+    ["a repository inside a folder", "registry.cloudflare.com/account-test/eden/REPOSITORY@DIGEST"],
+    ["a repository path that climbs", "registry.cloudflare.com/account-test/eve/../REPOSITORY@DIGEST"],
+    ["a tag in place of the digest", "registry.cloudflare.com/account-test/REPOSITORY:candidate"],
+    ["a tag before the digest", "registry.cloudflare.com/account-test/REPOSITORY:candidate@DIGEST"],
+    ["the digest in upper case", `registry.cloudflare.com/account-test/REPOSITORY@sha256:${"D".repeat(64)}`],
+    ["another digest algorithm", `registry.cloudflare.com/account-test/REPOSITORY@sha512:${"d".repeat(128)}`],
+  ] as const)("refuses an image reference with %s before it publishes", async (_name, spelling) => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root);
+    const repository = priorImage.slice(0, -":candidate".length);
+    const operations: string[] = [];
+    const controlPlane = {
+      ...updateControlPlane(root, operations),
+      containerImageReference: spelling.replace("REPOSITORY", repository).replace("DIGEST", manifest("d")),
+    };
+    Reflect.deleteProperty(controlPlane, "deleteRegistryRepository");
+    startFakeRegistry({
+      entries: { [repository]: ["candidate", manifest("b"), manifest("d")] },
+      answer: () => ({ status: 204, body: "", leavesAfterMs: 0 }),
+    });
+    const output: string[] = [];
+    try {
+      await expect(
+        runEdenCli(
+          ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+          { cwd: root, stdout: (line) => output.push(line), eveControlPlane: controlPlane },
+        ),
+      ).resolves.toBe(1);
+    } finally {
+      fakeRegistry.active = false;
+    }
+    expect(JSON.parse(output[0] as string)).toMatchObject({ ok: false, error: { code: "EVE_IMAGE_IDENTITY_MISMATCH" } });
+    expect(operations).toEqual([]);
+    expect(fakeRegistry.wranglerDeletes).toEqual([]);
+    expect(fakeRegistry.registryRequests).toEqual([]);
+    const current = await realpath(join(root, ".eden", "eve-deploy", "targets", `preview-${updateName}`, "CURRENT"));
+    expect(current).toContain("gen-prior");
+  });
+
+  test("deletes nothing from the superseded repository when the promoted image is in it", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root);
+    const repository = priorImage.slice(0, -":candidate".length);
+    const controlPlane = {
+      ...updateControlPlane(root, []),
+      // A programmatic caller names an image that it pushed to the prior generation's repository.
+      containerImageReference: `registry.cloudflare.com/account-test/${repository}@${manifest("d")}`,
+    };
+    Reflect.deleteProperty(controlPlane, "deleteRegistryRepository");
+    startFakeRegistry({
+      entries: { [repository]: ["candidate", manifest("b"), manifest("d")] },
+      answer: () => ({ status: 204, body: "", leavesAfterMs: 0 }),
+    });
+    const output: string[] = [];
+    try {
+      await expect(
+        runEdenCli(
+          ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+          { cwd: root, stdout: (line) => output.push(line), eveControlPlane: controlPlane },
+        ),
+      ).resolves.toBe(0);
+    } finally {
+      fakeRegistry.active = false;
+    }
+    expect(fakeRegistry.wranglerDeletes).toEqual([]);
+    expect(fakeRegistry.registryRequests).toEqual([]);
+    const result = JSON.parse(output[0] as string) as {
+      readonly deployment: { readonly imageReference: string };
+      readonly checks: readonly { readonly id: string; readonly status: string; readonly message: string }[];
+    };
+    expect(result.deployment.imageReference).toBe(controlPlane.containerImageReference);
+    expect(result.checks.find((entry) => entry.id === "VAL-LIFE-007")).toMatchObject({
+      status: "skipped",
+      message: expect.stringContaining("nothing in it was deleted") as unknown,
+    });
+  });
+
+  /** Builds a project whose World declares deployment affinity. */
+  const affinityWorldBuilder = () =>
+    fakeBuilder(async (request) => {
+      await mkdir(join(request.snapshotRoot, ".output/.eve/compile"), { recursive: true });
+      await writeFile(
+        join(request.snapshotRoot, ".output/.eve/compile/compiled-agent-manifest.json"),
+        JSON.stringify({ config: { experimental: { workflow: { world: "@moinulmoin/eden-world-cloudflare" } } } }),
+        "utf8",
+      );
+      const worldRoot = join(request.snapshotRoot, "node_modules/@moinulmoin/eden-world-cloudflare");
+      await mkdir(worldRoot, { recursive: true });
+      await writeFile(join(worldRoot, "package.json"), JSON.stringify({
+        version: "0.11.1",
+        eden: { capabilities: { worldRpcAuth: true, atomicStartHook: true, deploymentAffinity: true } },
+      }));
+    });
+
+  test.each([
+    ["an image reference in another spelling", `registry.cloudflare.com./account-test/eve@${manifest("d")}`],
+    ["an image reference with another digest", `registry.cloudflare.com/account-test/eve@${manifest("e")}`],
+  ] as const)("with deployment affinity, refuses %s before it changes the target", async (_name, containerImageReference) => {
+    const root = await createRoot();
+    await writeProject(root);
+    const { generationRoot } = await createOwnedTargetFixture(root, { worldCloudflare: true });
+    // The prior record keeps one version that has drained, so a deploy would retire it.
+    const kept = `eden-affinity-${"2".repeat(24)}`;
+    const recordPath = join(generationRoot, "deployment.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as { identity: Record<string, unknown> };
+    record.identity.retainedDeployments = {
+      [kept]: {
+        image: `registry.cloudflare.com/account-test/eden-eve-${updateTargetKey}-${kept}@${manifest("e")}`,
+        generationId: "gen-kept",
+        eveVersion: "0.90.0",
+        worldRpcAuth: true,
+      },
+    };
+    await writeFile(recordPath, JSON.stringify(record), "utf8");
+    const operations: string[] = [];
+    const output: string[] = [];
+    await expect(
+      runEdenCli(
+        ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            ...updateControlPlane(root, operations, { builder: affinityWorldBuilder() }),
+            containerImageReference,
+            protectedStore: {
+              put: async () => {
+                operations.push("write-control-secret");
+                return { revision: "revision-test", handle: "handle-test" };
+              },
+            },
+            deploymentRpc: async (request: { readonly operation: string; readonly deploymentIds: readonly string[] }) => {
+              operations.push(request.operation);
+              return request.operation === "deployments.retire"
+                ? { retired: request.deploymentIds }
+                : Object.fromEntries(request.deploymentIds.map((id) => [id, {
+                  liveRuns: 0, liveSessions: 0, pendingMessages: 0, unfinishedTransfers: 0, drained: true,
+                }]));
+            },
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(JSON.parse(output[0] as string)).toMatchObject({ ok: false, error: { code: "EVE_IMAGE_IDENTITY_MISMATCH" } });
+    // No control secret, no drain read, no retirement, no publication.
+    expect(operations).toEqual([]);
+  });
+
+  test.each([
+    ["sweeps each retired version's repository and records the retirements", "its own"],
+    ["leaves one retirement pending while a kept version's image is in its repository, and finishes the other", "the retiring"],
+    ["leaves every retirement pending while a kept version's image is spelled so that Eden cannot place it", "none"],
+  ] as const)("with deployment affinity, cleanup %s", async (_name, keptIn) => {
+    const root = await createRoot();
+    await writeProject(root);
+    const { generationRoot } = await createOwnedTargetFixture(root, { worldCloudflare: true });
+    const [retiring, kept, other] = ["1", "2", "3"].map((digit) => `eden-affinity-${digit.repeat(24)}`) as [string, string, string];
+    const repository = `eden-eve-${updateTargetKey}-${retiring}`;
+    const otherRepository = `eden-eve-${updateTargetKey}-${other}`;
+    const image = (name: string, letter: string): string => `registry.cloudflare.com/account-test/${name}@${manifest(letter)}`;
+    // The prior record keeps one version that still has a session and owes two retirements.
+    const recordPath = join(generationRoot, "deployment.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as { identity: Record<string, unknown> };
+    record.identity.retainedDeployments = {
+      [kept]: {
+        image: keptIn === "none"
+          // The same registry, with a trailing dot on its name.
+          ? image(repository, "e").replace("registry.cloudflare.com/", "registry.cloudflare.com./")
+          : image(keptIn === "the retiring" ? repository : `eden-eve-${updateTargetKey}-${kept}`, "e"),
+        generationId: "gen-kept",
+        eveVersion: "0.90.0",
+        worldRpcAuth: true,
+      },
+    };
+    record.identity.pendingRetirements = {
+      [retiring]: { image: image(repository, "c"), generationId: "gen-retiring" },
+      [other]: { image: image(otherRepository, "f"), generationId: "gen-other" },
+    };
+    await writeFile(recordPath, JSON.stringify(record), "utf8");
+    const rpc: string[] = [];
+    const controlPlane = {
+      ...updateControlPlane(root, [], { builder: affinityWorldBuilder() }),
+      protectedStore: { put: async () => ({ revision: "revision-test", handle: "handle-test" }) },
+      // A Worker with deployment affinity names its Container instance after the deployment.
+      health: async (request: EveDeploymentHealthRequest) => ({
+        status: "ready" as const,
+        identity: {
+          ...request.identity,
+          stableContainerInstanceName: `${request.identity.stableContainerInstanceName}:${request.identity.deploymentId}`,
+        },
+      }),
+      deploymentRpc: async (request: { readonly operation: string; readonly deploymentIds: readonly string[] }) => {
+        rpc.push(`${request.operation}:${request.deploymentIds.join(",")}`);
+        return request.operation === "deployments.retire"
+          ? { retired: request.deploymentIds }
+          : Object.fromEntries(request.deploymentIds.map((id) => [id, {
+            liveRuns: 0, liveSessions: 1, pendingMessages: 0, unfinishedTransfers: 0, drained: false,
+          }]));
+      },
+    };
+    Reflect.deleteProperty(controlPlane, "deleteRegistryRepository");
+    startFakeRegistry({
+      entries: {
+        [repository]: keptIn === "its own" ? [manifest("c")] : [manifest("c"), manifest("e")],
+        [otherRepository]: [manifest("f")],
+      },
+      answer: () => ({ status: 204, body: "", leavesAfterMs: 0 }),
+    });
+    const output: string[] = [];
+    try {
+      await expect(
+        runEdenCli(
+          ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+          { cwd: root, stdout: (line) => output.push(line), eveControlPlane: controlPlane },
+        ),
+      ).resolves.toBe(keptIn === "its own" ? 0 : 1);
+    } finally {
+      fakeRegistry.active = false;
+    }
+    expect(rpc).toContain(`deployments.retire:${retiring},${other}`);
+    expect(registryDeletes()).toEqual([
+      ...(keptIn === "its own" ? [`${repository}@${manifest("c")}`] : []),
+      ...(keptIn === "none" ? [] : [`${otherRepository}@${manifest("f")}`]),
+    ]);
+    const result = JSON.parse(output[0] as string) as {
+      readonly checks: readonly { readonly id: string; readonly status: string; readonly message: string }[];
+    };
+    const cleanup = result.checks.find((entry) => entry.id === "VAL-LIFE-007");
+    expect(cleanup?.status).toBe(keptIn === "its own" ? "passed" : "failed");
+    if (keptIn !== "its own") expect(cleanup?.message).toContain("holds an image that is still deployed; nothing in it was deleted");
+    // A pending retirement gets one instruction, in the check and in the error: wait for the next deploy.
+    if (keptIn !== "its own") {
+      const failed = JSON.parse(output[0] as string) as {
+        readonly checks: readonly { readonly id: string; readonly remediation?: string }[];
+        readonly error: { readonly code: string; readonly message: string; readonly remediation: string };
+      };
+      expect(failed.error.code).toBe("EVE_RUNTIME_IMAGE_CLEANUP_FAILED");
+      expect(failed.error.remediation).toContain("Do not redeploy for this");
+      expect(failed.error.remediation).toBe(failed.checks.find((entry) => entry.id === "VAL-LIFE-007")?.remediation);
+      expect(output[0]).not.toContain("Retry deploy");
+      expect(output[0]).not.toContain("Rerun eden deploy");
+    }
+    // Only a proven cleanup is recorded as done, so the next deploy retries the other.
+    const current = await realpath(join(root, ".eden", "eve-deploy", "targets", `preview-${updateName}`, "CURRENT"));
+    const completed = await readFile(join(current, "completed-retirements.json"), "utf8").catch(() => undefined);
+    expect(JSON.parse(completed ?? "[]")).toEqual(
+      keptIn === "its own" ? [retiring, other] : keptIn === "the retiring" ? [other] : [],
+    );
+  });
+
+  test("reads back the record of an update that gave a kept version a suffixed id", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    await createOwnedTargetFixture(root, { worldCloudflare: true });
+    const currentPath = join(root, ".eden", "eve-deploy", "targets", `preview-${updateName}`, "CURRENT");
+    // The Worker Cloudflare reports is the one the last successful deploy published.
+    let live: { deploymentId?: string; releaseId?: string } = { deploymentId: "eve-deploy-prior" };
+    const deploy = async (generation: string) => {
+      const output: string[] = [];
+      let published: EveDeploymentPublicationRequest["identity"] | undefined;
+      const read = existingTargetRead();
+      const code = await runEdenCli(
+        ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            ...updateControlPlane(root, [], {
+              // A World that declares deployment affinity and World RPC authentication.
+              builder: fakeBuilder(async (request) => {
+                await mkdir(join(request.snapshotRoot, ".output/.eve/compile"), { recursive: true });
+                await writeFile(
+                  join(request.snapshotRoot, ".output/.eve/compile/compiled-agent-manifest.json"),
+                  JSON.stringify({ config: { experimental: { workflow: { world: "@moinulmoin/eden-world-cloudflare" } } } }),
+                  "utf8",
+                );
+                const worldRoot = join(request.snapshotRoot, "node_modules/@moinulmoin/eden-world-cloudflare");
+                await mkdir(worldRoot, { recursive: true });
+                await writeFile(join(worldRoot, "package.json"), JSON.stringify({
+                  version: "0.11.2",
+                  eden: { capabilities: { worldRpcAuth: true, atomicStartHook: true, deploymentAffinity: true } },
+                }));
+              }),
+              onPublish: (request) => { published = request.identity; },
+            }),
+            artifactRoot: join(root, ".eden", "eve-deploy", "generations", generation),
+            cloudflareRead: async () => {
+              const base = await read();
+              return { ...base, target: { ...base.target, providerEvidence: {
+                ...base.target.providerEvidence, workerDeploymentId: live.deploymentId, workerReleaseId: live.releaseId,
+              } } };
+            },
+            protectedStore: { put: async () => ({ revision: "revision-test", handle: "handle-test" }) },
+            health: async (request: EveDeploymentHealthRequest) => ({
+              status: "ready" as const,
+              identity: {
+                ...request.identity,
+                stableContainerInstanceName: `${request.identity.stableContainerInstanceName}:${request.identity.deploymentId}`,
+              },
+            }),
+            deploymentRpc: async (request: { readonly operation: string; readonly deploymentIds: readonly string[] }) =>
+              request.operation === "deployments.retire"
+                ? { retired: request.deploymentIds }
+                : Object.fromEntries(request.deploymentIds.map((id) => [id, {
+                  liveRuns: 0, liveSessions: 0, pendingMessages: 0, unfinishedTransfers: 0, drained: true,
+                }])),
+          },
+        },
+      );
+      const result = JSON.parse(output[0] as string) as {
+        readonly ok: boolean;
+        readonly warnings?: readonly { readonly id: string }[];
+        readonly checks: readonly { readonly id: string; readonly status: string }[];
+      };
+      if (result.ok && published !== undefined) live = published;
+      return { code, result, deploymentId: published?.deploymentId };
+    };
+
+    const first = await deploy("generation-two");
+    expect(first.code).toBe(0);
+    expect(first.deploymentId).toMatch(/^eden-affinity-[a-f0-9]{24}$/u);
+    // Eden 0.11.0 and 0.11.1 kept a version like this one: its World had no RPC authentication.
+    const recordPath = join(await realpath(currentPath), "deployment.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as {
+      identity: { retainedDeployments: Record<string, { worldRpcAuth: boolean }> };
+    };
+    (record.identity.retainedDeployments[first.deploymentId as string] as { worldRpcAuth: boolean }).worldRpcAuth = false;
+    await writeFile(recordPath, JSON.stringify(record), "utf8");
+
+    // The same Eve version again: the old version is retired, and the new one cannot reuse its id.
+    const second = await deploy("generation-three");
+    expect(second.code).toBe(0);
+    expect(second.result.warnings?.map((warning) => warning.id)).toContain("EVE_UNAUTHENTICATED_VERSIONS_RETIRED");
+    expect(second.deploymentId).toMatch(new RegExp(`^${first.deploymentId as string}-[a-f0-9]{8}$`, "u"));
+
+    // The next update proves the Worker from that record and keeps the id.
+    const third = await deploy("generation-four");
+    expect(third.result.checks.filter((check) => check.status === "failed")).toEqual([]);
+    expect(third.code).toBe(0);
+    expect(third.deploymentId).toBe(second.deploymentId);
+
+    // Destroy reads it too.
+    const destroyed: string[] = [];
+    await expect(
+      runEdenCli(
+        ["destroy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => destroyed.push(line),
+          eveControlPlane: {
+            destroyCloudflareRead: async () => ({
+              workerExists: false,
+              containerApplicationId: undefined,
+              registryTagsPresent: [],
+              accountId: "account-test",
+            }),
+          },
+        },
+      ),
+    ).resolves.toBe(0);
+    expect(JSON.parse(destroyed[0] as string)).toMatchObject({ ok: true, status: "absent" });
   });
 
   test("still fails VAL-CLI-007-TARGET-CONFLICT when the existing target has no Eden record", async () => {
