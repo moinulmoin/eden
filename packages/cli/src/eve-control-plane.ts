@@ -178,6 +178,19 @@ interface EveOutcomeError {
   readonly diagnostics: readonly { readonly code: string; readonly message: string; readonly source?: string }[];
 }
 
+/**
+ * A failed retirement stays in the promoted record as pending, and the next
+ * deploy of the target runs it again after its own health check.
+ */
+const RETIREMENT_RETRY_REMEDIATION =
+  "Rerun eden deploy with the same --project, --env, --name, and --env-file. It deploys again and retries the recorded retirement cleanup.";
+
+function retirementPending(checks: readonly EvePreflightCheck[]): boolean {
+  return checks.some((value) =>
+    value.status === "failed" && value.remediation === RETIREMENT_RETRY_REMEDIATION
+  );
+}
+
 function eveOutcomeError(error: unknown, source: string): EveOutcomeError {
   const failure = error instanceof EveCliError ? error : new EveCliError({
     code: error instanceof EveRuntimeConfigError ? error.code : "EVE_EXECUTION_FAILED",
@@ -1299,7 +1312,9 @@ function humanEveResultLines(
       `  → ${result.deployment.status === "indeterminate"
         ? "The outcome is indeterminate; inspect the retained ownership evidence before retrying the same exact target."
         : result.deployment.status === "deployed"
-          ? "The deployment is live; cleanup failed, so do not retry the deployment."
+          ? retirementPending(result.checks)
+            ? "The deployment is live; retiring old versions was not proven. Rerun eden deploy to retry it."
+            : "The deployment is live; cleanup failed, so do not retry the deployment."
           : "The deployment failed before promotion; the exact target was not claimed."
       }`,
     );
@@ -3782,7 +3797,7 @@ async function runEveDeployment(
         : "Retired deployment instances were removed, and everything else in their owned registry repositories. Cloudflare's registry still lists some of their objects; see EVE_REGISTRY_OBJECTS_KEPT.");
     } catch (error: unknown) {
       const reason = error instanceof Error ? safeText(error.message) : "Unknown retirement failure.";
-      supersededImageCleanup = check("VAL-LIFE-007", "failed", `The deployment is healthy, but resource retirement was not proven: ${reason} Exact pending retirement records were retained for retry.`, "Retry deploy to finish only recorded retired resource cleanup.");
+      supersededImageCleanup = check("VAL-LIFE-007", "failed", `The deployment is healthy, but resource retirement was not proven: ${reason} Exact pending retirement records were retained for retry.`, RETIREMENT_RETRY_REMEDIATION);
     }
     if (completedRetirements.length > 0) {
       // Keep the immutable deployment record as evidence, but exclude proven
@@ -4606,7 +4621,9 @@ export async function runEveControlPlane(
       result = deploymentResult;
       if (!deploymentResult.ok) {
         const status = deploymentResult.deployment?.status;
+        const retryRetirement = status === "deployed" && retirementPending(deploymentResult.checks);
         throw new EveCliError({
+          ...(retryRetirement ? { remediation: RETIREMENT_RETRY_REMEDIATION } : {}),
           code: status === "indeterminate"
             ? "DEPLOY_INDETERMINATE"
             : status === "deployed"
@@ -4615,6 +4632,8 @@ export async function runEveControlPlane(
           message:
             status === "indeterminate"
               ? deploymentResult.deployment?.reason ?? "The Eve deployment outcome is indeterminate; inspect the retained exact ownership evidence before retrying."
+              : retryRetirement
+                ? "The Eve deployment is healthy and promoted, but retiring old versions was not proven."
               : status === "deployed"
                 ? "The Eve deployment is healthy and promoted, but exact image cleanup failed; do not retry the deployment."
               : deploymentResult.deployment?.reason ?? "The Eve deployment failed before exact target promotion.",
@@ -5991,6 +6010,24 @@ async function runEveDestroyLocked(
         "The authenticated account does not own the recorded deployment account.",
       );
     }
+    const clearCurrentPointer = async (): Promise<void> => {
+      const currentPath = join(
+        request.projectRoot,
+        ".eden",
+        "eve-deploy",
+        "targets",
+        `${request.environment}-${request.name}`,
+        "CURRENT",
+      );
+      await rm(currentPath, { force: true });
+      const gone = await lstat(currentPath).catch(() => undefined);
+      if (gone !== undefined) {
+        fail(
+          "EVE_DESTROY_POINTER_UNCLEARED",
+          "The target CURRENT pointer could not be cleared after verified absence.",
+        );
+      }
+    };
     if (
       !before.workerExists &&
       before.containerApplicationId === undefined &&
@@ -5998,6 +6035,9 @@ async function runEveDestroyLocked(
         (before.registryTagsPresent !== undefined &&
           before.registryTagsPresent.length === 0))
     ) {
+      // An earlier destroy can stop after the deletes with CURRENT still
+      // linked. This complete read proves absence, so the pointer goes now.
+      await clearCurrentPointer();
       emit({
         ok: true,
         status: "absent",
@@ -6212,22 +6252,7 @@ async function runEveDestroyLocked(
       ),
     );
 
-    const currentPath = join(
-      request.projectRoot,
-      ".eden",
-      "eve-deploy",
-      "targets",
-      `${request.environment}-${request.name}`,
-      "CURRENT",
-    );
-    await rm(currentPath, { force: true });
-    const gone = await lstat(currentPath).catch(() => undefined);
-    if (gone !== undefined) {
-      fail(
-        "EVE_DESTROY_POINTER_UNCLEARED",
-        "The target CURRENT pointer could not be cleared after verified absence.",
-      );
-    }
+    await clearCurrentPointer();
     emit({
       ok: true,
       status: "destroyed",
