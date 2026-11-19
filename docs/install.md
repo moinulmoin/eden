@@ -97,9 +97,10 @@ The Eve project must contain all of the following at its selected root:
 - one root `package-lock.json` for npm, or an exact
   `packageManager: "pnpm@..."` value with the matching root `pnpm-lock.yaml`
 - no competing package-manager lockfiles
+- Eve `0.91.0` or later
 - a project-local Eve executable resolved through `node_modules/.bin/eve`
 - `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`)
-- on Eve `0.83.0` and later, an explicit `JustBashSandbox` selection in
+- an explicit `JustBashSandbox` selection in
   `agent/sandbox.ts` (`agent/sandbox/sandbox.ts` when an `agent/sandbox/`
   folder exists); follow the
   [complete setup](./deploy.md#sandbox-setup)

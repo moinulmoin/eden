@@ -12,8 +12,17 @@ pnpm install
 pnpm run build && pnpm run typecheck && pnpm run lint && pnpm run test
 ```
 
-The Eve compatibility gate needs Postgres and Docker; see
-[docs/validation.md](docs/validation.md).
+The Eve compatibility gate needs Postgres and Docker. With Postgres running
+as [docs/validation.md](docs/validation.md) describes:
+
+```sh
+WORKFLOW_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres pnpm run compat:eve:local
+```
+
+It runs a Postgres leg and an Eden leg on the `floor` and `latest` fixtures.
+Append a fixture or a leg (`postgres`, `eden`) to run only that. CI runs the
+Postgres leg in the `gate` job and the Eden leg in one `eden-compat` job per
+fixture.
 
 ## Rules
 
@@ -31,7 +40,7 @@ The Eve compatibility gate needs Postgres and Docker; see
 | --- | --- |
 | A failure or warning code, or its remediation | Its entry in `docs/troubleshooting.md`; `skills/eden/SKILL.md` if agents hit it often |
 | A command, flag, environment variable, or JSON output field | `docs/reference.md`, `skills/eden/SKILL.md`, and the help text in `packages/cli/src/eve.ts` |
-| The supported Eve or World versions | The table in `docs/eve-compatibility.md`, the fixtures in `validation/eve-compat/`, the `EVE_VERSION_UNSUPPORTED` and `EVE_WORLD_PAIRING` checks, and the README's fresh-project steps |
+| The supported Eve or World versions | The table in `docs/eve-compatibility.md`, the fixtures in `validation/eve-compat/`, the `EVE_VERSION_UNSUPPORTED` and `EVE_WORLD_PAIRING` checks, the README's fresh-project steps, and the versions named in `docs/validation.md`, `docs/deploy.md`, and `docs/troubleshooting.md` |
 | Deploy, update, destroy, runtime, or World behavior | Run the live check on Cloudflare before release (`pnpm run check:live`, see `docs/validation.md`); update `docs/how-it-works.md` |
 | Anything about secrets, auth, or what Eden can change | `docs/security.md` |
 | Anything a user can notice | `CHANGELOG.md` |

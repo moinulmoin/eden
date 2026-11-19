@@ -112,7 +112,7 @@ function eveErrorRemediation(code: string): string {
     case "EVE_DEPLOYMENT_FAILED":
       return "Read the last check and .eden/eve-deploy/generations/<generation>/deployment.json, resolve the cause, then rerun eden deploy for the same target.";
     case "EVE_RUNTIME_IMAGE_CLEANUP_FAILED":
-      return "The deployment is live; do not redeploy. Remove only the recorded local runtime image or superseded registry tag.";
+      return "The deployment is live; do not redeploy. Remove only the recorded local runtime image, or what the failed VAL-LIFE-007 check names in the superseded registry repository.";
     case "EVE_IMAGE_IDENTITY_MISMATCH":
       return "Rerun eden deploy so Eden resolves the image reference from the verified local image again.";
     case "EVE_IMAGE_IDENTITY_UNAVAILABLE":

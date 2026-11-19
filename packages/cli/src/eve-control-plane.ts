@@ -520,8 +520,8 @@ export interface EvePreflightOptions {
       candidate: EveProjectBuildCandidate,
     ) => EveHostRequirements | Promise<EveHostRequirements>);
   /**
-   * A runtime runner is required for env-file preflight so runtime values can
-   * enter only through the deployment-safety protected local injection seam.
+   * The default runtime runner passes env-file values only through the
+   * deployment-safety protected local injection seam; callers may supply one.
    */
   readonly runtimeRunner?: EvePreflightRuntimeRunner;
   /**
@@ -548,8 +548,8 @@ export interface EvePreflightOptions {
    */
   readonly outputFormat?: "human" | "json";
   /**
-   * Destroy seams. Defaults use only Wrangler reads/deletes plus the
-   * immutable local deployment record; tests may inject exact fakes.
+   * Destroy seams. Defaults use the immutable local deployment record,
+   * Wrangler, and direct registry requests; tests may inject exact fakes.
    */
   readonly destroyCloudflareRead?: EveDestroyCloudflareReadRunner;
   readonly deleteWorker?: EveWorkerDeleteRunner;
@@ -1469,7 +1469,6 @@ async function withWranglerDirectory<T>(
 
 async function readWranglerJson(
   args: readonly string[],
-  timeoutMs: number = 30_000,
 ): Promise<WranglerJsonResult> {
   try {
     const result = await withWranglerDirectory((cwd) => execFileAsync(
@@ -1479,7 +1478,7 @@ async function readWranglerJson(
         env: safeWranglerEnvironment(cwd),
         cwd,
         maxBuffer: 2 * 1024 * 1024,
-        timeout: timeoutMs,
+        timeout: 30_000,
       },
     ));
     const parsed = JSON.parse(result.stdout.trim()) as unknown;
@@ -2390,7 +2389,7 @@ async function writeEveDeploymentArtifacts(
   return { workerSourcePath, wranglerConfigPath };
 }
 
-/** Deadline for bounded Wrangler reads, secret writes, and deletions. */
+/** Default deadline for Wrangler secret writes and deletions. */
 const WRANGLER_OPERATION_TIMEOUT_MS = 120_000;
 /** Deadline for the image push and `wrangler deploy`; either can take minutes on a slow registry or uplink. */
 const WRANGLER_PUBLICATION_TIMEOUT_MS = 600_000;
@@ -3795,8 +3794,8 @@ async function runEveDeployment(
   if (isUpdate && !affinityEnabled) {
     // The superseded generation's registry repository is generation-scoped
     // and no longer referenced once CURRENT promotes this generation; only
-    // then is it safe to delete. Every tag in the repository goes with it —
-    // including the snapshot tags Cloudflare created under it.
+    // then is it safe to delete. Every tag and manifest digest the registry
+    // lists in it is deleted; objects Cloudflare keeps are reported.
     const previousRepository = priorIdentity === undefined
       ? undefined
       : ownedRegistryRepository(
@@ -3832,13 +3831,13 @@ async function runEveDeployment(
           "VAL-LIFE-007",
           "failed",
           `The update is healthy and promoted, but the superseded registry repository ${previousRepository} could not be proven deleted.`,
-          `Remove only the recorded repository's tags ${previousRepository}; do not retry or run broad registry cleanup.`,
+          `Remove only what the registry still lists in the recorded repository ${previousRepository}, tags and sha256: entries; see VAL-LIFE-007 in docs/troubleshooting.md. Do not retry or run broad registry cleanup.`,
         )
         : check(
           "VAL-LIFE-007",
           "passed",
           deleted === "deleted"
-            ? "The superseded generation's registry repository (all tags, including snapshots) was deleted after promotion."
+            ? "Everything the registry listed in the superseded generation's registry repository was deleted after promotion."
             : deleted === "absent"
             ? "The superseded generation's registry repository was already absent."
             : "Everything else in the superseded generation's registry repository was deleted after promotion. Cloudflare's registry still lists some of its objects; see EVE_REGISTRY_OBJECTS_KEPT.",
@@ -5367,7 +5366,7 @@ function registryObjectsKeptWarning(kept: readonly EveRegistryObjectKept[]): Eve
   return {
     id: "EVE_REGISTRY_OBJECTS_KEPT",
     message: `Cloudflare's registry still lists ${kept.length} object(s) that Eden tried to delete: ${counted.join("; ")}. Cloudflare documents that it removes a snapshot ${SNAPSHOT_RETENTION_DAYS} days after it was created or last restored. Eden does not know when Cloudflare removes the other objects, or whether any of them counts toward the account's image storage limit.`,
-    remediation: "Eden sent each of these objects one delete and reports the registry's answer; it does not know whether a later delete would be answered differently. A kept snapshot still holds the container's files until Cloudflare removes it. To see what the registry lists later, follow the EVE_REGISTRY_OBJECTS_KEPT entry in docs/troubleshooting.md.",
+    remediation: "Eden reports the registry's answer to its delete of each of these objects; it does not know whether a later delete would be answered differently. A kept snapshot still holds the container's files until Cloudflare removes it. To see what the registry lists later, follow the EVE_REGISTRY_OBJECTS_KEPT entry in docs/troubleshooting.md.",
   };
 }
 

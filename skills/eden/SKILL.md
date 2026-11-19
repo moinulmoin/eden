@@ -171,16 +171,18 @@ npx @moinulmoin/eden destroy --name <name> --json
 - Eden writes build output and deployment records to `.eden/` in the project.
   Do not commit it (one build was 245 MB in a test, and it records absolute
   local paths): add `.eden` to the project's `.gitignore`. Never delete it.
-  Updates and `destroy` must run from the machine and project folder that
-  deployed. If it is lost, follow "The `.eden/` folder is lost" in
+  Updates and `destroy` need this folder. Run them from the project root
+  that holds it, or select that root with `--project`. If it is lost, follow
+  "The `.eden/` folder is lost" in
   `docs/troubleshooting.md`.
 - Get the user's explicit go-ahead before any `destroy` or production deploy;
   a request that already says to tear the agent down counts. Destroy deletes
   the agent immediately, even mid-conversation, and with the Cloudflare World
   also its stored sessions. An external Postgres database is not touched.
 - A successful `destroy` may carry `warnings` with
-  `EVE_REGISTRY_OBJECTS_KEPT`. Cloudflare's registry keeps some objects
-  after Eden deletes everything it lists. `registryObjectsKept` has one
+  [`EVE_REGISTRY_OBJECTS_KEPT`](https://github.com/moinulmoin/eden/blob/main/docs/troubleshooting.md#eve_registry_objects_kept).
+  Cloudflare's registry keeps some objects
+  after Eden tries to delete everything it lists. `registryObjectsKept` has one
   `{ ref, class }` per object. `refused-snapshot`: a container snapshot,
   which still holds the agent's files; Cloudflare documents that it removes
   one 30 days after it was created or last restored. `refused-singleton-artifact`:
@@ -190,7 +192,9 @@ npx @moinulmoin/eden destroy --name <name> --json
   Eden does not know when Cloudflare removes the last two kinds. Destroy
   has finished; do not rerun it for these.
   `deploy` can carry the same warning and field after it removes a
-  superseded version.
+  superseded version. Cleanup needs direct access to `registry.cloudflare.com`;
+  Eden's own registry requests never use a proxy. If destroy fails to verify
+  registry cleanup, it may already have removed the Worker and Container.
 
 ## Verify
 
@@ -235,7 +239,7 @@ the agent sleeps takes about 10–15 seconds.
 
 - The sandbox is `just-bash`, a simulated shell: files, grep, sed, jq,
   sqlite3, and curl work; python, git, and npm do not.
-- One container per agent, `workers.dev` URL only, no custom domains yet.
+- One container per kept version, `workers.dev` URL only, no custom domains yet.
 - The container sleeps after 1 hour idle and wakes on the next request.
   Standard 5-field cron schedules still fire while it sleeps; other cron forms
   only fire while it is awake (`EVE_SCHEDULE_UNSUPPORTED`).

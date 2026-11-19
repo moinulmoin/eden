@@ -178,14 +178,15 @@ temporary directory cannot redirect account operations or secret uploads.
   its binding.
   If the Worker is already gone, the record, account, and exact names still
   permit cleanup of leftover Containers and images. Failed inventory reads
-  are indeterminate, not proof of absence. Eden deletes only that target and
-  the registry images its records identify, then verifies they are gone.
+  are indeterminate, not proof of absence. Eden removes only that target and
+  checks its registry repositories for anything other than
+  [objects Cloudflare keeps](./troubleshooting.md#eve_registry_objects_kept).
   It never deletes by name prefix.
   Deployment and release IDs are public: these checks protect against stale
   records and name reuse, not a malicious project carrying a forged `.eden`
   record with a known account and release ID. Do not trust `.eden` state from
   an untrusted project.
-- **Registry cleanup deletes whole repositories.** It deletes every tag and
+- **Registry cleanup covers whole repositories.** It tries to delete every tag and
   manifest the registry lists in a repository that the record proves this
   target owns, including one that appears while it runs. Eden never runs it
   on a repository that holds the image it just promoted or the image of a
@@ -198,7 +199,7 @@ temporary directory cannot redirect account operations or secret uploads.
   only. It does not stop a copy of the project on another machine, or any
   other push to the registry: an image pushed to an owned repository while
   cleanup runs can be deleted.
-- **Some registry objects outlive destroy.** Destroy deletes everything
+- **Some registry objects outlive destroy.** Destroy tries to delete everything
   Cloudflare's registry lists for the target, and Cloudflare keeps three
   kinds of object. `destroy` lists each one, with the registry's answer, in
   `EVE_REGISTRY_OBJECTS_KEPT`.

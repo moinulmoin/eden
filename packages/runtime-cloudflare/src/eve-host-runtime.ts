@@ -115,7 +115,8 @@ async function publish(from, to) {
  * versions before 0.83 pick microsandbox at runtime, although Eden's isolated
  * builder prepared just-bash. Hide it to keep those versions' provider
  * selection aligned. Eve 0.83 removed microsandbox and records its provider
- * during build; the device removal remains for older supported Eve releases.
+ * during build, so no supported Eve release needs the device removal; it stays
+ * as a precaution.
  */
 const EVE_HOST_ENTRYPOINT = Object.freeze([
   "/bin/sh",

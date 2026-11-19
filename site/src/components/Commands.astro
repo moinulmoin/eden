@@ -22,10 +22,10 @@ const commands = [
     preview: "✓ deployed my-eve-agent-9e510242 (preview) → https://my-eve-agent-9e510242.<you>.workers.dev",
   },
   {
-    command: "eden destroy --name",
+    command: "eden destroy --name <target>",
     icon: Trash,
     detail:
-      "Removes that deployment and everything it created. Nothing else.",
+      "Removes only that deployment. Cloudflare may keep some registry objects.",
     preview: "✓ destroyed my-eve-agent-9e510242 (preview) in 31s",
   },
 ];
@@ -38,7 +38,7 @@ const commands = [
         <span class="tag tag--light">04 · The CLI</span>
         <h2 id="commands-title" class="section-title">Three commands to ship.</h2>
       </div>
-      <span class="json mono"><Braces class="icon" size={14} aria-hidden="true" /> every command takes --json</span>
+      <span class="json mono"><Braces class="icon" size={14} aria-hidden="true" /> these commands take --json</span>
     </div>
 
     <ul class="cmd-list">

@@ -2,91 +2,38 @@
 
 ## Unreleased
 
-Eve `1.0.2`, the first stable Eve 1.0, is now a tested version. Eden itself
-needed no change.
+Eve `1.0.2` is now a tested version, and Eve `0.91.0` stays the oldest
+supported one. `eden destroy` works again on a target whose container has
+slept, a first run reports its setup problems together before the build, and
+three bugs in released versions are fixed. Update `@moinulmoin/eden`, and
+`@moinulmoin/eden-world-cloudflare` if the project uses it.
 
-### Fixed
+### Added
 
-- `eden destroy` succeeds again on a target that has container snapshots,
-  and it now deletes the registry entries that Wrangler does not list. On
-  2026-11-18
-  Cloudflare's registry was observed refusing to delete snapshot tags, so
-  destroy removed everything else and then failed with
-  `EVE_DESTROY_IMAGES_RETAINED` on every retry. The registry also lists one
-  entry for each manifest, with or without a tag, and
-  `wrangler containers images list` does not show those, so destroy left
-  untagged manifests behind without saying so. Destroy now reads the
-  registry's own listing, asks Wrangler to delete every tag, and deletes
-  every other entry by digest with a request of its own. An entry that
-  appears while it runs gets its own delete, for at most three passes over
-  a repository. Destroy clears the target's `CURRENT` pointer only after a
-  final listing that it read in full. A listing page that is not exactly
-  in the form the registry was seen to send is unreadable, never empty:
-  another account or repository, entries out of order, or a `Link` header
-  that does not continue from the page's last entry.
-- Cloudflare keeps three kinds of registry object, and destroy reports each
-  one in the new warning `EVE_REGISTRY_OBJECTS_KEPT`, only on the
-  registry's own answer for that object: a container snapshot
-  (`refused-snapshot`, `403`), the chain artifact Cloudflare makes for each
-  pushed image (`refused-singleton-artifact`, `409` with
-  `SINGLETON_ARTIFACT_EXISTS`), and a manifest whose delete the registry
-  accepted with `202` or `204` and which it still lists at least 30 seconds
-  later (`accepted-still-listed`, seen for an earlier image with no tag).
-  Each accepted delete gets its own 30 seconds. Destroy ends with
-  `destroyed` when such
-  objects are all that is left, and `eden destroy --json` then adds
-  `warnings` and `registryObjectsKept`. A kept snapshot still holds the
-  agent's files until Cloudflare removes it, which Cloudflare documents as
-  30 days after it was created or last restored. When Cloudflare removes
-  the other two kinds is not known. Anything else left behind, and any
-  other answer, still fails with `EVE_DESTROY_IMAGES_RETAINED`.
-- Eden's registry requests never use a proxy, and requests that get no
-  answer may take 60 seconds in total. Where this machine cannot reach
-  `registry.cloudflare.com` directly, destroy cannot read the listing: it
-  deletes the Worker and the Container application and fails with
-  `EVE_DESTROY_IMAGES_RETAINED`, whose remediation says to rerun from a
-  machine that can.
-- `eden deploy` cleans up a superseded version's registry repository the
-  same way: `VAL-LIFE-007` passes, and the result adds
-  `EVE_REGISTRY_OBJECTS_KEPT` and `registryObjectsKept`. When something
-  else is left as well, `VAL-LIFE-007` fails and the result still lists the
-  objects the registry kept. Deploy deletes nothing from a repository that
-  holds an image that is still deployed: the check is `skipped` when the
-  promoted image is in the superseded repository, and a retirement stays
-  pending when a kept version's image is in the retiring one.
-- `eden deploy` waits ten minutes for the image push instead of two. On
-  2026-11-18 Cloudflare's registry was slow, the push of a new image took
-  longer than two minutes, and two deploys in a row ended with
-  `DEPLOY_INDETERMINATE` and `The exact Cloudflare Container image push did
-  not complete.` The Worker publication that follows already had ten minutes.
-- `eden deploy` and `eden destroy` can read the deployment record again after
-  an update that kept the Eve version and retired a kept version whose World
-  had no RPC authentication. Since `0.11.2` such an update gave the new
-  version an id with an extra suffix, and Eden could not read its own record
-  back: the next `eden deploy` failed with `VAL-CLI-007-TARGET-CONFLICT` and
-  `eden destroy` failed with `EVE_DESTROY_RECORD_UNPROVEN`. Records already
-  written that way are read as they are, so update Eden and rerun the
-  command.
-- Two Eden builds can run at the same time on one Docker host. Before, both
-  picked local port 4310 for the boot check. The second failed with
-  `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.
-  Docker now picks a free port, and the boot container is removed on every
-  failure. `EVE_HEALTH_PORT_UNAVAILABLE` no longer exists.
-- When Eve exits during the local boot check, `EVE_HEALTH_FAILED` says so,
-  with Eve's exit code and its last output (env-file values redacted).
-  Before, it reported a missed health deadline with no cause, and a crash
-  right after start could be reported as `DOCKER_PLATFORM_BLOCKED`.
-- `DOCKER_PLATFORM_BLOCKED` now ends with the underlying error, usually
-  Docker's own, and its remediation says to fix that error. Before, the
-  echoed command line could use up the message and cut the error off.
-
-### Changed
-
+- Eve `1.0.2` with `@workflow/world-postgres` `5.2.1` is the latest tested
+  pair, in place of `1.0.0-rc.6`. A project made with `npx eve@1.0.2 init`
+  and the README's fresh-project steps passed the build and boot checks of
+  `eden preflight`.
+- The warning `EVE_REGISTRY_OBJECTS_KEPT`, and the `--json` field
+  `registryObjectsKept` with one `{ ref, class }` per object. Cloudflare's
+  registry keeps three kinds of object after Eden deletes everything it
+  lists, and Eden reports each one only on the registry's own answer for
+  that object: a container snapshot (`refused-snapshot`, `403`), the chain
+  artifact Cloudflare makes for each pushed image
+  (`refused-singleton-artifact`, `409` with `SINGLETON_ARTIFACT_EXISTS`), and
+  a manifest whose delete the registry accepted with `202` or `204` and
+  which it still lists at least 30 seconds later (`accepted-still-listed`).
+  A kept snapshot still holds the agent's files until Cloudflare removes it,
+  which Cloudflare documents as 30 days after it was created or last
+  restored. When Cloudflare removes the other two kinds is not known.
 - The Cloudflare World declares `queueAuthMode: "skip"`. With the updated
   World package, Eve `1.0.2` no longer logs that the World declares no
   `queueAuthMode`. Nothing else changes: Eve never checked queue deliveries
   on this World, and Eden's Worker still answers `404` for the workflow
   queue routes.
+
+### Changed
+
 - `eden preflight` and `eden deploy` check the Cloudflare login before the
   build. Without a login they now stop in about 5 seconds instead of after the
   full build (299 seconds in the same test), and the remediation names the
@@ -97,71 +44,137 @@ needed no change.
   warnings. Before, an untouched `eve init` project showed only
   `EVE_SANDBOX_PROVIDER`, and the warnings appeared after the next full build.
 - Every failure now carries a `remediation`, in text and in `--json`,
-  including `EVE_NAME_REQUIRED`, `EVE_OPTION_UNKNOWN`, `EVE_PREFLIGHT_FAILED`,
-  `EVE_DEPLOY_CHECKS_FAILED`, and the other argument, lock, promotion, and
-  image codes. `EVE_OPTION_UNKNOWN` names the unknown option.
+  including the argument, lock, promotion, image, and destroy codes.
+  `EVE_OPTION_UNKNOWN` names the unknown option.
 - A failed env-file check starts with its code, for example
   `EVE_ENV_FILE_NOT_FOUND`, and a missing file says to create it or correct
   the path. A failed env file no longer adds four `blocked` filler checks.
-- The README's Quick start and fresh-project steps now match the skill:
-  sandbox, channel auth, Workflow World, env file with the model key, then
-  preflight.
+- `eden destroy` ends with `destroyed` when the objects Cloudflare's registry
+  keeps are all that is left, and adds `EVE_REGISTRY_OBJECTS_KEPT`; with
+  `--json` it adds `warnings` and `registryObjectsKept`. Anything else left
+  behind, any other answer, and a final listing that cannot be read in full
+  still fail with `EVE_DESTROY_IMAGES_RETAINED`. Destroy clears the target's
+  `CURRENT` pointer only after a final listing that it read in full.
+- `eden deploy` cleans up a superseded version's registry repository the
+  same way: `VAL-LIFE-007` passes, and the result adds
+  `EVE_REGISTRY_OBJECTS_KEPT` and `registryObjectsKept`. When something
+  else is left as well, `VAL-LIFE-007` fails and the result still lists the
+  objects the registry kept. Deploy deletes nothing from a repository that
+  holds an image that is still deployed: the check is `skipped` when the
+  promoted image is in the superseded repository, and a retirement stays
+  pending when a kept version's image is in the retiring one.
+- Eden's registry requests never use a proxy, and requests that get no
+  answer may take 60 seconds in total. Where this machine cannot reach
+  `registry.cloudflare.com` directly, destroy cannot read the listing: it
+  deletes the Worker and the Container application and fails with
+  `EVE_DESTROY_IMAGES_RETAINED`, whose remediation says to rerun from a
+  machine that can.
+- The remediations of a failed `VAL-LIFE-007` and of
+  `EVE_RUNTIME_IMAGE_CLEANUP_FAILED` name what the registry still lists,
+  tags and `sha256:` entries, instead of tags only.
+- When Eve exits during the local boot check, `EVE_HEALTH_FAILED` says so,
+  with Eve's exit code and its last output (env-file values redacted).
+  Before, it reported a missed health deadline with no cause, and a crash
+  right after start could be reported as `DOCKER_PLATFORM_BLOCKED`.
+- `DOCKER_PLATFORM_BLOCKED` now ends with the underlying error, usually
+  Docker's own, and its remediation says to fix that error. Before, the
+  echoed command line could use up the message and cut the error off.
+- The check of native modules runs the system `file` tool with the same
+  minimal environment as Docker. Before, `file` received every variable of
+  the shell that started Eden. No env-file value was involved.
+
+### Fixed
+
+- **`eden destroy` failed on every retry with `EVE_DESTROY_IMAGES_RETAINED`
+  on a target that has container snapshots.** On 2026-11-18 Cloudflare's
+  registry was observed refusing to delete snapshot tags, so destroy, in
+  `0.12.0` and earlier, removed everything else and then failed. Destroy now
+  reports those tags in `EVE_REGISTRY_OBJECTS_KEPT` and succeeds.
+- **`eden destroy` left untagged registry entries behind without saying
+  so.** The registry lists one entry for each manifest, with or without a
+  tag, and `wrangler containers images list` does not show the untagged
+  ones. Destroy now reads the registry's own listing, asks Wrangler to
+  delete every tag, and deletes every other entry by digest with a request
+  of its own. An entry that appears while it runs gets its own delete, for
+  at most three passes over a repository. A listing page that is not
+  exactly in the form the registry was seen to send is unreadable, never
+  empty.
+- **`eden deploy` and `eden destroy` could not read the deployment record
+  after one kind of update, in `0.11.2` through `0.12.0`.** An update that
+  kept the Eve version and retired a kept version whose World had no RPC
+  authentication gave the new version an id with an extra suffix, and Eden
+  could not read its own record back: the next `eden deploy` failed with
+  `VAL-CLI-007-TARGET-CONFLICT` and `eden destroy` failed with
+  `EVE_DESTROY_RECORD_UNPROVEN`. Records already written that way are read
+  as they are, so update Eden and rerun the command.
+- **`eden deploy` gave the image push 120 seconds.** It now waits ten
+  minutes, as the Worker publication after it already did. On 2026-11-18
+  Cloudflare's registry was slow, the push of a new image took longer than
+  two minutes, and two deploys in a row ended with `DEPLOY_INDETERMINATE`
+  and `The exact Cloudflare Container image push did not complete.`
+- **Two Eden builds on one Docker host clashed on local port 4310.** Both
+  picked it for the boot check; the second failed with
+  `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.
+  Docker now picks a free port, and the boot container is removed on every
+  failure.
+- `eden destroy --json` includes `"command": "eden destroy"`, like preflight
+  and deploy.
+
+### Removed
+
+- `EVE_HEALTH_PORT_UNAVAILABLE`. Eden no longer picks the boot-check port,
+  so nothing reports it.
+
+### Docs
+
+- The README's Quick start and fresh-project steps match the skill: start
+  from `npx eve@1.0.2 init`, then sandbox, channel auth, Workflow World, env
+  file with the model key, then preflight.
+- The README, the skill, and `docs/deploy.md` say not to commit `.eden/`, to
+  add it to `.gitignore`, and that updates and `destroy` need the `.eden/`
+  folder the deploy wrote. `docs/troubleshooting.md` has a new entry, "The
+  `.eden/` folder is lost", with the manual removal steps for the Worker,
+  Container application, and registry objects.
 - `docs/troubleshooting.md` explains `node: <path>: not found` (exit 9): with
   `npx`, a missing `--env-file` path stops npm's own Node process before
   Eden starts. It names the placement that lets Eden report the mistake
   itself, `npx -- @moinulmoin/eden …`, and says that a `NODE_OPTIONS` line in
   the env file is applied to npm's own Node process. That process does not
   load the file's other values.
-- The check of native modules runs the system `file` tool with the same
-  minimal environment as Docker. Before, `file` received every variable of
-  the shell that started Eden. No env-file value was involved.
-- `docs/troubleshooting.md` has a new entry, "The `.eden/` folder is lost",
-  with the manual removal steps for the Worker, Container application, and
-  registry images. `docs/deploy.md` and `docs/faq.md` link to it.
-- The README, the skill, and `docs/deploy.md` now say not to commit `.eden/`,
-  to add it to `.gitignore`, and that updates and `destroy` must run from the
-  machine and project folder that deployed.
-- `PRODUCT.md` is removed. It described Eve `0.66.3`, pnpm-only projects,
-  and a 1 GiB container. The README and `docs/` hold the current facts.
-- Eve `1.0.2` with `@workflow/world-postgres` `5.2.1` replaces `1.0.0-rc.6`
-  as the latest tested pair in CI. Eve `0.91.0` stays the oldest supported
-  version.
-- The README's fresh-project steps now start from `npx eve@1.0.2 init`. A
-  project made that way passed the build and boot checks of `eden preflight`.
 - `docs/deploy.md` and `docs/troubleshooting.md` name the Postgres World
   release for Eve `1.0.2`. `docs/eve-compatibility.md` explains the Node.js
-  `26.x` pin in new Eve projects and the `queueAuthMode` log line on the
-  Cloudflare World.
-- `eden destroy --json` now includes `"command": "eden destroy"`, like
-  preflight and deploy.
-- Destroy failures now say what to do next: `EVE_DESTROY_RECORD_UNPROVEN`,
-  `EVE_DESTROY_RECORD_MISMATCH`, `EVE_DESTROY_OWNERSHIP_UNPROVEN`,
-  `EVE_DESTROY_INDETERMINATE`, `EVE_DESTROY_ABSENCE_UNPROVEN`,
-  `EVE_DESTROY_IMAGES_RETAINED`, and `EVE_DESTROY_POINTER_UNCLEARED` carry a
-  `remediation`.
+  `26.x` pin in new Eve projects.
+- `PRODUCT.md` is removed. It described Eve `0.66.3`, pnpm-only projects,
+  and a 1 GiB container. The README and `docs/` hold the current facts.
+- The docs were checked against the code and against each other.
+  `packages/cli/README.md`, the npm page, no longer says that only pnpm
+  projects are supported or that a sandbox module is not.
+  `docs/troubleshooting.md` gains `EVE_OPTION_VALUE_MISSING`,
+  `EVE_PROJECT_INVALID`, `VAL-BUILD-002`, `VAL-BUILD-003`,
+  `HOST_ORIGIN_UNAVAILABLE`, and `HOST_REQUEST_ABORTED`, and its manual
+  cleanup checks read the registry's own listing instead of
+  `wrangler containers images list`, which shows tags only.
+  `docs/reference.md` lists `command` and `error` in the destroy result and
+  `reason` and `evidenceLocation` in a deployment result.
 
 ### Maintainers
 
-- `buildEveRuntimeImage` and the preflight options no longer take
-  `healthPort`.
-- The live check on Cloudflare is now one command, `pnpm run check:live`. It
+- The live check on Cloudflare is one command, `pnpm run check:live`. It
   deploys a fresh project to a temporary target, runs bash in a session,
-  updates in place, upgrades Eve, lets the container sleep and wakes it, then
-  destroys the target. Once a deploy has started, `eden destroy` also runs
-  when a step fails and on Ctrl-C; if destroy itself fails, the script prints
-  the retry command. Three attempts failed before the first passing run,
-  from Eve `0.91.0` to `1.0.2`; see `docs/eve-compatibility-history.md`.
+  updates in place, upgrades Eve, lets the container sleep and wakes it,
+  requires `404` from the two workflow queue routes, asks the server process
+  whether Eve logged the `queueAuthMode` warning, then destroys the target
+  and reads the registry's catalog for anything destroy did not report.
+  Once a deploy has started, `eden destroy` also runs when a step fails and
+  on Ctrl-C; if destroy itself fails, the script prints the retry command.
+  The run of 2026-11-19, from Eve `0.91.0` to `1.0.2`, passed all 18 steps;
+  see `docs/eve-compatibility-history.md`.
 - The live check installs the Cloudflare World packed from this repository
-  by default, through the same local tarball server as the gate's Eden leg.
-  A World change can now be checked on Cloudflare before it is published.
+  by default, through the same local tarball server as the gate's Eden leg,
+  so a World change can be checked on Cloudflare before it is published.
   That project uses pnpm, because Eden takes npm packages only from the
   public registry. `--world latest` or an exact version installs the
-  published package into an npm project, as before. The check also requires
-  `404` from the two workflow queue routes and asks the server process
-  whether Eve logged the `queueAuthMode` warning.
-- CI runs the gate's Eden leg in one parallel job per fixture, so a push
-  waits for the slowest job instead of their sum. Publish still runs the
-  whole gate in one step.
+  published package into an npm project.
 - The compatibility gate now tests Eden, not only Eve. For each fixture it
   also installs the Cloudflare World built from this repository, runs the
   built `eden preflight` up to the Cloudflare access checks, and requires a
@@ -169,17 +182,21 @@ needed no change.
   Cloudflare account. The World runs as its core over local RPC, not as a
   Durable Object. With the World source from before `0.11.1`, this leg fails
   with the HTTP 500 that release fixed.
+- CI runs the gate's Eden leg in one parallel job per fixture. Publish runs
+  the whole gate in one step.
 - The latest compatibility fixture pins Eve `1.0.2`,
   `@workflow/world-postgres` `5.2.1`, `just-bash` `3.6.1`, and `ai` `7.0.173`
   (Eve `1.0.2` needs `ai` `^7.0.172`).
 - The compatibility gate waits for the Eve server to exit. Eve `1.0.2` takes
   about five seconds to stop after a session has started, and the gate
   reported that as a failed cleanup.
-- The process-cleanup test helper retries a `ps` snapshot that fails once on
-  a busy machine, instead of failing the test.
 - Renovate waits until a release of `eve`, `@workflow/world-postgres`, or
   `just-bash` is one day old before it opens a pull request, so the
   fixture's frozen install passes pnpm's release-age check.
+- `buildEveRuntimeImage` and the preflight options no longer take
+  `healthPort`.
+- The process-cleanup test helper retries a `ps` snapshot that fails once on
+  a busy machine, instead of failing the test.
 
 ## 0.12.0 — 2026-11-08
 

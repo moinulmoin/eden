@@ -53,11 +53,9 @@ until the checks in steps 1–4 have passed.
    scripts), or the exact-pinned `pnpm install --frozen-lockfile`, then your
    project's own `eve build`.
    Private registries and project `.npmrc`-dependent installs are unsupported.
-   The builder has no Docker daemon. Eve `0.83.0` and later require a
-   project-owned, explicit `JustBashSandbox` selection; Eden rejects the
-   production default and other providers rather than substituting one.
-   Older Eve defaults still resolve to `just-bash`: Eden hides `/dev/kvm`
-   so they do not select microsandbox (see [Limits](#limits)).
+   The builder has no Docker daemon. Select `JustBashSandbox` in the project;
+   Eden rejects the production default and other providers rather than
+   substituting one.
 3. **Check Cloudflare** (`checking Cloudflare access and exact target`): your
    login resolves to exactly one account, and the target name is either free
    or already owned by Eden (then this deploy is an update).
@@ -212,21 +210,24 @@ the same in-place compatibility requirement.
 | Runtime variables | Worker secrets on your account | Yes | Only the names in this deploy's `--env-file` reach the new container | No |
 | Deployment records | `.eden/eve-deploy/` in your project, on your machine | n/a | Updated | Kept locally |
 
-For durable state across updates, use the Postgres World; see
-[Durable state (Postgres World)](./deploy.md#durable-state-postgres-world).
+For durable state across updates, use the
+[Cloudflare World](./deploy.md#durable-state-on-cloudflare-no-database) or
+[Postgres World](./deploy.md#durable-state-postgres-world).
 
 ## Destroy
 
 `eden destroy --name <target>` reads Eden's record for that exact target,
 checks that the live Worker and Container application still match it, deletes
-them and every retained container instance, image, and registry repository
-the records prove Eden owns, and verifies they are gone. This includes legacy
-deployments and does not wait for sessions to drain. It never matches by name
+them and every retained container instance the records prove Eden owns.
+It cleans up their registry repositories, except for
+[objects Cloudflare keeps](./troubleshooting.md#eve_registry_objects_kept).
+This includes legacy deployments and does not wait for sessions to drain.
+It never matches by name
 prefix or searches your account, so similarly named resources are never
 touched. Data in the Durable Object (including the experimental Cloudflare
 World) is deleted with the Worker; your Postgres database is not touched.
 
-Some registry objects are the exception. Destroy deletes everything
+Destroy tries to delete everything
 Cloudflare's registry lists for the target's repositories: every tag, and
 every `sha256:` entry, which the registry lists for each manifest.
 Cloudflare keeps three kinds of object (observed on 2026-11-18). Its
@@ -245,19 +246,21 @@ a superseded version's registry repository cleans up the same way and
 reports the same warning. It deletes nothing from a repository that holds
 an image that is still deployed.
 
-Because ownership comes from the records in `.eden/eve-deploy/`, a different
-clone or machine without those records cannot update or destroy the target;
-Eden reports a target conflict instead of guessing.
+Updates and `destroy` need the `.eden/` folder the deploy wrote. Run from the
+project root that holds it, or select that root with `--project`. Keep it out
+of git. Without the records, an update reports a target conflict and destroy
+reports `EVE_DESTROY_RECORD_UNPROVEN`. If the folder is lost, see
+[The `.eden/` folder is lost](./troubleshooting.md#the-eden-folder-is-lost).
 
 ## Limits
 
 - **Sandbox:** `just-bash`, a simulated shell. Files, `grep`/`sed`/`jq`/
   `sqlite3`, and `curl` work; `python`, `git`, `npm`, and other real programs
   do not. Eve prepares its sandbox during `eve build`. Eden's builder has no
-  Docker daemon, so Eve `0.83.0` and later must
+  Docker daemon, so projects must
   [explicitly select `JustBashSandbox`](./deploy.md#sandbox-setup); its
   production default does not fall back. Other providers are unsupported.
-  On older Eve releases, Eden hides `/dev/kvm` to avoid selecting
+  On older Eve releases, Eden hid `/dev/kvm` to avoid selecting
   microsandbox. Historical preparation of microsandbox inside a Cloudflare
   container added about 7 minutes per deploy in testing; Eve `0.83.0` removed
   that provider. The sandbox has unrestricted internet access.

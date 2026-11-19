@@ -30,15 +30,19 @@ Before deploying, confirm:
 - The selected Eve root contains `package.json` and one `package-lock.json`
   (npm), or `pnpm-lock.yaml` with an exact `packageManager: "pnpm@..."` pin.
 - No competing package-manager lockfiles are present.
+- The project uses Eve `0.91.0` or later.
 - The matching dependencies are installed and `node_modules/.bin/eve` resolves
   to the project-local Eve package.
 - The project declares `just-bash` as a production dependency
   (`npm add just-bash` or `pnpm add just-bash`).
-- Eve `0.83.0` and later explicitly select `JustBashSandbox` using the
+- The project explicitly selects `JustBashSandbox` using the
   [sandbox setup](#sandbox-setup) below. The production default no longer
   falls back to `just-bash`; Eden's builder has no Docker daemon.
 - Every provider, credential, database, external API, and Workflow World
   required by the Eve project is reachable from Cloudflare.
+- Registry cleanup needs direct access to `registry.cloudflare.com`.
+  [Eden's own registry requests](./security.md#what-eden-can-change-in-your-cloudflare-account)
+  never use a proxy.
 
 From the Eve project root, these checks should succeed:
 
@@ -70,7 +74,7 @@ npm install just-bash
 # For a pnpm project: pnpm add just-bash
 ```
 
-On Eve `0.83.0` and later, create or update `agent/sandbox.ts`, or
+Create or update `agent/sandbox.ts`, or
 `agent/sandbox/sandbox.ts` if the project has an `agent/sandbox/` folder (Eve
 ignores or rejects `agent/sandbox.ts` next to that folder):
 
@@ -87,10 +91,9 @@ available, but neither is available in Eden's isolated builder. Its `just-bash`
 fallback is limited to development and evaluation. Eden rejects the production
 default early rather than substituting a provider. Docker, Vercel Sandbox,
 and other providers are unsupported, even when selected by a project module.
-Eve releases before `0.83.0` retain their existing default-to-`just-bash`
-behavior in Eden's isolated builder, where no Docker daemon is available and
-Eden hides `/dev/kvm` to avoid selecting the older microsandbox provider.
-Eve `0.83.0` removed microsandbox.
+Before Eve `0.83.0`, the default fell back to `just-bash` in Eden's isolated
+builder, which has no Docker daemon or `/dev/kvm`. Eve `0.83.0` removed
+microsandbox.
 
 
 ## First successful preview deployment
@@ -172,8 +175,9 @@ Again, omit `--env-file` when it is not needed.
 Eden writes its build output and deployment records to `.eden/` in the
 project. Do not commit it: one build was 245 MB in a test, and its files
 record absolute paths on your machine. Add `.eden` to the project's
-`.gitignore`, and keep the folder: updates and `destroy` must run from the
-machine and project folder that deployed. If it is lost, see
+`.gitignore`. Updates and `destroy` need this folder. Run them from the
+project root that holds it, or select that root with `--project`. If it is
+lost, see
 [The `.eden/` folder is lost](./troubleshooting.md#the-eden-folder-is-lost).
 
 A successful command prints progress lines and a summary ending with the
@@ -292,8 +296,9 @@ eden destroy \
 ```
 
 `destroy` rejects `--env-file`; cleanup does not need application secrets.
-Destroy needs the project's `.eden/` folder from the machine that deployed;
-if it is lost, remove the deployment by hand as described in
+Destroy needs the `.eden/` folder the deploy wrote. Run from the project
+root that holds it or select it with `--project`. Keep it out of git. If it
+is lost, follow
 [The `.eden/` folder is lost](./troubleshooting.md#the-eden-folder-is-lost).
 Destroy requires Eden's immutable ownership record, checks the current remote
 identity, removes only that Worker and Container application and **every
@@ -310,28 +315,23 @@ Container and images is still supported. A failed inventory read stops
 cleanup as indeterminate; it never counts as absence. These checks do not
 make untrusted `.eden` records safe: deployment IDs are public.
 
-Destroy also removes every retained image and registry repository, including
-legacy images and the managed-registry image tag
-(`eden-eve-<target>-<generation>:candidate` in `registry.cloudflare.com`) for
-every generation the ownership records prove this exact target pushed,
-including images retained by aborted pushes, then verifies each ref is gone.
-Any image left behind is reported in the destroy output with its exact
-`repository:tag` ref; remove only the listed refs with
-`npx wrangler@4.147.0 containers images delete <repository:tag>` and never
-filter by prefix.
+Destroy tries to remove every tag and manifest in the registry repositories
+the records prove this target owns, including legacy images and recorded
+images from aborted pushes. Cloudflare may keep some objects; destroy reports
+their exact refs in
+[`EVE_REGISTRY_OBJECTS_KEPT`](./troubleshooting.md#eve_registry_objects_kept).
+If Eden cannot read the registry directly, the Worker and Container may
+already be gone when cleanup fails.
 
 After a healthy deployment is promoted, `deploy` also verifies and removes its
 exact retained local Docker image and publication tags. The immutable
 generation label must match before Eden removes anything. An indeterminate
 publication keeps its exact local evidence instead of guessing at cleanup.
 
-Confirm the URL is no longer reachable:
+Confirm the URL returns HTTP 404:
 
 ```sh
-if curl --fail --silent "$DEPLOY_URL/eve/v1/health"; then
-  echo "unexpected: deployment is still reachable" >&2
-  exit 1
-fi
+test "$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$DEPLOY_URL/eve/v1/health")" = 404
 ```
 
 Also compare the Cloudflare Workers list and the Container inventory before and
@@ -339,12 +339,12 @@ after the run:
 
 ```sh
 npx wrangler@4.147.0 containers list
-npx wrangler@4.147.0 containers images list
 ```
 
-Require zero new Worker, Container, or managed-registry image residue
-associated with `WORKER_NAME`. An unreachable URL alone is not sufficient
-cleanup evidence.
+The exact Worker and Container must be gone. Use the
+[registry inventory steps](./troubleshooting.md#checking-for-leftovers-yourself)
+to check that the registry lists nothing the destroy did not report. An
+unreachable URL alone is not sufficient cleanup evidence.
 
 Maintainers validating Eden against the current Eve release should also follow
 the [Eve compatibility page](./eve-compatibility.md).
@@ -384,17 +384,17 @@ startup, and fresh request handling only. Container-local disk survives sleep
 — when the Container has been idle for the sleep window, Eden snapshots the
 writable filesystem and stops the instance, and the next request restores
 that snapshot — and an update carries Eve's sandbox sessions (conversation
-files) across the image change through the Durable Object's storage, so
-sessions now survive updates too. Local World *state* still reinitializes
-across an update, and snapshots expire after 30 idle days. Schedules still
+files) across the image change through the Durable Object's storage.
+Local World *state* still resets on update, and snapshots expire after
+30 idle days. Schedules still
 fire while the Container sleeps (see "Schedules" below). Durable Object
 memory always survives sleep and restarts.
 
 Production durability requires a project-configured, Cloudflare-reachable,
-durable Eve-compatible Workflow World such as Postgres (for example
-`@workflow/world-postgres`). See
-[Durable state (Postgres World)](#durable-state-postgres-world) for the exact
-tested setup. This release runs one `standard-1` Container instance
+durable Eve-compatible Workflow World. See the tested
+[Cloudflare](#durable-state-on-cloudflare-no-database) and
+[Postgres](#durable-state-postgres-world) setups. Eden runs one `standard-1`
+Container instance per kept version
 (1/2 vCPU, 4 GiB; awake time is billed at 4 GiB, asleep costs nothing) and
 does not promise horizontal scaling or custom domains.
 
@@ -469,8 +469,8 @@ logs `session handoff unavailable` and the session's run history keeps growing.
 driven by a Durable Object alarm: after the sleep window, Eden snapshots the
 container's filesystem, stops the instance, and restores the snapshot on the
 next request. Workflow memory lives in the Durable Object and survives container
-restarts and updates. Automatic container sleep with this World remains
-unverified.
+restarts and updates. The [2026-11-19 live check](./eve-compatibility-history.md#registry-cleanup-run-on-cloudflare-2026-11-19)
+verified sleep and wake with the workspace World.
 
 ## Durable state (Postgres World)
 
@@ -483,7 +483,7 @@ the Postgres World
 full `eden destroy` + `eden deploy` container replacement. This section is
 the tested recipe; other durable Worlds are project-owned and untested here.
 
-The latest live run, on 2026-11-07, used Eve `1.0.0-rc.6` with
+A live Postgres World run on 2026-11-07 used Eve `1.0.0-rc.6` with
 `@workflow/world-postgres` `5.1.1` and a Neon database: a new session ran bash
 and wrote a file, an in-place update kept that session going with the file
 intact, and a new session started after the update.
@@ -505,9 +505,8 @@ easy to miss; `eden preflight` warns when it sees a pooled URL.
 
 ### 1. Add the version-paired dependency
 
-Eve pins and validates its World at `eve build`, so the Postgres World must
-be on the same major version as the `@workflow/world` your Eve release
-bundles. The pairs below are the tested ones.
+Use the tested pairs below. Eden checks the installed World after the
+packaging build, before booting the runtime image.
 For Eve `1.0.2`, which bundles `@workflow/world` `5.2.0`:
 
 ```sh
@@ -525,10 +524,11 @@ Eve `0.91.0` bundles `@workflow/world` `5.0.5` and pairs with
 Use `pnpm add` instead for a pnpm project; keep the existing package manager
 and its matching lockfile.
 
-For other Eve versions, install the `@workflow/world-postgres` release whose
-`@workflow/world` dependency matches the one Eve bundles; `eden preflight`
-and `eden deploy` fail with an `EVE_WORLD_PAIRING` check when the installed
-release would not pair.
+For other Eve versions, select a compatible Postgres World. The
+[`EVE_WORLD_PAIRING` check](./troubleshooting.md#eve_world_pairing--the-world-version-does-not-pair-with-eve)
+compares the World's `@workflow/core` or `@workflow/world` dependency with
+Eve's `@workflow/core`: the majors must match, and if both declare a
+prerelease family those must match too.
 
 ### 2. Select the World in `agent.ts`
 

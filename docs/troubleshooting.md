@@ -52,7 +52,7 @@ The codes come from three places:
 | --- | --- |
 | `VAL-*` | Validation gates. Most run before Eden touches anything remote; the `VAL-LIFE-*` ones check cleanup and leftovers afterwards. |
 | `EVE_*` | Findings from the CLI, from packaging and publication, and from the deployed runtime. |
-| `HOST_*` | Errors raised inside the published Worker when it cannot reach the Container. |
+| `HOST_*` | Errors from the Worker or Container host, such as an invalid origin or a failed readiness check. |
 
 Some packaging codes are renamed when they enter the check list. The names
 you will actually see for those are `VAL-CLI-004` (from `ROOT_INVALID`),
@@ -115,6 +115,11 @@ positional argument where none is accepted. `EVE_OPTION_UNKNOWN` names the
 option, for example `Unknown option --bogus.` Run `eden <command> --help`
 for the accepted options.
 
+### `EVE_OPTION_VALUE_MISSING`
+
+`The <option> option requires a value.` Supply the value after the option.
+Run `eden <command> --help` to see what it accepts.
+
 ### `node: <path>: not found`, exit status 9
 
 The `--env-file` path does not exist, and the command was started through
@@ -174,6 +179,11 @@ Cleanup does not need application secrets, so `eden destroy` rejects
 `The --env-file option may be supplied only once.`, or
 `The --env-file option requires a non-empty path.`
 
+### `EVE_PROJECT_INVALID`
+
+`The --project option requires a non-empty path.` Supply the Eve project
+root or omit `--project` when running from that root.
+
 ### `EVE_PROJECT_ROOT_INVALID`
 
 `The selected Eve project root must be an existing, canonical directory.`
@@ -232,10 +242,10 @@ This covers the package manager and the lockfile:
 | Missing or unsupported package manager declaration | pnpm has no exact pin, or `packageManager` declares an unsupported manager/version. | For pnpm, use an exact pin such as `pnpm@11.21.0`. For npm, omit `packageManager` to use npm `11.13.0`, or declare an exact npm pin at version 7 or newer, with a root `package-lock.json`. |
 | Missing or malformed root lockfile | The selected manager's regular root lockfile is absent or invalid. | Regenerate the matching `package-lock.json` (npm lockfile v2/v3) or `pnpm-lock.yaml` locally, then retry. |
 | `A competing package-manager lockfile was found` | Another package manager's lockfile is present. | Keep only the selected manager's root lockfile; do not convert a valid npm project to pnpm. |
-| `is malformed or does not match the exact packageManager pin` | The pnpm lockfile does not match the declared pnpm version. | Regenerate the lockfile with the declared pnpm version and retry without changing it during packaging. |
+| `The root lockfile is malformed or incompatible with the selected package manager or public registry.` | The lockfile cannot be used with the selected package manager or public registry. | Regenerate it with the selected package manager and use public dependencies. |
 | `could not complete without changing or bypassing the lockfile` | Frozen dependency installation found an out-of-date or incomplete lockfile. | Regenerate the selected manager's lockfile locally, then retry without relaxing frozen mode (`npm ci` or `pnpm install --frozen-lockfile`). |
 | `refused dependency build scripts that the project pnpm policy neither allows nor ignores` | The frozen install failed with `ERR_PNPM_IGNORED_BUILDS`. | Name the dependency under `allowBuilds` or `ignoredBuiltDependencies` in the project `pnpm-workspace.yaml` and retry. The known-optional `cbor-extract` addon is already exempted by Eden. |
-| `The isolated pinned pnpm install failed with ERR_PNPM_…` | Any other pnpm failure inside the isolated builder. | Fix the reported pnpm failure without relaxing the frozen lockfile or the declared pnpm pin, then retry. |
+| `The isolated pinned pnpm install failed with <code>.` | Any other pnpm failure inside the isolated builder. | Fix the reported pnpm failure without relaxing the frozen lockfile or the declared pnpm pin, then retry. |
 | npm dependency installation fails | The lockfile needs private registry configuration, unsupported dependency scripts, or other unavailable install inputs. | Use public registry dependencies that work with `npm ci --ignore-scripts`; `.npmrc` is excluded and private registries are unsupported. |
 
 For npm, run these from the Eve project root:
@@ -264,12 +274,17 @@ observed`. Eden builds from one immutable snapshot and refuses to mix
 generations. Stop the editor, watcher, or build process that is writing into
 the project, then retry.
 
+### `VAL-BUILD-002` and `VAL-BUILD-003` — frozen install and immutable snapshot
+
+These checks only ever pass. The isolated builder was given the exact
+frozen install command and built from one snapshot, with source races checked.
+
 ### `VAL-BUILD-004` — the project-local Eve build failed
 
 Eden runs the project's own `eve build` inside an isolated Linux/amd64
 builder. When that build fails, the message is
 `The project-local Eve build failed inside the isolated Linux/amd64 builder.`
-followed by `Eve reported:` and the last lines Eve printed. Fix that error
+It may add `Eve reported:` and the last lines Eve printed. Fix that error
 (running `eve build` locally usually reproduces it) and retry.
 
 The same check also carries the build-output problems, which report as
@@ -371,7 +386,7 @@ remote mutation was attempted.
 
 ### `VAL-CLI-007-TARGET-CONFLICT` — the target exists and Eden cannot prove it owns it
 
-Two different messages can land on this check.
+The message depends on what Eden could verify.
 
 **The target exists and the inventory cannot prove Eden owns it:**
 
@@ -386,7 +401,7 @@ resources it cannot prove it created.
 
 > The exact Worker or Container target exists, and although a local Eden
 > record matches, provider state cannot prove it is the one Eden deployed —
-> the target may have been recreated outside Eden.
+> the target may have been recreated outside Eden. Unproven: <details>.
 
 Inspect the Worker at its `workers.dev` origin and the recorded deployment
 history before redeploying. If it is not Eden's, deploy under a different
@@ -419,6 +434,8 @@ with `npx wrangler@4.147.0 login` and confirm the account, then retry.
 The authenticated account and `workers.dev` subdomain were not returned by
 the read-only resolver, or the authenticated origin did not match the exact
 Worker target. The same `wrangler whoami` and `wrangler login` check applies.
+If the origin resolver rejects the Worker name or account subdomain
+(`HOST_ORIGIN_UNAVAILABLE`), the CLI reports its message under this code.
 
 ## Packaging and the `eve build`
 
@@ -445,13 +462,10 @@ npm install just-bash
 # For a pnpm project: pnpm add just-bash
 ```
 
-On Eve `0.83.0` and later, installing the dependency is not sufficient:
+Installing the dependency is not sufficient:
 explicitly select `JustBashSandbox` using the
 [sandbox setup](./deploy.md#sandbox-setup). The production default has no
 provider in Eden's isolated builder and does not fall back to `just-bash`.
-Older Eve releases still use
-their existing default fallback inside Eden's builder, which has no Docker
-daemon and hides `/dev/kvm`.
 
 For an already-declared dependency with an out-of-date lockfile, reinstall
 using the project's package manager:
@@ -478,8 +492,8 @@ docker version
 ### `EVE_SANDBOX_PROVIDER` — select explicit JustBash
 
 Eden supports only `just-bash`, including a project-owned module that explicitly
-selects `JustBashSandbox`. On Eve `0.83.0` and later, leaving the default selected
-fails before the snapshot, build, or remote reads:
+selects `JustBashSandbox`. Leaving the default selected fails before the
+snapshot and build:
 
 ```text
 Eve <version> requires an explicit JustBash sandbox in <path> on Eden; DefaultSandbox has no provider in Eden's isolated builder because production builds do not fall back to just-bash.
@@ -559,8 +573,8 @@ the unsupported capability:
 
 ### `DOCKER_PLATFORM_BLOCKED` — the image could not be built or started
 
-`The Linux/amd64 Eve runtime image could not be built or inspected safely:
-<error>.` The message ends with the underlying error: the last lines Docker
+`The Linux/amd64 Eve runtime image could not be built or inspected safely`
+may end with the underlying error: the last lines Docker
 printed, or a local error such as a full disk. Fix that error and retry.
 Docker or OrbStack must be able to build and run `linux/amd64` images.
 
@@ -570,18 +584,17 @@ runs can share one Docker host.
 
 ### `EVE_HEALTH_FAILED` — Eve never reported ready locally
 
-`Eve exited with code <code> before it reported ready. Its last output:
-<output>.` Eve stopped during startup in the local boot check. The message
-ends with the last lines Eve printed, with env-file values redacted. Fix that
-error and retry. If the project reads a variable at startup, add it to
+`Eve exited with code <code> before it reported ready.` Eve stopped during the
+local boot check. If Eve printed output, the message adds `Its last output:`
+and the last lines, with env-file values redacted. Fix that error and retry.
+If the project reads a variable at startup, add it to
 `--env-file`.
 
 `The real Eve health route did not report ready before the bounded deadline
-(last status: <status>).` Eve kept running but did not report ready within
-30 seconds. Inspect the project-local `eve start` supervisor, the Nitro
-child, the sandbox prewarm, and the Workflow World startup. Eden does not
-replace them with a synthetic listener. If the machine was under heavy load,
-retry.
+(last status: <status>).` The local polling budget is 30 seconds; an
+individual probe can take up to 5 seconds. Inspect the project-local `eve start`
+supervisor, the Nitro child, the sandbox prewarm, and the Workflow World
+startup. Eden does not replace them with a synthetic listener.
 
 If health never reaches ready on a live deployment either, check the Eve
 project's provider, Workflow World, and startup requirements. Eden deploys
@@ -710,9 +723,10 @@ Read the last check and the deployment evidence under
 ### `EVE_RUNTIME_IMAGE_CLEANUP_FAILED`
 
 `The Eve deployment is healthy and promoted, but exact image cleanup failed;
-do not retry the deployment.` The deployment is live. Only the local runtime
-image or the superseded registry tag was left behind. Remove exactly the
-recorded identity; do not redeploy.
+do not retry the deployment.` The remediation is:
+`The deployment is live; do not redeploy. Remove only the recorded local
+runtime image, or what the failed VAL-LIFE-007 check names in the superseded
+registry repository.` Read the failed check to tell which cleanup failed.
 
 ### `VAL-CROSS-004` after a healthy deploy
 
@@ -722,13 +736,27 @@ and boot container. Never use broad Docker cleanup.
 
 ### `VAL-LIFE-007`
 
-`The update is healthy and promoted, but the superseded registry repository
-<repository> could not be proven deleted.` Remove only that repository's
-tags. Do not retry the deployment and do not run broad registry cleanup.
-An object that Cloudflare's registry keeps does not fail this check; it is
-reported as [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept). Eden reads the registry's listing and each answer with
-direct requests to `registry.cloudflare.com` and never uses a proxy for
-them. Where the registry cannot be reached directly, the check fails.
+The deployment is live. Read the check message to see which cleanup failed:
+
+- `The update is healthy and promoted, but the superseded registry repository
+  <repository> could not be proven deleted.` The check says: `Remove only
+  what the registry still lists in the recorded repository <repository>,
+  tags and sha256: entries; see VAL-LIFE-007 in docs/troubleshooting.md.
+  Do not retry or run broad registry cleanup.` Use the
+  [complete repository listing](#eve_registry_objects_kept).
+- `The deployment is healthy, but resource retirement was not proven:
+  <reason> Exact pending retirement records were retained for retry.` The
+  check says: `Retry deploy to finish only recorded retired resource cleanup.`
+  The top-level `EVE_RUNTIME_IMAGE_CLEANUP_FAILED` message still says not
+  to redeploy; the failed check identifies the pending retirement.
+
+Kept objects alone do not fail the check. Deploy reports them in
+[`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept), even when something
+else makes the check fail. Eden's own requests to `registry.cloudflare.com`
+never use a proxy. Without direct access it cannot verify the registry.
+
+A complete deletion reports `Everything the registry listed in the
+superseded generation's registry repository was deleted after promotion.`
 
 Cleanup deletes everything the registry lists in a repository, so Eden
 never runs it on a repository that holds a deployed image:
@@ -926,6 +954,11 @@ When the Worker cannot start or reach the Container, it fails with
 
 Read the Worker log in Cloudflare for the exact code, then check the
 deployment's own providers, World, and startup requirements.
+The Worker can also throw `HOST_ORIGIN_UNAVAILABLE` when its configured
+origin or deployment identity is missing or invalid. Check the Worker log
+and the exact target's origin. `HOST_REQUEST_ABORTED` means the client
+cancelled while the Worker was waiting for Eve to become ready; it is a
+Worker exception, not an Eden CLI error or a JSON response code.
 
 ### The session stream hangs with headers only
 
@@ -937,8 +970,8 @@ events do persist in the database.
 
 Eden warns about this during preflight:
 
-> `EVE_WORLD_POSTGRES_POOLED` — The configured Postgres connection uses a
-> transaction-mode pooler host; transaction-mode poolers accept LISTEN but
+> `EVE_WORLD_POSTGRES_POOLED` — The configured Postgres connection uses
+> <pooler reason>; transaction-mode poolers accept LISTEN but
 > never deliver notifications, so live session streaming hangs.
 
 Use the direct, unpooled URL for `WORKFLOW_POSTGRES_URL`. On Neon that is
@@ -983,11 +1016,10 @@ Files, `grep`, `sed`, `jq`, `sqlite3`, and `curl` work. `python`, `git`, and
 
 If every sandbox tool fails with a provider mismatch instead, the Container
 selected a different sandbox provider than the one the builder prepared.
-Cloudflare's durable-object Containers expose `/dev/kvm`, which makes Eve's
-`DefaultSandbox` pick microsandbox at runtime, while Eden's isolated builder
-prepared the just-bash template. Eden removes the device before Eve starts so
-runtime selection matches the build. That removal is part of the generated
-image entrypoint, so a replaced image loses it.
+In older Eve versions, access to `/dev/kvm` made `DefaultSandbox` choose
+microsandbox at runtime while the builder prepared just-bash. Eden removes
+that device before Eve starts. Current projects must select JustBash
+explicitly.
 
 ### The sandbox template is missing from the image
 
@@ -1036,9 +1068,8 @@ through `--env-file`.
 
 ### `EVE_WORLD_LOCAL`
 
-> This project uses Eve's default local Workflow World; workflow state lives
-> on the container disk, survives sleep, and resets when you update the
-> agent.
+> Local World stores memory on container disk; updates or a lost sleep
+> snapshot reset sessions and approvals.
 
 For durable state without a database, add `@moinulmoin/eden-world-cloudflare`
 to the project's production dependencies and select it in `agent.ts`:
@@ -1063,8 +1094,10 @@ transaction-mode pooled URL breaks live session streaming.
 > The installed <world> targets <package> <range>, but the project's Eve
 > bundles `@workflow/core` <range>; Eve rejects this World at runtime.
 
-Install the `<world>` release whose `@workflow/core` dependency matches the
-Eve-bundled line. The pairing is version-specific: for Eve `1.0.2`, which
+This check runs after the packaging build and before the runtime boot check.
+It checks the two known durable Worlds. Match the World's `@workflow/core`
+or `@workflow/world` dependency to Eve's `@workflow/core` major and, if both
+declare one, prerelease family. The tested pairs are: for Eve `1.0.2`, which
 bundles `@workflow/world` `5.2.0`, the tested pair is
 `@workflow/world-postgres@5.2.1`; for Eve `0.91.0`, which bundles
 `@workflow/world` `5.0.5`, it is `@workflow/world-postgres@5.0.5`.
@@ -1086,11 +1119,11 @@ project's World: `@moinulmoin/eden-world-cloudflare` to `0.11.2` or later, or
 
 ## Destroy and cleanup leftovers
 
-`eden destroy` removes exactly one target, including **all** kept images,
-container instances, and registry repositories, even with sessions still
-running. Use the same project, environment, and Worker name you deployed
-with. Destroy refuses `--env-file`. Destroy cannot remove what Cloudflare's
-registry keeps; see [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept).
+`eden destroy` removes exactly one target, including its retained instances
+and images, except for
+[`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept). It does not wait for
+sessions to finish. Use the same project, environment, and Worker name.
+Destroy refuses `--env-file`.
 
 Destroy reports one check per step:
 
@@ -1106,8 +1139,8 @@ Destroy reports one check per step:
 
 `No immutable deployed record matched the exact target; destroy refuses to
 guess or broaden cleanup.` Eden keeps its deployment records under
-`<project>/.eden/eve-deploy`. Deploy from this project root, or point
-`--project` at the project you deployed, and retry. If the folder no longer
+`<project>/.eden/eve-deploy`. Retry destroy from the root that holds those
+records, or select that root with `--project`. If the folder no longer
 exists anywhere, see [The `.eden/` folder is lost](#the-eden-folder-is-lost).
 
 Eden `0.11.2` through `0.12.0` could write a record that they could not read
@@ -1245,24 +1278,24 @@ observed on 2026-11-18:
 | --- | --- | --- |
 | `refused-snapshot` | `403` with one error: code `DENIED`, message `snapshot manifests cannot be deleted through this API` | A container snapshot: its tags, seen so far as `rootfs-snapshot-*` and `rootfs-set-*`, and its manifest. A target has them once it has slept or moved to a new Eve version. |
 | `refused-singleton-artifact` | `409` with the code `SINGLETON_ARTIFACT_EXISTS`, the artifact type `application/vnd.cloudchamber.btrfs-chain.v1` and two digests | The chain artifact that Cloudflare makes for each pushed image. Eden does not know whether either digest in the answer is the one it asked to delete. |
-| `accepted-still-listed` | `202` or `204`, and a listing that Eden began at least 30 seconds after that answer still has the entry | The earlier image of a repository that got a second push. It had no tag. |
+| `accepted-still-listed` | A delete by digest answered `202` or `204`, and a listing Eden began at least 30 seconds later still has the entry | The earlier image of a repository that got a second push. It had no tag. |
 
 Each accepted delete gets its own 30 seconds, so cleanup of a repository
 can take that long after its last accepted delete.
 
 When the registry answers Wrangler's delete of a tag with `403`, Eden
 repeats the delete for that same tag against the registry and reads the
-answer. An object with any other answer, and anything else that is still
-listed, fails destroy with
+answer. An object still listed without a kept answer, or an unreadable
+final listing, fails destroy with
 [`EVE_DESTROY_IMAGES_RETAINED`](#eve_destroy_images_retained). Eden's
 requests go straight to `registry.cloudflare.com` and never through a
 proxy. Where the registry cannot be reached that way, destroy fails with
 that code too.
 
-The Worker, its secrets and Durable Object data, and the Container
-application are gone. Eden sent each kept object one delete. It does not
-know whether a later delete would get another answer. What is known about
-the kept objects:
+After a successful destroy, the Worker, its secrets and Durable Object data,
+and the Container application are gone. Eden reports the registry's answer
+to its delete of each of these objects; it does not know whether a later
+delete would be answered differently. What is known about the kept objects:
 
 - A kept snapshot still holds the container's disk, including the agent's
   files. Cloudflare documents that it removes a snapshot 30 days after it
@@ -1324,9 +1357,9 @@ the deployment by hand. These are the resources Eden creates for a target
 (see [What Eden creates](./reference.md#what-eden-creates)) and the Wrangler
 commands `eden destroy` itself runs.
 
-1. Confirm the account, and the exact target name the deploy printed (a
-   derived preview name is the `package.json` name plus a dash and eight
-   hexadecimal characters):
+1. Confirm the account and the exact target name the deploy printed. A derived
+   preview name uses a sanitized, possibly shortened `package.json` name
+   plus a dash and eight hexadecimal characters:
 
    ```sh
    npx wrangler@4.147.0 whoami
@@ -1364,13 +1397,13 @@ commands `eden destroy` itself runs.
    `eden-eve-<environment>-<name>-<24 hexadecimal characters>-<rest>`. Do not
    pick repositories by how their names start: with a target named `foo`,
    `eden-eve-preview-foo-` also starts the repositories of a target named
-   `foo-bar`. Without `.eden` the 24 characters cannot be worked out, and
-   the Container application does not name its repository (its `image` is
-   empty in `containers list --json`).
+   `foo-bar`. The digest comes from the original project name, account ID,
+   environment, and target name. It helps find candidates, not prove ownership.
 
-   The proof Cloudflare keeps is in a snapshot. A repository with a tag named
-   `rootfs-snapshot-*` holds a snapshot whose configuration names the
-   Container application it was taken from. Get a registry credential (valid
+   The proof Cloudflare keeps is in a snapshot. Use Wrangler's tag list below
+   to find a `rootfs-snapshot-*` tag, not as the full registry inventory.
+   The snapshot's configuration names the Container application it came from.
+   Get a registry credential (valid
    for five minutes) and read it with the `account_id` and `username` the
    credential command prints. Leave the password out of the commands: curl
    asks for it, and you paste the `password` value at its prompt, so it
@@ -1405,9 +1438,9 @@ commands `eden destroy` itself runs.
    as tags named `rootfs-snapshot-*` and `rootfs-set-*`), and Wrangler then
    prints only `403 Forbidden`. That line does not say why: a missing
    permission prints the same. A tag's name does not say why either. Treat
-   every tag Wrangler refuses as unresolved until the registry itself gives
-   the snapshot answer for that tag. To read it, repeat the delete with the
-   same credential, again without the password in the command:
+   a refused tag as unresolved. Only repeat the delete when Wrangler reports a
+   registry `403` for that exact tag. Read the answer using the same
+   credential, again without the password in the command:
 
    ```sh
    curl --noproxy '*' -X DELETE -u '<username>' -w '\nHTTP %{http_code}\n' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<tag>
@@ -1421,10 +1454,9 @@ commands `eden destroy` itself runs.
    ```
 
    Cloudflare documents that it removes a snapshot 30 days after it was
-   created or last restored. If curl prints a status from `HTTP 200` to
-   `HTTP 299`, that request deleted the tag; do not delete it again, and let
-   step 5 confirm it is gone. With any other answer the tag is unresolved:
-   check that the Wrangler login can delete registry images.
+   created or last restored. HTTP `202` or `204` means the registry accepted
+   the delete, not that the entry is gone. Check the listing in step 5.
+   Any other answer leaves the tag unresolved if it is still listed.
 
    Wrangler lists and deletes tags only. The registry also lists one
    `sha256:` entry for each manifest; the `tags/list` command under
@@ -1432,12 +1464,12 @@ commands `eden destroy` itself runs.
    `sha256:<digest>` in place of the tag. That entry also names the three
    answers with which Cloudflare keeps an object.
 
-5. Run the two list commands again. Confirm the Container application is
-   gone, and that the repositories you proved in step 4 hold no tag apart
-   from the ones that got the snapshot answer. A tag that Wrangler refused
-   without that answer is not cleaned up. Delete any other tag the list
-   shows in those repositories, whatever its name. Confirm
-   the Worker is gone too; this command must fail with
+5. Run `npx wrangler@4.147.0 containers list` again to check the Container
+   application is gone. Read the full
+   [`tags/list` listing](#eve_registry_objects_kept) for each repository
+   proved in step 4. Check that only refs with one of the three kept
+   answers remain; a tag still listed after an accepted delete is unresolved.
+   Confirm the Worker is gone too; this command must fail with
    `This Worker does not exist on your account. [code: 10007]`:
 
    ```sh
@@ -1452,14 +1484,19 @@ of this.
 
 ```sh
 npx wrangler@4.147.0 containers list
-npx wrangler@4.147.0 containers images list
 ```
 
-Require zero new Worker, Container, or managed-registry image residue
-associated with your target name. An unreachable URL alone is not sufficient
-cleanup evidence. `containers images list` shows tags only; the `tags/list`
-command under [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept) also shows the `sha256:` entries of a repository, once
-you have read its listing to the end.
+Confirm the exact Worker and Container are gone and that the registry lists
+nothing the destroy did not report. An unreachable URL alone is not enough.
+For a known repository, read the full
+[`tags/list` listing](#eve_registry_objects_kept), including `sha256:` entries.
+
+A failed destroy names the repositories it could not verify, and each kept
+object's `ref` starts with its repository. The deployment records under
+`.eden/eve-deploy/` hold each image reference. `npx wrangler@4.147.0 containers images list`
+also shows them, but only for repositories that still have a tag, and it
+shows no `sha256:` entry. A failed or incomplete listing is not proof of
+cleanup, and a matching name prefix is not proof of ownership.
 
 ## Indeterminate outcomes
 
@@ -1486,8 +1523,9 @@ What to do:
    `deployment-attempt.json` in the same generation directory.
 2. Inspect the exact target in Cloudflare, and only the exact target:
    `npx wrangler@4.147.0 deployments list --name <name> --json`,
-   `npx wrangler@4.147.0 containers list`, and
-   `npx wrangler@4.147.0 containers images list`.
+   `npx wrangler@4.147.0 containers list`, and a full
+   [`tags/list` listing](#eve_registry_objects_kept) for the exact
+   repositories the evidence names.
 3. Retry the same exact target with the same `--project`, `--env`, and
    `--name` once you know what the previous attempt left behind. Eden will
    not adopt or replace a resource it cannot prove it created, so a retry

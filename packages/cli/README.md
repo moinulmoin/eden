@@ -43,13 +43,14 @@ Bun can install Eden, but Eden still runs on Node. Do not use `bunx --bun`.
   ```
 
 - Docker or OrbStack with Linux/amd64 container support
-- an existing Eve project with an exact `packageManager: "pnpm@..."` entry
-- the matching root `pnpm-lock.yaml`
+- an Eve project on `0.91.0` or later, with one root `package-lock.json` or
+  an exact `packageManager: "pnpm@..."` pin and matching `pnpm-lock.yaml`
+- `just-bash` as a production dependency, selected explicitly in
+  `agent/sandbox.ts` (or `agent/sandbox/sandbox.ts` if that folder exists)
 - any providers, databases, Workflow World, credentials, and external services
   already required by that Eve project
 
-Eden Deploy supports pinned pnpm Eve projects in this release. Bun lockfiles and
-native Windows are not currently supported.
+Bun project lockfiles and native Windows are not supported.
 
 ## Deploy an existing Eve project
 
@@ -62,7 +63,7 @@ npx @moinulmoin/eden deploy
 With no flags, `deploy` uses the current directory, the `preview`
 environment, and a target name derived deterministically from the project's
 `package.json` name. Deploy performs its checks inline, installs the
-project's pinned pnpm lockfile, runs its project-local Eve executable,
+project's npm or pinned pnpm lockfile, runs its project-local Eve executable,
 packages the real Eve server into one Cloudflare Container, and publishes one
 Worker in front of it.
 
@@ -114,7 +115,8 @@ eden destroy --name my-eve-preview
 
 Destroy always requires an explicit `--name`. It verifies Eden's ownership
 record and the current remote identity before removing anything. It never
-deletes by prefix or broad account search.
+deletes by prefix or broad account search. Cloudflare may keep some
+[registry objects](https://github.com/moinulmoin/eden/blob/main/docs/troubleshooting.md#eve_registry_objects_kept).
 
 ## Command map
 
@@ -132,8 +134,8 @@ Run `eden <command> --help` for command-specific options.
   World, authentication, schedules, or channels.
 - The agent's sandbox is `just-bash`, a simulated shell, not a real Linux VM
   like Vercel Sandbox. Files, `grep`/`sed`/`jq`/`sqlite3`, and `curl` work;
-  `python`, `git`, and `npm` do not. A custom `agent/sandbox.ts` or
-  `agent/sandbox/Dockerfile` is not supported yet.
+  `python`, `git`, and `npm` do not. A sandbox Dockerfile cannot provide a
+  Linux VM on Eden.
 - Container files survive sleep via snapshots, and image updates now carry
   Eve's sandbox sessions — every conversation's files — across the image
   change through the Durable Object's storage (capped at 1 GiB compressed).
@@ -142,7 +144,7 @@ Run `eden <command> --help` for command-specific options.
   World, such as Postgres or `@moinulmoin/eden-world-cloudflare`.
 - Standard 5-field cron schedules wake the Container; unsupported cron forms
   only run while it is awake.
-- This release uses one logical Container instance (`standard-1`, 1/2 vCPU,
+- This release uses one Container instance per kept version (`standard-1`, 1/2 vCPU,
   4 GiB) and does not promise horizontal scaling or custom domains.
 - Bun is an installer only; Node remains the runtime.
 
