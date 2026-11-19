@@ -46,7 +46,7 @@ Cloudflare account.
 
 Preflight changes nothing in your Cloudflare account: it performs read-only
 calls (`wrangler whoami --json`, the name-filtered Container applications API,
-`wrangler deployments list --name <target> --json`, the account's
+the Worker's deployments endpoint, the account's
 `workers/subdomain` endpoint, and the Worker's script settings) and never
 uploads, publishes, or deletes. The login and Container reads run once before
 the build and again with the target reads after it. Locally it writes one generation directory
@@ -160,6 +160,15 @@ destroy still succeeds and adds the warning `EVE_REGISTRY_OBJECTS_KEPT`
 with each object and the registry's answer for it. Anything else left
 behind, and a final listing that cannot be read in full, fails destroy with
 `EVE_DESTROY_IMAGES_RETAINED`.
+
+Each read asks Wrangler for the account once and sends every request to that
+account. Destroy reads nothing from an account other than the one in the
+record. It takes a Worker as absent only when Cloudflare's API answers
+status `404` with a null result and the single error code `10007`; any other
+answer about the Worker that is not a list of its deployments stops destroy
+with `EVE_DESTROY_INDETERMINATE`. Wrangler runs each delete with the
+recorded account set. Destroy removes `CURRENT` only if the pointer is still
+the file it read at the start; that check is not atomic.
 
 Destroy reads the local deployment records and the Cloudflare account, and
 changes both: it deletes the owned resources even when sessions have not
@@ -368,10 +377,10 @@ in the account.
 | Variable | Read by | Effect |
 | --- | --- | --- |
 | `EDEN_EVE_CONTAINER_SLEEP_AFTER` | `eden deploy` | Sets the container idle sleep window. Format: a number with an optional `ms`, `s`, `m`, `h`, or `d` suffix, where a bare number means seconds (`90s`, `3h`). Default `1h`; the maximum is `345m` (5 h 45 min), because Cloudflare stops a container within six hours of its Durable Object going idle and Eden must snapshot before that. A larger value fails the publish step with `EVE_HOST_CONFIG_INVALID`; the Worker-side check is `HOST_READINESS_UNPROVEN` |
-| `CLOUDFLARE_API_TOKEN` | Eden | Used instead of the Wrangler OAuth token for the account and subdomain reads |
+| `CLOUDFLARE_API_TOKEN` | Eden | Used instead of the Wrangler OAuth token for Eden's own reads of Cloudflare's API: the Worker, the Container applications, and the subdomain |
 | `WRANGLER_HOME` | Eden | Directory that holds the Wrangler OAuth token for direct API reads. Otherwise Eden follows Wrangler's legacy `~/.wrangler` directory when present, then `$XDG_CONFIG_HOME/.wrangler`, or `~/Library/Preferences/.wrangler` on macOS and `~/.config/.wrangler` elsewhere |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY` | Eden and Wrangler | Passed from your shell to the Docker CLI and Wrangler image push, so both use the same daemon and credentials |
-| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and Wrangler | Passed from your shell to Docker and Wrangler. [Eden's own registry requests](./security.md#what-eden-can-change-in-your-cloudflare-account) never use a proxy |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and Wrangler | Passed from your shell to Docker and Wrangler. Eden's own reads of Cloudflare's API (the Worker, the Container applications, the subdomain, the Worker's settings) use Node's `fetch`, which used these variables only with `NODE_USE_ENV_PROXY=1` set when tested on Node 24.21.0. [Eden's own registry requests](./security.md#what-eden-can-change-in-your-cloudflare-account) never use a proxy |
 | `NODE_EXTRA_CA_CERTS`, `XDG_CONFIG_HOME`, `CLOUDFLARE_ACCOUNT_ID` | Wrangler (configuration/account selection also checked by Eden) | Trusted shell settings for certificate trust, configuration location, and account selection; Eden still requires exactly one authenticated account, matching `CLOUDFLARE_ACCOUNT_ID` when set |
 
 ### Variables Eden sets in the container

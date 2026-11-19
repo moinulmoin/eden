@@ -17,6 +17,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   readdir,
   realpath,
   rename,
@@ -588,13 +589,13 @@ export type EveDestroyCloudflareReadRunner = (
 ) => EveDestroyTargetRead | Promise<EveDestroyTargetRead>;
 
 export type EveWorkerDeleteRunner = (
-  request: { readonly name: string },
+  request: { readonly name: string; readonly accountId: string },
 ) => "deleted" | "absent" | "indeterminate" | Promise<
   "deleted" | "absent" | "indeterminate"
 >;
 
 export type EveContainerDeleteRunner = (
-  request: { readonly applicationId: string },
+  request: { readonly applicationId: string; readonly accountId: string },
 ) => "deleted" | "absent" | "indeterminate" | Promise<
   "deleted" | "absent" | "indeterminate"
 >;
@@ -637,6 +638,8 @@ export type EveRuntimeConfigLoader = (
 ) => EveRuntimeConfig | Promise<EveRuntimeConfig>;
 
 export interface EveDestroyCloudflareReadRequest {
+  /** The account the deployment record names; nothing is read from any other. */
+  readonly accountId: string;
   readonly workerName: string;
   readonly containerApplicationName: string;
   /** Registry repository names this target provably owns. */
@@ -1552,17 +1555,6 @@ function exactContainerEntries(
   return entries;
 }
 
-function exactDeploymentEntries(
-  value: unknown,
-): readonly unknown[] | undefined {
-  const collection = jsonCollection(value);
-  if (collection === undefined) return undefined;
-  if (collection.some((entry) => typeof entry !== "object" || entry === null)) {
-    return undefined;
-  }
-  return collection;
-}
-
 function authenticatedWranglerAccount(value: unknown): boolean {
   return typeof value === "object" &&
     value !== null &&
@@ -1626,6 +1618,7 @@ async function readWorkersDevSubdomain(
           Authorization: `Bearer ${token}`,
           Accept: "application/json",
         },
+        redirect: "error",
         signal: AbortSignal.timeout(30_000),
       },
     );
@@ -1658,11 +1651,29 @@ export function exactTargetContainerEntries(
   return exactContainerEntries(value, boundedResourceName(name, "container"));
 }
 
-async function readTargetContainers(name: string): Promise<WranglerJsonResult> {
-  const account = await readWranglerJson(["whoami", "--json"]);
-  const accountId = authenticatedAccountId(account.value);
+/**
+ * One read of Cloudflare's API: the status and the body as sent. Undefined
+ * without a token or without an answer. A redirect is refused, so an answer
+ * is the API's own for this exact URL.
+ */
+async function readCloudflareApi(
+  url: URL,
+): Promise<{ readonly status: number; readonly body: string } | undefined> {
   const token = process.env.CLOUDFLARE_API_TOKEN || await readWranglerOAuthToken();
-  if (accountId === undefined || !token) return { failed: true };
+  if (!token) return undefined;
+  try {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(30_000),
+    });
+    return { status: response.status, body: await response.text() };
+  } catch {
+    return undefined;
+  }
+}
+
+async function readTargetContainers(accountId: string, name: string): Promise<WranglerJsonResult> {
   // Unlike `containers list --json`, this endpoint supports an exact name
   // filter and exposes result_info.next_page_token. No per_page means all.
   const entries: unknown[] = [];
@@ -1675,12 +1686,9 @@ async function readTargetContainers(name: string): Promise<WranglerJsonResult> {
       );
       url.searchParams.set("name", name);
       if (pageToken !== undefined) url.searchParams.set("page_token", pageToken);
-      const response = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!response.ok) return { failed: true };
-      const body: unknown = await response.json();
+      const response = await readCloudflareApi(url);
+      if (response === undefined || response.status < 200 || response.status > 299) return { failed: true };
+      const body: unknown = JSON.parse(response.body);
       if (typeof body !== "object" || body === null ||
         !("success" in body) || body.success !== true ||
         !("result" in body) || !Array.isArray(body.result)) return { failed: true };
@@ -1710,16 +1718,62 @@ async function readTargetContainers(name: string): Promise<WranglerJsonResult> {
   }
 }
 
-async function readExactTargetInventory(workerName: string, containerApp: string) {
-  const containers = await readTargetContainers(containerApp);
-  const deployments = await readWranglerJson([
-    "deployments", "list", "--name", workerName, "--json",
-  ]);
+/**
+ * The exact Worker in the account: "deployed" or "undeployed" when the API
+ * lists its deployments (status 200), "absent" only for the API's own answer
+ * that it does not exist. That answer, read on 2026-11-19, is status 404
+ * with success false, a null result, and one error whose code is 10007.
+ * Undefined for anything else, which proves nothing either way: no answer,
+ * a redirect, another status or error, a body that names a field twice, or
+ * one that says 10007 beside anything that contradicts it.
+ */
+async function readWorkerPresence(
+  accountId: string,
+  workerName: string,
+): Promise<"deployed" | "undeployed" | "absent" | undefined> {
+  const response = await readCloudflareApi(new URL(
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}/deployments`,
+  ));
+  if (response === undefined) return undefined;
+  if (response.status === 200) {
+    let listed: unknown;
+    try {
+      listed = JSON.parse(response.body);
+    } catch {
+      return undefined;
+    }
+    return typeof listed === "object" && listed !== null && "success" in listed && listed.success === true &&
+        "result" in listed && typeof listed.result === "object" && listed.result !== null &&
+        "deployments" in listed.result && Array.isArray(listed.result.deployments)
+      ? listed.result.deployments.length > 0 ? "deployed" : "undeployed"
+      : undefined;
+  }
+  // Absence is read strictly: a body that names a field twice is no answer.
+  const body = exactJson(response.body);
+  if (typeof body !== "object" || body === null || !("success" in body) || !("result" in body)) return undefined;
+  const errors = "errors" in body ? body.errors : undefined;
+  const error: unknown = Array.isArray(errors) && errors.length === 1 ? errors[0] : undefined;
+  return response.status === 404 && body.success === false && body.result === null &&
+      typeof error === "object" && error !== null && "code" in error && error.code === 10007
+    ? "absent"
+    : undefined;
+}
+
+/**
+ * The exact Worker and Container application, both read from the one
+ * account the caller verified. Either is undefined when its read proved
+ * nothing.
+ */
+async function readExactTargetInventory(
+  accountId: string | undefined,
+  workerName: string,
+  containerApp: string,
+) {
+  if (accountId === undefined) return { containerEntries: undefined, worker: undefined };
+  const containers = await readTargetContainers(accountId, containerApp);
   return {
-    containers,
-    deployments,
     containerEntries: containers.failed ? undefined : exactContainerEntries(containers.value, containerApp, true),
-    deploymentEntries: exactDeploymentEntries(deployments.value),
+    worker: await readWorkerPresence(accountId, workerName),
   };
 }
 
@@ -1727,24 +1781,23 @@ async function defaultCloudflareRead(
   request: EveCloudflareReadRequest,
 ): Promise<EveCloudflareReadResult> {
   const account = await readWranglerJson(["whoami", "--json"]);
-  const { containers, deployments, containerEntries, deploymentEntries: listedDeployments } =
-    await readExactTargetInventory(request.name, boundedResourceName(request.name, "container"));
   const accountId = authenticatedAccountId(account.value);
+  const { containerEntries, worker } = await readExactTargetInventory(
+    accountId,
+    request.name,
+    boundedResourceName(request.name, "container"),
+  );
   const accountAccess = account.failed || accountId === undefined
     ? "unavailable"
     : "available";
-  const containerAccess = containers.failed || containerEntries === undefined
+  const containerAccess = containerEntries === undefined
     ? "unavailable"
     : "available";
-  const deploymentEntries = deployments.failed &&
-      /(?:does not exist|not found)/iu.test(deployments.stderr ?? "")
-    ? []
-    : listedDeployments;
   const workersDevSubdomain = await readWorkersDevSubdomain(accountId);
   if (
     accountAccess === "unavailable" ||
     containerAccess === "unavailable" ||
-    deploymentEntries === undefined
+    worker === undefined
   ) {
     return {
       accountAccess,
@@ -1765,7 +1818,7 @@ async function defaultCloudflareRead(
     };
   }
   if (
-    deploymentEntries.length === 0 &&
+    worker === "absent" &&
     containerEntries?.length === 0
   ) {
     return {
@@ -1780,7 +1833,7 @@ async function defaultCloudflareRead(
       target: { state: "absent" },
     };
   }
-  const workerPresent = deploymentEntries.length > 0;
+  const workerPresent = worker !== "absent";
   const containerPresent = (containerEntries?.length ?? 0) > 0;
   const providerEvidence = await readProviderEvidence(
     request.name,
@@ -1877,6 +1930,7 @@ async function readProviderEvidence(
           `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}/settings`,
           {
             headers: { authorization: `Bearer ${token}` },
+            redirect: "error",
             signal: AbortSignal.timeout(20_000),
           },
         );
@@ -2156,10 +2210,11 @@ type EveCloudflareAccess = Pick<
 /** The login and Container read that need no build, so they run before it. */
 async function defaultCloudflareAccess(name: string): Promise<EveCloudflareAccess> {
   const account = await readWranglerJson(["whoami", "--json"]);
-  if (account.failed || authenticatedAccountId(account.value) === undefined) {
+  const accountId = authenticatedAccountId(account.value);
+  if (account.failed || accountId === undefined) {
     return { accountAccess: "unavailable", containerAccess: "unavailable" };
   }
-  const containers = await readTargetContainers(boundedResourceName(name, "container"));
+  const containers = await readTargetContainers(accountId, boundedResourceName(name, "container"));
   return {
     accountAccess: "available",
     containerAccess: containers.failed ? "unavailable" : "available",
@@ -2407,6 +2462,8 @@ async function runWranglerWithInput(
   args: readonly string[],
   input?: string,
   timeoutMs: number = WRANGLER_OPERATION_TIMEOUT_MS,
+  /** Makes Wrangler act on this account or fail, whatever its login resolves to. */
+  accountId?: string,
 ): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
   // The project's TypeScript lib predates Promise.withResolvers.
   return withWranglerDirectory((cwd) => new Promise((resolveResult) => {
@@ -2417,7 +2474,10 @@ async function runWranglerWithInput(
         : ["--config", join(cwd, "wrangler.json")])],
       {
         cwd,
-        env: safeWranglerEnvironment(cwd),
+        env: {
+          ...safeWranglerEnvironment(cwd),
+          ...(accountId === undefined ? {} : { CLOUDFLARE_ACCOUNT_ID: accountId }),
+        },
         stdio: ["pipe", "pipe", "pipe"],
       },
     );
@@ -2599,19 +2659,13 @@ function defaultPublicationRunner(): EveDeploymentPublicationRunner {
         ownershipEvidenceRetained: true,
       };
     }
-    const { containers, deployments, containerEntries, deploymentEntries } =
-      await readExactTargetInventory(
-        request.identity.workerName,
-        request.hostConfig.container.applicationName,
-      );
-    if (
-      containers.failed ||
-      containerEntries === undefined ||
-      containerEntries.length !== 1 ||
-      deployments.failed ||
-      deploymentEntries === undefined ||
-      deploymentEntries.length === 0
-    ) {
+    const { containerEntries, worker } = await readExactTargetInventory(
+      request.identity.accountId,
+      request.identity.workerName,
+      request.hostConfig.container.applicationName,
+    );
+    // A script with no deployment serves nothing, so it is not a publication.
+    if (containerEntries?.length !== 1 || worker !== "deployed") {
       return {
         status: "indeterminate",
         reason:
@@ -4743,6 +4797,56 @@ type VerifiedEveDestroyIdentity = {
   readonly name: string;
 };
 
+/**
+ * What a target's CURRENT is right now: which file, and where it points.
+ * Undefined when there is none. Two reads that return the same value saw
+ * the same file.
+ */
+async function readEveTargetPointer(targetRoot: string): Promise<string | undefined> {
+  const path = join(targetRoot, "CURRENT");
+  const details = await lstat(path, { bigint: true }).catch(() => undefined);
+  if (details === undefined) return undefined;
+  const link = details.isSymbolicLink() ? await readlink(path).catch(() => "") : "";
+  return `${details.dev}:${details.ino}:${details.ctimeNs}:${link}`;
+}
+
+const DESTROY_RECORD_OUTSIDE_PROJECT =
+  "The target's deployment record is not inside this project's own .eden folder: a folder on the way to it is a symlink or could not be checked. Destroy does not follow it; nothing was read from or changed on Cloudflare.";
+
+/**
+ * True when the folders destroy reads and writes for a target are this
+ * project's own: none is reached through a symlink. A folder that does not
+ * exist yet passes; one that cannot be checked does not.
+ */
+async function eveDestroyFoldersLocal(
+  projectRoot: string,
+  environment: EveCliEnvironment,
+  name: string,
+): Promise<boolean> {
+  const deploymentRoot = join(projectRoot, ".eden", "eve-deploy");
+  for (
+    const directory of [
+      dirname(deploymentRoot),
+      deploymentRoot,
+      join(deploymentRoot, "locks"),
+      join(deploymentRoot, "targets", `${environment}-${name}`),
+      join(deploymentRoot, "generations"),
+    ]
+  ) {
+    const canonical = await realpath(directory).catch((error: NodeJS.ErrnoException) =>
+      error.code === "ENOENT" ? directory : undefined
+    );
+    if (canonical !== directory) return false;
+  }
+  return true;
+}
+
+/**
+ * The target's deployment record, with CURRENT as it was when the record was
+ * read. "outside-project" when a folder on the way to it, or the generation
+ * CURRENT names, is reached through a symlink that leaves this project's
+ * .eden folder: that record is not this project's, whatever it says.
+ */
 async function readEveDestroyRecord(
   projectRoot: string,
   environment: EveCliEnvironment,
@@ -4752,36 +4856,31 @@ async function readEveDestroyRecord(
     readonly recordPath: string;
     readonly generationRoot: string;
     readonly identity: VerifiedEveDestroyIdentity;
+    readonly pointer: string | undefined;
   }
+  | "outside-project"
   | undefined
 > {
-  const targetsRoot = join(
-    projectRoot,
-    ".eden",
-    "eve-deploy",
-    "targets",
-    `${environment}-${name}`,
-  );
-  const current = await lstat(join(targetsRoot, "CURRENT")).catch(
+  const deploymentRoot = join(projectRoot, ".eden", "eve-deploy");
+  const targetRoot = join(deploymentRoot, "targets", `${environment}-${name}`);
+  const generationsRoot = join(deploymentRoot, "generations");
+  if (!await eveDestroyFoldersLocal(projectRoot, environment, name)) return "outside-project";
+  const pointer = await readEveTargetPointer(targetRoot);
+  const current = await lstat(join(targetRoot, "CURRENT")).catch(
     () => undefined,
   );
-  if (current === undefined || !current.isSymbolicLink()) {
-    return readEveDestroyRecordFromGenerations(
-      projectRoot,
-      environment,
-      name,
-    );
-  }
-  const generationRoot = await realpath(join(targetsRoot, "CURRENT")).catch(
-    () => undefined,
-  );
+  const generationRoot = current?.isSymbolicLink()
+    ? await realpath(join(targetRoot, "CURRENT")).catch(() => undefined)
+    : undefined;
   if (generationRoot === undefined) {
-    return readEveDestroyRecordFromGenerations(
+    const found = await readEveDestroyRecordFromGenerations(
       projectRoot,
       environment,
       name,
     );
+    return found === undefined ? undefined : { ...found, pointer };
   }
+  if (dirname(generationRoot) !== generationsRoot) return "outside-project";
   const parsed = await parseEveDestroyRecord(
     await deploymentRecordPath(generationRoot),
     environment,
@@ -4789,7 +4888,7 @@ async function readEveDestroyRecord(
   );
   return parsed === undefined
     ? undefined
-    : { ...parsed, generationRoot };
+    : { ...parsed, generationRoot, pointer };
 }
 
 async function readEveDestroyRecordFromGenerations(
@@ -4843,6 +4942,20 @@ async function readEveDestroyRecordFromGenerations(
   return undefined;
 }
 
+/**
+ * The text of a deployment evidence file, only when it is a regular file in
+ * a generation directory that is itself a real directory. A symlink at
+ * either place could stand another project's record in for this one's.
+ */
+async function readEvidenceFile(path: string): Promise<string | undefined> {
+  const [directory, file] = await Promise.all([
+    lstat(dirname(path)).catch(() => undefined),
+    lstat(path).catch(() => undefined),
+  ]);
+  if (directory?.isDirectory() !== true || file?.isFile() !== true) return undefined;
+  return readFile(path, "utf8").catch(() => undefined);
+}
+
 async function parseEveDestroyRecord(
   recordPath: string,
   environment: EveCliEnvironment,
@@ -4851,12 +4964,8 @@ async function parseEveDestroyRecord(
   readonly recordPath: string;
   readonly identity: VerifiedEveDestroyIdentity;
 } | undefined> {
-  let raw: string;
-  try {
-    raw = await readFile(recordPath, "utf8");
-  } catch {
-    return undefined;
-  }
+  const raw = await readEvidenceFile(recordPath);
+  if (raw === undefined) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw) as unknown;
@@ -5225,13 +5334,14 @@ async function defaultDestroyTargetRead(
   registry: CloudflareRegistry,
 ): Promise<EveDestroyTargetRead> {
   const account = await readWranglerJson(["whoami", "--json"]);
-  const { containers, deployments, containerEntries: entries, deploymentEntries: listedDeployments } =
-    await readExactTargetInventory(request.workerName, request.containerApplicationName);
   const accountId = authenticatedAccountId(account.value);
-  const deploymentEntries = deployments.failed &&
-    /(?:does not exist|not found|10007)/iu.test(deployments.stderr ?? "")
-    ? [] : deployments.failed ? undefined : listedDeployments;
-  const workerExists = (deploymentEntries?.length ?? 0) > 0;
+  if (accountId !== undefined && accountId !== request.accountId) {
+    // A login for another account: nothing is read, and the caller refuses on the account.
+    return { workerExists: false, accountId };
+  }
+  const { containerEntries: entries, worker } =
+    await readExactTargetInventory(accountId, request.workerName, request.containerApplicationName);
+  const workerExists = worker === "deployed" || worker === "undeployed";
   const firstContainer = entries === undefined ? undefined : entries[0];
   let registryTagsPresent: string[] | undefined;
   if (accountId !== undefined && (request.registryRepositories?.length ?? 0) > 0) {
@@ -5248,8 +5358,7 @@ async function defaultDestroyTargetRead(
   return {
     workerExists,
     inventoryComplete: !account.failed && accountId !== undefined &&
-      !containers.failed && entries !== undefined && entries.length <= 1 &&
-      deploymentEntries !== undefined,
+      entries !== undefined && entries.length <= 1 && worker !== undefined,
     providerEvidence: await readProviderEvidence(
       request.workerName, accountId, workerExists, firstContainer,
     ),
@@ -5264,11 +5373,13 @@ async function defaultDestroyTargetRead(
 }
 
 async function defaultWorkerDelete(
-  request: { readonly name: string },
+  request: { readonly name: string; readonly accountId: string },
 ): Promise<"deleted" | "absent" | "indeterminate"> {
   const result = await runWranglerWithInput(
     ["delete", "--name", request.name, "--force"],
     "y\n",
+    undefined,
+    request.accountId,
   );
   if (result.exitCode === 0) return "deleted";
   if (/(?:does not exist|not found|10007)/iu.test(result.stderr)) {
@@ -5278,10 +5389,13 @@ async function defaultWorkerDelete(
 }
 
 async function defaultContainerDelete(
-  request: { readonly applicationId: string },
+  request: { readonly applicationId: string; readonly accountId: string },
 ): Promise<"deleted" | "absent" | "indeterminate"> {
   const result = await runWranglerWithInput(
     ["containers", "delete", request.applicationId],
+    undefined,
+    undefined,
+    request.accountId,
   );
   if (result.exitCode === 0) return "deleted";
   if (/(?:does not exist|not found|not supported|10007)/iu.test(result.stderr)) {
@@ -5307,12 +5421,12 @@ const REGISTRY_PAGE_ENTRIES = 1_000;
 const REGISTRY_ENTRY = /^(?:sha256:[0-9a-f]{64}|[A-Za-z0-9_][A-Za-z0-9._-]{0,127})$/u;
 
 /**
- * The value of a JSON text from the registry, or undefined when the text is
+ * The value of a JSON text Cloudflare sent, or undefined when the text is
  * not that value written out again, spacing aside. `JSON.parse` keeps only
  * the last of two fields with one name, so a text that says a thing twice
  * would otherwise be read as saying it once.
  */
-function registryJson(text: string): unknown {
+function exactJson(text: string): unknown {
   const squeezed = (value: string): string => value.replace(/\s/gu, "");
   try {
     const value: unknown = JSON.parse(text);
@@ -5344,7 +5458,7 @@ function registryListingPage(
   after: string | undefined,
 ): readonly string[] | undefined {
   if (response?.status !== 200) return undefined;
-  const listing = registryJson(response.body);
+  const listing = exactJson(response.body);
   if (typeof listing !== "object" || listing === null || Object.keys(listing).sort().join() !== "name,tags") {
     return undefined;
   }
@@ -5391,7 +5505,7 @@ function registryObjectsKeptWarning(kept: readonly EveRegistryObjectKept[]): Eve
 /** True only for the registry's structured refusal to delete a snapshot manifest. */
 function isSnapshotDeleteRefusal(status: number, body: string): boolean {
   if (status !== 403) return false;
-  const parsed = registryJson(body);
+  const parsed = exactJson(body);
   const errors = typeof parsed === "object" && parsed !== null
     ? (parsed as { readonly errors?: unknown }).errors
     : undefined;
@@ -5409,7 +5523,7 @@ function isSnapshotDeleteRefusal(status: number, body: string): boolean {
  */
 function isSingletonArtifactRefusal(status: number, body: string): boolean {
   if (status !== 409) return false;
-  const parsed = registryJson(body);
+  const parsed = exactJson(body);
   if (typeof parsed !== "object" || parsed === null) return false;
   const refusal = parsed as Record<string, unknown>;
   return refusal.code === "SINGLETON_ARTIFACT_EXISTS" &&
@@ -5674,6 +5788,9 @@ function registryRepositoryDeleter(
           const ask = () => registry.delete(accountId, repository, entry).catch(() => undefined);
           const wrangler = untagged(entry) ? undefined : await runWranglerWithInput(
             ["containers", "images", "delete", `${repository}:${entry}`, "--skip-confirmation"],
+            undefined,
+            undefined,
+            accountId,
           );
           const answer = wrangler === undefined
             ? await ask()
@@ -5775,7 +5892,7 @@ async function attemptRegistryRepository(
   accountId: string,
   targetKey: string,
 ): Promise<string | undefined> {
-  const raw = await readFile(attemptPath, "utf8").catch(() => undefined);
+  const raw = await readEvidenceFile(attemptPath);
   if (raw === undefined) return undefined;
   let parsed: unknown;
   try {
@@ -5889,13 +6006,22 @@ export async function runEveDestroy(
   const emit = (outcome: EveDestroyOutcome): void => {
     result = outcome;
   };
-  const fail = (code: string, message: string): never => {
-    throw new EveCliError({ code, message, source: "eden destroy" });
+  const fail = (code: string, message: string, remediation?: string): never => {
+    throw new EveCliError({
+      code,
+      message,
+      source: "eden destroy",
+      ...(remediation === undefined ? {} : { remediation }),
+    });
   };
 
   let primaryError: unknown;
   let lockReleased = true;
   try {
+    // Checked before the lock, which is itself a write under .eden.
+    if (!await eveDestroyFoldersLocal(request.projectRoot, request.environment, request.name)) {
+      fail("EVE_DESTROY_RECORD_UNPROVEN", DESTROY_RECORD_OUTSIDE_PROJECT);
+    }
     const lock = await acquireEveTargetLock(
       request.projectRoot,
       request.environment,
@@ -5945,20 +6071,23 @@ async function runEveDestroyLocked(
   options: EvePreflightOptions,
   checks: EvePreflightCheck[],
   emit: (outcome: EveDestroyOutcome) => void,
-  fail: (code: string, message: string) => never,
+  fail: (code: string, message: string, remediation?: string) => never,
 ): Promise<void> {
     const found = await readEveDestroyRecord(
       request.projectRoot,
       request.environment,
       request.name,
     );
+    if (found === "outside-project") {
+      fail("EVE_DESTROY_RECORD_UNPROVEN", DESTROY_RECORD_OUTSIDE_PROJECT);
+    }
     if (found === undefined) {
       fail(
         "EVE_DESTROY_RECORD_UNPROVEN",
         "No immutable deployed record matched the exact target; destroy refuses to guess or broaden cleanup.",
       );
     }
-    const record = found as NonNullable<typeof found>;
+    const record = found as Exclude<typeof found, "outside-project" | undefined>;
     const expectedWorker: string = record.identity.workerName;
     const expectedContainer: string = record.identity.containerApplicationName;
     if (
@@ -5989,6 +6118,7 @@ async function runEveDestroyLocked(
 
     const readTarget = (): Promise<EveDestroyTargetRead> =>
       Promise.resolve(reader({
+        accountId: record.identity.accountId,
         workerName: expectedWorker,
         containerApplicationName: expectedContainer,
         registryRepositories: ownedRegistryRepositories,
@@ -6057,7 +6187,7 @@ async function runEveDestroyLocked(
     const deleteWorker = options.deleteWorker ?? defaultWorkerDelete;
     if (before.workerExists) {
       eveProgress(options, `deleting Worker ${expectedWorker}`);
-      const workerResult = await deleteWorker({ name: expectedWorker });
+      const workerResult = await deleteWorker({ name: expectedWorker, accountId: record.identity.accountId });
       if (workerResult === "indeterminate") {
         emit({
           ok: false,
@@ -6091,6 +6221,7 @@ async function runEveDestroyLocked(
     if (before.containerApplicationId !== undefined) {
       eveProgress(options, `deleting Container application ${expectedContainer}`);
       const containerResult = await deleteContainer({
+        accountId: record.identity.accountId,
         applicationId: before.containerApplicationId,
       });
       if (containerResult === "indeterminate") {
@@ -6230,14 +6361,27 @@ async function runEveDestroyLocked(
       ),
     );
 
-    const currentPath = join(
+    const targetRoot = join(
       request.projectRoot,
       ".eden",
       "eve-deploy",
       "targets",
       `${request.environment}-${request.name}`,
-      "CURRENT",
     );
+    const currentPath = join(targetRoot, "CURRENT");
+    // Only the CURRENT that named the record just destroyed is cleared. A
+    // check and an unlink are two steps, so a writer outside Eden's lock can
+    // still slip between them; see docs/how-it-works.md.
+    if (
+      await realpath(targetRoot).catch(() => targetRoot) !== targetRoot ||
+      await readEveTargetPointer(targetRoot) !== record.pointer
+    ) {
+      fail(
+        "EVE_DESTROY_POINTER_UNCLEARED",
+        "The target's CURRENT pointer changed while destroy ran, so it was left in place. Destroy finished its deletes for the record it read at the start; the checks list them.",
+        "CURRENT now names another deployment record. Open .eden/eve-deploy/targets/<env>-<name>/CURRENT and confirm that deployment is one you mean to remove. Only then rerun eden destroy with the same --project, --env, and --name; it destroys what that record names.",
+      );
+    }
     await rm(currentPath, { force: true });
     const gone = await lstat(currentPath).catch(() => undefined);
     if (gone !== undefined) {

@@ -178,10 +178,25 @@ temporary directory cannot redirect account operations or secret uploads.
   its binding.
   If the Worker is already gone, the record, account, and exact names still
   permit cleanup of leftover Containers and images. Failed inventory reads
-  are indeterminate, not proof of absence. Eden removes only that target and
+  are indeterminate, not proof of absence. A Worker counts as absent only
+  when Cloudflare's API answers status `404` with a null result and the
+  single error code `10007`, and Eden follows no redirect on its API reads.
+  Each read asks Wrangler for the account once and sends every request to
+  that account, and destroy reads nothing from an account other than the
+  recorded one. Wrangler runs destroy's Worker, Container application, and
+  image deletes with `CLOUDFLARE_ACCOUNT_ID` set to the recorded account, so
+  a login that changes mid-run cannot move a delete to another account. Eden removes only that target and
   checks its registry repositories for anything other than
   [objects Cloudflare keeps](./troubleshooting.md#eve_registry_objects_kept).
   It never deletes by name prefix.
+- **Destroy clears only its own pointer.** Destroy refuses a target whose
+  record is reached through a symlink that leaves the project's `.eden`
+  folder, and reads no record file that is a symlink. It removes `CURRENT` only if the pointer is still the file it read
+  before it read Cloudflare. The check and the removal are two steps, so a
+  program outside Eden's lock that replaces the pointer between them is not
+  stopped. A deploy of the same Worker from another folder or machine is not
+  stopped either: destroy proves absence at the time of its last read, not
+  afterwards.
   Deployment and release IDs are public: these checks protect against stale
   records and name reuse, not a malicious project carrying a forged `.eden`
   record with a known account and release ID. Do not trust `.eden` state from
