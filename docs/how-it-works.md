@@ -53,6 +53,9 @@ until the checks in steps 1–4 have passed.
    scripts), or the exact-pinned `pnpm install --frozen-lockfile`, then your
    project's own `eve build`.
    Private registries and project `.npmrc`-dependent installs are unsupported.
+   Eden asks each image build to load its result into Docker
+   (`docker build --load`, when Docker Buildx is installed), so the builder
+   Docker has selected can use the `docker` or the `docker-container` driver.
    The builder has no Docker daemon. Select `JustBashSandbox` in the project;
    Eden rejects the production default and other providers rather than
    substituting one.

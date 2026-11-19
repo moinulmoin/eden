@@ -3065,6 +3065,25 @@ export async function revalidateEveProjectCandidateInputs(
   }
 }
 
+/**
+ * `--load` when Buildx runs `docker build`. A docker-container builder keeps
+ * the image in its own cache unless the build asks to load it into Docker;
+ * the classic builder loads it either way. The legacy builder, which runs
+ * when Buildx is not installed, always loads the image and rejects the flag.
+ */
+export async function dockerBuildLoadArgs(
+  dockerCommand: string,
+  options: {
+    readonly env: NodeJS.ProcessEnv;
+    readonly cwd: string;
+  },
+): Promise<readonly string[]> {
+  return execFileAsync(dockerCommand, ["buildx", "version"], options).then(
+    () => ["--load"],
+    () => [],
+  );
+}
+
 async function dockerIdentityAbsent(
   dockerCommand: string,
   args: readonly string[],
@@ -3159,6 +3178,10 @@ export function createDockerEveProjectBuilder(options: {
           dockerCommand,
           [
             "build",
+            ...await dockerBuildLoadArgs(dockerCommand, {
+              env: safeEnv,
+              cwd: request.generationRoot,
+            }),
             "--platform=linux/amd64",
             "--file",
             request.dockerfilePath,

@@ -24,6 +24,7 @@ import {
 } from "node:util";
 
 import {
+  dockerBuildLoadArgs,
   EvePackagingError,
   EVE_SANDBOX_CACHE_ROOT,
   eveSnapshotSourceEntries,
@@ -1675,9 +1676,14 @@ export async function buildEveRuntimeImage(
     runtimeContextPath = context.runtimeContextPath;
     writtenPaths.push(context.runtimeContextPath, context.dockerfilePath);
     await docker(state, ["version", "--format", "{{.Server.Version}}"]);
+    const loadArgs = await dockerBuildLoadArgs(state.command, {
+      env: state.env,
+      cwd: state.generationRoot,
+    });
     state.imageBuilt = true;
     await docker(state, [
       "build",
+      ...loadArgs,
       "--platform=linux/amd64",
       "--file",
       context.dockerfilePath,
