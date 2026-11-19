@@ -1693,10 +1693,16 @@ async function readTargetContainers(accountId: string, name: string): Promise<Wr
       if (pageToken !== undefined) url.searchParams.set("page_token", pageToken);
       const response = await readCloudflareApi(url);
       if (response?.status !== 200) return { failed: true };
+      // Every page is read the same way, whether it lists the application
+      // or not: the API's answer, read on 2026-11-19, has status 200, success
+      // true, and an empty errors list, and a body that names a field twice
+      // is no answer.
       const body: unknown = JSON.parse(response.body);
       if (typeof body !== "object" || body === null ||
         !("success" in body) || body.success !== true ||
-        !("result" in body) || !Array.isArray(body.result)) return { failed: true };
+        !("errors" in body) || !Array.isArray(body.errors) || body.errors.length > 0 ||
+        !("result" in body) || !Array.isArray(body.result) ||
+        namesFieldTwice(response.body)) return { failed: true };
       const info = "result_info" in body ? body.result_info : undefined;
       if (info !== undefined &&
         (typeof info !== "object" || info === null || Array.isArray(info))) {
@@ -1708,18 +1714,6 @@ async function readTargetContainers(accountId: string, name: string): Promise<Wr
       if (next !== undefined && next !== null && typeof next !== "string") {
         return { failed: true };
       }
-      // A page without the exact application is evidence of absence, so it
-      // is read strictly: the API's answer, read on 2026-11-19, has status
-      // 200, success true, and an empty errors list, and a body that names a
-      // field twice is no answer.
-      if (
-        !body.result.some((entry: unknown) =>
-          typeof entry === "object" && entry !== null && "name" in entry && entry.name === name
-        ) && (
-          !("errors" in body) || !Array.isArray(body.errors) || body.errors.length > 0 ||
-          exactJson(response.body) === undefined
-        )
-      ) return { failed: true };
       // Missing pagination metadata on a full page cannot prove absence.
       if (info === undefined && body.result.length >= 100) return { failed: true };
       entries.push(...body.result);
@@ -1759,10 +1753,14 @@ async function readWorkerPresence(
     } catch {
       return undefined;
     }
+    // Each deployment the API lists has an id; read on 2026-11-19.
     return typeof listed === "object" && listed !== null && "success" in listed && listed.success === true &&
         "result" in listed && typeof listed.result === "object" && listed.result !== null &&
         "deployments" in listed.result && Array.isArray(listed.result.deployments) &&
-        listed.result.deployments.every((entry: unknown) => typeof entry === "object" && entry !== null)
+        listed.result.deployments.every((entry: unknown) =>
+          typeof entry === "object" && entry !== null && "id" in entry &&
+          typeof entry.id === "string" && entry.id.length > 0
+        ) && !namesFieldTwice(response.body)
       ? listed.result.deployments.length > 0 ? "deployed" : "undeployed"
       : undefined;
   }
@@ -4119,8 +4117,9 @@ async function collectEvePreflight(
   const builder = options.builder ??
     createDockerEveProjectBuilder({ nodeImage });
   try {
-    // One plain directory name: anything else would put the record where destroy does not look.
-    if (options.generationId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(options.generationId)) {
+    // One plain directory name that can also be part of an image repository
+    // name: anything else would put the record where destroy does not look.
+    if (options.generationId !== undefined && !/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/u.test(options.generationId)) {
       throw new Error("The generation id must be a single plain directory name.");
     }
     const baseSnapshotOptions = {
@@ -4878,6 +4877,8 @@ async function readEveDestroyRecord(
     readonly generationRoot: string;
     readonly identity: VerifiedEveDestroyIdentity;
     readonly pointer: string | undefined;
+    /** True when CURRENT is the symlink that named this record. */
+    readonly namedByPointer: boolean;
   }
   | "outside-project"
   | undefined
@@ -4899,7 +4900,8 @@ async function readEveDestroyRecord(
       environment,
       name,
     );
-    return found === undefined ? undefined : { ...found, pointer };
+    // A CURRENT that is no symlink to a generation did not name this record.
+    return found === undefined ? undefined : { ...found, pointer, namedByPointer: false };
   }
   if (dirname(generationRoot) !== generationsRoot) return "outside-project";
   const parsed = await parseEveDestroyRecord(
@@ -4909,7 +4911,7 @@ async function readEveDestroyRecord(
   );
   return parsed === undefined
     ? undefined
-    : { ...parsed, generationRoot, pointer };
+    : { ...parsed, generationRoot, pointer, namedByPointer: true };
 }
 
 async function readEveDestroyRecordFromGenerations(
@@ -5447,6 +5449,33 @@ const REGISTRY_ENTRY = /^(?:sha256:[0-9a-f]{64}|[A-Za-z0-9_][A-Za-z0-9._-]{0,127
  * the last of two fields with one name, so a text that says a thing twice
  * would otherwise be read as saying it once.
  */
+/**
+ * True when an object in this JSON text names a field twice. JSON.parse
+ * keeps only the last of the two, so such a text says two things at once.
+ * The text must already have parsed.
+ */
+function namesFieldTwice(text: string): boolean {
+  const objects: (Set<string> | undefined)[] = [];
+  for (let at = 0; at < text.length; at += 1) {
+    const char = text[at];
+    if (char === "{") objects.push(new Set());
+    else if (char === "[") objects.push(undefined);
+    else if (char === "}" || char === "]") objects.pop();
+    else if (char === '"') {
+      const start = at;
+      for (at += 1; text[at] !== '"'; at += 1) if (text[at] === "\\") at += 1;
+      const names = objects.at(-1);
+      let next = at + 1;
+      while (" \t\n\r".includes(text[next] ?? "x")) next += 1;
+      if (names === undefined || text[next] !== ":") continue;
+      const name = JSON.parse(text.slice(start, at + 1)) as string;
+      if (names.has(name)) return true;
+      names.add(name);
+    }
+  }
+  return false;
+}
+
 function exactJson(text: string): unknown {
   const squeezed = (value: string): string => value.replace(/\s/gu, "");
   try {
@@ -6403,9 +6432,10 @@ async function runEveDestroyLocked(
         "CURRENT now names another deployment record. Open .eden/eve-deploy/targets/<env>-<name>/CURRENT and confirm that deployment is one you mean to remove. Only then rerun eden destroy with the same --project, --env, and --name; it destroys what that record names.",
       );
     }
-    await rm(currentPath, { force: true });
+    // A file at CURRENT that did not name the record is not Eden's to remove.
+    if (record.namedByPointer) await rm(currentPath, { force: true });
     const gone = await lstat(currentPath).catch(() => undefined);
-    if (gone !== undefined) {
+    if (record.namedByPointer && gone !== undefined) {
       fail(
         "EVE_DESTROY_POINTER_UNCLEARED",
         "The target CURRENT pointer could not be cleared after verified absence.",

@@ -234,12 +234,14 @@ Destroy acts only on evidence it read itself. It asks Wrangler which account
 is signed in, and reads the Worker and the Container application from
 Cloudflare's API under that account. If that is not the account in the
 record, it reads nothing. A Worker is absent only when the API answers
-status `404` with a null result and the single error code `10007`. A failed
-or unclear read of the Worker stops destroy with `EVE_DESTROY_INDETERMINATE`
-and leaves the record alone. Wrangler runs each delete with the recorded
+status `404` with `success` false, a null result, the single error code
+`10007`, and no field named twice. A Container application list counts
+only with status `200`, `success` true, an empty `errors` list, and no
+field named twice. A failed or unclear read of either stops destroy with
+`EVE_DESTROY_INDETERMINATE` and leaves the record alone. Wrangler runs each delete with the recorded
 account set. Destroy reads everything again after its deletes and clears
-the `CURRENT` pointer only if that pointer is still the file it read at the
-start. That check and the removal are two steps, not one atomic step. Destroy
+the `CURRENT` pointer only if it is the symlink that named the record and
+is still the file it read at the start. That check and the removal are two steps, not one atomic step. Destroy
 also cannot stop a deploy of the same Worker from another folder or machine,
 so absence is proven at the time of the last read.
 

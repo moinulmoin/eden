@@ -179,8 +179,11 @@ temporary directory cannot redirect account operations or secret uploads.
   If the Worker is already gone, the record, account, and exact names still
   permit cleanup of leftover Containers and images. Failed inventory reads
   are indeterminate, not proof of absence. A Worker counts as absent only
-  when Cloudflare's API answers status `404` with a null result and the
-  single error code `10007`, and Eden follows no redirect on its API reads.
+  when Cloudflare's API answers status `404` with `success` false, a null
+  result, the single error code `10007`, and no field named twice. A
+  Container application list counts only with status `200`, `success` true,
+  an empty `errors` list, and no field named twice. Eden follows no redirect
+  on its API reads.
   Each read asks Wrangler for the account once and sends every request to
   that account, and destroy reads nothing from an account other than the
   recorded one. Wrangler runs destroy's Worker, Container application, and

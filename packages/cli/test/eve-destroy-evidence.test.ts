@@ -48,6 +48,8 @@ const cloud = vi.hoisted(() => {
     containerAnswer: undefined as ((entries: string) => string) | undefined,
     /** The status of the API's answer to the Container applications read. */
     containerStatus: 200,
+    /** When set, the body of the API's 200 answer about a Worker that exists. */
+    workerAnswer: undefined as ((deployments: string) => string) | undefined,
     /** The plain-text bindings of the Worker: what the last publish stamped. */
     stamps: [] as { readonly type: string; readonly name: string; readonly text: string }[],
     /** Called before each Wrangler command that changes the account. */
@@ -217,15 +219,10 @@ async function cloudflareApi(input: string | URL | Request, init?: RequestInit):
       return answer;
     }
     if (cloud.workers.has(account + "/" + rest[2])) {
-      return json(200, {
-        success: true,
-        errors: [],
-        messages: [],
-        result: {
-          deployments: cloud.deploymentEntries ??
-            Array.from({ length: cloud.deployments }, (_, nth) => ({ id: "deployment-" + nth })),
-        },
-      });
+      const deployments = cloud.deploymentEntries ??
+        Array.from({ length: cloud.deployments }, (_, nth) => ({ id: "deployment-" + nth }));
+      return json(200, cloud.workerAnswer?.(JSON.stringify(deployments)) ??
+        { success: true, errors: [], messages: [], result: { deployments } });
     }
   }
   if (rest[0] === "workers" && rest[1] === "scripts" && rest[3] === "settings" && cloud.workers.has(account + "/" + rest[2])) {
@@ -331,6 +328,7 @@ beforeEach(() => {
     deploymentEntries: undefined,
     containerAnswer: undefined,
     containerStatus: 200,
+    workerAnswer: undefined,
     stamps: [{ type: "plain_text", name: "EDEN_EVE_DEPLOYMENT_ID", text: "eve-deploy-test" }],
     onMutation: () => undefined,
     apiAccounts: [],
@@ -729,10 +727,11 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     const { root, current } = await deployedProject();
     cloud.containers.add(container);
     cloud.onMutation = () => {
-      cloud.containerAnswer = (entries) => '{"success":true,"result":[{"id":"container-123","name":"eve-destroy-fixture-container"}],"result":' + entries + ',"result_info":{}}';
+      cloud.containerAnswer = (entries) => '{"success":true,"errors":[],"messages":[],"result":[{"id":"container-123","name":"eve-destroy-fixture-container"}],"result":' + entries + ',"result_info":{}}';
     };
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
+    expect(cloud.deleted).toContain("container:" + container);
     await expect(lstat(current)).resolves.toBeDefined();
   });
 
@@ -776,12 +775,59 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(lstat(current)).resolves.toBeDefined();
   });
 
-  test.each(["", ".", "..", "/", "a/b"])("a generation id of %j is refused before anything is published", async (generationId) => {
+  test.each(["", ".", "..", "/", "a/b", "Release-1"])("a generation id of %j is refused before anything is published", async (generationId) => {
     const root = await deployableProject();
     const { exitCode, result } = await deploy(root, generationId);
     expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 1, ok: false });
     expect(result.error?.code).toBe("EVE_DEPLOY_CHECKS_FAILED");
     expect(cloud.pinned).toEqual([]);
     await expect(lstat(join(root, ".eden", "eve-deploy", "targets"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test.each([
+    ["an authentication error", (entries: string) => '{"success":true,"errors":[{"code":10000,"message":"Authentication error"}],"messages":[],"result":' + entries + ',"result_info":{}}'],
+    ["result named twice", (entries: string) => '{"success":true,"errors":[],"messages":[],"result":' + entries + ',"result":' + entries + ',"result_info":{}}'],
+  ] as const)("a Container answer that lists the application beside %s names nothing to delete", async (_name, answer) => {
+    const { root, current } = await deployedProject();
+    cloud.workers.clear();
+    cloud.containers.add(container);
+    cloud.containerAnswer = answer;
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
+    expect(cloud.deleted).toEqual([]);
+    await expect(lstat(current)).resolves.toBeDefined();
+  });
+
+  test("a clean Container answer with escaped text and other fields still lets destroy finish", async () => {
+    const { root, current } = await deployedProject();
+    cloud.containers.add(container);
+    cloud.containerAnswer = (entries) => '{ "success": true, "errors": [], "messages": [], "result": ' +
+      entries.replace('"name"', '"note":"a\\/b \\u0026 c","size":1.0,"name"') + ', "result_info": {} }';
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
+    expect(cloud.deleted).toContain("container:" + container);
+    await expect(lstat(current)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("a regular file at CURRENT is not the pointer: destroy leaves it in place", async () => {
+    const { root, current } = await deployedProject();
+    await rm(current);
+    await writeFile(current, "not a pointer");
+    cloud.containers.add(container);
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
+    expect((await lstat(current)).isFile()).toBe(true);
+  });
+
+  test.each([
+    ["an entry with no id", () => { cloud.deploymentEntries = [{}]; }],
+    ["an entry that is a list", () => { cloud.deploymentEntries = [[]]; }],
+    ["an entry with an empty id", () => { cloud.deploymentEntries = [{ id: "" }]; }],
+    ["deployments named twice", () => { cloud.workerAnswer = (deployments) => '{"success":true,"errors":[],"messages":[],"result":{"deployments":[],"deployments":' + deployments + '}}'; }],
+  ] as const)("after publish, a deployments answer with %s is not a publication", async (_name, arrange) => {
+    const root = await deployableProject();
+    arrange();
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
   });
 });

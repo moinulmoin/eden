@@ -21,9 +21,11 @@
   `404`, `success` false, a null `result`, and one error with code `10007`.
   It follows no redirect. Any other answer about the Worker stops destroy
   with `EVE_DESTROY_INDETERMINATE` before anything is deleted.
-  `eden preflight` and `eden deploy` read the Worker the same way. An empty
-  Container application list proves absence only with status `200`,
-  `success` true, an empty `errors` list, and no field named twice.
+  `eden preflight` and `eden deploy` read the Worker the same way. Eden
+  reads a Container application list only from status `200` with `success`
+  true, an empty `errors` list, and no field named twice. After a publish,
+  each deployment the API lists must have an id. Destroy removes `CURRENT`
+  only when it is the symlink that named the record.
 - **Destroy could read the Container application from another account.**
   The Container read asked Wrangler for the account a second time. If the
   login changed in between, destroy missed a Container application in the

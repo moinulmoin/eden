@@ -164,9 +164,12 @@ behind, and a final listing that cannot be read in full, fails destroy with
 Each read asks Wrangler for the account once and sends every request to that
 account. Destroy reads nothing from an account other than the one in the
 record. It takes a Worker as absent only when Cloudflare's API answers
-status `404` with a null result and the single error code `10007`; any other
-answer about the Worker that is not a list of its deployments stops destroy
-with `EVE_DESTROY_INDETERMINATE`. Wrangler runs each delete with the
+status `404` with `success` false, a null result, the single error code
+`10007`, and no field named twice; any other answer about the Worker that
+is not a list of its deployments stops destroy with
+`EVE_DESTROY_INDETERMINATE`. It reads a Container application list only
+from status `200` with `success` true, an empty `errors` list, and no field
+named twice. Wrangler runs each delete with the
 recorded account set. Destroy removes `CURRENT` only if the pointer is still
 the file it read at the start; that check is not atomic.
 

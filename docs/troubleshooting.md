@@ -1207,12 +1207,13 @@ an authentication, permission, network, malformed or incomplete inventory
 result as absence. Inspect the retained deployment record and Cloudflare
 inventory, then retry the exact target.
 Eden reads the Worker from Cloudflare's API and follows no redirect. Status
-`200` with a list of deployments means the Worker exists. Status `404` with
-a null result and the single error code `10007` means it is absent. Any
-other answer about the Worker, and no answer, is indeterminate. An empty
-Container application list means absent only with status `200`, `success`
-true, an empty `errors` list, and no field named twice; otherwise it is
-indeterminate too. An
+`200` with `success` true and a list of deployments, each with an id, means
+the Worker exists. Status `404` with `success` false, a null result, and
+the single error code `10007` means it is absent. Any other answer about
+the Worker, an answer that names a field twice, and no answer, are
+indeterminate. Eden reads a Container application list, empty or not, only
+from status `200` with `success` true, an empty `errors` list, and no field
+named twice; any other answer is indeterminate too. An
 unreadable registry listing is reported separately, as
 `EVE_DESTROY_IMAGES_RETAINED`. Rerun `eden destroy` with the same selectors;
 if it keeps failing, check the login with `npx wrangler@4.147.0 whoami`. On
