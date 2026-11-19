@@ -1,6 +1,7 @@
 import type * as ChildProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import type * as Https from "node:https";
 import { tmpdir } from "node:os";
@@ -41,6 +42,12 @@ const cloud = vi.hoisted(() => {
     workerReads: 0,
     /** How many deployments the API lists for a Worker that exists. */
     deployments: 1,
+    /** When set, the deployments the API lists, whatever they are. */
+    deploymentEntries: undefined as readonly unknown[] | undefined,
+    /** When set, the API's whole answer to the Container applications read, given its true entries. */
+    containerAnswer: undefined as ((entries: string) => string) | undefined,
+    /** The plain-text bindings of the Worker: what the last publish stamped. */
+    stamps: [] as { readonly type: string; readonly name: string; readonly text: string }[],
     /** Called before each Wrangler command that changes the account. */
     onMutation: (() => undefined) as () => void,
     apiAccounts: [] as string[],
@@ -142,6 +149,11 @@ vi.mock("node:child_process", async (importOriginal) => {
       const account = pinned || cloud.wranglerAccount;
       let exitCode = 1;
       if (args[0] === "deploy") {
+        // What Wrangler would publish: the plain-text vars of the config Eden wrote.
+        const config = JSON.parse(readFileSync(args[2] ?? "", "utf8")) as { readonly vars?: Readonly<Record<string, unknown>> };
+        cloud.stamps = Object.entries(config.vars ?? {}).flatMap(([name, text]) =>
+          typeof text === "string" ? [{ type: "plain_text", name, text }] : []
+        );
         cloud.workers.add(account + "/" + args[4]);
         cloud.containers.add(account + "/" + args[4] + "-container#container-new");
         exitCode = 0;
@@ -183,15 +195,13 @@ async function cloudflareApi(input: string | URL | Request, init?: RequestInit):
   cloud.apiAccounts.push(account);
   if (rest.join("/") === "containers/applications") {
     const name = url.searchParams.get("name");
-    return json(200, {
-      success: true,
-      result: [...cloud.containers].flatMap((entry) => {
-        const [owner, rest2 = ""] = entry.split("/");
-        const [application, id] = rest2.split("#");
-        return owner === account && application === name ? [{ id, name: application }] : [];
-      }),
-      result_info: {},
+    const entries = [...cloud.containers].flatMap((entry) => {
+      const [owner, rest2 = ""] = entry.split("/");
+      const [application, id] = rest2.split("#");
+      return owner === account && application === name ? [{ id, name: application }] : [];
     });
+    return json(200, cloud.containerAnswer?.(JSON.stringify(entries)) ??
+      { success: true, errors: [], messages: [], result: entries, result_info: {} });
   }
   if (rest[0] === "workers" && rest[1] === "scripts" && rest[3] === "deployments") {
     await cloud.onWorkerRead(cloud.workerReads++);
@@ -209,7 +219,10 @@ async function cloudflareApi(input: string | URL | Request, init?: RequestInit):
         success: true,
         errors: [],
         messages: [],
-        result: { deployments: Array.from({ length: cloud.deployments }, (_, nth) => ({ id: "deployment-" + nth })) },
+        result: {
+          deployments: cloud.deploymentEntries ??
+            Array.from({ length: cloud.deployments }, (_, nth) => ({ id: "deployment-" + nth })),
+        },
       });
     }
   }
@@ -218,7 +231,7 @@ async function cloudflareApi(input: string | URL | Request, init?: RequestInit):
       success: true,
       result: {
         bindings: [
-          { type: "plain_text", name: "EDEN_EVE_DEPLOYMENT_ID", text: "eve-deploy-test" },
+          ...cloud.stamps,
           { type: "durable_object_namespace", name: "EVE_CONTAINER", namespace_id: "namespace-test" },
         ],
       },
@@ -313,6 +326,9 @@ beforeEach(() => {
     onWorkerRead: () => undefined,
     workerReads: 0,
     deployments: 1,
+    deploymentEntries: undefined,
+    containerAnswer: undefined,
+    stamps: [{ type: "plain_text", name: "EDEN_EVE_DEPLOYMENT_ID", text: "eve-deploy-test" }],
     onMutation: () => undefined,
     apiAccounts: [],
     pinned: [],
@@ -438,7 +454,7 @@ async function deploy(root: string): Promise<{ readonly exitCode: number; readon
       stdout: (line) => output.push(line),
       stderr: (line) => output.push(line),
       eveControlPlane: {
-        artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+        generationId: "generation-one",
         builder: { build: async (request) => { await writeBuild(request.snapshotRoot); return { eveVersion: "0.91.0" }; } },
         containerImageReference: "registry.cloudflare.com/account-test/eve@" + imageDigest,
         runtimeRunner: async () => ({
@@ -690,5 +706,54 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     const promoted = await lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))
       .then(() => true, () => false);
     expect(promoted).toBe(expected === 0);
+  });
+
+  test.each([
+    ["an empty list", "[]"],
+    ["another application", '[{"id":"container-999","name":"another-container"}]'],
+  ] as const)("a Container answer that names result twice, the live application then %s, is no proof of absence", async (_name, second) => {
+    const { root, current } = await deployedProject();
+    cloud.containers.add(container);
+    cloud.tags = ["candidate"];
+    cloud.containerAnswer = (entries) => '{"success":true,"errors":[],"messages":[],"result":' + entries + ',"result":' + second + ',"result_info":{}}';
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
+    expect(cloud.deleted).toEqual([]);
+    await expect(lstat(current)).resolves.toBeDefined();
+  });
+
+  test("a Container answer that turns ambiguous after the deletes leaves CURRENT in place", async () => {
+    const { root, current } = await deployedProject();
+    cloud.containers.add(container);
+    cloud.onMutation = () => {
+      cloud.containerAnswer = (entries) => '{"success":true,"result":[{"id":"container-123","name":"eve-destroy-fixture-container"}],"result":' + entries + ',"result_info":{}}';
+    };
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
+    await expect(lstat(current)).resolves.toBeDefined();
+  });
+
+  test("after publish, a deployments list of [null] is not a publication", async () => {
+    const root = await deployableProject();
+    cloud.deploymentEntries = [null];
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+  });
+
+  test("a deploy's record is one destroy accepts: deploy, then destroy, then absent", async () => {
+    const root = await deployableProject();
+    expect((await deploy(root)).exitCode).toBe(0);
+    await expect(realpath(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT")))
+      .resolves.toBe(join(root, ".eden", "eve-deploy", "generations", "generation-one"));
+    const run = async (): Promise<{ readonly exitCode: number; readonly status: unknown }> => {
+      const output: string[] = [];
+      const exitCode = await runEdenCli(
+        ["destroy", "--project", root, "--env", "preview", "--name", "eve-deploy-fixture", "--json"],
+        { cwd: root, stdout: (line) => output.push(line), stderr: (line) => output.push(line) },
+      );
+      return { exitCode, status: (JSON.parse(output.at(-1) ?? "") as { readonly status?: unknown }).status };
+    };
+    await expect(run()).resolves.toEqual({ exitCode: 0, status: "destroyed" });
+    await expect(run()).resolves.toEqual({ exitCode: 0, status: "absent" });
   });
 });

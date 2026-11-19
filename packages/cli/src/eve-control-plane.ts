@@ -9,6 +9,7 @@ import {
 } from "node:crypto";
 import {
   join,
+  basename,
   dirname,
   relative,
 } from "node:path";
@@ -523,7 +524,12 @@ export interface EvePreflightOptions {
    */
   readonly builder?: EveProjectBuilder;
   readonly nodeImage?: EveNodeImage;
-  readonly artifactRoot?: string;
+  /**
+   * The name of the generation directory to create under
+   * .eden/eve-deploy/generations, the only place deploy and destroy keep
+   * records. A random one when omitted.
+   */
+  readonly generationId?: string;
   readonly hostRequirements?:
     | EveHostRequirements
     | ((
@@ -1703,6 +1709,13 @@ async function readTargetContainers(accountId: string, name: string): Promise<Wr
       if (next !== undefined && next !== null && typeof next !== "string") {
         return { failed: true };
       }
+      // A page without the exact application is evidence of absence, so it
+      // is read strictly: a body that names a field twice is no answer.
+      if (
+        !body.result.some((entry: unknown) =>
+          typeof entry === "object" && entry !== null && "name" in entry && entry.name === name
+        ) && exactJson(response.body) === undefined
+      ) return { failed: true };
       // Missing pagination metadata on a full page cannot prove absence.
       if (info === undefined && body.result.length >= 100) return { failed: true };
       entries.push(...body.result);
@@ -1744,7 +1757,8 @@ async function readWorkerPresence(
     }
     return typeof listed === "object" && listed !== null && "success" in listed && listed.success === true &&
         "result" in listed && typeof listed.result === "object" && listed.result !== null &&
-        "deployments" in listed.result && Array.isArray(listed.result.deployments)
+        "deployments" in listed.result && Array.isArray(listed.result.deployments) &&
+        listed.result.deployments.every((entry: unknown) => typeof entry === "object" && entry !== null)
       ? listed.result.deployments.length > 0 ? "deployed" : "undeployed"
       : undefined;
   }
@@ -4090,14 +4104,13 @@ async function collectEvePreflight(
   );
 
   const nodeImage = options.nodeImage ?? DEFAULT_EVE_NODE_IMAGE;
-  const artifactRoot = options.artifactRoot ??
-    join(
-      request.projectRoot,
-      ".eden",
-      "eve-deploy",
-      "generations",
-      `preflight-${randomUUID()}`,
-    );
+  const artifactRoot = join(
+    request.projectRoot,
+    ".eden",
+    "eve-deploy",
+    "generations",
+    basename(options.generationId ?? `preflight-${randomUUID()}`),
+  );
   let packaging: EveProjectPackagingResult;
   const builder = options.builder ??
     createDockerEveProjectBuilder({ nodeImage });
