@@ -2358,9 +2358,9 @@ async function writeEveDeploymentArtifacts(
   return { workerSourcePath, wranglerConfigPath };
 }
 
-/** Deadline for bounded Wrangler reads, secret writes, pushes, and deletions. */
+/** Deadline for bounded Wrangler reads, secret writes, and deletions. */
 const WRANGLER_OPERATION_TIMEOUT_MS = 120_000;
-/** Deadline for `wrangler deploy`, whose Container image preparation alone can approach two minutes. */
+/** Deadline for the image push and `wrangler deploy`; either can take minutes on a slow registry or uplink. */
 const WRANGLER_PUBLICATION_TIMEOUT_MS = 600_000;
 
 async function runWranglerWithInput(
@@ -2470,6 +2470,8 @@ async function defaultImagePublicationRunner(
     );
     const pushed = await runWranglerWithInput(
       ["containers", "push", request.localImageTag],
+      undefined,
+      WRANGLER_PUBLICATION_TIMEOUT_MS,
     );
     if (pushed.exitCode !== 0) {
       return {
