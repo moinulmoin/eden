@@ -622,7 +622,8 @@ local check has passed.
 Eden pushes the runtime image to the managed Cloudflare registry
 (`registry.cloudflare.com`). When the push does not return a terminal
 success, or the published image does not match the exact target repository
-and digest identity, the deploy ends as indeterminate. See
+and digest identity, the deploy ends as indeterminate. The push may take ten
+minutes; Eden stops waiting after that. See
 [Indeterminate outcomes](#indeterminate-outcomes) below.
 
 ### `EVE_IMAGE_IDENTITY_MISMATCH`
