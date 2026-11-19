@@ -1004,6 +1004,7 @@ describe("Eve project snapshot/build boundary", () => {
       .map((line) => JSON.parse(line) as string[]);
     const buildArgs = commands.find((args) => args[0] === "build");
     expect(buildArgs).toEqual(expect.arrayContaining([
+      "--load",
       "--platform=linux/amd64",
       "--iidfile",
     ]));

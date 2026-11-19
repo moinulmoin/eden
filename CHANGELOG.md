@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `eden preflight` and `eden deploy` no longer fail at `VAL-BUILD-005` when
+  Docker's selected builder uses the `docker-container` driver. That builder
+  keeps a built image in its own cache, so Docker never received it. Eden now
+  runs `docker build --load` when Docker Buildx is installed.
+
 ## 0.13.0 — 2026-11-19
 
 Eve `1.0.2` is now a tested version, and Eve `0.91.0` stays the oldest

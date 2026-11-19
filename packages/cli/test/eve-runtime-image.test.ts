@@ -471,7 +471,7 @@ describe("Eve runtime image boundary", () => {
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
     expect(dockerArgs.find((args) => args[0] === "build")).toEqual(
-      expect.arrayContaining(["--platform=linux/amd64", "--iidfile"]),
+      expect.arrayContaining(["--load", "--platform=linux/amd64", "--iidfile"]),
     );
     expect(dockerArgs.find((args) => args[0] === "create")).toEqual(
       expect.arrayContaining(["--publish", "127.0.0.1::8080"]),

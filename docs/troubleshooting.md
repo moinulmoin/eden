@@ -489,6 +489,13 @@ build Linux/amd64 images, and retry without changing the project inputs:
 docker version
 ```
 
+Eden runs `docker build --load` when Docker Buildx is installed, so a
+builder that keeps its result in its own cache, such as one with the
+`docker-container` driver, still hands the image to Docker. Without Buildx
+Eden runs plain `docker build`. A builder that cannot load a Linux/amd64
+image into the Docker that `docker version` reports still fails here. Select
+another builder with `docker buildx use <name>` and retry.
+
 ### `EVE_SANDBOX_PROVIDER` — select explicit JustBash
 
 Eden supports only `just-bash`, including a project-owned module that explicitly
