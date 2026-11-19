@@ -117,16 +117,14 @@ three bugs in released versions are fixed. Update `@moinulmoin/eden`, and
   `DOCKER_PLATFORM_BLOCKED` and left a boot container in state `Created`.
   Docker now picks a free port, and the boot container is removed on every
   failure.
-- A retry of `eden destroy` that found nothing left reported `absent` and
-  left the target's `CURRENT` pointer in place, although the
-  `EVE_DESTROY_IMAGES_RETAINED` remediation says the rerun clears the
-  record. It now clears the pointer, on the same complete read of the
-  Worker, the Container application, and the registry listing. An
-  unreadable read keeps the record.
+- The `EVE_DESTROY_IMAGES_RETAINED` remediation said a rerun of
+  `eden destroy` "clears the record". A rerun that finds nothing left
+  reports `absent` and leaves the `CURRENT` pointer. The remediation and
+  `docs/troubleshooting.md` now say so, and that nothing more is needed.
 - A deploy whose retirement of old versions was not proven said "Retry
   deploy" in `VAL-LIFE-007` and "do not retry the deployment" in its summary
-  and error. All three now say to rerun `eden deploy`, which retries the
-  recorded retirement.
+  and error. The check and the error now say the same: do not redeploy only
+  for this; the next deploy of the target retries the retirement.
 - `eden destroy --json` includes `"command": "eden destroy"`, like preflight
   and deploy.
 

@@ -647,8 +647,7 @@ When Cloudflare's registry keeps objects, a
 `  kept: <ref> (<class>)` line per object come before it. A deploy that
 removes a superseded version's registry repository prints the same lines.
 
-A target that a complete read shows already absent has its `CURRENT` pointer
-cleared, if one is left, and prints `✓ <name> (<environment>) is already
+A target that was already absent prints `✓ <name> (<environment>) is already
 absent — nothing removed`, followed by the same `  retained: local deployment
 records under .eden/eve-deploy` line.
 

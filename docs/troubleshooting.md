@@ -730,7 +730,8 @@ registry repository.` Read the failed check to tell which cleanup failed.
 
 When the failed check is a pending retirement of old versions, the message
 is `The Eve deployment is healthy and promoted, but retiring old versions was
-not proven.` and the remediation is the check's own: rerun `eden deploy`.
+not proven; the next deploy of this target retries it. Do not retry the
+deployment for this.` The remediation is then the failed checks' own.
 
 ### `VAL-CROSS-004` after a healthy deploy
 
@@ -750,12 +751,14 @@ The deployment is live. Read the check message to see which cleanup failed:
   [complete repository listing](#eve_registry_objects_kept).
 - `The deployment is healthy, but resource retirement was not proven:
   <reason> Exact pending retirement records were retained for retry.` The
-  check says: `Rerun eden deploy with the same --project, --env, --name, and
-  --env-file. It deploys again and retries the recorded retirement cleanup.`
-  The summary line and the `EVE_RUNTIME_IMAGE_CLEANUP_FAILED` error say the
-  same. The retirement stays in the deployment record as pending, and the
-  next deploy of the target runs it again after its own health check. That
-  deploy is an ordinary update: it builds and publishes again.
+  check says: `Do not redeploy only for this. The deployment is live, and the
+  next eden deploy of this target retries the retirement cleanup. Until then,
+  or until eden destroy, the retired versions' recorded resources stay.`
+  The `EVE_RUNTIME_IMAGE_CLEANUP_FAILED` error carries the same remediation.
+  The retirement stays in the deployment record as pending. The next deploy
+  you make for your own reasons runs it again after its own health check.
+  A deploy is an ordinary update that builds and publishes a new image, so
+  do not make one for this cleanup alone.
 
 Kept objects alone do not fail the check. Deploy reports them in
 [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept), even when something
@@ -1205,8 +1208,11 @@ destroy once the provider state settles.
 `The exact Worker and Container are absent, but registry objects remain, or
 could not be listed, in: <repositories>.` The message lists every
 repository. Retry `eden destroy` with the same selectors: it deletes what
-the registry still lists, verifies the registry, and clears the record. When
-the retry finds nothing left, it reports `absent` and clears the record too.
+the registry still lists, verifies the registry, and clears the target's
+`CURRENT` pointer. A retry that finds nothing left reports `absent` and
+changes nothing, so a `CURRENT` pointer from the failed run stays. Nothing
+more is needed: destroy keeps reporting `absent`, and deploy reads a record
+only for a target that exists on Cloudflare.
 
 You can delete a listed tag by hand first:
 
@@ -1214,8 +1220,7 @@ You can delete a listed tag by hand first:
 npx wrangler@4.147.0 containers images delete <repository:tag>
 ```
 
-That removes no `sha256:` entry and does not clear the record, so run
-`eden destroy` again afterwards. Never filter by prefix. An object with one
+That removes no `sha256:` entry, so run `eden destroy` again afterwards. Never filter by prefix. An object with one
 of the three kept answers is not counted here; see
 [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept). Destroy fails
 with this code for anything else the registry still lists, including a tag
