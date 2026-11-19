@@ -179,12 +179,13 @@ interface EveOutcomeError {
 }
 
 /**
- * A failed retirement stays in the promoted record as pending, and the next
- * deploy of the target runs it again after its own health check. That deploy
- * publishes a new image, so it is never worth making for the cleanup alone.
+ * A failed retirement stays in the promoted record as pending. A later
+ * healthy deploy runs it again, unless that deploy makes the pending version
+ * current. A deploy publishes a new image, so none is worth making for the
+ * cleanup alone.
  */
 const RETIREMENT_PENDING_REMEDIATION =
-  "Do not redeploy only for this. The deployment is live, and the next eden deploy of this target retries the retirement cleanup. Until then, or until eden destroy, the retired versions' recorded resources stay.";
+  "Do not redeploy for this. The deployment is live. A later successful deploy retries cleanup for versions still pending retirement. Some retired resources may remain.";
 
 function eveOutcomeError(error: unknown, source: string): EveOutcomeError {
   const failure = error instanceof EveCliError ? error : new EveCliError({
@@ -4631,7 +4632,7 @@ export async function runEveControlPlane(
             status === "indeterminate"
               ? deploymentResult.deployment?.reason ?? "The Eve deployment outcome is indeterminate; inspect the retained exact ownership evidence before retrying."
               : retirementPending
-                ? "The Eve deployment is healthy and promoted, but retiring old versions was not proven; the next deploy of this target retries it. Do not retry the deployment for this."
+                ? "The Eve deployment is healthy and promoted, but retiring old versions was not proven. A later successful deploy retries cleanup for versions still pending retirement; do not retry the deployment for this."
               : status === "deployed"
                 ? "The Eve deployment is healthy and promoted, but exact image cleanup failed; do not retry the deployment."
               : deploymentResult.deployment?.reason ?? "The Eve deployment failed before exact target promotion.",

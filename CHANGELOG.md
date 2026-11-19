@@ -123,8 +123,9 @@ three bugs in released versions are fixed. Update `@moinulmoin/eden`, and
   `docs/troubleshooting.md` now say so, and that nothing more is needed.
 - A deploy whose retirement of old versions was not proven said "Retry
   deploy" in `VAL-LIFE-007` and "do not retry the deployment" in its summary
-  and error. The check and the error now say the same: do not redeploy only
-  for this; the next deploy of the target retries the retirement.
+  and error. The check and the error now say the same: do not redeploy for
+  this; a later successful deploy retries cleanup for versions still
+  pending retirement.
 - `eden destroy --json` includes `"command": "eden destroy"`, like preflight
   and deploy.
 

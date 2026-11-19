@@ -730,8 +730,9 @@ registry repository.` Read the failed check to tell which cleanup failed.
 
 When the failed check is a pending retirement of old versions, the message
 is `The Eve deployment is healthy and promoted, but retiring old versions was
-not proven; the next deploy of this target retries it. Do not retry the
-deployment for this.` The remediation is then the failed checks' own.
+not proven. A later successful deploy retries cleanup for versions still
+pending retirement; do not retry the deployment for this.` The remediation
+is then the failed checks' own.
 
 ### `VAL-CROSS-004` after a healthy deploy
 
@@ -751,14 +752,16 @@ The deployment is live. Read the check message to see which cleanup failed:
   [complete repository listing](#eve_registry_objects_kept).
 - `The deployment is healthy, but resource retirement was not proven:
   <reason> Exact pending retirement records were retained for retry.` The
-  check says: `Do not redeploy only for this. The deployment is live, and the
-  next eden deploy of this target retries the retirement cleanup. Until then,
-  or until eden destroy, the retired versions' recorded resources stay.`
+  check says: `Do not redeploy for this. The deployment is live. A later
+  successful deploy retries cleanup for versions still pending retirement.
+  Some retired resources may remain.`
   The `EVE_RUNTIME_IMAGE_CLEANUP_FAILED` error carries the same remediation.
-  The retirement stays in the deployment record as pending. The next deploy
-  you make for your own reasons runs it again after its own health check.
-  A deploy is an ordinary update that builds and publishes a new image, so
-  do not make one for this cleanup alone.
+  The retirement stays in the deployment record as pending. A later deploy
+  you make for your own reasons runs it again after its own health check,
+  unless that deploy makes the pending version current again. A failed
+  cleanup does not show which of the retired versions' resources are still
+  there. A deploy is an ordinary update that builds and publishes a new
+  image, so do not make one for this cleanup alone.
 
 Kept objects alone do not fail the check. Deploy reports them in
 [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept), even when something
