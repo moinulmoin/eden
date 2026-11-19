@@ -178,6 +178,15 @@ interface EveOutcomeError {
   readonly diagnostics: readonly { readonly code: string; readonly message: string; readonly source?: string }[];
 }
 
+/**
+ * A failed retirement stays in the promoted record as pending. A later
+ * healthy deploy runs it again, unless that deploy makes the pending version
+ * current. A deploy publishes a new image, so none is worth making for the
+ * cleanup alone.
+ */
+const RETIREMENT_PENDING_REMEDIATION =
+  "Do not redeploy for this. The deployment is live. A later successful deploy retries cleanup for versions still pending retirement. Some retired resources may remain.";
+
 function eveOutcomeError(error: unknown, source: string): EveOutcomeError {
   const failure = error instanceof EveCliError ? error : new EveCliError({
     code: error instanceof EveRuntimeConfigError ? error.code : "EVE_EXECUTION_FAILED",
@@ -3782,7 +3791,7 @@ async function runEveDeployment(
         : "Retired deployment instances were removed, and everything else in their owned registry repositories. Cloudflare's registry still lists some of their objects; see EVE_REGISTRY_OBJECTS_KEPT.");
     } catch (error: unknown) {
       const reason = error instanceof Error ? safeText(error.message) : "Unknown retirement failure.";
-      supersededImageCleanup = check("VAL-LIFE-007", "failed", `The deployment is healthy, but resource retirement was not proven: ${reason} Exact pending retirement records were retained for retry.`, "Retry deploy to finish only recorded retired resource cleanup.");
+      supersededImageCleanup = check("VAL-LIFE-007", "failed", `The deployment is healthy, but resource retirement was not proven: ${reason} Exact pending retirement records were retained for retry.`, RETIREMENT_PENDING_REMEDIATION);
     }
     if (completedRetirements.length > 0) {
       // Keep the immutable deployment record as evidence, but exclude proven
@@ -4606,7 +4615,14 @@ export async function runEveControlPlane(
       result = deploymentResult;
       if (!deploymentResult.ok) {
         const status = deploymentResult.deployment?.status;
+        const failedCleanup = deploymentResult.checks.filter((value) => value.status === "failed");
+        const retirementPending = status === "deployed" &&
+          failedCleanup.some((value) => value.remediation === RETIREMENT_PENDING_REMEDIATION);
         throw new EveCliError({
+          // One instruction: the failed checks' own, so none contradicts another.
+          ...(retirementPending
+            ? { remediation: failedCleanup.flatMap((value) => value.remediation ?? []).join(" ") }
+            : {}),
           code: status === "indeterminate"
             ? "DEPLOY_INDETERMINATE"
             : status === "deployed"
@@ -4615,6 +4631,8 @@ export async function runEveControlPlane(
           message:
             status === "indeterminate"
               ? deploymentResult.deployment?.reason ?? "The Eve deployment outcome is indeterminate; inspect the retained exact ownership evidence before retrying."
+              : retirementPending
+                ? "The Eve deployment is healthy and promoted, but retiring old versions was not proven. A later successful deploy retries cleanup for versions still pending retirement; do not retry the deployment for this."
               : status === "deployed"
                 ? "The Eve deployment is healthy and promoted, but exact image cleanup failed; do not retry the deployment."
               : deploymentResult.deployment?.reason ?? "The Eve deployment failed before exact target promotion.",
@@ -6187,7 +6205,7 @@ async function runEveDestroyLocked(
             "VAL-LIFE-006-REGISTRY",
             "failed",
             `The registry still lists objects of the exact target that it gave no kept answer for, or its listing could not be read: ${retainedRepositories.join(", ")}.`,
-            "Retry eden destroy with the same selectors: it deletes what the registry still lists, verifies the registry, and clears the record. Deleting tags by hand with wrangler containers images delete removes no sha256: entry and does not clear the record, so retry eden destroy afterwards. An object with one of the three kept answers (refused-snapshot, refused-singleton-artifact, accepted-still-listed) is reported as EVE_REGISTRY_OBJECTS_KEPT and does not count here. Eden reads the registry's listing and each answer with direct requests to registry.cloudflare.com and never uses a proxy for them; if this machine cannot reach the registry directly, retry from one that can.",
+            "Retry eden destroy with the same selectors: it deletes what the registry still lists, verifies the registry, and clears the target's CURRENT pointer. A retry that finds nothing left reports absent; nothing more is needed then. Deleting tags by hand with wrangler containers images delete removes no sha256: entry, so retry eden destroy afterwards. An object with one of the three kept answers (refused-snapshot, refused-singleton-artifact, accepted-still-listed) is reported as EVE_REGISTRY_OBJECTS_KEPT and does not count here. Eden reads the registry's listing and each answer with direct requests to registry.cloudflare.com and never uses a proxy for them; if this machine cannot reach the registry directly, retry from one that can.",
           ),
       );
     }
