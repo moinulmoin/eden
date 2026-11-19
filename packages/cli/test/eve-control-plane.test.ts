@@ -2221,7 +2221,7 @@ describe("eden destroy", () => {
             errors: [{ code: 10007, message: "This Worker does not exist on your account." }],
             messages: [],
           }
-          : { success: true, result: [], result_info: {} }),
+          : { success: true, result: [], errors: [], messages: [], result_info: {} }),
         { status: worker ? 404 : 200 },
       ));
     });

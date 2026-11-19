@@ -21,9 +21,9 @@
   `404`, `success` false, a null `result`, and one error with code `10007`.
   It follows no redirect. Any other answer about the Worker stops destroy
   with `EVE_DESTROY_INDETERMINATE` before anything is deleted.
-  `eden preflight` and `eden deploy` read the Worker the same way. An answer
-  about the Container application that names a field twice proves no absence
-  either.
+  `eden preflight` and `eden deploy` read the Worker the same way. An empty
+  Container application list proves absence only with status `200`,
+  `success` true, an empty `errors` list, and no field named twice.
 - **Destroy could read the Container application from another account.**
   The Container read asked Wrangler for the account a second time. If the
   login changed in between, destroy missed a Container application in the

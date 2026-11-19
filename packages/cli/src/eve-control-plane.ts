@@ -9,7 +9,6 @@ import {
 } from "node:crypto";
 import {
   join,
-  basename,
   dirname,
   relative,
 } from "node:path";
@@ -1693,7 +1692,7 @@ async function readTargetContainers(accountId: string, name: string): Promise<Wr
       url.searchParams.set("name", name);
       if (pageToken !== undefined) url.searchParams.set("page_token", pageToken);
       const response = await readCloudflareApi(url);
-      if (response === undefined || response.status < 200 || response.status > 299) return { failed: true };
+      if (response?.status !== 200) return { failed: true };
       const body: unknown = JSON.parse(response.body);
       if (typeof body !== "object" || body === null ||
         !("success" in body) || body.success !== true ||
@@ -1710,11 +1709,16 @@ async function readTargetContainers(accountId: string, name: string): Promise<Wr
         return { failed: true };
       }
       // A page without the exact application is evidence of absence, so it
-      // is read strictly: a body that names a field twice is no answer.
+      // is read strictly: the API's answer, read on 2026-11-19, has status
+      // 200, success true, and an empty errors list, and a body that names a
+      // field twice is no answer.
       if (
         !body.result.some((entry: unknown) =>
           typeof entry === "object" && entry !== null && "name" in entry && entry.name === name
-        ) && exactJson(response.body) === undefined
+        ) && (
+          !("errors" in body) || !Array.isArray(body.errors) || body.errors.length > 0 ||
+          exactJson(response.body) === undefined
+        )
       ) return { failed: true };
       // Missing pagination metadata on a full page cannot prove absence.
       if (info === undefined && body.result.length >= 100) return { failed: true };
@@ -4109,12 +4113,16 @@ async function collectEvePreflight(
     ".eden",
     "eve-deploy",
     "generations",
-    basename(options.generationId ?? `preflight-${randomUUID()}`),
+    options.generationId ?? `preflight-${randomUUID()}`,
   );
   let packaging: EveProjectPackagingResult;
   const builder = options.builder ??
     createDockerEveProjectBuilder({ nodeImage });
   try {
+    // One plain directory name: anything else would put the record where destroy does not look.
+    if (options.generationId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(options.generationId)) {
+      throw new Error("The generation id must be a single plain directory name.");
+    }
     const baseSnapshotOptions = {
       projectRoot: request.projectRoot,
       artifactRoot,

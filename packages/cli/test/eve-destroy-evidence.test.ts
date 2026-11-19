@@ -46,6 +46,8 @@ const cloud = vi.hoisted(() => {
     deploymentEntries: undefined as readonly unknown[] | undefined,
     /** When set, the API's whole answer to the Container applications read, given its true entries. */
     containerAnswer: undefined as ((entries: string) => string) | undefined,
+    /** The status of the API's answer to the Container applications read. */
+    containerStatus: 200,
     /** The plain-text bindings of the Worker: what the last publish stamped. */
     stamps: [] as { readonly type: string; readonly name: string; readonly text: string }[],
     /** Called before each Wrangler command that changes the account. */
@@ -200,7 +202,7 @@ async function cloudflareApi(input: string | URL | Request, init?: RequestInit):
       const [application, id] = rest2.split("#");
       return owner === account && application === name ? [{ id, name: application }] : [];
     });
-    return json(200, cloud.containerAnswer?.(JSON.stringify(entries)) ??
+    return json(cloud.containerStatus, cloud.containerAnswer?.(JSON.stringify(entries)) ??
       { success: true, errors: [], messages: [], result: entries, result_info: {} });
   }
   if (rest[0] === "workers" && rest[1] === "scripts" && rest[3] === "deployments") {
@@ -328,6 +330,7 @@ beforeEach(() => {
     deployments: 1,
     deploymentEntries: undefined,
     containerAnswer: undefined,
+    containerStatus: 200,
     stamps: [{ type: "plain_text", name: "EDEN_EVE_DEPLOYMENT_ID", text: "eve-deploy-test" }],
     onMutation: () => undefined,
     apiAccounts: [],
@@ -444,7 +447,7 @@ async function writeBuild(snapshotRoot: string): Promise<void> {
 }
 
 /** A deploy that publishes through Eden's own Wrangler call and its own read afterwards. */
-async function deploy(root: string): Promise<{ readonly exitCode: number; readonly result: { readonly ok?: boolean; readonly error?: { readonly code?: string } } }> {
+async function deploy(root: string, generationId = "generation-one"): Promise<{ readonly exitCode: number; readonly result: { readonly ok?: boolean; readonly error?: { readonly code?: string } } }> {
   const output: string[] = [];
   const imageDigest = "sha256:" + "d".repeat(64);
   const exitCode = await runEdenCli(
@@ -454,7 +457,7 @@ async function deploy(root: string): Promise<{ readonly exitCode: number; readon
       stdout: (line) => output.push(line),
       stderr: (line) => output.push(line),
       eveControlPlane: {
-        generationId: "generation-one",
+        generationId,
         builder: { build: async (request) => { await writeBuild(request.snapshotRoot); return { eveVersion: "0.91.0" }; } },
         containerImageReference: "registry.cloudflare.com/account-test/eve@" + imageDigest,
         runtimeRunner: async () => ({
@@ -755,5 +758,30 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     };
     await expect(run()).resolves.toEqual({ exitCode: 0, status: "destroyed" });
     await expect(run()).resolves.toEqual({ exitCode: 0, status: "absent" });
+  });
+
+  test.each([
+    ["status 206", 206, '{"success":true,"result":[],"errors":[],"messages":[],"result_info":{}}'],
+    ["an authentication error beside success", 200, '{"success":true,"result":[],"errors":[{"code":10000,"message":"Authentication error"}],"messages":[],"result_info":{}}'],
+    ["no errors field", 200, '{"success":true,"result":[],"result_info":{}}'],
+  ] as const)("an empty Container list with %s is no proof of absence", async (_name, status, body) => {
+    const { root, current } = await deployedProject();
+    cloud.containers.add(container);
+    cloud.tags = ["candidate"];
+    cloud.containerStatus = status;
+    cloud.containerAnswer = () => body;
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
+    expect(cloud.deleted).toEqual([]);
+    await expect(lstat(current)).resolves.toBeDefined();
+  });
+
+  test.each(["", ".", "..", "/", "a/b"])("a generation id of %j is refused before anything is published", async (generationId) => {
+    const root = await deployableProject();
+    const { exitCode, result } = await deploy(root, generationId);
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 1, ok: false });
+    expect(result.error?.code).toBe("EVE_DEPLOY_CHECKS_FAILED");
+    expect(cloud.pinned).toEqual([]);
+    await expect(lstat(join(root, ".eden", "eve-deploy", "targets"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
