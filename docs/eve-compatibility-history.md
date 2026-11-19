@@ -4,6 +4,54 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for the destroy evidence change (2026-11-19)
+
+Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
+account, with Wrangler `4.147.0` and an OAuth login, on the branch of
+[#21](https://github.com/moinulmoin/eden/pull/21) at `01a01aa`, which is
+main at `0dada03` with that change.
+
+Full run of `pnpm run check:live`, target `eden-live-20261119-2daa57f5`,
+`21:48:07Z` to `22:03:29Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+this workspace (version `0.13.0`), a 90-second idle window. All 18 steps
+passed.
+
+- `eden preflight` passed 14 checks with no warnings in 74 seconds. The
+  fresh deploy took 164 seconds, the same-version update 110 seconds, and
+  the deploy on Eve `1.0.2` 200 seconds, all on the same URL. Each deploy
+  read the Worker and the Container application from Cloudflare's API
+  before it moved `CURRENT`.
+- Session `wrun_01M7TWR6AZB2P8ZN0XRS5MZZWP` answered after each deploy and
+  after the sleep, with its earlier turns in its stream and its file
+  intact. After 165 seconds with no requests the first health request took
+  7.6 seconds, and the server process was 8 seconds old.
+- An unauthenticated session request got `401`, and the two workflow queue
+  routes answered `404`. A session on Eve `1.0.2` asked its server
+  process: no `queueAuthMode` line.
+- `eden destroy` ended with `destroyed` in 90 seconds and reported 19
+  objects in `EVE_REGISTRY_OBJECTS_KEPT`. In the repository of the Eve
+  `0.91.0` version: eight snapshot tags, four snapshot manifests, two chain
+  artifacts, and the first image, which lost its tag to the second push
+  (`accepted-still-listed`). In the repository of the Eve `1.0.2` version:
+  two snapshot tags, one snapshot manifest, and one chain artifact.
+- The check's catalog read found those 19 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+- Read on the same account without creating anything: the Container
+  application list for a name that does not exist answered `200` with
+  `{"success":true,"result":[],"errors":[],"messages":[],"result_info":{}}`.
+  A `destroy` whose record named the destroyed Worker and Container
+  application, and no image, ended with `absent`. The same `destroy` with a
+  login Cloudflare refuses ended with `EVE_DESTROY_INDETERMINATE`.
+
+One earlier run the same day, on the branch at `db3101f`, target
+`eden-live-20261119-c688e9b2`, `21:33:47Z` to `21:44:30Z`, failed one
+step. After the deploy on Eve `1.0.2` reported healthy, the session stream
+answered `500` with a Cloudflare HTML error page. The cause was not
+investigated, and the run above did not repeat it. `eden destroy` in that
+run ended with `destroyed`, reported 7 kept objects, and the check found
+nothing else of the target.
+
 ## Live check for release 0.13.0 (2026-11-19)
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
