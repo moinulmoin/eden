@@ -23,7 +23,8 @@ What you get on your own account:
   conversation's files kept
 - the container sleeps when idle and wakes on the next request; standard cron
   schedules still fire while it sleeps
-- `eden destroy` removes exactly what Eden created, nothing else
+- `eden destroy` removes only what Eden created; Cloudflare may keep some
+  [registry objects](./docs/troubleshooting.md#eve_registry_objects_kept)
 
 ## Quick start
 
@@ -35,11 +36,11 @@ npx @moinulmoin/eden preflight --env-file ~/.config/my-agent/preview.env
 npx @moinulmoin/eden deploy --env-file ~/.config/my-agent/preview.env
 ```
 
-A project straight from `eve init` fails these commands until it has the
-five changes in
+A project straight from `eve init` needs setup before it can serve requests
+on Cloudflare. Follow
 [Starting from a fresh Eve project](#starting-from-a-fresh-eve-project).
-`preflight` changes nothing on Cloudflare and lists everything that is
-missing in its first run, before it builds.
+`preflight` changes nothing on Cloudflare and reports the setup problems
+it can detect before building.
 
 The env file holds your model key and auth secrets and lives outside the
 project. Deploy prints the live URL. Run the same command again to ship a
@@ -113,7 +114,7 @@ nothing on Cloudflare.
 - Eve `>=0.91.0`; `preflight` and `deploy` reject older versions with
   `EVE_VERSION_UNSUPPORTED`.
 - `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`).
-  On Eve `0.83.0` and later, explicitly select `JustBashSandbox` as shown
+  Explicitly select `JustBashSandbox` as shown
   [below](#starting-from-a-fresh-eve-project); the production default no longer
   falls back to it.
 - the providers, credentials, databases, Workflow World, and external services
@@ -238,8 +239,8 @@ record absolute paths on your machine. Add it to `.gitignore`:
 printf '\n.eden/\n' >> .gitignore
 ```
 
-Keep the folder, though. Updates and `destroy` must run from the machine and
-project folder that deployed. If it is lost, see
+Updates and `destroy` need this folder. Run them from the project root that
+holds it, or select that root with `--project`. If it is lost, see
 [The `.eden/` folder is lost](./docs/troubleshooting.md#the-eden-folder-is-lost).
 
 ## Deploy
@@ -284,8 +285,9 @@ eden destroy --name my-eve-preview
 
 Destroy always requires an explicit `--name` and Eden's ownership record. It
 verifies the remote identity first and never touches similarly named
-resources. Cloudflare's registry keeps some objects that destroy deletes,
-such as container snapshots; destroy lists them with the registry's answer.
+resources. Cloudflare's registry keeps some objects destroy tries to delete,
+such as container snapshots; see
+[`EVE_REGISTRY_OBJECTS_KEPT`](./docs/troubleshooting.md#eve_registry_objects_kept).
 A kept snapshot still holds the agent's files until Cloudflare removes it,
 which it documents as 30 days after the snapshot was created or last
 restored.
@@ -354,9 +356,9 @@ Things that differ from Vercel, and what Eden does about each:
   conversation's sandbox files into it before it serves requests.
 - **Eve prepares its sandbox at build time, on the machine that builds.** A
   real Linux sandbox (microsandbox or Docker) needs KVM or a Docker daemon
-  there; Eden's builder has neither, so agents get `just-bash`. microsandbox
-  does run inside Cloudflare's container, but preparing it there adds about 7
-  minutes to every deploy and update, so Eden does not use it yet.
+  there; Eden's builder has neither, so agents get `just-bash`. Historical
+  microsandbox preparation in the Container added about 7 minutes per deploy;
+  Eve `0.83.0` removed microsandbox.
 - **Waking a sleeping agent takes about 10–15 seconds**, mostly Eve's server
   starting up. The container itself starts in about a second.
 

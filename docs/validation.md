@@ -52,9 +52,9 @@ workspace (`pnpm run build`), and no Cloudflare account:
 4. It checks health, fail-closed bearer auth, and keyless session admission,
    then removes the container, both images, and the copied project.
 
-CI and publish gates run both legs on both fixtures, with Postgres 16. On a
-push, CI runs the Postgres leg in the main job and the Eden leg in one parallel
-job per fixture. Publish runs the whole gate in one step.
+CI runs both legs on pull requests and pushes to `main`, with Postgres 16.
+The Postgres leg runs in the main job and the Eden leg in one parallel job
+per fixture. Publish runs both legs on both fixtures in one step on version tags.
 See [Current Eve compatibility](./eve-compatibility.md) for compatibility details.
 
 Stop the local service afterward:
@@ -67,15 +67,17 @@ docker stop eden-compat-postgres
 
 Run this before a release that changes deploy, update, destroy, runtime, or
 World behavior. It uses the real Cloudflare account that Wrangler on this
-machine is logged in to, and Docker. It does not run in CI.
+machine is logged in to, Docker, and direct access to
+`registry.cloudflare.com` for the catalog read; that read never uses a
+proxy. It does not run in CI.
 
 ```sh
 pnpm run check:live -- --env-file ~/.config/eden/eve-compat.env
 ```
 
 The env file must hold `AI_GATEWAY_API_KEY=<key>`. The script copies only
-that value into its own temporary env file and never prints it. A run takes
-about 30 minutes.
+that value into its own temporary env file and never prints it. Allow about
+30 minutes; this is an estimate, not a time limit.
 
 What it does, in order:
 
@@ -102,33 +104,36 @@ What it does, in order:
 9. Sends no requests for longer than the idle window, then sends one. The
    server process must be younger than the wait, and the file must still be
    there.
-10. Runs `eden destroy`, then confirms the URL returns 404 and that no Worker,
-    secret, Container application, or registry image with the target's name
-    is left. The step reads the registry's catalog, which also shows
-    manifests that have no tag. It uses a credential that can only pull,
-    for the account the deploy result named. It starts just before the
-    target's repositories, reads pages of 25 entries, tries a page up to
+10. Runs `eden destroy`, confirms the URL returns 404 if one was recorded,
+    and checks that no Worker, secret, or Container application for the
+    target remains. It reads the registry's catalog, which also shows
+    manifests that have no tag. It uses a pull-only credential and checks it
+    against the account the deploy result named, if one was recorded. It
+    starts just before the target's repositories, reads pages of 25 entries,
+    tries a page up to
     four times, and fails unless it reaches the first repository after
     the target's or the catalog's end. The only registry objects that may remain
     are the exact ones destroy reported in `EVE_REGISTRY_OBJECTS_KEPT`. The
     destroy step lists them, and the final JSON object has them in
     `registryObjectsKept`.
 
-Each step prints `✓` or `✗` with its time. The last output is one JSON
-object with `ok`, the target, and every step. The exit code is `0` only when
-every step passed.
+Each step prints `✓`, `✗`, or `-` (skipped) with its time. The last output
+is one JSON object with `ok`, the target, and every step. The exit code is
+`0` when no step fails.
 
 Defaults and options:
 
 | Option | Default | Effect |
 | --- | --- | --- |
+| `--env-file <path>` | Required | File holding `AI_GATEWAY_API_KEY` |
 | `--eve <version>` | The floor fixture's Eve | Eve version the project starts on |
 | `--upgrade-to <version>` | The latest fixture's Eve | Eve version for step 7; the step is skipped when it equals `--eve` |
 | `--world <source>` | `workspace` | `workspace` packs `packages/world-cloudflare` into a pnpm project; `latest` or an exact version installs the published `@moinulmoin/eden-world-cloudflare` into an npm project |
 | `--model <id>` | The fixtures' model and fallbacks | AI Gateway model |
-| `--sleep-after <time>` | `90s` | Idle window for step 9, set with `EDEN_EVE_CONTAINER_SLEEP_AFTER` |
-| `--skip-sleep` | off | Skip step 9 and keep the 1 hour default |
+| `--sleep-after <time>` | `90s` | Idle window for step 9 in whole seconds or minutes (for example `90s` or `3m`), set with `EDEN_EVE_CONTAINER_SLEEP_AFTER` |
+| `--skip-sleep` | off | Skip step 9 and leave `EDEN_EVE_CONTAINER_SLEEP_AFTER` unchanged (1 hour if unset) |
 | `--keep-work` | off | Keep the temporary project folder; the target is still destroyed |
+| `--help`, `-h` | off | Print help |
 
 Safety:
 
@@ -168,15 +173,17 @@ Add a dated entry for each run to
 - npm projects with one root `package-lock.json` and exact-pinned pnpm projects
   are supported; mixed locks, Bun project lockfiles, and native Windows are not.
 - `.npmrc` is excluded from build layers; private registries are unsupported.
-- One logical Container instance per deployment; no horizontal scaling or
+- One Container instance per kept version; no horizontal scaling or
   custom domains.
-- Container-local disk survives sleep via filesystem snapshots but resets on
-  image updates. Production durability requires the tested Postgres World setup
-  in [deploy.md](deploy.md#durable-state-postgres-world).
+- Container disk survives sleep via snapshots. Only conversation sandbox
+  files carry over on image updates. For durable workflow state, use the
+  [Cloudflare World](./deploy.md#durable-state-on-cloudflare-no-database) or
+  [Postgres World](./deploy.md#durable-state-postgres-world).
 
 ## Cleanup
 
 For a deployed validation, remove only the resources created for that exact
-`--env`/`--name` target. Verify the deployment URL is unreachable and
-resource/secret listings no longer contain the temporary entries. Preserve
-shared preview or production resources.
+`--env`/`--name` target. Verify the deployment URL returns 404 and
+resource/secret listings no longer contain the temporary entries. Check that
+the registry lists nothing the destroy did not report. Preserve shared
+preview or production resources.

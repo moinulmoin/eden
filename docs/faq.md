@@ -33,7 +33,7 @@ Not your agent code. The project does need:
   `packageManager: "pnpm@..."` pin and matching `pnpm-lock.yaml`; no mixed lockfiles
 - `just-bash` as a production dependency (`npm add just-bash` or `pnpm add just-bash`); a fresh
   `eve init` project does not include it
-- on Eve `0.83.0` and later, an explicit `JustBashSandbox` module; the production
+- an explicit `JustBashSandbox` module; the production
   default has no provider in Eden's builder and does not fall back to `just-bash`
 - a real [Eve authenticator](https://eve.dev/docs/guides/auth-and-route-protection);
   the generated Vercel and localhost ones do not grant access on Cloudflare
@@ -86,7 +86,7 @@ from the outside. See [What is public](./security.md#what-is-public).
 
 ### How long does a deploy take?
 
-In the last full live run (Eve `0.81.0`, a fresh project): first deploy 215
+In the 2026-10-19 live run (Eve `0.81.0`, a fresh project): first deploy 215
 seconds, an update 194 seconds, destroy 31 seconds. Most of a deploy is
 building the Linux/amd64 image. `eden preflight` on Eve `0.82.0` took 74
 seconds.
@@ -141,9 +141,9 @@ blocking versions and live session counts. There is no override flag.
 
 `--json` gives scripts a machine-readable result, and any machine with Docker,
 Node, and Wrangler access can deploy. Updating or destroying an existing
-target needs the deployment records Eden wrote under `.eden/eve-deploy/` on
-the machine that created it; without them Eden refuses to touch the target
-rather than guess. If they are lost, see
+target needs the `.eden/` folder Eden wrote. Run from the project root that
+holds it, or select that root with `--project`. Keep the folder out of git.
+If it is lost, see
 [The `.eden/` folder is lost](./troubleshooting.md#the-eden-folder-is-lost).
 
 ### How do I remove everything?
@@ -152,9 +152,10 @@ rather than guess. If they are lost, see
 eden destroy --name <target>
 ```
 
-It deletes exactly the Worker, Container application, **every retained
-container instance and image**, and all registry repositories Eden created
-for that target, including legacy deployments, then checks they are gone.
+It deletes only the Worker, Container application, retained instances, and
+registry objects for that target, including legacy deployments. It checks
+what remains and reports any
+[`EVE_REGISTRY_OBJECTS_KEPT`](./troubleshooting.md#eve_registry_objects_kept).
 Destroy also removes sessions still running. Your Postgres database, if you
 use one, is not touched.
 
@@ -174,12 +175,12 @@ count toward the 50 GB of image storage per account. See
 ### Why no real Linux sandbox with python and git?
 
 Eve prepares its sandbox during `eve build`. Eden's builder has no Docker
-daemon, and Eden supports only `just-bash`, a simulated shell. On Eve `0.83.0`
-and later, [select it explicitly](./deploy.md#sandbox-setup); the production
+daemon, and Eden supports only `just-bash`, a simulated shell.
+[Select it explicitly](./deploy.md#sandbox-setup); the production
 default no longer falls back to it.
 
 Older Eve releases could select microsandbox when `/dev/kvm` was visible.
-Eden hides that device in its builder to keep their existing `just-bash`
+Eden hid that device in its builder to keep their existing `just-bash`
 selection. Historical microsandbox preparation inside a Cloudflare container
 added about 7 minutes per deploy in testing; that is not an available provider
 on Eve `0.83.0`, which removed microsandbox.

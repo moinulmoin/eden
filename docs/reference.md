@@ -24,8 +24,9 @@ arguments prints the same usage. An unknown command fails with
 `eden <command> --help` prints the options of that command.
 
 For `preflight`, `deploy`, and `destroy`, every option that takes a value
-accepts both `--option value` and `--option=value`, may be given only once,
-and takes a value that is neither empty nor starting with `-`.
+accepts both `--option value` and `--option=value` and may be given only once.
+With `--option value`, a missing or empty value or one starting with `-`
+fails with `EVE_OPTION_VALUE_MISSING`.
 `--json` and `--help` are switches and take no
 value. A repeated option fails with a `..._REPEATED` code, an unknown option
 with `EVE_OPTION_UNKNOWN`, and a positional argument with
@@ -142,9 +143,12 @@ versions until that work finishes and Eden stops the old version's schedules.
 Removes the exact target Eden owns, not just its newest deployment. Destroy
 verifies the immutable ownership record, reads the current remote inventory,
 deletes only that Worker and Container application, every retained container
-instance and image (including legacy), and the registry repositories this
-target pushed. It proves absence before clearing the target's `CURRENT`
-pointer, and never deletes by prefix or a broad account search.
+instance (including legacy), and the registry objects in repositories this
+target pushed, except for
+[objects Cloudflare keeps](./troubleshooting.md#eve_registry_objects_kept).
+It verifies cleanup before clearing the target's `CURRENT` pointer and
+never deletes by prefix or a broad account search. Registry cleanup needs
+direct access to `registry.cloudflare.com`.
 
 Destroy deletes everything Cloudflare's registry lists for those
 repositories: every tag, and every `sha256:` entry, which the registry
@@ -367,7 +371,7 @@ in the account.
 | `CLOUDFLARE_API_TOKEN` | Eden | Used instead of the Wrangler OAuth token for the account and subdomain reads |
 | `WRANGLER_HOME` | Eden | Directory that holds the Wrangler OAuth token for direct API reads. Otherwise Eden follows Wrangler's legacy `~/.wrangler` directory when present, then `$XDG_CONFIG_HOME/.wrangler`, or `~/Library/Preferences/.wrangler` on macOS and `~/.config/.wrangler` elsewhere |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY` | Eden and Wrangler | Passed from your shell to the Docker CLI and Wrangler image push, so both use the same daemon and credentials |
-| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and Wrangler | Passed from your shell to Docker and Wrangler |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and Wrangler | Passed from your shell to Docker and Wrangler. [Eden's own registry requests](./security.md#what-eden-can-change-in-your-cloudflare-account) never use a proxy |
 | `NODE_EXTRA_CA_CERTS`, `XDG_CONFIG_HOME`, `CLOUDFLARE_ACCOUNT_ID` | Wrangler (configuration/account selection also checked by Eden) | Trusted shell settings for certificate trust, configuration location, and account selection; Eden still requires exactly one authenticated account, matching `CLOUDFLARE_ACCOUNT_ID` when set |
 
 ### Variables Eden sets in the container
@@ -546,7 +550,7 @@ image identity and never runs a broad Docker cleanup.
 | Project package manager | npm defaults to `11.13.0` when `packageManager` is absent, or uses an exact `npm@<major>.<minor>.<patch>` pin with major 7 or newer. pnpm requires an exact `pnpm@<major>.<minor>.<patch>` pin; ranges and tags are rejected |
 | Project lockfile | Exactly one regular root lockfile for the selected manager; mixed locks are rejected. npm accepts `package-lock.json` v2/v3 and uses `npm ci --ignore-scripts --no-audit --no-fund` (production adds `--omit=dev`); dependency lifecycle scripts do not run. pnpm 9 and newer require `lockfileVersion: '9'`, pnpm 7 and 8 require `lockfileVersion: '6'`, older pnpm requires `lockfileVersion: '5'` |
 | Registry configuration | `.npmrc` is excluded from build layers; private registries and installs requiring project `.npmrc` configuration are unsupported |
-| `just-bash` | A production dependency of the Eve project. Eve `0.83.0` and later must explicitly select `JustBashSandbox` ([setup](./deploy.md#sandbox-setup)); the production default has no provider in Eden's isolated builder and no longer falls back. Eden's builder has no Docker daemon and hides `/dev/kvm` for older Eve releases, whose default still resolves to `just-bash` |
+| `just-bash` | A production dependency of the Eve project. Select `JustBashSandbox` explicitly ([setup](./deploy.md#sandbox-setup)); the production default has no provider in Eden's isolated builder |
 | Docker | Docker or OrbStack with `linux/amd64` support. Eden selects no other architecture |
 | Builder image | `node:24.17.0-bookworm-slim`, built and run as `linux/amd64` |
 | Container instance | `standard-1` (1/2 vCPU, 4 GiB) |
@@ -690,12 +694,13 @@ the command produced them.
 | `warnings` | array | `id`, `message`, and `remediation` when present |
 | `registryObjectsKept` | array of objects, on deploy with the warning `EVE_REGISTRY_OBJECTS_KEPT` | Each object of a superseded version's repository that Cloudflare's registry still lists after Eden's delete, with the same `ref` and `class` as on destroy |
 | `candidate` | object or `null` | `generationId`, `sourceDigest`, `outputDigest`, and `imageDigest` when the image was built |
-| `deployment` | object, on deploy | `status`, `operation` (`create` or `update`), `targetKey`, `deploymentId`, `workerName`, `containerApplicationName`, `stableContainerInstanceName`, `stableWorkersDevOrigin`, `imageReference`, `supersededGenerationId` and `supersededImageReference` on an update, `runtimeVariableNames`, and `evidenceRetained` |
+| `deployment` | object, on deploy | `status`, `operation` (`create` or `update`), `targetKey`, `deploymentId`, `workerName`, `containerApplicationName`, `stableContainerInstanceName`, `stableWorkersDevOrigin`, `imageReference`, `supersededGenerationId` and `supersededImageReference` on an update, `runtimeVariableNames`, and `evidenceRetained`. `reason` and `evidenceLocation` explain the outcome and where to find its local evidence; an indeterminate result may omit identity fields |
 
 `destroy` prints the destroy outcome:
 
 | Field | Type | Notes |
 | --- | --- | --- |
+| `command` | `"eden destroy"` | |
 | `ok` | boolean | |
 | `status` | `"destroyed"`, `"absent"`, `"failed"`, or `"indeterminate"` | |
 | `environment` | `"preview"` or `"production"` | |
@@ -703,5 +708,6 @@ the command produced them.
 | `checks` | array | Same shape as the preflight and deploy checks |
 | `warnings` | array, only on a successful destroy that leaves registry objects | One `EVE_REGISTRY_OBJECTS_KEPT` entry with `id`, `message`, and `remediation` |
 | `registryObjectsKept` | array of objects, with that warning | Each object Cloudflare's registry still lists after Eden's delete. `ref` is `<repository>:<tag>`, or `<repository>@sha256:<digest>` for a manifest's own entry. `class` is the registry's answer for that object: `refused-snapshot`, `refused-singleton-artifact`, or `accepted-still-listed`. Nothing else is left in the registry's listing |
+| `error` | object, on failure | `code`, `message`, `remediation`, `source`, and `diagnostics` as described above |
 
 Return to the [documentation index](./README.md).
