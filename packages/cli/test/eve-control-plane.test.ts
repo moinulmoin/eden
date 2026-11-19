@@ -1079,7 +1079,7 @@ describe("top-level Eden Deploy commands", () => {
             artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
             builder: fakeBuilder(),
             containerImageReference:
-              `registry.example/eve@${imageDigest}`,
+              `registry.cloudflare.com/account-test/eve@${imageDigest}`,
             hostRequirements: {
               architecture: "linux/amd64",
               world: "supported",
@@ -1239,7 +1239,7 @@ describe("top-level Eden Deploy commands", () => {
             artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
             builder: fakeBuilder(),
             containerImageReference:
-              `registry.example/eve@sha256:${"e".repeat(64)}`,
+              `registry.cloudflare.com/account-test/eve@sha256:${"e".repeat(64)}`,
             hostRequirements: {
               architecture: "linux/amd64",
               world: "supported",
@@ -1332,7 +1332,7 @@ describe("top-level Eden Deploy commands", () => {
               artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
               builder: fakeBuilder(),
               containerImageReference:
-                `registry.example/eve@sha256:${"e".repeat(64)}`,
+                `registry.cloudflare.com/account-test/eve@sha256:${"e".repeat(64)}`,
               hostRequirements: {
                 architecture: "linux/amd64",
                 world: "supported",
@@ -2461,7 +2461,7 @@ export default eveChannel({
               }),
             ),
             containerImageReference:
-              `registry.example/eve@sha256:${"a".repeat(64)}`,
+              `registry.cloudflare.com/account-test/eve@sha256:${"a".repeat(64)}`,
             cloudflareRead: async () => ({
               accountAccess: "available" as const,
               containerAccess: "available" as const,
@@ -2922,7 +2922,7 @@ describe("eden deploy in-place update", () => {
     return {
       artifactRoot: join(root, ".eden", "eve-artifacts", "generation-two"),
       builder: options.builder ?? fakeBuilder(),
-      containerImageReference: `registry.example/eve@${newDigest}`,
+      containerImageReference: `registry.cloudflare.com/account-test/eve@${newDigest}`,
       hostRequirements: {
         architecture: "linux/amd64",
         world: "supported",
@@ -3017,7 +3017,7 @@ describe("eden deploy in-place update", () => {
     expect(publishedMigrations).toEqual([
       { tag: "v1", new_sqlite_classes: ["EveHostDurableContainer"] },
     ]);
-    expect(publishedImage).toBe(`registry.example/eve@sha256:${"d".repeat(64)}`);
+    expect(publishedImage).toBe(`registry.cloudflare.com/account-test/eve@sha256:${"d".repeat(64)}`);
     expect(operations).toEqual([
       "publish",
       "health",

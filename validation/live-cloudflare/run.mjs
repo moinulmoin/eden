@@ -24,6 +24,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { serveWorldTarball } from "../eve-compat/eden-leg.mjs";
+import { registryCatalogRefs } from "./registry-catalog.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const edenCli = join(repoRoot, "packages/cli/dist/index.js");
@@ -252,6 +253,8 @@ async function eden(command, { withEnvFile = true, interruptible = true } = {}) 
   } catch {
     throw new Error("eden " + command + " did not print one JSON object (exit " + result.code + ").\n" + tail(result.stdout + "\n" + result.stderr));
   }
+  // A deploy names the account it pushed to, also when it fails after publishing.
+  registryAccount = /^registry\.cloudflare\.com\/([A-Za-z0-9_-]+)\/eden-eve-/u.exec(output.deployment?.imageReference ?? "")?.[1] ?? registryAccount;
   if (result.code !== 0 || output.ok !== true) {
     const failed = (output.checks ?? []).filter((check) => check.status === "failed").map((check) => check.id + ": " + check.message);
     throw new Error(["eden " + command + " failed (exit " + result.code + "): " + (output.error?.code ?? "no error code") + " " + (output.error?.message ?? ""), ...failed, tail(result.stderr, 15)].filter(Boolean).join("\n"));
@@ -533,6 +536,7 @@ async function deploy(expectUpdate) {
   const origin = output.deployment?.stableWorkersDevOrigin;
   if (typeof origin !== "string" || !origin.startsWith("https://")) throw new Error("The deploy result has no deployment.stableWorkersDevOrigin.");
   if (output.name !== target) throw new Error("The deploy result names " + output.name + ", not " + target + ".");
+  if (registryAccount === undefined) throw new Error("The deploy result does not name the registry account in deployment.imageReference.");
   if (expectUpdate && origin !== summary.origin) throw new Error("The URL changed from " + summary.origin + " to " + origin + ".");
   summary.origin = origin;
   const deployed = seconds(Date.now() - started);
@@ -543,6 +547,29 @@ async function deploy(expectUpdate) {
 
 async function wrangler(args) {
   return run(wranglerCli, args, { timeoutMs: 120_000, interruptible: false });
+}
+
+// What Cloudflare's registry itself lists for this run's repositories: each
+// tag, and one sha256 entry per manifest. Wrangler's image list leaves the
+// sha256 entries out.
+// Every repository of this target starts with the same name. The credential
+// can only read, and must be for the account a deploy result named; when no
+// deploy got far enough to name one, the credential's own account is read.
+async function registryRefs() {
+  const minted = await wrangler(["containers", "registries", "credentials", "registry.cloudflare.com", "--pull", "--expiration-minutes", "5", "--json"]);
+  if (minted.code !== 0) throw new Error("wrangler containers registries credentials exited with code " + minted.code);
+  let credential;
+  try {
+    credential = JSON.parse(minted.stdout);
+  } catch {
+    throw new Error("wrangler containers registries credentials did not print JSON");
+  }
+  if (typeof credential?.password === "string") secrets.push(credential.password);
+  return registryCatalogRefs({
+    account: registryAccount ?? credential?.account_id,
+    repositoryPrefix: "eden-eve-preview-" + target + "-",
+    credential,
+  });
 }
 
 // Read-only checks, each filtered to this run's exact temporary name.
@@ -564,22 +591,23 @@ async function verifyGone() {
   if (containers.code !== 0) problems.push("wrangler containers list failed: " + tail(containers.stderr, 3));
   else if (containers.stdout.includes(target)) problems.push("a Container application for " + target + " remains");
   else notes.push("no Container application");
-  const images = await wrangler(["containers", "images", "list", "--json"]);
-  if (images.code !== 0) problems.push("wrangler containers images list failed: " + tail(images.stderr, 3));
+  // Only the exact objects destroy reported as kept may remain.
+  const refs = await registryRefs().catch((error) => String(error.message ?? error));
+  if (typeof refs === "string") problems.push("the registry's listing could not be read: " + refs);
   else {
-    // Only the exact tags destroy reported as refused snapshots may remain.
-    // This sees tags, not untagged registry entries.
-    const refs = JSON.parse(images.stdout).flatMap((image) => image.name.includes(target) ? image.tags.map((tag) => image.name + ":" + tag) : []);
-    const unexpected = refs.filter((ref) => !retainedSnapshotTags.includes(ref));
-    if (unexpected.length > 0) problems.push("registry tag(s) remain that destroy did not report as refused snapshots: " + unexpected.join(", "));
-    else notes.push(refs.length === 0 ? "no registry tag" : "no registry tag except the " + refs.length + " snapshot tag(s) destroy reported");
+    const reported = registryObjectsKept.map((object) => object.ref);
+    const unexpected = refs.filter((ref) => !reported.includes(ref));
+    if (unexpected.length > 0) problems.push("the registry still lists object(s) that destroy did not report as kept: " + unexpected.join(", "));
+    else notes.push(refs.length === 0 ? "nothing in the registry's listing" : "nothing in the registry's listing except the " + refs.length + " object(s) destroy reported as kept");
   }
   if (problems.length > 0) throw new Error(problems.join("; "));
   return notes.join(", ");
 }
 
 let deployStarted = false;
-let retainedSnapshotTags = [];
+let registryObjectsKept = [];
+// The account in a deploy result's image reference.
+let registryAccount;
 let failure;
 log("Live Cloudflare check: target " + target + ", Eve " + options.eve + (summary.upgradedTo === null ? "" : " -> " + options.upgradeTo) + ", work folder " + workRoot);
 
@@ -673,11 +701,10 @@ try {
     try {
       await step("eden destroy", async () => {
         const output = await eden("destroy", { withEnvFile: false, interruptible: false });
-        retainedSnapshotTags = output.retainedSnapshotTags ?? [];
-        if (retainedSnapshotTags.length === 0) return undefined;
-        summary.retainedSnapshotTags = retainedSnapshotTags;
-        summary.retainedSnapshotsExpiryEstimate = output.retainedSnapshotsExpiryEstimate;
-        return "Cloudflare's registry refused to delete " + retainedSnapshotTags.length + " snapshot tag(s); estimated removal by " + output.retainedSnapshotsExpiryEstimate + " if nothing restores them:\n" + retainedSnapshotTags.join("\n");
+        registryObjectsKept = output.registryObjectsKept ?? [];
+        if (registryObjectsKept.length === 0) return undefined;
+        summary.registryObjectsKept = registryObjectsKept;
+        return "Cloudflare's registry still lists " + registryObjectsKept.length + " object(s) that destroy tried to delete:\n" + registryObjectsKept.map((object) => object.ref + " (" + object.class + ")").join("\n");
       });
       await step("Nothing of the target remains", verifyGone);
       cleaned = true;

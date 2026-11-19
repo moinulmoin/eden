@@ -146,11 +146,15 @@ instance and image (including legacy), and the registry repositories this
 target pushed. It proves absence before clearing the target's `CURRENT`
 pointer, and never deletes by prefix or a broad account search.
 
-Cloudflare's registry refuses to delete container snapshots. Destroy asks
-for every tag to be deleted. When the only tags left are ones the registry
-refused as snapshots, destroy still succeeds and adds the warning
-`EVE_SNAPSHOTS_RETAINED` with those exact tags and an estimated removal
-date. Any other tag left behind fails destroy with
+Destroy deletes everything Cloudflare's registry lists for those
+repositories: every tag, and every `sha256:` entry, which the registry
+lists for each manifest. Cloudflare's registry keeps some objects. It
+refuses to delete container snapshots and the chain artifact it makes for
+each pushed image, and it can accept the delete of a manifest and still
+list it at least 30 seconds later. When such objects are all that is left,
+destroy still succeeds and adds the warning `EVE_REGISTRY_OBJECTS_KEPT`
+with each object and the registry's answer for it. Anything else left
+behind, and a final listing that cannot be read in full, fails destroy with
 `EVE_DESTROY_IMAGES_RETAINED`.
 
 Destroy reads the local deployment records and the Cloudflare account, and
@@ -450,6 +454,10 @@ Cloudflare adds tags to a repository when it stores a snapshot of the
 container's disk. The ones seen so far are named `rootfs-snapshot-*` and
 `rootfs-set-*`. Its registry refuses to delete them. Cloudflare documents
 that it removes a snapshot 30 days after it was created or last restored.
+Cloudflare also adds one artifact of type
+`application/vnd.cloudchamber.btrfs-chain.v1` for each pushed image, and
+its registry refuses to delete that too. The artifact has no tag, so
+`wrangler containers images list` does not show it.
 
 The Worker is published with `compatibility_date` `2026-04-01`, the
 `enable_ctx_exports` compatibility flag, and `workers_dev` enabled. The
@@ -630,9 +638,9 @@ A successful destroy ends with:
   retained: local deployment records under .eden/eve-deploy
 ```
 
-When Cloudflare's registry refused to delete snapshot tags, a
-`! EVE_SNAPSHOTS_RETAINED — <message>` warning line and one
-`  kept: <repository>:<tag>` line per tag come before it. A deploy that
+When Cloudflare's registry keeps objects, a
+`! EVE_REGISTRY_OBJECTS_KEPT — <message>` warning line and one
+`  kept: <ref> (<class>)` line per object come before it. A deploy that
 removes a superseded version's registry repository prints the same lines.
 
 A target that was already absent prints `✓ <name> (<environment>) is already
@@ -680,8 +688,7 @@ the command produced them.
 | `name` | string | The exact target name |
 | `checks` | array | `id`, `status` (`passed`, `failed`, `blocked`, `skipped`), `message`, and `remediation` when present |
 | `warnings` | array | `id`, `message`, and `remediation` when present |
-| `retainedSnapshotTags` | array of strings, on deploy with the warning `EVE_SNAPSHOTS_RETAINED` | Each tag of a superseded version's repository that the registry refused to delete as a snapshot, as `<repository>:<tag>` |
-| `retainedSnapshotsExpiryEstimate` | string, with those tags | The same estimated date as on destroy |
+| `registryObjectsKept` | array of objects, on deploy with the warning `EVE_REGISTRY_OBJECTS_KEPT` | Each object of a superseded version's repository that Cloudflare's registry still lists after Eden's delete, with the same `ref` and `class` as on destroy |
 | `candidate` | object or `null` | `generationId`, `sourceDigest`, `outputDigest`, and `imageDigest` when the image was built |
 | `deployment` | object, on deploy | `status`, `operation` (`create` or `update`), `targetKey`, `deploymentId`, `workerName`, `containerApplicationName`, `stableContainerInstanceName`, `stableWorkersDevOrigin`, `imageReference`, `supersededGenerationId` and `supersededImageReference` on an update, `runtimeVariableNames`, and `evidenceRetained` |
 
@@ -694,8 +701,7 @@ the command produced them.
 | `environment` | `"preview"` or `"production"` | |
 | `name` | string | The exact target name |
 | `checks` | array | Same shape as the preflight and deploy checks |
-| `warnings` | array, only on a successful destroy that leaves snapshot tags | One `EVE_SNAPSHOTS_RETAINED` entry with `id`, `message`, and `remediation` |
-| `retainedSnapshotTags` | array of strings, with that warning | Each tag the registry refused to delete as a snapshot, as `<repository>:<tag>`. No other tag is left |
-| `retainedSnapshotsExpiryEstimate` | string, with that warning | A UTC date (`YYYY-MM-DD`): the day of the run plus 30 days. An estimate that assumes nothing restores a snapshot later, not a confirmation that Cloudflare removed anything |
+| `warnings` | array, only on a successful destroy that leaves registry objects | One `EVE_REGISTRY_OBJECTS_KEPT` entry with `id`, `message`, and `remediation` |
+| `registryObjectsKept` | array of objects, with that warning | Each object Cloudflare's registry still lists after Eden's delete. `ref` is `<repository>:<tag>`, or `<repository>@sha256:<digest>` for a manifest's own entry. `class` is the registry's answer for that object: `refused-snapshot`, `refused-singleton-artifact`, or `accepted-still-listed`. Nothing else is left in the registry's listing |
 
 Return to the [documentation index](./README.md).

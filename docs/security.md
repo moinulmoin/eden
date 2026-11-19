@@ -125,24 +125,43 @@ Container application, its Durable Objects, registry images, and, only when
 your project has schedules, one Cron Trigger. The exact names are listed in
 the [reference](./reference.md).
 Eden also reads the target's state from Cloudflare's API with requests of
-its own. One of its own requests can change something, and it is Eden's
-first direct registry mutation: when the registry answers Wrangler's delete
-of a tag with `403`, Eden repeats that delete for the same tag against
-`registry.cloudflare.com` to read the registry's answer, because Wrangler
-prints only the status. Eden sends no request of its own after any other
-Wrangler failure. For this, Eden asks Wrangler for a registry credential
+its own. Its own requests to `registry.cloudflare.com` can change
+something. They name only repositories that the deployment record proves
+this target owns. When `eden destroy` or an update cleans up such a
+repository, Eden:
+
+- reads the registry's listing of the repository, because Wrangler lists
+  tags only;
+- deletes each `sha256:` entry of the listing by digest, because Wrangler
+  deletes tags only. The registry lists one such entry for every manifest,
+  with or without a tag;
+- repeats the delete of a tag when the registry answered Wrangler's delete
+  of that tag with `403`, to read the registry's answer, because Wrangler
+  prints only the status. Eden repeats no tag delete after any other
+  Wrangler failure.
+
+For these, Eden asks Wrangler for a registry credential
 (push and pull on your account's registry, valid for five minutes), checks
-that it names the account in the deployment record, and reuses it within
-one command until four minutes have passed since it asked. It drops a
-credential the registry answers with `401`. The request uses a connection
+that it names the account in the deployment record, and reuses it for that
+account only, within one command, until four minutes have passed since it
+asked. It drops a
+credential the registry answers with `401`. Each request uses a connection
 of its own: no proxy, certificate verification always on, no redirect
-followed, 30 seconds at most, and at most 4 KiB of response read. Requests
-that get no answer may take 60 seconds in total in one command. After that
-Eden sends no more of them. `eden destroy` then fails only if a tag that
-was not confirmed is still in its final inventory, or if it cannot read
-that inventory. `eden deploy` fails `VAL-LIFE-007` when it cannot prove
-that every other tag of the repository is gone, which includes a list it
-cannot read after the deletes. Eden does not store or print the credential.
+followed, 30 seconds at most. Eden reads at most 4 KiB of the answer to a
+delete and 1 MiB of one page of a listing. Requests that get no answer may
+take 60 seconds in total in one command. After that Eden sends no more of
+them. `eden destroy` then fails if anything without
+one of the registry's kept answers is still in its final listing, or if it
+cannot read that listing. `eden deploy` fails `VAL-LIFE-007` when it cannot
+prove that everything else in the repository is gone, which includes a
+listing it cannot read. A listing counts as read only when every page is
+exactly in the form the registry sent on 2026-11-18: the recorded account
+and the repository asked for, entries in ascending order, and a `Link`
+header that continues from the page's last entry and is empty only after
+an empty page, within 100 pages. An answer that names a field twice is
+refused, for a listing and for a refusal alike. Eden cannot tell a stale answer from a
+current one when both pass these checks.
+Eden does not store or print the credential.
 Wrangler runs in a fresh, private Eden-owned temporary directory outside the
 project, with its configuration file and account cache pinned inside it.
 Project `.env` files and configuration or cache files planted in a shared
@@ -166,15 +185,41 @@ temporary directory cannot redirect account operations or secret uploads.
   records and name reuse, not a malicious project carrying a forged `.eden`
   record with a known account and release ID. Do not trust `.eden` state from
   an untrusted project.
-- **Snapshots outlive destroy.** A snapshot holds the container's whole disk
-  from the moment it was taken, including the agent's files and, with the
-  default local World, its workflow state. Cloudflare's registry refuses to
-  delete one. Cloudflare documents that it removes a snapshot 30 days after
-  it was created or last restored; Eden cannot confirm when that happens.
-  Until then the tags stay in your account's Cloudflare registry, and a
-  registry read with your account's credentials still returns the
-  snapshot's manifest. `destroy` lists the exact tags and an estimated date
-  in `EVE_SNAPSHOTS_RETAINED`.
+- **Registry cleanup deletes whole repositories.** It deletes every tag and
+  manifest the registry lists in a repository that the record proves this
+  target owns, including one that appears while it runs. Eden never runs it
+  on a repository that holds the image it just promoted or the image of a
+  version it still keeps. Eden works with one spelling of an image,
+  `registry.cloudflare.com/<account>/<repository>@sha256:<digest>`, and
+  refuses any other reference before it changes anything on the target. A recorded image that is
+  not in that form cannot be placed in a repository, so it stops every
+  sweep of that deploy. `eden deploy` and `eden destroy` take one lock in
+  the project's `.eden` folder, which stops two runs from the same folder
+  only. It does not stop a copy of the project on another machine, or any
+  other push to the registry: an image pushed to an owned repository while
+  cleanup runs can be deleted.
+- **Some registry objects outlive destroy.** Destroy deletes everything
+  Cloudflare's registry lists for the target, and Cloudflare keeps three
+  kinds of object. `destroy` lists each one, with the registry's answer, in
+  `EVE_REGISTRY_OBJECTS_KEPT`.
+  - A snapshot holds the container's whole disk from the moment it was
+    taken, including the agent's files and, with the default local World,
+    its workflow state. Cloudflare's registry refuses to delete one.
+    Cloudflare documents that it removes a snapshot 30 days after it was
+    created or last restored; Eden cannot confirm when that happens.
+  - The registry can accept the delete of a manifest and still list it.
+    The one seen was an earlier image with no tag, still listed 18 minutes
+    later. An image manifest names the layers of an image. They hold the
+    project's built code and no `--env-file` value.
+  - Cloudflare makes a chain artifact for each pushed image, and its
+    registry refuses to delete it. Cloudflare does not document what it
+    holds.
+
+  Until Cloudflare removes them, these objects stay in your account's
+  registry, and a registry read with your account's credentials still
+  returns them. Not known: when Cloudflare removes chain artifacts and
+  untagged manifests, and whether kept objects count toward the 50 GB of
+  image storage per account in Cloudflare's Containers limits.
 - **Production is explicit.** `--env production` and `destroy` always require
   `--name`.
 

@@ -148,7 +148,7 @@ function eveErrorRemediation(code: string): string {
     case "EVE_DESTROY_ABSENCE_UNPROVEN":
       return "Wait a minute for Cloudflare to settle, then rerun eden destroy with the same --project, --env, and --name. Keep the .eden folder; never delete resources by name prefix.";
     case "EVE_DESTROY_IMAGES_RETAINED":
-      return "Rerun eden destroy with the same --project, --env, and --name, or delete only the listed repository tags with npx wrangler@4.147.0 containers images delete <repository:tag>. A tag that Cloudflare's registry refuses to delete as a snapshot is reported as EVE_SNAPSHOTS_RETAINED and does not count here. Eden confirms that refusal with a direct request to registry.cloudflare.com and never uses a proxy for it; if this machine cannot reach the registry directly, rerun eden destroy from one that can.";
+      return "Rerun eden destroy with the same --project, --env, and --name: it deletes what the registry still lists, verifies the registry, and clears the record. Deleting tags by hand with npx wrangler@4.147.0 containers images delete <repository:tag> removes no sha256: entry and does not clear the record, so rerun eden destroy afterwards. An object with one of the three kept answers (refused-snapshot, refused-singleton-artifact, accepted-still-listed) is reported as EVE_REGISTRY_OBJECTS_KEPT and does not count here. Eden reads the registry's listing and each answer with direct requests to registry.cloudflare.com and never uses a proxy for them; if this machine cannot reach the registry directly, rerun eden destroy from one that can.";
     case "EVE_DESTROY_POINTER_UNCLEARED":
       return "The Cloudflare resources are gone; only the local .eden/eve-deploy/targets/<env>-<name>/CURRENT pointer is left. Check that the .eden folder is writable, then rerun eden destroy with the same --project, --env, and --name.";
     case "EVE_EXECUTION_FAILED":
@@ -185,11 +185,11 @@ Options:
   --json               Print the machine-readable result object (default: human summary)
   --help               Show this help
 
-When an update removes a superseded version and Cloudflare's registry refuses
-to delete its container snapshot tags, deploy adds the warning
-EVE_SNAPSHOTS_RETAINED. With --json the result then lists it in warnings and
-adds retainedSnapshotTags and retainedSnapshotsExpiryEstimate (an estimated
-date, not a confirmation).
+When an update removes a superseded version and Cloudflare's registry still
+lists some of its objects, deploy adds the warning EVE_REGISTRY_OBJECTS_KEPT.
+With --json the result then lists it in warnings and adds registryObjectsKept:
+one { ref, class } per object, where class is the registry's answer
+(refused-snapshot, refused-singleton-artifact, or accepted-still-listed).
 `,
   destroy: `Usage: eden destroy --name <name> [--project <path>] [--env <preview|production>] [--json]
 
@@ -202,10 +202,14 @@ Options:
   --json               Print the machine-readable result object (default: human summary)
   --help               Show this help
 
-Cloudflare's registry refuses to delete container snapshot tags. When those
-are all that is left, destroy succeeds with the warning EVE_SNAPSHOTS_RETAINED.
-With --json the result then adds warnings, retainedSnapshotTags, and
-retainedSnapshotsExpiryEstimate (an estimated date, not a confirmation).
+Destroy deletes everything Cloudflare's registry lists for the target. The
+registry keeps some objects: it refuses to delete container snapshots and
+its own chain artifacts, and it can accept the delete of a manifest and
+still list it. When those are all that is left, destroy succeeds with
+the warning EVE_REGISTRY_OBJECTS_KEPT. With --json the result then adds
+warnings and registryObjectsKept: one { ref, class } per object, where class
+is the registry's answer (refused-snapshot, refused-singleton-artifact, or
+accepted-still-listed).
 `,
 };
 

@@ -4,6 +4,227 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Registry cleanup, run on Cloudflare (2026-11-19)
+
+Run on macOS with Docker, against the maintainer's Cloudflare account, with
+Wrangler `4.147.0`, from 2026-11-18 `23:13Z` to 2026-11-19 `01:02Z`. The
+CLI and the Cloudflare World were built from the branch of
+[#13](https://github.com/moinulmoin/eden/pull/13) at `921b741`, which is
+main at `2789345` with this change. The full check ran on the same source
+files just before they were committed.
+
+What the registry sends, read with a credential that can only pull:
+
+- `tags/list` on an 18-entry repository, with `n=1000` and with `n=7`,
+  and on a repository the registry does not know. Each page's body was
+  exactly `{"name":"<account>/<repository>","tags":[…]}`, in ascending
+  order. Each `Link` header was the full URL of the request, path and
+  query, then `?n=<n>&last=<cursor>; rel=next`. The cursor was the page's
+  last entry as listed, and empty only on the empty last page. A request
+  whose own cursor was written `sha256%3A…` came back with `%3A` in the
+  header. The unknown repository answered `200` with no entries and an
+  empty cursor. Eden's page parser accepted every page as it was.
+- `GET /v2/_catalog` for the whole account no longer answered: `500`
+  after 16 seconds with `tags=true`, no answer in 150 seconds without it,
+  and `500` with `tags=true&n=1000`. With `tags=true`, pages of 5 and 25
+  entries answered `200`. Pages of 100 answered three times and then
+  failed. A page holds `n`
+  entries in the order of the registry's storage keys, so one repository
+  can span pages. The `Link` header was
+  `https://registry.cloudflare.com/v2/_catalog?n=<n>&last=<account>/<account>/<repository>/manifests/<entry>&tags=true; rel=next`.
+  A start key past the last repository got no answer in 60 seconds. The
+  same request answered `500` and then `200` a few seconds later. The
+  catalog's last page was never seen.
+- So the live check no longer reads the whole catalog. It starts at the
+  key just before the target's repositories, reads pages of 25, tries a
+  page up to four times, and stops at the first repository after the
+  target's. For sets of repositories that held from 0 to 137 refs it gave
+  the same refs as `tags/list` on each repository. One early comparison
+  differed, 122 refs against 137, and matched when it was repeated; the
+  cause was not found.
+
+Full run of `pnpm run check:live`, target `eden-live-20261119-174c653b`,
+`00:10:06Z` to `00:25:56Z`, Eve `0.91.0` to `1.0.2`, the World packed
+from this workspace (version `0.12.0`), a 90-second idle window. All 18
+steps passed.
+
+- `eden preflight` passed 14 checks with no warnings in 96 seconds. The
+  fresh deploy took 175 seconds, the same-version update 117 seconds, and
+  the deploy on Eve `1.0.2` 179 seconds, all on the same URL.
+- Session `wrun_01M7RJG9XMBDBCK56EWRX301EN` answered after each deploy and
+  after the sleep, with its earlier turns in its stream and its file
+  intact. After 165 seconds with no requests the first health request took
+  5.2 seconds, and the server process was 6 seconds old.
+- `eden destroy` ended with `destroyed` in 108 seconds and reported 16
+  objects in `EVE_REGISTRY_OBJECTS_KEPT`. In the repository of the Eve
+  `0.91.0` version: six snapshot tags, three snapshot manifests, two chain
+  artifacts, and the first image, which lost its tag to the second push
+  (`accepted-still-listed`). In the repository of the Eve `1.0.2`
+  version: two snapshot tags, one snapshot manifest, and one chain
+  artifact.
+- The check's catalog read found those 16 refs and no others. A separate
+  `tags/list` read of both repositories gave the same 16. The URL returned
+  404, and Wrangler showed no Worker, no secrets, and no Container
+  application.
+
+Two more runs used a copy of the check's script with extra steps. Each kept
+a copy of a deployed image in a repository of its own, under a tag, with the
+same digest. Each compared what the registry listed with what Eden
+reported, entry by entry.
+
+Affinity retirement, target `eden-live-20261119-4aa8f322`, `00:26:58Z` to
+`00:49:32Z`, all 28 steps passed.
+
+- The Eve `0.91.0` version slept once, got a second image from a
+  same-version update, and stayed alive beside the Eve `1.0.2` version
+  until its one session was ended with `POST /eve/v1/session/<id>/end`
+  (`202`).
+- The script's own deletes in that version's repository: a snapshot tag
+  and a snapshot manifest each answered `403`, content type
+  `application/json`, body
+  `{"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}`.
+  A chain artifact answered `409`, content type `application/json`, body
+  `{"code":"SINGLETON_ARTIFACT_EXISTS","subjectDigest":"sha256:…","artifactType":"application/vnd.cloudchamber.btrfs-chain.v1","committedDigest":"sha256:…"}`.
+  In it `committedDigest` was the digest in the delete request and
+  `subjectDigest` was the image the artifact names as its subject, as for
+  two other chain artifacts deleted the evening before. Eden reads neither
+  field. The listing was unchanged afterwards.
+- The next `eden deploy` retired the version in 265 seconds. `VAL-LIFE-007`
+  passed and the result reported 15 kept objects: 12 `refused-snapshot`,
+  2 `refused-singleton-artifact`, and the first image as
+  `accepted-still-listed`. The repository listed those 15 entries and no
+  others, and `HEAD` on each answered `200`. The `candidate` tag and the
+  second image were gone.
+- The copy of the first image, same digest, in the script's repository was
+  still listed, `HEAD` answered `200`, and `docker pull` by digest
+  succeeded. The session on Eve `1.0.2` ran bash again.
+- `eden destroy` ended with `destroyed` in 150 seconds and reported 24
+  kept objects: 18 `refused-snapshot`, 4 `refused-singleton-artifact`,
+  and 2 `accepted-still-listed`. The two repositories listed those 24
+  entries and no others. Both copies were intact in the same way.
+
+Superseded repository, target `eden-live-20261119-07476f99`, `00:50:45Z`
+to `01:01:49Z`, Eve `1.0.2` with Eve's local World in an npm project, all
+17 steps passed.
+
+- The first repository listed the `candidate` tag, the image, and its
+  chain artifact. The update pushed to a new repository and cleaned up the
+  first one: `VAL-LIFE-007` passed and the result reported the chain
+  artifact as `refused-singleton-artifact`. The first repository listed
+  only that artifact. The image and its tag were gone.
+- The copy of that image, same digest, in the script's repository was
+  still listed. `HEAD` on the manifest and on each of its 20 blobs
+  answered `200`, and `docker pull` by digest succeeded. The target's
+  health answered ready.
+- `eden destroy` ended with `destroyed` in 38 seconds and reported the two
+  chain artifacts, one in each repository. The repositories listed those
+  two entries and no others. Both copies were intact in the same way.
+
+The script removed its four copies with
+`wrangler containers images delete`. Each repository then listed nothing.
+
+Tags and untagged images, in a repository made for the test:
+
+- Two images under two tags. `wrangler containers images delete` on one
+  tag removed the tag and its image from the listing at once, and `HEAD`
+  on the digest answered `404`.
+- A third image pushed under the other tag left the second image listed
+  with no tag. `DELETE` of that image by digest answered `204` with no
+  body. It was still listed 35 seconds later and `HEAD` answered `200`.
+  After the tag and the third image were deleted, a second `DELETE` of it
+  answered `204` again and it stayed.
+
+So in these runs an image went away when its tag was deleted, and stayed
+when it had lost its tag to a later push.
+
+Before the full run passed, two runs failed at the fresh deploy with
+`DEPLOY_INDETERMINATE` after 223 and 236 seconds: `eden deploy` stopped
+waiting for the image push after 120 seconds. The registry was slow that
+evening. One new 64 MB layer took 35 seconds to push and its manifest 39
+seconds more, on an uplink that measured about 70 Mbit/s. The second
+upload finished after Eden stopped waiting: the repository held a
+`candidate` tag and its image, with no Worker and no deployment record.
+After the first, every layer was already in the registry when the push
+was repeated by hand. `eden destroy` answered `EVE_DESTROY_RECORD_UNPROVEN`
+both times, and the two images were removed with
+`wrangler containers images delete`. The push now gets ten minutes
+([#16](https://github.com/moinulmoin/eden/pull/16)).
+
+Left in the account by these runs: the 42 objects that the three destroys
+reported, and the one untagged 36-byte image from the tag test.
+
+Not known: the catalog's last page and how the reader ends for a target
+whose repositories sort last, when Cloudflare removes chain artifacts and
+untagged manifests, whether kept objects count toward the 50 GB of image
+storage, and what `subjectDigest` and `committedDigest` mean beyond what
+was seen.
+
+## What the registry lists after destroy (2026-11-18)
+
+Read on macOS against the maintainer's Cloudflare account, with a registry
+credential from Wrangler `4.147.0`, between `14:33Z` and `15:13Z`. These
+observations are why destroy now reads the registry's own listing and
+deletes entries by digest.
+
+- `GET /v2/_catalog?tags=true` and `GET /v2/<account>/<repository>/tags/list`
+  list each tag and one `sha256:<digest>` entry for each manifest.
+  `wrangler containers images list` leaves the `sha256:` entries out: the
+  catalog had 142 repositories, Wrangler listed 15. `tags/list` pages with
+  `n` and `last`, in sorted order, and a page after the last entry is
+  empty. A repository the registry does not know lists as `200` with no
+  entries.
+- Each `tags/list` page answered `{"name":"<account>/<repository>","tags":[…]}`,
+  for an unknown repository too. Each carried a `Link` header that ended in
+  `&last=<cursor>; rel=next`. The cursor was the page's last entry, and
+  empty on an empty page. The header's URL was the request's URL with
+  `?n=<n>&last=<cursor>` appended, even when the request already had a
+  query. A 29-entry repository read with `n=7` and with `n=1000` gave the
+  same 29 entries as the catalog.
+- The two live-check targets destroyed earlier that day each still listed
+  twelve entries in the repository of their Eve `0.91.0` version: six
+  snapshot tags, three snapshot manifests, two artifacts of type
+  `application/vnd.cloudchamber.btrfs-chain.v1`, and one image manifest
+  with no tag. The untagged image was the first one pushed to a repository
+  that later got a second push.
+- `DELETE` of a snapshot manifest by digest answered `403` with
+  `{"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}`,
+  as for a snapshot tag.
+- `DELETE` of a chain artifact by digest answered `409` with
+  `{"code":"SINGLETON_ARTIFACT_EXISTS","subjectDigest":"sha256:…","artifactType":"application/vnd.cloudchamber.btrfs-chain.v1","committedDigest":"sha256:…"}`.
+  The answer was the same right after the registry accepted the delete of
+  the image the artifact names as its subject.
+- `DELETE` of an untagged image manifest by digest answered `204`, and the
+  manifest stayed. One was deleted at `14:55:23Z`; at `15:13:19Z` `HEAD` on
+  its digest still answered `200` and the listing still had it. A second
+  one, deleted at `15:11:56Z`, was still listed at `15:13:19Z`.
+  `PUT /v2/gc/layers` afterwards answered `200` with an empty `deleted`
+  list. Putting a new tag on such a manifest and deleting that tag with
+  `wrangler containers images delete` printed `Deleted` and left the
+  manifest listed.
+- During the run on target `eden-live-20261118-17bac346`, the image that
+  held the `candidate` tag left the listing about 15 seconds after destroy
+  deleted the tag.
+- Dated from their configs at `14:58Z`, the account's untagged entries were
+  34 image manifests (oldest 2026-10-07), 188 chain artifacts (oldest
+  2026-10-06), and 99 snapshot manifests (oldest 2026-10-06). 18 of the
+  snapshot manifests were created more than 30 days earlier; when a
+  snapshot was last restored cannot be read.
+
+Not known: when Cloudflare removes chain artifacts and untagged manifests,
+and whether kept objects count toward the 50 GB of image storage per
+account in Cloudflare's limits. Cloudflare's image-management and limits
+pages do not say.
+
+Destroy with this change ran on Cloudflare the next day; see the entry
+above. Before that it was checked with a stand-in for Wrangler and the
+registry: each of the three kept answers, an
+accepted delete that leaves the listing, any other answer, an entry that
+appears during cleanup, entries that keep appearing, a listing in several
+pages, a listing that cannot be read at the start or at the end, an answer
+for another account or repository, a page whose cursor contradicts it, a
+second accepted delete late in the wait, a repository that holds a deployed
+image, and an image reference in another spelling.
+
 ## Destroy with a bounded wait on the registry (2026-11-18)
 
 Run on macOS with Docker, against the maintainer's Cloudflare account, with
