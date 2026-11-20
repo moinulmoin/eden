@@ -5243,6 +5243,44 @@ describe("eden deploy in-place update", () => {
     expect(own.operations).toContain("publish");
   });
 
+  test("an update names the live Worker's release as the one it replaces, not the one the local pointer names", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    const { generationRoot } = await createOwnedTargetFixture(root);
+    // Another deploy published "eve-deploy-live"; its record is here, but
+    // CURRENT still points at the older one.
+    const record = JSON.parse(await readFile(join(generationRoot, "deployment.json"), "utf8")) as { identity: Record<string, unknown> };
+    record.identity.generationId = "gen-live";
+    record.identity.releaseId = "eve-deploy-live";
+    await mkdir(join(generationRoot, "..", "gen-live"), { recursive: true });
+    await writeFile(join(generationRoot, "..", "gen-live", "deployment.json"), JSON.stringify(record), "utf8");
+    const read = existingTargetRead();
+    let publishedPreviousRelease: unknown;
+    const code = await runEdenCli(
+      ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+      {
+        cwd: root,
+        stdout: () => undefined,
+        eveControlPlane: {
+          ...updateControlPlane(root, [], {
+            onPublish: (request) => {
+              publishedPreviousRelease = request.hostConfig.worker.vars.EDEN_EVE_PREVIOUS_RELEASE_ID;
+            },
+          }),
+          cloudflareRead: async () => {
+            const live = await read();
+            return {
+              ...live,
+              target: { ...live.target, providerEvidence: { ...live.target.providerEvidence, workerReleaseId: "eve-deploy-live" } },
+            };
+          },
+        },
+      },
+    );
+    expect(code).toBe(0);
+    expect(publishedPreviousRelease).toBe("eve-deploy-live");
+  });
+
   test("a retry after a health-failed update keeps the already-published migration tag", async () => {
     const root = await createRoot();
     await writeProject(root);
