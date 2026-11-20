@@ -8,11 +8,36 @@ see [Eve compatibility](./eve-compatibility.md).
 
 Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
 Cloudflare account, with `cf` `1.0.0-rc.2` and an OAuth login, on branch
-`eden-19/cf-cli` at `331ff53`. At that commit Eden reads Cloudflare's API
-itself and takes the login's token from `cf`. `CLOUDFLARE_API_TOKEN` was not
-set, so every API read in these runs used that token.
+`eden-19/cf-cli`. From `331ff53` on, Eden reads Cloudflare's API itself and
+takes the login's token from `cf`. `CLOUDFLARE_API_TOKEN` was not set, so
+every API read in these runs used that token.
 
-Full run of `pnpm run check:live`, target `eden-live-20261120-11615232`,
+At `8612338`, where the listener that takes the token keeps its port until
+`cf` has exited, and with Eve `1.1.0` as the latest fixture:
+
+- Full run of `pnpm run check:live`, target `eden-live-20261120-e2e38459`,
+  `17:41:53Z` to `17:55:44Z`, Eve `0.91.0` to `1.1.0`. All 18 steps
+  passed. Preflight passed 14 checks in 75 seconds. `cf deploy` was
+  interrupted and exited 1 after 5 refused reads; Eden ran
+  `cf containers applications create` and `cf workers triggers deploy`,
+  both exit 0, and the fresh deploy took 170 seconds. The update took 119
+  seconds and the deploy on Eve `1.1.0` 170 seconds. `eden destroy` took 52
+  seconds and reported 15 kept registry objects; nothing else of the target
+  remained.
+- The run before it at the same commit failed
+  (`eden-live-20261120-a33b677f`, `17:31:34Z` to `17:37:56Z`). The fresh
+  deploy passed. The update stopped before the build with
+  `VAL-CLI-007-TARGET-CONFLICT` (`did not return a complete exact-target
+  result`) and `VAL-HOST-006`, and published nothing. Destroy then passed.
+  Which read failed was not recorded. Afterwards 40 rounds of taking the
+  token, `cf auth whoami`, and one API read all succeeded, and the rerun
+  above passed.
+- **A first deploy of a new name** (`eden19-f4`, `17:55Z` to `18:00Z`):
+  deploy exited 0 with health 200, a second deploy exited 0, destroy exited
+  0, and health was 404. The same sequence passed on `eden19-f3`
+  (`17:26Z` to `17:31Z`).
+
+At `331ff53`, full run of `pnpm run check:live`, target `eden-live-20261120-11615232`,
 `16:27:03Z` to `16:42:14Z`, Eve `0.91.0` to `1.0.2`, the World packed from
 this workspace (version `0.14.0`), a 90-second idle window. All 18 steps
 passed on the first run.
