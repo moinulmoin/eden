@@ -120,6 +120,12 @@ What it does, in order:
     destroy step lists them, and the final JSON object has them in
     `registryObjectsKept`.
 
+The deployed Worker keeps no logs. From the first deploy on, the script
+records `wrangler tail` for the target into the work folder and restarts it
+before each later deploy. When a step fails, it prints the invocations that
+threw or were reset, with their exception messages. A passing run prints
+nothing from it.
+
 Each step prints `✓`, `✗`, or `-` (skipped) with its time. The last output
 is one JSON object with `ok`, the target, and every step. The exit code is
 `0` when no step fails.

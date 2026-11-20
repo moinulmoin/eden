@@ -4038,6 +4038,7 @@ describe("eden deploy in-place update", () => {
     const operations: string[] = [];
     let publishedMigrations: unknown;
     let publishedImage: unknown;
+    let publishedPreviousRelease: unknown;
 
     await expect(
       runEdenCli(
@@ -4049,6 +4050,7 @@ describe("eden deploy in-place update", () => {
           stderr: (line) => errors.push(line),
           eveControlPlane: updateControlPlane(root, operations, {
             onPublish: (request) => {
+              publishedPreviousRelease = request.hostConfig.worker.vars.EDEN_EVE_PREVIOUS_RELEASE_ID;
               publishedMigrations = request.hostConfig.worker.migrations;
               publishedImage = request.identity.containerImage;
             },
@@ -4074,6 +4076,8 @@ describe("eden deploy in-place update", () => {
       { tag: "v1", new_sqlite_classes: ["EveHostDurableContainer"] },
     ]);
     expect(publishedImage).toBe(`registry.cloudflare.com/account-test/eve@sha256:${"d".repeat(64)}`);
+    // The published Worker names the release it replaces, so its object serves that release's Workers.
+    expect(publishedPreviousRelease).toBe("eve-deploy-prior");
     expect(operations).toEqual([
       "publish",
       "health",
@@ -5237,6 +5241,44 @@ describe("eden deploy in-place update", () => {
     const own = await run("eve-deploy-this-project");
     expect(own.code).toBe(0);
     expect(own.operations).toContain("publish");
+  });
+
+  test("an update names the live Worker's release as the one it replaces, not the one the local pointer names", async () => {
+    const root = await createRoot();
+    await writeProject(root);
+    const { generationRoot } = await createOwnedTargetFixture(root);
+    // Another deploy published "eve-deploy-live"; its record is here, but
+    // CURRENT still points at the older one.
+    const record = JSON.parse(await readFile(join(generationRoot, "deployment.json"), "utf8")) as { identity: Record<string, unknown> };
+    record.identity.generationId = "gen-live";
+    record.identity.releaseId = "eve-deploy-live";
+    await mkdir(join(generationRoot, "..", "gen-live"), { recursive: true });
+    await writeFile(join(generationRoot, "..", "gen-live", "deployment.json"), JSON.stringify(record), "utf8");
+    const read = existingTargetRead();
+    let publishedPreviousRelease: unknown;
+    const code = await runEdenCli(
+      ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+      {
+        cwd: root,
+        stdout: () => undefined,
+        eveControlPlane: {
+          ...updateControlPlane(root, [], {
+            onPublish: (request) => {
+              publishedPreviousRelease = request.hostConfig.worker.vars.EDEN_EVE_PREVIOUS_RELEASE_ID;
+            },
+          }),
+          cloudflareRead: async () => {
+            const live = await read();
+            return {
+              ...live,
+              target: { ...live.target, providerEvidence: { ...live.target.providerEvidence, workerReleaseId: "eve-deploy-live" } },
+            };
+          },
+        },
+      },
+    );
+    expect(code).toBe(0);
+    expect(publishedPreviousRelease).toBe("eve-deploy-live");
   });
 
   test("a retry after a health-failed update keeps the already-published migration tag", async () => {

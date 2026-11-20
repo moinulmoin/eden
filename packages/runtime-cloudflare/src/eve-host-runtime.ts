@@ -26,6 +26,113 @@ import {
 const EVE_CLOUDFLARE_CONTAINERS_CA_PATH =
   "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
 const EVE_HOST_STALE_WORKER_REASON = "stale Worker version";
+/**
+ * How long a request waits for an object that is still on the release before
+ * its caller's. A reset object can come back on the old code until Cloudflare
+ * has the new version where the object runs: 20 s was seen on 2026-11-20.
+ */
+const EVE_HOST_RELEASE_WAIT_MS = 30_000;
+const EVE_HOST_RELEASE_RETRY_DELAYS_MS = [0, 250, 500, 1_000, 2_000, 4_000];
+
+function isStaleRelease(error: unknown): boolean {
+  return error instanceof Error && error.message.includes(EVE_HOST_STALE_WORKER_REASON);
+}
+
+function switchingVersions(retryAfterSeconds: number): Response {
+  return new Response("Eden is switching versions. Retry the request.\n", {
+    status: 503,
+    headers: { "retry-after": String(retryAfterSeconds) },
+  });
+}
+
+/** The release stamp an object uses to place its caller. */
+function releaseHeaders(env: EveHostContainerEnvironment): Record<string, string> {
+  const release = env.EDEN_EVE_RELEASE_ID ?? env.EDEN_EVE_DEPLOYMENT_ID;
+  return {
+    ...(release === undefined ? {} : { "x-eden-eve-release-id": release }),
+    ...(env.EDEN_EVE_PREVIOUS_RELEASE_ID === undefined
+      ? {}
+      : { "x-eden-eve-previous-release-id": env.EDEN_EVE_PREVIOUS_RELEASE_ID }),
+  };
+}
+
+/**
+ * Where an object places a caller. It serves its own release and the one it
+ * replaced. It resets only for the release that names it as the one it
+ * replaces, which proves that caller is newer. Any other release gets a 503,
+ * so two releases can never reset each other.
+ */
+function placeCaller(
+  env: EveHostContainerEnvironment,
+  headers: Headers,
+  caller: string | undefined,
+): "current" | "older" | "newer" | "unknown" {
+  if (caller === undefined || caller === (env.EDEN_EVE_RELEASE_ID ?? env.EDEN_EVE_DEPLOYMENT_ID)) return "current";
+  if (caller === env.EDEN_EVE_PREVIOUS_RELEASE_ID) return "older";
+  return headers.get("x-eden-eve-previous-release-id") === (env.EDEN_EVE_RELEASE_ID ?? env.EDEN_EVE_DEPLOYMENT_ID)
+    ? "newer"
+    : "unknown";
+}
+
+/**
+ * Sends a request that is safe to repeat (a read) until the object stops
+ * resetting for it. An object-wide reset says nothing about whether a request
+ * ran, so a write is never sent through here. No try starts after
+ * `deadline`; a failed stub can stay broken, so `send` resolves the object
+ * anew on every try.
+ */
+async function sendWhileSwitching(
+  send: () => Promise<Response>,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const gone = (): boolean => signal?.aborted === true;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await send();
+    } catch (error: unknown) {
+      if (!isStaleRelease(error)) throw error;
+      const left = deadline - Date.now();
+      if (left <= 0 || gone()) return switchingVersions(5);
+      const delay = EVE_HOST_RELEASE_RETRY_DELAYS_MS[attempt] ?? 4_000;
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(delay, left)));
+      // A timer can fire late; the deadline is checked again before the try.
+      if (Date.now() > deadline || gone()) return switchingVersions(5);
+    }
+  }
+}
+
+/** A retained version's object could not place this release; see `placeCaller`. */
+const EVE_HOST_RETAINED_SWITCHING = new Error("A retained deployment is switching versions.");
+
+type EveWorldNamespace = { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
+const worldsOnThisRelease = new WeakSet<EveWorldNamespace>();
+
+/**
+ * One read-only request before a World call, bounded by `deadline`. A World
+ * object on the release before this one resets itself for it and the call
+ * throws. It proves nothing about routes: it only keeps a World call from
+ * being the request that meets the reset. The World object answers a GET
+ * with 405; only that answer is remembered.
+ */
+async function nudgeWorld(env: EveHostContainerEnvironment, world: EveWorldNamespace, deadline: number): Promise<Response> {
+  if (worldsOnThisRelease.has(world)) return new Response(null, { status: 405 });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const response = await Promise.race([
+      world.get(world.idFromName("world")).fetch(
+        new Request(new URL("/__eden/world/rpc", env.EVE_PUBLIC_ORIGIN), { headers: releaseHeaders(env) }),
+      ),
+      new Promise<Response>((resolve) => {
+        timer = setTimeout(() => resolve(switchingVersions(5)), Math.max(0, deadline - Date.now()));
+      }),
+    ]);
+    if (response.status === 405) worldsOnThisRelease.add(world);
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function deploymentImages(env: EveHostContainerEnvironment): Record<string, EveDeploymentRoute> {
   const raw = env.EDEN_EVE_DEPLOYMENTS;
@@ -372,6 +479,13 @@ export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnviro
   }
 
   override async fetch(request: Request): Promise<Response> {
+    // Cloudflare can keep this object on an earlier release after a deploy,
+    // with that release's route table. It resets only for a container of
+    // the release that replaced its own; every other caller is served as
+    // before.
+    if (placeCaller(this.env, request.headers, request.headers.get("x-eden-eve-release-id") ?? undefined) === "newer") {
+      this.ctx.abort(EVE_HOST_STALE_WORKER_REASON);
+    }
     if (request.method !== "POST") return new Response(null, { status: 405 });
     const result = await this.core.handleRpc(new Uint8Array(await request.arrayBuffer()));
     return new Response(result as Uint8Array<ArrayBuffer>, {
@@ -453,7 +567,23 @@ export async function routeEveOutboundRequest(
       get(id: unknown): { fetch(request: Request): Promise<Response> };
     } | undefined;
     if (world === undefined) return new Response(null, { status: 404 });
-    return world.get(world.idFromName("world")).fetch(request);
+    const deadline = Date.now() + EVE_HOST_RELEASE_WAIT_MS;
+    const nudge = await sendWhileSwitching(() => nudgeWorld(env, world, deadline), deadline);
+    if (nudge.status === 503) return nudge;
+    await nudge.body?.cancel();
+    const headers = new Headers(request.headers);
+    headers.delete("x-eden-eve-release-id");
+    headers.delete("x-eden-eve-previous-release-id");
+    for (const [name, value] of Object.entries(releaseHeaders(env))) headers.set(name, value);
+    try {
+      return await world.get(world.idFromName("world")).fetch(new Request(request, { headers }));
+    } catch (error: unknown) {
+      if (!isStaleRelease(error)) throw error;
+      // The World object was reset while this call was in flight. Whether it
+      // ran is unknown, so it is not sent again.
+      worldsOnThisRelease.delete(world);
+      return switchingVersions(1);
+    }
   }
   if (env.EDEN_EVE_WORLD_CLOUDFLARE && isEveWorkflowInternalRoute(new URL(request.url).pathname)) {
     return new Response(null, { status: 403 });
@@ -527,6 +657,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   private activeDeliveries = 0;
   private activeForwarding = 0;
   private schedulerRoleReconcile: Promise<void> | undefined;
+  private imageReconcile: Promise<void> | undefined;
   private retainedFences: Promise<void> | undefined;
   private readonly deliveryClaims = new Map<EveQueueDeliveryClaim, { generation: number; fail(error: Error): void }>();
 
@@ -573,17 +704,12 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       for (const id of Object.keys(deploymentImages(this.env))) {
         if (id === this.deploymentId) continue;
         const request = new Request(new URL("/__eden/internal/fence-schedules", this.env.EVE_PUBLIC_ORIGIN), {
-          headers: {
-            "x-eden-eve-deployment-id": id,
-            "x-eden-eve-release-id": this.env.EDEN_EVE_RELEASE_ID ?? this.env.EDEN_EVE_DEPLOYMENT_ID!,
-          },
+          headers: { "x-eden-eve-deployment-id": id, ...releaseHeaders(this.env) },
         });
-        let response: Response;
-        try { response = await namespace.getByName(deploymentInstance(this.env, id)).fetch(request); }
-        catch (error) {
-          if (!(error instanceof Error) || !error.message.includes(EVE_HOST_STALE_WORKER_REASON)) throw error;
-          response = await namespace.getByName(deploymentInstance(this.env, id)).fetch(request);
-        }
+        // One try: a retained object still on the old release resets itself
+        // and this throws, and the Worker that owns the request waits.
+        const response = await namespace.getByName(deploymentInstance(this.env, id)).fetch(request);
+        if (response.status === 503) throw EVE_HOST_RETAINED_SWITCHING;
         if (!response.ok) throw new Error(`Cannot fence schedules on retained deployment ${id}.`);
         await response.body?.cancel();
       }
@@ -865,6 +991,10 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     const worldToken = globalThis.crypto.randomUUID();
     await this.ctx.storage.put("eden.eve.host.world-token", worldToken);
     this.envVars.EDEN_WORLD_TOKEN = worldToken;
+    // Both start sources run `expectedImage` (a snapshot is only restored
+    // from that image). Recorded before the start, so a request that inspects
+    // the new container before it reports its image does not replace it.
+    await this.ctx.storage.put(EVE_HOST_CONTAINER_STARTED_IMAGE_KEY, expectedImage);
     runtime.start({
       ...(snapshotId === undefined
         ? { image: expectedImage }
@@ -887,9 +1017,6 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     // A fresh process receives the retained scheduler fence even when its
     // filesystem came from a snapshot of the formerly-current deployment.
     await this.ctx.storage.delete("eden.eve.host.scheduler-fence-pending");
-    // Both start sources run `expectedImage` (a snapshot is only restored
-    // from that image).
-    await this.ctx.storage.put(EVE_HOST_CONTAINER_STARTED_IMAGE_KEY, expectedImage);
     // Intercepts do not survive a container start and late registration lags;
     // register inside the same block before readiness polling.
     await this.registerLoopbackIntercept(runtime);
@@ -905,6 +1032,13 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
    * at start stands in for it.
    */
   private async reconcileRunningImage(): Promise<void> {
+    // One replacement at a time: a second caller that judged the old
+    // container would otherwise destroy the new one the first just started.
+    this.imageReconcile ??= this.replaceStaleImage().finally(() => { this.imageReconcile = undefined; });
+    await this.imageReconcile;
+  }
+
+  private async replaceStaleImage(): Promise<void> {
     if (this.imageVerified) return;
     const runtime = this.containerRuntime();
     if (runtime === undefined || !runtime.running) return;
@@ -1219,8 +1353,20 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     const requestDeploymentId =
       request.headers.get("x-eden-eve-deployment-id") ?? undefined;
     const requestedRelease = request.headers.get("x-eden-eve-release-id") ?? requestDeploymentId;
-    if (requestedRelease !== undefined && requestedRelease !== (this.env.EDEN_EVE_RELEASE_ID ?? this.env.EDEN_EVE_DEPLOYMENT_ID)) {
-      this.ctx.abort(EVE_HOST_STALE_WORKER_REASON);
+    const caller = placeCaller(this.env, request.headers, requestedRelease);
+    if (caller === "newer") this.ctx.abort(EVE_HOST_STALE_WORKER_REASON);
+    if (caller === "unknown") return switchingVersions(5);
+    const olderCaller = caller === "older";
+    // A Worker of the release this one replaced is still serving while
+    // Cloudflare switches versions. It is served only as the deployment it
+    // names: with affinity, one this release still routes (the same one after
+    // a same-version update, the kept one after an Eve upgrade); without
+    // affinity every release is its own deployment, so it never is. Otherwise
+    // the client retries and reaches the new Worker.
+    if (olderCaller && requestDeploymentId !== undefined && (this.env.EDEN_EVE_DEPLOYMENTS === undefined
+      ? requestDeploymentId !== this.env.EDEN_EVE_DEPLOYMENT_ID
+      : deploymentImages(this.env)[requestDeploymentId] === undefined)) {
+      return switchingVersions(1);
     }
     await this.identifyDeployment(requestDeploymentId);
     if (new URL(request.url).pathname === "/__eden/internal/fence-schedules") {
@@ -1230,7 +1376,13 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       }
       return new Response(null, { status: 204 });
     }
-    const response = await this.forwardToEve(request);
+    let response: Response;
+    try {
+      response = await this.forwardToEve(request);
+    } catch (error: unknown) {
+      if (error !== EVE_HOST_RETAINED_SWITCHING) throw error;
+      return switchingVersions(5);
+    }
     // Reporting the verified start back lets deploy health-gate promotion on
     // the served container actually running this generation's image: the
     // header echoes only when the running container's image equals this
@@ -1239,6 +1391,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     if (
       requestDeploymentId !== undefined &&
       requestDeploymentId === this.deploymentId &&
+      !olderCaller &&
       this.readinessEvidence !== undefined &&
       this.imageVerified
     ) {
@@ -1689,6 +1842,7 @@ export function createEveHostWorker(
       publicOrigin: options.publicOrigin,
       deploymentId: options.deploymentId,
       releaseId: options.releaseId ?? options.deploymentId,
+      ...(env.EDEN_EVE_PREVIOUS_RELEASE_ID === undefined ? {} : { previousReleaseId: env.EDEN_EVE_PREVIOUS_RELEASE_ID }),
       generationId: options.generationId,
       correlationId: globalThis.crypto.randomUUID(),
       ...(options.runtimeRevisionHandle === undefined
@@ -1696,34 +1850,35 @@ export function createEveHostWorker(
         : { runtimeRevisionHandle: options.runtimeRevisionHandle }),
     };
     const forwarded = createTrustedEveRequest(request, metadata);
-    // Synchronize the DO version before sending an upload. Cloning a body
-    // would retain an unread tee of the entire upload in isolate memory.
-    const bodyless = forwarded.body === null
+    // A read is its own version check. Anything else waits for a health read
+    // first, so the object is on a release that serves this Worker before the
+    // request is sent. Cloning a body would retain an unread tee of the entire
+    // upload in isolate memory.
+    const read = request.method === "GET" || request.method === "HEAD";
+    const check = read
       ? forwarded
       : createTrustedEveRequest(new Request(
           new URL(EVE_HOST_DEFAULTS.healthPath, options.publicOrigin),
           { signal: forwarded.signal },
         ), metadata);
-    let container = resolveContainer(env);
-    let response: Response;
-    try {
-      response = await container.fetch(bodyless);
-    } catch (error: unknown) {
-      if (
-        !(error instanceof Error) ||
-        !error.message.includes(EVE_HOST_STALE_WORKER_REASON)
-      ) {
-        throw error;
-      }
-      // Only the pre-forwarding stale abort is safe to retry. A failed stub
-      // can remain broken, so resolve it again and retry the bodyless request once.
-      container = resolveContainer(env);
-      response = await container.fetch(bodyless);
-    }
-    if (bodyless === forwarded) return response;
+    let container!: ReturnType<typeof resolveContainer>;
+    const response = await sendWhileSwitching(
+      () => {
+        container = resolveContainer(env);
+        return container.fetch(check);
+      },
+      Date.now() + EVE_HOST_RELEASE_WAIT_MS,
+      request.signal,
+    );
+    if (read || !response.ok) return response;
     await response.body?.cancel();
-    // Stream the original body exactly once, outside the retry path.
-    return container.fetch(forwarded);
+    try {
+      // Sent exactly once: a reset from here on does not say whether it ran.
+      return await container.fetch(forwarded);
+    } catch (error: unknown) {
+      if (!isStaleRelease(error)) throw error;
+      return switchingVersions(1);
+    }
   };
   return {
     async fetch(request, env): Promise<Response> {
@@ -1787,6 +1942,10 @@ export function createEveHostWorker(
               forwardToContainer(new Request(
                 new URL(EVE_HOST_DEFAULTS.healthPath, options.publicOrigin),
               ), env)
+                .then((response) => {
+                  if (!response.ok) console.error("The scheduled wake request failed:", `HTTP ${response.status}`);
+                  return response;
+                })
                 .catch((error: unknown) => {
                   console.error(
                     "The scheduled wake request failed:",

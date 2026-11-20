@@ -333,7 +333,8 @@ with `EVE_ENV_RESERVED_VARIABLE`:
 `HOST`, `NITRO_HOST`, `PORT`, `NITRO_PORT`, `NODE_ENV`,
 `NODE_EXTRA_CA_CERTS`, `WORKFLOW_LOCAL_BASE_URL`, `EDEN_WORLD_URL`,
 `EDEN_WORLD_TOKEN`, `EDEN_EVE_WORLD_RPC_AUTH`, `EDEN_EVE_DEPLOYMENT_ID`,
-`EDEN_EVE_GENERATION_ID`, `EDEN_EVE_RELEASE_ID`, `EDEN_EVE_DEPLOYMENTS`,
+`EDEN_EVE_GENERATION_ID`, `EDEN_EVE_RELEASE_ID`,
+`EDEN_EVE_PREVIOUS_RELEASE_ID`, `EDEN_EVE_DEPLOYMENTS`,
 `EDEN_AFFINITY_CONTRACT`, `EVE_SCHEDULES_DISABLED`, `EDEN_EVE_CONTROL_TOKEN`,
 `EVE_DEV`, `VERCEL`, `VERCEL_ENV`, `VERCEL_TARGET_ENV`.
 
@@ -421,6 +422,7 @@ The published Worker carries these plain-text variables:
 | `EVE_CONTAINER_INSTANCE_NAME` | The base container instance name |
 | `EDEN_EVE_DEPLOYMENT_ID` | The newest affinity deployment identity |
 | `EDEN_EVE_RELEASE_ID` | The per-publish release identity |
+| `EDEN_EVE_PREVIOUS_RELEASE_ID` | The release identity this publish replaced, on an update; its Workers are served while Cloudflare switches versions |
 | `EDEN_EVE_DEPLOYMENTS` | JSON map of retained affinity IDs to `image`, `generationId`, and optional `runtimeRevisionHandle`, `eveVersion`, `affinityContract`, `releaseId`, and per-deployment `worldRpcAuth` |
 | `EDEN_EVE_GENERATION_ID` | The generation identity |
 | `EVE_RUNTIME_VARIABLE_NAMES` | The names of the `--env-file` variables of this run |

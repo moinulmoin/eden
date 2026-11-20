@@ -2149,6 +2149,7 @@ async function resolveEveTargetOwnership(
     target: {
       state: "owned",
       identity: priorIdentity,
+      providerEvidence: evidence,
       ...(result.target.observed === undefined
         ? {}
         : { observed: result.target.observed }),
@@ -3260,6 +3261,10 @@ async function runEveDeployment(
     request.name,
   );
   const releaseId = `eve-deploy-${randomUUID()}`;
+  // What the replaced release's Workers stamp on their requests, read from
+  // the live Worker's settings: a local record can be out of date.
+  const liveWorker = cloudflare.target.providerEvidence;
+  const previousReleaseId = liveWorker?.workerReleaseId ?? liveWorker?.workerDeploymentId;
   let previousEveVersion = priorIdentity?.eveVersion;
   if (previousEveVersion === undefined && prior !== undefined) {
     previousEveVersion = (await readInstalledManifest(join(prior.generationRoot, "container/snapshot"), "eve"))?.version;
@@ -3523,6 +3528,7 @@ async function runEveDeployment(
   try {
     hostConfig = createEveHostConfig({
       ...baseConfigRequest,
+      ...(previousReleaseId === undefined || previousReleaseId === releaseId ? {} : { previousReleaseId }),
     });
   } catch (error: unknown) {
     throw deploymentFailure(

@@ -1,4 +1,4 @@
-/* global AbortController, console, fetch, process, setTimeout, clearTimeout, TextDecoder */
+/* global AbortController, console, fetch, process, setTimeout, clearTimeout, TextDecoder, URL */
 
 // Live Cloudflare check: runs Eden's whole life cycle against the real
 // Cloudflare account this machine's Wrangler is logged in to, on one temporary
@@ -11,9 +11,11 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -530,9 +532,59 @@ async function newSession(label, expectedEve) {
   return turn.sessionId + " ran bash on Eve " + turn.eveVersion;
 }
 
+// The deployed Worker keeps no logs, so wrangler tail records every
+// invocation of the target into the work folder. It is restarted before each
+// update and read only when a step fails.
+let tailChild;
+const tailFiles = [];
+function startTail() {
+  tailChild?.kill("SIGTERM");
+  const file = join(workRoot, "tail-" + (tailFiles.length + 1) + ".json");
+  tailFiles.push(file);
+  const out = openSync(file, "a");
+  tailChild = spawn(wranglerCli, ["tail", target, "--format", "json"], { cwd: workRoot, env: baseEnvironment, stdio: ["ignore", out, "ignore"] });
+  tailChild.on("error", () => {});
+  closeSync(out);
+}
+
+// Invocations that threw or were reset, oldest first.
+function tailExceptions() {
+  const lines = [];
+  for (const file of tailFiles) {
+    let text = "";
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    // Wrangler prints one indented JSON object per invocation. Diagnostics
+    // only: a part that cannot be read is skipped, never a failure.
+    for (const part of text.split(/\n(?=\{\n)/u)) {
+      try {
+        const event = JSON.parse(part);
+        if (event.outcome === "ok" || event.outcome === "canceled") continue;
+        const request = event.event?.request;
+        lines.push([
+          new Date(event.eventTimestamp).toISOString(),
+          event.entrypoint ?? "Worker",
+          "version " + String(event.scriptVersion?.id).slice(0, 8),
+          event.outcome,
+          request === undefined ? "" : request.method + " " + new URL(request.url).pathname,
+          (event.exceptions ?? []).map((exception) => exception.name + ": " + exception.message).join("; "),
+        ].join(" "));
+      } catch {
+        continue;
+      }
+    }
+  }
+  return lines;
+}
+
 async function deploy(expectUpdate, expectImageReplaced = false) {
   const started = Date.now();
+  if (expectUpdate) startTail();
   const output = await eden("deploy");
+  if (!expectUpdate) startTail();
   const origin = output.deployment?.stableWorkersDevOrigin;
   if (typeof origin !== "string" || !origin.startsWith("https://")) throw new Error("The deploy result has no deployment.stableWorkersDevOrigin.");
   if (output.name !== target) throw new Error("The deploy result names " + output.name + ", not " + target + ".");
@@ -699,8 +751,17 @@ try {
   }
 } catch (error) {
   failure = error;
+  if (tailFiles.length > 0) {
+    // Tail delivers an invocation a moment after it ends.
+    await wait(3_000);
+    const exceptions = tailExceptions();
+    log(exceptions.length === 0
+      ? "wrangler tail recorded no invocation that threw or was reset."
+      : "Invocations that threw or were reset, from wrangler tail (last " + Math.min(exceptions.length, 30) + " of " + exceptions.length + "):\n    " + exceptions.slice(-30).join("\n    "));
+  }
 } finally {
   cleaning = true;
+  tailChild?.kill("SIGTERM");
   let cleaned = !deployStarted;
   if (deployStarted) {
     try {

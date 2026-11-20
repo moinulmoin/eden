@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { createRequire } from "node:module";
 import { NodeSqliteAdapter } from "../../world-cloudflare/src/core/node-sqlite.js";
 
@@ -256,6 +256,7 @@ function hostContainer(
   options: {
     readonly deploymentId?: string;
     readonly abort?: (reason?: string) => void;
+    readonly env?: Record<string, string>;
   } = {},
 ) {
   const container = new EveHostDurableContainer(
@@ -287,6 +288,7 @@ function hostContainer(
       EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
       EDEN_EVE_DEPLOYMENT_ID: options.deploymentId ?? IDENTITY.deploymentId,
       EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
+      ...options.env,
     },
   );
   return container;
@@ -356,6 +358,157 @@ describe("durable World queue acknowledgements", () => {
       }
     },
   );
+});
+
+describe("World object after a deploy", () => {
+  const origin = "https://eden-eve-preview.account.workers.dev";
+  const { encode } = createRequire(
+    import.meta.resolve("@moinulmoin/eden-world-cloudflare"),
+  )("cbor-x") as { encode(value: unknown): Uint8Array };
+
+  /** One World object in SQLite that Cloudflare restarts on `restartsOn` when it resets. */
+  function worldFixture(startsOn: readonly [string, string?], restartsOn: readonly [string, string?]) {
+    const sql = new NodeSqliteAdapter();
+    const resets: string[] = [];
+    const worldOn = ([release, previous]: readonly [string, string?]): EdenWorldDurableObject => new EdenWorldDurableObject({
+      storage: {
+        sql,
+        transactionSync: sql.transactionSync.bind(sql),
+        setAlarm: async () => undefined,
+        deleteAlarm: async () => undefined,
+      },
+      blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(),
+      waitUntil: () => undefined,
+      abort: (reason?: string) => {
+        resets.push(release);
+        fixture.live = worldOn(restartsOn);
+        throw new Error(`remote exception: ${reason}`);
+      },
+    } as never, {
+      EVE_PUBLIC_ORIGIN: origin,
+      EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+      EDEN_EVE_DEPLOYMENT_ID: "dep-test",
+      EDEN_EVE_RELEASE_ID: release,
+      ...(previous === undefined ? {} : { EDEN_EVE_PREVIOUS_RELEASE_ID: previous }),
+      EVE_CONTAINER: { getByName: () => ({ loopbackFetch: async () => Response.json({}) }) },
+    });
+    const fixture = {
+      live: worldOn(startsOn),
+      resets,
+      messages: () => sql.exec("SELECT COUNT(*) AS n FROM workflow_queue_messages").toArray()[0]?.n,
+      /** A container of `release` enqueues one message through `send`. */
+      container(release: string, previous?: string, send = (request: Request) => fixture.live.fetch(request)) {
+        const env = {
+          EVE_PUBLIC_ORIGIN: origin,
+          EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+          EDEN_EVE_DEPLOYMENT_ID: "dep-test",
+          EDEN_EVE_RELEASE_ID: release,
+          ...(previous === undefined ? {} : { EDEN_EVE_PREVIOUS_RELEASE_ID: previous }),
+          EDEN_WORLD: { idFromName: () => "world", get: () => ({ fetch: send }) },
+        };
+        return () => routeEveOutboundRequest(
+          new Request(`${origin}/__eden/world/rpc`, {
+            method: "POST",
+            headers: { "x-eden-world-token": "token" },
+            body: encode({ op: "queue.enqueue", args: ["workflow", { runId: "proof" }] }) as Uint8Array<ArrayBuffer>,
+          }),
+          env as never,
+          "dep-test",
+          "token",
+        );
+      },
+      close: () => sql.close(),
+    };
+    return fixture;
+  }
+
+  // Workers have crypto.subtle.timingSafeEqual; Node does not.
+  const subtle = crypto.subtle as unknown as Record<string, unknown>;
+  beforeEach(() => {
+    subtle.timingSafeEqual = (a: Uint8Array, b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b));
+  });
+  afterEach(() => {
+    delete subtle.timingSafeEqual;
+  });
+
+  test("a World object left on the release before restarts for the new release's container and still serves the replaced one", async () => {
+    const world = worldFixture(["release-1"], ["release-2", "release-1"]);
+    try {
+      expect((await world.container("release-2", "release-1")()).status).toBe(200);
+      expect(world.resets).toEqual(["release-1"]);
+      expect((await world.container("release-1")()).status).toBe(200);
+      expect((await world.container("release-2", "release-1")()).status).toBe(200);
+      expect(world.resets).toEqual(["release-1"]);
+      expect(world.messages()).toBe(3);
+    } finally {
+      world.close();
+    }
+  });
+
+  test("a call whose answer is lost in a World reset gets a retryable 503 and is not sent again", async () => {
+    const world = worldFixture(["release-2", "release-1"], ["release-2", "release-1"]);
+    try {
+      const lost = world.container("release-2", "release-1", async (request) => {
+        const response = await world.live.fetch(request);
+        // The enqueue committed; another caller's reset loses the reply.
+        if (request.method === "POST") throw new Error("remote exception: stale Worker version");
+        return response;
+      });
+      const response = await lost();
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("1");
+      expect(world.messages()).toBe(1);
+    } finally {
+      world.close();
+    }
+  });
+
+  test("a container of any other release is answered as before, and the World object is not reset", async () => {
+    const world = worldFixture(["release-3", "release-2"], ["release-3", "release-2"]);
+    try {
+      for (const [release, previous] of [["release-1", undefined], ["release-9", "release-8"]] as const) {
+        expect((await world.container(release, previous)()).status).toBe(200);
+      }
+      expect(world.resets).toEqual([]);
+      expect(world.messages()).toBe(2);
+    } finally {
+      world.close();
+    }
+  });
+
+  test("a World object that does not answer holds a call 30 seconds, then the container gets a retryable 503", async () => {
+    const world = worldFixture(["release-2", "release-1"], ["release-2", "release-1"]);
+    vi.useFakeTimers();
+    try {
+      const started = Date.now();
+      const pending = world.container("release-2", "release-1", () => new Promise<Response>(() => {}))();
+      await vi.runAllTimersAsync();
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(Date.now() - started).toBe(30_000);
+      expect(world.messages()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      world.close();
+    }
+  });
+
+  test("a container waits 30 seconds for a World object that keeps coming back on the release before, then gets a retryable 503", async () => {
+    const world = worldFixture(["release-1"], ["release-1"]);
+    vi.useFakeTimers();
+    try {
+      const started = Date.now();
+      const pending = world.container("release-2", "release-1")();
+      await vi.runAllTimersAsync();
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(Date.now() - started).toBe(30_000);
+      expect(world.messages()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      world.close();
+    }
+  });
 });
 
 describe("generic Eve Cloudflare host", () => {
@@ -731,7 +884,6 @@ describe("generic Eve Cloudflare host", () => {
   test.each([
     new Error("container transport failed"),
     Object.assign(new Error("transient infrastructure failure"), { retryable: true }),
-    new Error("remote exception: stale Worker version"),
     "stale Worker version",
   ])("does not replay POST requests after their transport fails: %s", async (error) => {
     const upstreamFetch = vi.fn(async (request: Request) => {
@@ -823,24 +975,215 @@ describe("generic Eve Cloudflare host", () => {
     }
   });
 
-  test("propagates the second stale-Worker failure without a retry loop", async () => {
-    const error = new Error("remote exception: stale Worker version");
+  test.each([
+    ["POST", "non-idempotent-body"],
+    ["DELETE", undefined],
+  ] as const)("a %s whose answer is lost in an object reset gets a retryable 503 and runs once", async (method, body) => {
+    let ran = 0;
     const upstreamFetch = vi.fn(async (request: Request) => {
-      expect(request.method).toBe("GET");
-      expect(new URL(request.url).pathname).toBe(EVE_HOST_DEFAULTS.healthPath);
-      throw error;
+      if (request.method === "GET") return new Response("synchronized");
+      ran += 1;
+      // The request ran; another caller's reset loses the reply.
+      throw new Error("remote exception: stale Worker version");
     });
-    const getByName = vi.fn(() => ({ fetch: upstreamFetch }));
     const worker = createEveHostWorker({
       publicOrigin: "https://eden-eve-preview.account.workers.dev",
       ...IDENTITY,
     });
-    await expect(worker.fetch(new Request("https://client.invalid/write", {
+    const response = await worker.fetch(new Request("https://client.invalid/write", {
+      method,
+      ...(body === undefined ? {} : { body }),
+    }), { EVE_CONTAINER: { getByName: () => ({ fetch: upstreamFetch }) } });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("1");
+    expect(ran).toBe(1);
+    expect(upstreamFetch).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not send an upload when the health read before it is refused", async () => {
+    const methods: string[] = [];
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    const response = await worker.fetch(new Request("https://client.invalid/write", {
       method: "POST",
       body: "non-idempotent-body",
-    }), { EVE_CONTAINER: { getByName } })).rejects.toBe(error);
-    expect(upstreamFetch).toHaveBeenCalledTimes(2);
-    expect(getByName).toHaveBeenCalledTimes(2);
+    }), {
+      EVE_CONTAINER: {
+        getByName: () => ({
+          fetch: async (request: Request) => {
+            methods.push(request.method);
+            return new Response("retired", { status: 503 });
+          },
+        }),
+      },
+    });
+    expect(response.status).toBe(503);
+    expect(await response.text()).toBe("retired");
+    expect(methods).toEqual(["GET"]);
+  });
+
+  test.each([0, 7_000])(
+    "waits 30 seconds for an object still on the old release, then answers a retryable 503 without sending the body (each try takes %d ms)",
+    async (tryMs) => {
+      const startedAt: number[] = [];
+      const upstreamFetch = vi.fn(async (request: Request) => {
+        expect(request.method).toBe("GET");
+        expect(new URL(request.url).pathname).toBe(EVE_HOST_DEFAULTS.healthPath);
+        startedAt.push(Date.now());
+        await new Promise((resolve) => setTimeout(resolve, tryMs));
+        throw new Error("remote exception: stale Worker version");
+      });
+      const worker = createEveHostWorker({
+        publicOrigin: "https://eden-eve-preview.account.workers.dev",
+        ...IDENTITY,
+      });
+      vi.useFakeTimers();
+      try {
+        const started = Date.now();
+        const pending = worker.fetch(new Request("https://client.invalid/write", {
+          method: "POST",
+          body: "non-idempotent-body",
+        }), { EVE_CONTAINER: { getByName: () => ({ fetch: upstreamFetch }) } });
+        await vi.runAllTimersAsync();
+        const response = await pending;
+        expect(response.status).toBe(503);
+        expect(response.headers.get("retry-after")).toBe("5");
+        // No try starts after 30 seconds; the last one may still be in flight.
+        expect(Math.max(...startedAt) - started).toBeLessThanOrEqual(30_000);
+        expect(Date.now() - started).toBeLessThanOrEqual(30_000 + tryMs);
+        expect(Date.now() - started).toBeGreaterThanOrEqual(30_000);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  test("no try starts after 30 seconds when the pauses run late", async () => {
+    const startedAt: number[] = [];
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    vi.useFakeTimers();
+    const fakeSetTimeout = globalThis.setTimeout;
+    const late = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number) =>
+      fakeSetTimeout(() => {
+        vi.setSystemTime(Date.now() + 15_000);
+        callback();
+      }, ms)) as never);
+    try {
+      const started = Date.now();
+      const pending = worker.fetch(new Request("https://client.invalid/eve/v1/info"), {
+        EVE_CONTAINER: {
+          getByName: () => ({
+            fetch: async () => {
+              startedAt.push(Date.now() - started);
+              throw new Error("remote exception: stale Worker version");
+            },
+          }),
+        },
+      });
+      await vi.runAllTimersAsync();
+      expect((await pending).status).toBe(503);
+      expect(Math.max(...startedAt)).toBeLessThanOrEqual(30_000);
+    } finally {
+      late.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a retained version's object that cannot place this release gives the client a retryable 503", async () => {
+    const current = hostContainer(new Map(), fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE }), undefined, {
+      env: {
+        EDEN_EVE_DEPLOYMENTS: JSON.stringify({
+          [IDENTITY.deploymentId]: { image: "eve", generationId: IDENTITY.generationId },
+          "dep-retained": { image: "eve-retained", generationId: "gen-retained" },
+        }),
+        EVE_CONTAINER: {
+          idFromName: (name: string) => name,
+          getByName: () => ({
+            fetch: async () => new Response("Eden is switching versions. Retry the request.\n", { status: 503, headers: { "retry-after": "5" } }),
+          }),
+        } as never,
+      },
+    });
+    (current as unknown as { ctx: { id: unknown } }).ctx.id = {
+      equals: (other: string) => other !== IDENTITY.stableContainerInstanceName && other.includes(IDENTITY.deploymentId),
+    };
+    const response = await createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    }).fetch(new Request("https://client.invalid/eve/v1/health"), {
+      EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => current.fetch(new Request(request)) }) },
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("5");
+  });
+
+  test("one retained version still on the old release holds a request 30 seconds, not longer, before the retryable 503", async () => {
+    const retainedFetch = vi.fn(async () => {
+      throw new Error("remote exception: stale Worker version");
+    });
+    const current = hostContainer(new Map(), fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE }), undefined, {
+      env: {
+        EDEN_EVE_DEPLOYMENTS: JSON.stringify({
+          [IDENTITY.deploymentId]: { image: "eve", generationId: IDENTITY.generationId },
+          "dep-retained": { image: "eve-retained", generationId: "gen-retained" },
+        }),
+        EVE_CONTAINER: { idFromName: (name: string) => name, getByName: () => ({ fetch: retainedFetch }) } as never,
+      },
+    });
+    // This object is the one named for the current version.
+    (current as unknown as { ctx: { id: unknown } }).ctx.id = {
+      equals: (other: string) => other !== IDENTITY.stableContainerInstanceName && other.includes(IDENTITY.deploymentId),
+    };
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    vi.useFakeTimers();
+    try {
+      const started = Date.now();
+      const pending = worker.fetch(new Request("https://client.invalid/write", { method: "POST", body: "{}" }), {
+        EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => current.fetch(new Request(request)) }) },
+      });
+      await vi.runAllTimersAsync();
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(Date.now() - started).toBe(30_000);
+      // One call to the retained object for each try of the Worker.
+      expect(retainedFetch.mock.calls.length).toBeLessThanOrEqual(13);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a request that meets an object on the old release is served once the object restarts on the new one", async () => {
+    let attempts = 0;
+    const getByName = vi.fn(() => ({
+      fetch: async () => {
+        attempts += 1;
+        if (attempts <= 4) throw new Error("remote exception: stale Worker version");
+        return new Response("eve");
+      },
+    }));
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    vi.useFakeTimers();
+    try {
+      const pending = worker.fetch(new Request("https://client.invalid/eve/v1/session/s/stream"), { EVE_CONTAINER: { getByName } });
+      await vi.runAllTimersAsync();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("eve");
+      expect(attempts).toBe(5);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("routes container egress to the public origin back through the container", async () => {
@@ -1024,7 +1367,7 @@ describe("Eve schedule wake triggers", () => {
   });
 
   test.each([false, true])(
-    "retries a scheduled stale-Worker wake only once (second attempt fails: %s)",
+    "a scheduled wake waits for an object on the old release (object stays old: %s)",
     async (secondAttemptFails) => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const error = new Error("remote exception: stale Worker version");
@@ -1050,25 +1393,25 @@ describe("Eve schedule wake triggers", () => {
         schedules: [{ name: "digest", cron: "0 9 * * 1-5" }],
       });
       const waited: Promise<unknown>[] = [];
+      vi.useFakeTimers();
       try {
         worker.scheduled?.(
           { cron: "* * * * *", scheduledTime: Date.parse("2026-10-02T08:57:00Z") },
           { EVE_CONTAINER: { getByName } },
           { waitUntil: (task) => { waited.push(task); } },
         );
-        await Promise.all(waited);
+        await vi.runAllTimersAsync();
+        const [wake] = await Promise.all(waited) as [Response];
         expect(waited).toHaveLength(1);
-        expect(wakeFetch).toHaveBeenCalledTimes(2);
-        expect(getByName).toHaveBeenCalledTimes(2);
+        expect(wake.status).toBe(secondAttemptFails ? 503 : 200);
         if (secondAttemptFails) {
-          expect(errorSpy).toHaveBeenCalledWith(
-            "The scheduled wake request failed:",
-            error.message,
-          );
+          expect(errorSpy).toHaveBeenCalledExactlyOnceWith("The scheduled wake request failed:", "HTTP 503");
         } else {
+          expect(wakeFetch).toHaveBeenCalledTimes(2);
           expect(errorSpy).not.toHaveBeenCalled();
         }
       } finally {
+        vi.useRealTimers();
         errorSpy.mockRestore();
       }
     },
@@ -1212,13 +1555,128 @@ describe("EveHostDurableContainer lifecycle", () => {
     const container = hostContainer(stored, runtime, alarms, { abort });
     await expect(container.fetch(new Request(
       "https://eden-eve-preview.account.workers.dev/eve/v1/info",
-      { headers: { "x-eden-eve-deployment-id": "dep-current" } },
+      { headers: { "x-eden-eve-deployment-id": "dep-current", "x-eden-eve-previous-release-id": IDENTITY.deploymentId } },
     ))).rejects.toThrow("stale Worker version");
     expect(abort).toHaveBeenCalledExactlyOnceWith("stale Worker version");
     expect(runtime.state.timeline).toEqual([]);
     expect(stored.size).toBe(0);
     expect(alarms).toEqual([]);
     expect(runtime.running).toBe(true);
+  });
+
+  test("requests that arrive together during an image update all get Eve's answer from one new container", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: OLD_IMAGE, carryArchive: "session-files" });
+    const object = hostContainer(new Map(), runtime);
+    const responses = await Promise.all([1, 2, 3, 4].map(() => object.fetch(new Request(
+      "https://eden-eve-preview.account.workers.dev/eve/v1/info",
+      { headers: { "x-eden-eve-deployment-id": IDENTITY.deploymentId } },
+    ))));
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200]);
+    expect(runtime.state.timeline.filter((event) => event !== "health" && event !== "forward")).toEqual([
+      "carry-out", "destroy", "start", "carry-in",
+    ]);
+    expect(runtime.lastStart?.image).toBe(CURRENT_IMAGE);
+  });
+
+  test("a request through a Worker of the replaced release gets Eve's answer, and the new object is not reset", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
+    const abort = vi.fn((reason?: string) => { throw new Error(reason); });
+    const object = hostContainer(new Map(), runtime, undefined, {
+      abort,
+      env: { EDEN_EVE_RELEASE_ID: "release-new", EDEN_EVE_PREVIOUS_RELEASE_ID: "release-old" },
+    });
+    const env = { EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => object.fetch(new Request(request)) }) } };
+    const worker = (releaseId: string) => createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+      releaseId,
+    });
+
+    for (const init of [{}, { method: "POST", body: "{}" }]) {
+      const older = await worker("release-old").fetch(new Request("https://client.invalid/eve/v1/session", init), env);
+      expect(older.status).toBe(200);
+      expect(await older.json()).toEqual({ status: "ready" });
+      expect(older.headers.get("x-eden-eve-release-id")).toBe("release-old");
+      // Only a Worker of this release proves the deploy's health.
+      expect(older.headers.get("x-eden-eve-started-deployment")).toBeNull();
+    }
+    const current = await worker("release-new").fetch(new Request("https://client.invalid/eve/v1/health"), env);
+    expect(current.headers.get("x-eden-eve-started-deployment")).toBe("release-new");
+    expect(abort).not.toHaveBeenCalled();
+
+    // A release this object cannot place gets a retryable answer and no
+    // reset, with or without a claim about some other release.
+    for (const previous of [undefined, "release-older"]) {
+      const unknown = await object.fetch(new Request("https://client.invalid/eve/v1/health", {
+        headers: {
+          "x-eden-eve-deployment-id": IDENTITY.deploymentId,
+          "x-eden-eve-release-id": "release-unknown",
+          ...(previous === undefined ? {} : { "x-eden-eve-previous-release-id": previous }),
+        },
+      }));
+      expect(unknown.status).toBe(503);
+      expect(unknown.headers.get("retry-after")).toBe("5");
+    }
+    expect(abort).not.toHaveBeenCalled();
+
+    // Only the release that names this one as the release it replaces resets it.
+    await expect(object.fetch(new Request("https://client.invalid/eve/v1/health", {
+      headers: {
+        "x-eden-eve-deployment-id": IDENTITY.deploymentId,
+        "x-eden-eve-release-id": "release-next",
+        "x-eden-eve-previous-release-id": "release-new",
+      },
+    }))).rejects.toThrow("stale Worker version");
+    expect(abort).toHaveBeenCalledTimes(1);
+  });
+
+  test("without deployment affinity a Worker of the replaced release gets a retryable 503, and nothing reaches the new image", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
+    const abort = vi.fn((reason?: string) => { throw new Error(reason); });
+    // Every release is its own deployment without affinity.
+    const object = hostContainer(new Map(), runtime, undefined, {
+      abort,
+      deploymentId: "release-new",
+      env: { EDEN_EVE_RELEASE_ID: "release-new", EDEN_EVE_PREVIOUS_RELEASE_ID: "release-old" },
+    });
+    const env = { EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => object.fetch(new Request(request)) }) } };
+    for (const init of [{}, { method: "POST", body: "{}" }]) {
+      const response = await createEveHostWorker({
+        publicOrigin: "https://eden-eve-preview.account.workers.dev",
+        ...IDENTITY,
+        deploymentId: "release-old",
+        releaseId: "release-old",
+      }).fetch(new Request("https://client.invalid/eve/v1/session", init), env);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("1");
+    }
+    expect(abort).not.toHaveBeenCalled();
+    expect(runtime.state.timeline).toEqual([]);
+  });
+
+  test("a Worker of the replaced release that names a version no longer routed gets a retryable 503", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
+    const abort = vi.fn((reason?: string) => { throw new Error(reason); });
+    const object = hostContainer(new Map(), runtime, undefined, {
+      abort,
+      env: {
+        EDEN_EVE_RELEASE_ID: "release-new",
+        EDEN_EVE_PREVIOUS_RELEASE_ID: "release-old",
+        EDEN_EVE_DEPLOYMENTS: JSON.stringify({ "dep-new": { image: "eve", generationId: "gen-new" } }),
+      },
+    });
+    const response = await createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+      releaseId: "release-old",
+    }).fetch(new Request("https://client.invalid/eve/v1/session", { method: "POST", body: "{}" }), {
+      EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+      EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => object.fetch(new Request(request)) }) },
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("1");
+    expect(abort).not.toHaveBeenCalled();
+    expect(runtime.state.timeline).toEqual([]);
   });
 
   test("a current Worker resets the old DO, carries files, and only then echoes its started deployment", async () => {
@@ -1275,7 +1733,7 @@ describe("EveHostDurableContainer lifecycle", () => {
       method: "POST",
       headers: { "x-eden-eve-deployment-id": "spoofed-deployment" },
       body: bytes,
-    }), { EVE_CONTAINER: { getByName } });
+    }), { EVE_CONTAINER: { getByName }, EDEN_EVE_PREVIOUS_RELEASE_ID: "dep-old" });
 
     expect(abort).toHaveBeenCalledExactlyOnceWith("stale Worker version");
     expect(getByName).toHaveBeenCalledTimes(2);

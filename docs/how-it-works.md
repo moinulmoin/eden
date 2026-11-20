@@ -181,6 +181,62 @@ sessions across Eve upgrades. Update both the CLI and the World package;
 updating the CLI alone is not enough. Older Worlds keep the previous update
 behavior and the warning that an Eve upgrade can strand sessions.
 
+- **The version switch:** Cloudflare does not move the Worker and its
+  Durable Objects to the new version at the same instant. On 2026-11-20
+  they ran different releases for between half a second and 20 seconds, in
+  either order. Each caller stamps its release ID on a request, with the
+  release it replaced. `eden deploy` reads the replaced release from the
+  live Worker's settings when it starts, not from the local record.
+  - An object resets itself only for the release that names it as the one
+    it replaced. That proves the caller is newer, and the object restarts
+    on the new code. Two releases cannot reset each other.
+  - A Container object serves its own release. It serves a Worker of the
+    release it replaced only as the version that Worker names. With
+    deployment affinity that is the same version after a same-version
+    update and the kept old version after an Eve upgrade, so a request
+    from an old Worker never reaches a new Eve version. Without affinity,
+    or when the version is no longer routed, the answer is `503` with
+    `Retry-After: 1`. Any other release gets `503` with
+    `Retry-After: 5` and no reset. Such an object changes version when
+    Cloudflare moves it.
+  - The World object answers every caller as before, apart from that one
+    reset.
+  - A reset says nothing about whether a request in flight ran. Eden
+    repeats only a GET or HEAD, and the health read it sends before any
+    other request. It never sends a POST, PUT, PATCH or DELETE twice, and
+    never a World call. When a reset loses the answer before the response
+    headers, the client or Eve gets `503` with `Retry-After: 1`. The
+    request may have run, so check its outcome before sending it again.
+  - A reset object can come back on the old code until Cloudflare has the
+    new version where the object runs. The Worker starts no new try later
+    than 30 seconds after the request arrived, then answers `503` with
+    `Retry-After: 5`. This covers every object the request needs,
+    including a retained version's object. The wait for a starting
+    Container is separate and unchanged.
+  - Requests that arrive while the object replaces the Container wait for
+    the one new Container.
+  - Before a World call, a container sends the World object one read. A
+    World object on the replaced release resets for it, and the container
+    waits up to 30 seconds for it to come back. The deploy's health check
+    does not test the World object. A World object deployed by Eden
+    `0.13.0` or earlier has no reset: after the first Eve upgrade made
+    with a newer CLI it can keep the old list of versions until Cloudflare
+    moves it, 2 minutes 20 seconds when measured, and new sessions get
+    Eve's `500` for that time although the deploy reported healthy.
+
+  Two deploys of one target that overlap can both name the same replaced
+  release. The Container objects of the one published last then answer
+  `503` to the other's Workers until Cloudflare has switched them all.
+  A second deploy from the same project folder is refused with
+  `EVE_DEPLOY_BUSY`; that lock does not cover another checkout or machine.
+
+  What can still return Cloudflare's error 1101 page (HTTP 500) around a
+  switch: Cloudflare's own Durable Object errors, such as "Internal error
+  in Durable Object storage caused object to be reset", which Eden does not
+  retry. The measurements are in the
+  [compatibility history](./eve-compatibility-history.md). Two earlier HTTP
+  500 answers, at least 20 seconds after a switch, left no log and are not
+  proven to have one of these causes.
 - **Same Eve version:** update in place. Eden carries
   `/workspace/.eve/sandbox-cache/just-bash/sessions` through Durable Object
   storage, up to 1 GiB compressed (using the sleep-time copy if asleep).
