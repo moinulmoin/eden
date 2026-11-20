@@ -185,6 +185,28 @@ eden deploy --env production --name my-eve-production
 The `--name` value must be a lowercase alphanumeric target name with optional
 dashes.
 
+### `EVE_NAME_CONTAINER_SHARED`
+
+`The name <name> would get the Container application <application>, which is
+also the Container application of the name <shorter name>; nothing was read
+or changed on Cloudflare.` Eden names a target's Container application
+`<name>-container` and cuts it to 63 characters. A name of 62 or 63
+characters leaves no room for the suffix, so its application has the
+Worker's own name. When a shorter name's application is cut to that same
+name, the two targets would share one Container application, and
+`preflight` and `deploy` refuse the longer name. This happens only for a
+62-character name that ends in `-container`, or a 63-character name that
+ends in `-container` or a cut of it from `-c` to `-containe`. Rerun with
+another `--name`. A name of 61 characters or fewer always gets a Container
+application of its own. `eden destroy` still accepts the name.
+
+Eden `0.15.0` and older accepted these names. If such a version deployed
+both the long name and the shorter one, the two targets share one Container
+application, and `eden destroy` of one whose Worker is already gone deletes
+that application without checking whose it is. Before you destroy either
+name, check in the Cloudflare dashboard whether a Worker with the other name
+still exists; if it does, it stops working when the application is deleted.
+
 ### `EVE_NAME_REPEATED` and `EVE_PROJECT_REPEATED`
 
 `--name` and `--project` may each be supplied only once.
