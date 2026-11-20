@@ -769,8 +769,20 @@ Eden pushes the runtime image to the managed Cloudflare registry
 (`registry.cloudflare.com`). When the push does not return a terminal
 success, or the published image does not match the exact target repository
 and digest identity, the deploy ends as indeterminate. The push may take ten
-minutes; Eden stops waiting after that. See
+minutes. Then Eden kills `cf` and the `docker push` under it; Docker's
+reference says that killing `docker push` ends the push. See
 [Indeterminate outcomes](#indeterminate-outcomes) below.
+
+A push that had finished its upload before it was stopped leaves an image
+in the registry. `deployment-attempt.json` in the generation folder names
+its repository as `imageRepository`. Run `eden deploy` again: once a deploy
+of the target has succeeded, `eden destroy` also empties the repositories
+of its failed attempts. A target that never deployed has no deployment
+record, so `eden destroy` answers `EVE_DESTROY_RECORD_UNPROVEN` and deletes
+nothing. If you give the target up at that point, list that one repository
+as [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept) shows and
+delete what it lists with
+`npx cf@1.0.0-rc.2 containers images delete <repository>:<tag>`.
 
 `cf containers push` signs Docker in to the registry, then runs
 `docker tag` and `docker push`. When it fails, the message starts with

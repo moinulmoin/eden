@@ -2621,7 +2621,7 @@ async function publishImageWithCf(
       const how = /-25299|already exists in the keychain/u.test(pushed.stderr)
         ? "Docker's credential store already holds an entry for registry.cloudflare.com. On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry."
         : pushed.exitCode === undefined
-        ? "cf containers push ended without an exit code. Eden stops it after ten minutes."
+        ? "cf containers push ended without an exit code. Eden stops it, and the docker push under it, after ten minutes."
         : /Login failed with code: \d+/u.test(pushed.stderr)
         ? "docker login to registry.cloudflare.com failed. cf signs Docker in to the registry, and Docker saves that in its credential store."
         : /Docker command exited with code: \d+/u.test(pushed.stderr)

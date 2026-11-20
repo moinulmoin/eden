@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -57,6 +57,42 @@ export function pinnedCliProblem(
       : `Eden runs Cloudflare's cf CLI ${CF_VERSION}, which is installed with Eden, and could not find it.`,
     remediation: `Install @moinulmoin/eden again with your package manager, which installs cf ${CF_VERSION} beside it, and do not install another cf version over that one. Then run the command again.`,
   };
+}
+
+/**
+ * Stops cf and every process under it. cf 1.0.0-rc.2 runs docker in a
+ * process group of its own, so a kill of cf alone left its docker push
+ * running after Eden had stopped waiting (run on 2026-11-20). The processes
+ * under cf are read from ps before cf is killed. Where ps cannot be run,
+ * only cf is killed.
+ */
+function stop(cf: ReturnType<typeof spawn>): void {
+  const under: number[] = [];
+  if (cf.pid !== undefined) {
+    try {
+      const rows = execFileSync("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf8", timeout: 5_000 })
+        .split("\n").map((row) => row.trim().split(/\s+/u).map(Number));
+      const parents = [cf.pid];
+      for (let parent = parents.shift(); parent !== undefined; parent = parents.shift()) {
+        for (const [pid, ppid] of rows) {
+          if (ppid === parent && pid !== undefined && Number.isInteger(pid) && pid > 1) {
+            under.push(pid);
+            parents.push(pid);
+          }
+        }
+      }
+    } catch {
+      under.length = 0;
+    }
+  }
+  cf.kill("SIGKILL");
+  for (const pid of under) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
 }
 
 export interface CloudflareCliRequest {
@@ -150,7 +186,7 @@ async function runCf(
   // The folder can hold the secrets file. Ctrl-C and a plain kill must not
   // leave it: remove it, stop cf, then let the signal end Eden as it would have.
   const interrupted = (signal: NodeJS.Signals): void => {
-    child?.kill("SIGKILL");
+    if (child !== undefined) stop(child);
     rmSync(cwd, { recursive: true, force: true });
     process.removeListener("SIGINT", interrupted);
     process.removeListener("SIGTERM", interrupted);
@@ -203,13 +239,13 @@ async function runCf(
           ...(running ? { running: true as const } : {}),
         });
       };
-      // Out of time: cf is killed, and the result waits until it is gone.
+      // Out of time: cf and what it started are killed, and the result waits until cf is gone.
       // Only cf's own exit shows that. A kill that could not be delivered
       // does not, so after two seconds without an exit the result says cf
       // may still run.
       const timer = setTimeout(() => {
         timedOut = true;
-        started.kill("SIGKILL");
+        stop(started);
         unstopped = setTimeout(() => finish(undefined, true), 2_000);
       }, left);
       started.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));

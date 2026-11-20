@@ -1,5 +1,5 @@
 import { ChildProcess, spawn } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -42,6 +42,57 @@ test.each(["SIGINT", "SIGTERM"] as const)("%s while cf runs removes the folder t
   child.kill(signal);
   expect(await exited).toBe(signal);
   expect(folders()).toEqual([]);
+}, 30_000);
+
+test("stopping Eden while cf pushes also stops the docker push that cf started", async () => {
+  const temporary = await realpath(await mkdtemp(join(tmpdir(), "eden-cf-push-")));
+  cleanups.push(() => rm(temporary, { recursive: true, force: true }));
+  const account = "1".repeat(32);
+  // The one request cf makes before it runs Docker: a credential for the registry.
+  const api = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ success: true, errors: [], messages: [], result: { account_id: account, registry_host: "registry.cloudflare.com", username: "v1", password: "stand-in-password" } }));
+  });
+  await new Promise<void>((resolve) => api.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise((resolve) => { api.closeAllConnections(); api.close(resolve); }));
+  // A docker whose push writes its process ID and then takes a minute.
+  const pushing = join(temporary, "pushing");
+  await writeFile(join(temporary, "docker"), [
+    "#!/bin/sh",
+    'case "$1" in',
+    "  login) cat >/dev/null;;",
+    "  image) echo linux/amd64;;",
+    '  push) echo $$ > "$PUSHING.part"; mv "$PUSHING.part" "$PUSHING"; exec sleep 60;;',
+    "esac",
+  ].join("\n"), { mode: 0o755 });
+  const script = join(temporary, "run.mjs");
+  await writeFile(script, [
+    "const { createCloudflareCliRunner, cloudflareCliEnvironment } = await import(process.argv[2]);",
+    "const run = createCloudflareCliRunner((account) => ({ ...cloudflareCliEnvironment(account), PATH: process.argv[4] + ':' + process.env.PATH, PUSHING: process.argv[5], CLOUDFLARE_API_TOKEN: 'no-ones-token-' + '0'.repeat(30), CLOUDFLARE_API_BASE_URL: process.argv[3] }));",
+    "await run({ args: ['containers', 'push', '--tag', 'eden-stand-in:candidate'], accountId: '1'.repeat(32) });",
+  ].join("\n"), "utf8");
+  const child = spawn(process.execPath, [
+    script,
+    fileURLToPath(new URL("../src/eve-cloudflare-cli.ts", import.meta.url)),
+    "http://127.0.0.1:" + String((api.address() as AddressInfo).port) + "/client/v4",
+    temporary,
+    pushing,
+  ], { env: { ...process.env, TMPDIR: temporary }, stdio: "ignore" });
+  const exited = new Promise<NodeJS.Signals | null>((resolve) => child.on("close", (_code, by) => resolve(by)));
+  await expect.poll(() => existsSync(pushing), { timeout: 20_000 }).toBe(true);
+  const push = Number(readFileSync(pushing, "utf8"));
+  cleanups.push(async () => { try { process.kill(push, "SIGKILL"); } catch { /* already gone */ } });
+  const alive = (): boolean => {
+    try {
+      return process.kill(push, 0);
+    } catch {
+      return false;
+    }
+  };
+  expect(alive()).toBe(true);
+  child.kill("SIGTERM");
+  expect(await exited).toBe("SIGTERM");
+  await expect.poll(alive, { timeout: 5_000 }).toBe(false);
 }, 30_000);
 
 /** Whether another program could take the port now. */

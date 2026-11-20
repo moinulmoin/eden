@@ -1505,7 +1505,7 @@ describe("a failed image push says how it failed and keeps what cf and Docker pr
     [
       "that Eden stopped",
       { exitCode: null, stderr: "" },
-      /push did not complete: cf containers push ended without an exit code\. Eden stops it after ten minutes\./u,
+      /push did not complete: cf containers push ended without an exit code\. Eden stops it, and the docker push under it, after ten minutes\./u,
     ],
     [
       "whose docker login failed",

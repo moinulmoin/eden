@@ -73,7 +73,11 @@ until the checks in steps 1–4 have passed.
    `cf` runs every command with the account from step 3, so a login
    that changes mid-deploy cannot move a write to another account. Step 3
    itself runs before the build and again after it, and the deploy stops if
-   the two name different accounts.
+   the two name different accounts. `cf containers push` gets ten minutes.
+   When they pass, or when Eden is stopped with Ctrl-C or a kill, Eden
+   kills `cf` and every process under it. `cf` runs `docker push` in a
+   process group of its own, so killing `cf` alone would leave the upload
+   running.
 6. **Stage runtime variables** (only with `--env-file`). The values are
    held for the publish, which uploads them as Worker secrets with the
    Worker version, so code and values change together. Values never go into

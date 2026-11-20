@@ -40,6 +40,17 @@
   what `cf` and Docker printed is kept in `cf-push.log` in the generation
   folder, and the message names the file. Until now every one of these read
   `The exact Cloudflare Container image push did not complete.`
+- When Eden stops `cf` because its time ran out, or because Eden itself
+  got Ctrl-C or a kill, it now also stops every process `cf` started. `cf`
+  `1.0.0-rc.2` runs `docker push` in a process group of its own, so until
+  now the upload went on after `eden deploy` had ended with
+  `DEPLOY_INDETERMINATE`, and could leave an image in the registry that no
+  deployment record named. Run with the pinned `cf` and a stand-in
+  `docker`: before the change the push finished three seconds after Eden
+  had returned; after it the push was gone when Eden returned. The upload
+  to Cloudflare's registry itself was not interrupted in a test.
+  `docs/troubleshooting.md` says how to remove an image that a push left
+  before it was stopped.
 
 ## 0.15.0 — 2026-11-20
 
