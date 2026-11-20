@@ -4,6 +4,75 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for the move to cf (2026-11-20)
+
+Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
+Cloudflare account, with `cf` `1.0.0-rc.2` and an OAuth login, on branch
+`eden-19/cf-cli` at `8afaf17`. Later commits on the branch change docs only.
+
+Full run of `pnpm run check:live`, target `eden-live-20261120-218e40a3`,
+`13:48:13Z` to `14:03:26Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+this workspace (version `0.14.0`), a 90-second idle window. All 18 steps
+passed on the first run.
+
+- `eden preflight` passed 14 checks with no warnings in 75 seconds.
+- The check interrupts its first `cf deploy` after the upload. `cf deploy`
+  exited 1 after 5 refused reads of the uploaded version. Eden then ran
+  `cf containers applications create` and `cf workers triggers deploy`, both
+  exit 0, and the fresh deploy ended in 158 seconds with health ready.
+- The same-version update took 126 seconds and the deploy on Eve `1.0.2`
+  227 seconds, on the same URL. Both carried `EVE_UPDATE_IN_FLIGHT`. The
+  update reported `VAL-LIFE-007` passed: `The superseded image was deleted
+  from the registry by its tag after promotion.`
+- The first session answered after each deploy and after the sleep, with its
+  earlier turns in its stream and its file intact. After 165 seconds with no
+  requests the first health request took 4.6 seconds, and the server process
+  was 6 seconds old.
+- No `queueAuthMode` line on Eve `1.0.2`. An unauthenticated session request
+  got `401`, and the two workflow queue routes answered `404`.
+- `eden destroy` ended in 54 seconds and reported 15 objects in
+  `EVE_REGISTRY_OBJECTS_KEPT`. The check then found the URL at 404, no
+  Worker, no secrets, no Container application, and nothing in the
+  registry's listing except those 15.
+
+Other runs the same day, each on a disposable target that was destroyed
+afterwards:
+
+- **Cloudflare was slow to show new Workers.** Its reads answered `This
+  Worker does not exist` for up to about 25 seconds after `cf` had uploaded
+  one. `cf deploy` itself failed that way without the check's interruption,
+  and so did `cf workers triggers deploy`. At `19a0723` and `8afaf17` Eden
+  got waits for these reads and steps; before them, deploys of
+  `eden19-m2` and `eden19-m3` ended `DEPLOY_INDETERMINATE`.
+- **A half-published target** (`eden19-m3`, at `19a0723`): `cf deploy` was
+  interrupted after its upload and Container application creation was
+  blocked. The deploy ended `DEPLOY_INDETERMINATE` with the Worker present
+  and no Container application. `eden destroy` exited 0, and both Worker
+  reads then answered code `10007`.
+- **Planted files** (`eden19-m3`, at `19a0723`): with a `.env` naming another
+  account and a token, and a `cloudflare.config.ts` that writes a file, in
+  the project and in its parent folder, deploy exited 0 with health 200. The
+  Worker and the Container application were in the checked account, and the
+  planted config had not run.
+- **API token login** (`eden19-tok`, at `0c3710e`): with
+  `CLOUDFLARE_API_TOKEN` set and an empty `cf` config folder,
+  `cf auth whoami` reported the token as its source. Preflight, a first
+  deploy, an update, and destroy exited 0. The token came from Cloudflare's
+  "Edit Cloudflare Workers" template, unchanged.
+- **An account with no Worker, by stand-in** (`eden19-new`, at `8afaf17`):
+  the answer to `cf workers list` was replaced with an empty list; every
+  other command was real. Eden deployed the temporary Worker in 7.9 seconds,
+  read it, deleted it, and the deploy exited 0 with health 200. No
+  temporary Worker remained.
+- **A deployment made by Eden 0.14.0** (`eden19-m1`, before the merge of
+  `0.14.0` into the branch): this build updated it (health 200) and later
+  destroyed it (health 404). Eden `0.14.0` run on the target after this
+  build had deployed it exited 1 with `DEPLOY_INDETERMINATE`; health stayed
+  200.
+
+Not run: an account that has no `workers.dev` subdomain, and an account
+that truly has no Worker.
+
 ## Live check for release 0.14.0 (2026-11-20)
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
