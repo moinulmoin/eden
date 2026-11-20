@@ -8,22 +8,23 @@ see [Eve compatibility](./eve-compatibility.md).
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
 account, with Wrangler `4.147.0` and an OAuth login, on the branch of
-[#27](https://github.com/moinulmoin/eden/pull/27) at `0f418bc`. From this
+[#27](https://github.com/moinulmoin/eden/pull/27) at `e4b7bdd`. From this
 change on, Eden tags each pushed image with the release ID of its deploy
 and, after a same-version update is promoted, deletes the image it replaced
-by its tag, once the registry resolves that tag to the replaced image.
+by that tag, once the registry resolves the tag to the replaced image. It
+never deletes `candidate`.
 
-Full run of `pnpm run check:live`, target `eden-live-20261120-d3d806d2`,
-`04:03:29Z` to `04:17:55Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+Full run of `pnpm run check:live`, target `eden-live-20261120-16af6584`,
+`04:41:30Z` to `04:54:50Z`, Eve `0.91.0` to `1.0.2`, the World packed from
 this workspace (version `0.13.0`), a 90-second idle window. All 18 steps
 passed.
 
-- The same-version update took 108 seconds and reported `VAL-LIFE-007`
+- The same-version update took 101 seconds and reported `VAL-LIFE-007`
   passed: `The superseded image was deleted from the registry by its tag
   after promotion.` It kept nothing and carried no
   `EVE_SUPERSEDED_IMAGE_NOT_DELETED` warning. The session from before the
   update answered after it with its file intact.
-- `eden destroy` ended with `destroyed` in 44 seconds and reported 12
+- `eden destroy` ended with `destroyed` in 45 seconds and reported 12
   objects in `EVE_REGISTRY_OBJECTS_KEPT`: snapshot tags, snapshot manifests
   and chain artifacts, none of them `accepted-still-listed`. The run before
   this change, below, left 13, one of them an `accepted-still-listed` image
@@ -33,37 +34,41 @@ passed.
   application.
 
 A target made by the released `0.13.0` CLI, then updated and destroyed by
-this build at `0f418bc`: `eden-live-20261120-m2272921`, Eve `1.0.2`, World
+this build at `e4b7bdd`: `eden-live-20261120-m227a793`, Eve `1.0.2`, World
 `0.13.0` from npm, no `--env-file` and no session.
 
 - `npx @moinulmoin/eden@0.13.0 deploy` twice. After the second, the
   registry listed `candidate` and four `sha256:` entries: the first image
   had lost its tag.
 - This build's first `eden deploy` pushed under the tag
-  `eve-deploy-9370ff51-…`, passed `VAL-LIFE-007` with the message above, and
-  the registry no longer listed `candidate` or the image `0.13.0` had
-  pushed second. Its second `eden deploy` pushed under
-  `eve-deploy-66031651-…` and the registry no longer listed the first tag or
-  its image.
+  `eve-deploy-f812f5f6-…` and deleted nothing: `VAL-LIFE-007` was
+  `skipped` with `Nothing was deleted: the registry lists no release tag
+  that names the superseded image.` The registry still listed `candidate`
+  and the image `0.13.0` had pushed second.
+- Its second `eden deploy` pushed under `eve-deploy-42cbdaf2-…` and passed
+  `VAL-LIFE-007` with the message of the full run. The registry no longer
+  listed the first release tag or its image, and still listed `candidate`.
 - This build's `eden destroy` ended with `destroyed` and reported five kept
   objects: four chain artifacts, one per push, and one
   `accepted-still-listed` image manifest, the one `0.13.0` had left
-  untagged. A listing after it showed those five entries and no tag.
+  untagged. A listing after it showed those five entries and no tag: the
+  image under `candidate` and the last pushed image were gone.
 
 Not shown by these runs: a failed delete of the replaced image, an update
 interrupted between promotion and the delete, and a session asleep across a
 same-version update.
 
-Earlier runs on this branch, before the tag and the selection of what to
-delete changed (`5ea4473` and `fbc96d2`, which tagged by generation ID):
-a full check passed 18 of 18 with the same result, and the `0.13.0`
-scenario gave the same listings. Two tries of that scenario stopped inside
-the `0.13.0` CLI: one first deploy ended `DEPLOY_INDETERMINATE` at the
-publish, and one second deploy, started right after the first, failed
-`VAL-CLI-007-TARGET-CONFLICT`. One full check passed every step up to
-destroy; its `eden destroy` ended `EVE_DESTROY_ABSENCE_UNPROVEN` once, as
-did one destroy of the scenario, and a rerun of each ended `destroyed`.
-Every one of these targets was destroyed by this build.
+Earlier runs on this branch, with other rules for the tag and for what to
+delete (`5ea4473`, `fbc96d2` and `0f418bc`): two full checks passed 18 of
+18 with the same result, and the `0.13.0` scenario, which then deleted
+`candidate` on the first update, ended with the same five kept objects.
+Two tries of that scenario stopped inside the `0.13.0` CLI: one first
+deploy ended `DEPLOY_INDETERMINATE` at the publish, and one second deploy,
+started right after the first, failed `VAL-CLI-007-TARGET-CONFLICT`. One
+full check passed every step up to destroy; its `eden destroy` ended
+`EVE_DESTROY_ABSENCE_UNPROVEN` once, as did one destroy of the scenario,
+and a rerun of each ended `destroyed`. Every one of these targets was
+destroyed by this build.
 
 ## Live check for the account binding (2026-11-20)
 
