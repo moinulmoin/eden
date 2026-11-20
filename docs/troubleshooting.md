@@ -1464,14 +1464,33 @@ has the ID <id>, not the ID <id> this deployment's record holds. It is not
 the one Eden deployed; nothing was deleted.` The Worker does not exist, and
 a Container application of the target's name does, with another ID than the
 one the deploy wrote into `deployment.json`: it is not the application
-that deploy read back. Destroy deletes nothing, the registry included, and keeps the record. Look
-at that application in the Cloudflare dashboard of the account the message
-names. If it is yours to remove, delete it there, then run `eden destroy`
-again with the same `--project`, `--env`, and `--name`; it removes the
-rest and clears the record. If it belongs to something else, leave it and
-keep the `.eden` folder. A record written by Eden `0.15.0` or older holds
-no ID, so for such a target destroy still deletes the application by its
-name; the next `eden deploy` writes the ID.
+that deploy read back.
+
+`The Worker is gone, and this deployment's record holds no usable ID for
+the Container application named <name>-container: the publish ended before
+Eden had read it, or the record is damaged. ...` The record's
+`identity.containerApplicationId` is `null` or is not one ID. Eden writes
+`null` before a publish and writes the ID only after it has read the
+release in service and its Container application together. So a first
+deploy that ended `DEPLOY_INDETERMINATE` has a record with `null`. While
+its Worker exists, `eden destroy` still removes that Worker and its
+Container application, proven by the Worker as before. Once the Worker is
+gone, Eden cannot tell the application from another of the same name.
+
+In both cases destroy deletes nothing, the registry included, and leaves
+the record and `CURRENT` as they are. Look at that application in the
+Cloudflare dashboard of the account the message names. If it is yours to
+remove, delete it there, then run `eden destroy` again with the same
+`--project`, `--env`, and `--name`; it removes the rest and clears
+`CURRENT`. If it belongs to something else, leave it and keep the `.eden`
+folder.
+
+A record written by Eden `0.15.0` or older has no
+`containerApplicationId` field at all. Only for such a record does destroy
+still delete the application by its name, until a deploy by a newer Eden
+writes one. Going back is not supported: a deploy by Eden `0.15.0` or
+older over a target this version deployed promotes a record without the
+field, and destroy then treats the target as one of those older records.
 
 A Worker that a first deploy left without its Container application does
 not fail here: destroy proves it from the version in service and the failed

@@ -354,7 +354,8 @@ export interface EveDeploymentIdentity {
   /**
    * The ID Cloudflare gave the Container application, read back after the
    * publish. Destroy deletes an application left without its Worker only
-   * when it has this ID. Records from Eden 0.15.0 and older have none.
+   * when it has this ID. A record written before the publish read it back
+   * holds null. Records from Eden 0.15.0 and older have no such field.
    */
   readonly containerApplicationId?: string;
   readonly stableContainerInstanceName: string;
@@ -2491,9 +2492,9 @@ function safeIdentity(identity: EveDeploymentIdentity): Record<string, unknown> 
     stableWorkersDevOrigin: identity.stableWorkersDevOrigin,
     workerName: identity.workerName,
     containerApplicationName: identity.containerApplicationName,
-    ...(identity.containerApplicationId === undefined
-      ? {}
-      : { containerApplicationId: identity.containerApplicationId }),
+    // Always written, as null until a publish has read the ID back. A record
+    // with no such field is from before the field existed.
+    containerApplicationId: identity.containerApplicationId ?? null,
     stableContainerInstanceName: identity.stableContainerInstanceName,
     containerImage: identity.containerImage,
     runtimeVariableNames: identity.runtimeVariableNames,
@@ -5213,7 +5214,12 @@ type VerifiedEveDestroyIdentity = {
   readonly generationId?: string;
   readonly workerName: string;
   readonly containerApplicationName: string;
-  readonly containerApplicationId?: string;
+  /**
+   * Undefined when the record has no such field: it is from Eden 0.15.0 or
+   * older. Null when the field is there and is not one ID: the publish
+   * ended before Eden read it, or the record is damaged.
+   */
+  readonly containerApplicationId?: string | null;
   readonly stableContainerInstanceName: string;
   readonly containerImage?: string;
   readonly deploymentId?: string;
@@ -5429,7 +5435,7 @@ async function parseEveDestroyRecord(
     return undefined;
   }
   const metadata: Partial<VerifiedEveDestroyIdentity> = {};
-  for (const key of ["deploymentId", "eveVersion", "releaseId", "runtimeRevisionHandle", "containerApplicationId"] as const) {
+  for (const key of ["deploymentId", "eveVersion", "releaseId", "runtimeRevisionHandle"] as const) {
     if (typeof identity[key] === "string") Object.assign(metadata, { [key]: identity[key] });
   }
   if (typeof identity.affinityContract === "number") Object.assign(metadata, { affinityContract: identity.affinityContract });
@@ -5449,6 +5455,12 @@ async function parseEveDestroyRecord(
           (deployment.runtimeRevisionHandle !== undefined && typeof deployment.runtimeRevisionHandle !== "string")) return undefined;
     }
     Object.assign(metadata, { [key]: value });
+  }
+  if ("containerApplicationId" in identity) {
+    const id = identity.containerApplicationId;
+    Object.assign(metadata, {
+      containerApplicationId: typeof id === "string" && /^[0-9a-f]{32}$/u.test(id) && !namesFieldTwice(raw) ? id : null,
+    });
   }
   const verified: VerifiedEveDestroyIdentity = {
     ...metadata,
@@ -6696,17 +6708,20 @@ async function runEveDestroyLocked(
 
     // Without its Worker, a Container application has nothing on Cloudflare
     // that proves it. The record's ID does: another application of the same
-    // name has another ID. A record from before IDs were written has none,
-    // and the name alone decides as it did then.
+    // name has another ID. Only a record from before IDs were written, which
+    // has no such field, lets the name alone decide, as it did then.
+    const recordedApplication = record.identity.containerApplicationId;
     if (
       !before.workerExists &&
       before.containerApplicationId !== undefined &&
-      record.identity.containerApplicationId !== undefined &&
-      before.containerApplicationId !== record.identity.containerApplicationId
+      recordedApplication !== undefined &&
+      before.containerApplicationId !== recordedApplication
     ) {
       fail(
         "EVE_DESTROY_OWNERSHIP_UNPROVEN",
-        `The Worker is gone, and the Container application named ${expectedContainer} has the ID ${before.containerApplicationId}, not the ID ${record.identity.containerApplicationId} this deployment's record holds. It is not the one Eden deployed; nothing was deleted.`,
+        recordedApplication === null
+          ? `The Worker is gone, and this deployment's record holds no usable ID for the Container application named ${expectedContainer}: the publish ended before Eden had read it, or the record is damaged. Eden cannot tell that application from another of the same name; nothing was deleted.`
+          : `The Worker is gone, and the Container application named ${expectedContainer} has the ID ${before.containerApplicationId}, not the ID ${recordedApplication} this deployment's record holds. It is not the one Eden deployed; nothing was deleted.`,
         `Look at the Container application ${expectedContainer} in the Cloudflare dashboard of account ${record.identity.accountId}. If it is yours to remove, delete it there, then run eden destroy again with the same --project, --env, and --name to remove the rest. If it belongs to something else, leave it and keep the .eden folder.`,
       );
     }

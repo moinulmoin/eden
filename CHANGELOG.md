@@ -51,14 +51,19 @@
   standard error. `docs/troubleshooting.md` says what happens to an image
   such a push leaves.
 - `eden destroy` no longer deletes a Container application by its name
-  alone when the Worker is gone. Each deploy now writes the Container
+  alone when the Worker is gone. A deploy now writes the Container
   application's ID into `deployment.json` as
-  `identity.containerApplicationId`. When Cloudflare says the Worker does
-  not exist and lists a Container application of the target's name under
-  another ID, destroy stops with `EVE_DESTROY_OWNERSHIP_UNPROVEN`, deletes
-  nothing, and says where to look. Until now it deleted that application and
-  reported `destroyed`. A record written by `0.15.0` or older has no ID, and
-  for it destroy behaves as before until the next `eden deploy`.
+  `identity.containerApplicationId`, once it has read the release in
+  service and the application together; before that the field is `null`.
+  When Cloudflare says the Worker does not exist and lists a Container
+  application of the target's name, destroy deletes it only under the
+  recorded ID. With another ID, a `null`, or a field that is not one ID,
+  destroy stops with `EVE_DESTROY_OWNERSHIP_UNPROVEN`, deletes nothing, and
+  says where to look. Until now it deleted that application and reported
+  `destroyed`. Only a record written by `0.15.0` or older, which has no
+  such field, keeps the old behavior until a deploy by a newer Eden. A
+  first deploy left half published is still destroyed while its Worker
+  exists.
 
 ## 0.15.0 — 2026-11-20
 
