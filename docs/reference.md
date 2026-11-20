@@ -545,8 +545,10 @@ record the update path reads to carry the Durable Object history forward.
 `deployment.json` holds the version, the status (`deployed`, `failed`, or
 `indeterminate`), the deployment identity (project, source digest, generation,
 deployment id, environment, name, account, subdomain, origin, Worker,
-Container application, instance, image reference, runtime variable names, and
-revision handle), the published Worker configuration, the Container
+Container application name and `containerApplicationId` (the application's
+ID once a publish has read it back, `null` before that, and no such field
+in a record from `0.15.0` or older), instance, image reference,
+runtime variable names, and revision handle), the published Worker configuration, the Container
 configuration, and the Durable Object bindings and migrations. It is the
 immutable ownership proof: `destroy` refuses to act without it.
 

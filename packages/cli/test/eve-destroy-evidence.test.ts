@@ -425,7 +425,7 @@ const targetKey = "preview-eve-destroy-fixture-" + createHash("sha256")
 const repository = "eden-eve-" + targetKey + "-gen-destroy-1";
 
 /** A project with one deployed generation and CURRENT pointing at it. */
-async function deployedProject(generation = "gen-destroy-1"): Promise<{
+async function deployedProject(generation = "gen-destroy-1", /** Raw JSON members added to the record's identity. */ moreIdentity = ""): Promise<{
   readonly root: string;
   readonly targetRoot: string;
   readonly current: string;
@@ -435,7 +435,11 @@ async function deployedProject(generation = "gen-destroy-1"): Promise<{
   await writeFile(join(root, "package.json"), JSON.stringify({ name: "eve-destroy-fixture", private: true }), "utf8");
   const targetRoot = join(root, ".eden", "eve-deploy", "targets", "preview-eve-destroy-fixture");
   await mkdir(targetRoot, { recursive: true });
-  await addGeneration(root, generation);
+  const generationRoot = await addGeneration(root, generation);
+  if (moreIdentity.length > 0) {
+    const record = join(generationRoot, "deployment.json");
+    await writeFile(record, (await readFile(record, "utf8")).replace('"identity":{', '"identity":{' + moreIdentity + ","), "utf8");
+  }
   await symlink(relative(targetRoot, join(root, ".eden", "eve-deploy", "generations", generation)), join(targetRoot, "CURRENT"));
   return { root, targetRoot, current: join(targetRoot, "CURRENT") };
 }
@@ -1555,6 +1559,122 @@ describe("a failed image push says how it ended and keeps nothing cf or Docker p
       expect(await readFile(join(entry.parentPath, entry.name), "utf8")).not.toContain("registry-password");
     }
     expect([...cloud.workers]).toEqual([]);
+  });
+});
+
+describe("destroy deletes a Container application left without its Worker only when it is the recorded one (MOI-322)", () => {
+  const current = (root: string) => join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT");
+  const destroyDeployed = async (root: string) => {
+    const output: string[] = [];
+    const exitCode = await runEdenCli(
+      ["destroy", "--project", root, "--env", "preview", "--name", "eve-deploy-fixture", "--json"],
+      { cwd: root, stdout: (line) => output.push(line), stderr: (line) => output.push(line) },
+    );
+    expect(output).toHaveLength(1);
+    return { exitCode, result: JSON.parse(output[0] ?? "") as { readonly status?: string; readonly error?: { readonly code?: string; readonly message?: string; readonly remediation?: string } } };
+  };
+  /** A deploy by Eden's own publish, then the Worker removed by hand. */
+  const deployedWithoutWorker = async (): Promise<string> => {
+    const root = await deployableProject();
+    expect((await deploy(root)).exitCode).toBe(0);
+    cloud.workers.clear();
+    return root;
+  };
+
+  test("a deploy writes the Container application's ID into the deployment record", async () => {
+    const root = await deployableProject();
+    expect((await deploy(root)).exitCode).toBe(0);
+    const record = JSON.parse(await readFile(join(await realpath(current(root)), "deployment.json"), "utf8")) as { readonly identity: Record<string, unknown> };
+    expect(record.identity.containerApplicationId).toBe(cloud.namespace);
+  });
+
+  test("the application with the recorded ID is deleted, and the target ends destroyed", async () => {
+    const root = await deployedWithoutWorker();
+    const { exitCode, result } = await destroyDeployed(root);
+    expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
+    expect(cloud.deleted).toEqual(["container:account-test/eve-deploy-fixture-container#" + cloud.namespace]);
+    await expect(lstat(current(root))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("another application of the same name is not deleted: destroy stops and says where to look", async () => {
+    const root = await deployedWithoutWorker();
+    const other = "f".repeat(32);
+    cloud.containers = new Set(["account-test/eve-deploy-fixture-container#" + other]);
+    cloud.tags = ["candidate"];
+    const { exitCode, result } = await destroyDeployed(root);
+    expect({ exitCode, status: result.status, code: result.error?.code }).toEqual({ exitCode: 1, status: "failed", code: "EVE_DESTROY_OWNERSHIP_UNPROVEN" });
+    expect(result.error?.message).toBe(
+      "The Worker is gone, and the Container application named eve-deploy-fixture-container has the ID " + other + ", not the ID " + cloud.namespace +
+        " this deployment's record holds. It is not the one Eden deployed; nothing was deleted.",
+    );
+    expect(result.error?.remediation).toMatch(/^Look at the Container application eve-deploy-fixture-container in the Cloudflare dashboard of account account-test\. .* run eden destroy again with the same --project, --env, and --name/u);
+    // Nothing is deleted, the registry included, and the record stays.
+    expect({ deleted: cloud.deleted, containers: [...cloud.containers], tags: cloud.tags }).toEqual({
+      deleted: [],
+      containers: ["account-test/eve-deploy-fixture-container#" + other],
+      tags: ["candidate"],
+    });
+    await expect(lstat(current(root))).resolves.toBeDefined();
+  });
+
+  test.each([
+    ["null", '"containerApplicationId":null'],
+    ["a number", '"containerApplicationId":123'],
+    ["a string that is no ID", '"containerApplicationId":"container-123"'],
+    ["two IDs", '"containerApplicationId":"' + "a".repeat(32) + '","containerApplicationId":"' + "a".repeat(32) + '"'],
+    ["missing beside a field written twice", '"note":1,"note":2'],
+  ] as const)("a record whose ID is %s is not a record without one: destroy stops and deletes nothing", async (_name, member) => {
+    const { root, current: pointer } = await deployedProject("gen-destroy-1", member);
+    cloud.containers.add("account-test/eve-destroy-fixture-container#" + "a".repeat(32));
+    cloud.tags = ["candidate"];
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_OWNERSHIP_UNPROVEN" });
+    expect((result.error as { readonly message?: string }).message).toBe(
+      "The Worker is gone, and this deployment's record holds no usable ID for the Container application named eve-destroy-fixture-container: the publish ended before Eden had read it, or the record is damaged. Eden cannot tell that application from another of the same name; nothing was deleted.",
+    );
+    expect(result.error?.remediation).toMatch(/^Look at the Container application eve-destroy-fixture-container in the Cloudflare dashboard of account account-test\./u);
+    expect({ deleted: cloud.deleted, tags: cloud.tags }).toEqual({ deleted: [], tags: ["candidate"] });
+    await expect(lstat(pointer)).resolves.toBeDefined();
+  });
+
+  test("a first publish that ended before Eden recorded the application's ID is not a record without one", async () => {
+    const root = await deployableProject();
+    // cf uploads the Worker, Eden creates the Container application, and the triggers never apply.
+    cloud.deployFailure = "after-upload";
+    cloud.triggerFailures = 1_000;
+    const failed = await deploy(root);
+    expect({ exitCode: failed.exitCode, code: failed.result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect([...cloud.containers]).toEqual(["account-test/eve-deploy-fixture-container#" + cloud.namespace]);
+    // Someone removes the Worker and the application, and another application of the name appears.
+    cloud.workers.clear();
+    const other = "account-test/eve-deploy-fixture-container#" + "f".repeat(32);
+    cloud.containers = new Set([other]);
+    const { exitCode, result } = await destroyDeployed(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_OWNERSHIP_UNPROVEN" });
+    expect(result.error?.message).toMatch(/holds no usable ID for the Container application named eve-deploy-fixture-container/u);
+    expect({ deleted: cloud.deleted, containers: [...cloud.containers] }).toEqual({ deleted: [], containers: [other] });
+  });
+
+  test("that half-published first deploy is still destroyed while its Worker exists", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.triggerFailures = 1_000;
+    expect((await deploy(root)).exitCode).toBe(1);
+    const { exitCode, result } = await destroyDeployed(root);
+    expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
+    expect(cloud.deleted).toEqual([
+      "worker:account-test/eve-deploy-fixture",
+      "container:account-test/eve-deploy-fixture-container#" + cloud.namespace,
+    ]);
+  });
+
+  test("a record with no ID, from Eden 0.15.0 or older, still deletes the application by its name", async () => {
+    const { root, current: pointer } = await deployedProject();
+    cloud.containers.add(container);
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
+    expect(cloud.deleted).toEqual(["container:" + container]);
+    await expect(lstat(pointer)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 

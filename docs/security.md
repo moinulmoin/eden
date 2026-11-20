@@ -365,14 +365,25 @@ login cannot act on the checked account, the command fails.
   checks its registry repositories for anything other than
   [objects Cloudflare keeps](./troubleshooting.md#eve_registry_objects_kept).
   It never deletes by name prefix.
-- **A Container application left without its Worker is deleted on the
-  record and its name.** While the Worker exists, destroy proves the
+- **A Container application left without its Worker is deleted only when
+  it has the recorded ID.** While the Worker exists, destroy proves the
   Container application by the namespace the Worker binds. Once Cloudflare's
-  API says the Worker does not exist, there is nothing left to compare the
-  application with, and the deployment record holds its name, not its ID.
-  So destroy deletes the one application of the recorded name in the
-  recorded account. If someone deleted the Worker and created another
-  Container application of that exact name, destroy deletes that one.
+  API says the Worker does not exist, there is nothing on Cloudflare left to
+  compare the application with. So a deploy writes the application's ID
+  into the deployment record once it has read the release in service and
+  its Container application together, and destroy deletes an application
+  without its Worker only when Cloudflare lists it under that ID. Another
+  application of the same name stops destroy with
+  `EVE_DESTROY_OWNERSHIP_UNPROVEN`, and nothing is deleted. A record Eden
+  wrote before it had read the ID holds `null`. That, and a field that is
+  not one ID, stop destroy the same way: such a record is not treated as
+  an old one.
+  **Records without the field:** a record written by Eden `0.15.0` or
+  older has no `containerApplicationId` at all. For such a target destroy
+  still deletes the one application of the recorded name in the recorded
+  account, whoever created it, until a deploy by a newer Eden writes the
+  ID. A deploy by Eden `0.15.0` or older over a newer target promotes such
+  a record again; going back is not supported.
 - **Destroy clears only its own pointer.** Destroy refuses a target whose
   record is reached through a symlink that leaves the project's `.eden`
   folder, and reads no record file that is a symlink. It removes `CURRENT` only if the pointer is still the file it read

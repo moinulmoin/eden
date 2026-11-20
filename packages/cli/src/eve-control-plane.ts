@@ -351,6 +351,13 @@ export interface EveDeploymentIdentity {
   readonly stableWorkersDevOrigin: string;
   readonly workerName: string;
   readonly containerApplicationName: string;
+  /**
+   * The ID Cloudflare gave the Container application, read back after the
+   * publish. Destroy deletes an application left without its Worker only
+   * when it has this ID. A record written before the publish read it back
+   * holds null. Records from Eden 0.15.0 and older have no such field.
+   */
+  readonly containerApplicationId?: string;
   readonly stableContainerInstanceName: string;
   readonly containerImage: string;
   readonly runtimeVariableNames: readonly string[];
@@ -455,6 +462,8 @@ export type EveDeploymentPublicationResult =
     readonly identity: EveDeploymentIdentityProof;
     readonly createdByAttempt: boolean;
     readonly ownershipProven: true;
+    /** The ID of the target's one Container application, as read with the release in service. */
+    readonly containerApplicationId?: string;
   }
   | {
     readonly status: "failed";
@@ -2483,6 +2492,9 @@ function safeIdentity(identity: EveDeploymentIdentity): Record<string, unknown> 
     stableWorkersDevOrigin: identity.stableWorkersDevOrigin,
     workerName: identity.workerName,
     containerApplicationName: identity.containerApplicationName,
+    // Always written, as null until a publish has read the ID back. A record
+    // with no such field is from before the field existed.
+    containerApplicationId: identity.containerApplicationId ?? null,
     stableContainerInstanceName: identity.stableContainerInstanceName,
     containerImage: identity.containerImage,
     runtimeVariableNames: identity.runtimeVariableNames,
@@ -2936,7 +2948,7 @@ function defaultPublicationRunner(
     // service and its one Container application on the namespace that
     // release binds. Cloudflare can lag behind a publish, so the reads are
     // repeated for two minutes.
-    let published = false;
+    let published: string | undefined;
     const verifying = withinTime(120_000, cf, api);
     for (
       let attempt = 0;
@@ -2952,12 +2964,13 @@ function defaultPublicationRunner(
         await readPublishApplication(verifying.api, request, namespaceId) === "matches" &&
         (await readServedRelease(verifying.api, request))?.namespaceId === namespaceId
       ) {
-        published = true;
+        // The application's ID is that namespace: readPublishApplication requires it.
+        published = namespaceId;
         break;
       }
     }
     // A check that ended after the deadline does not count either.
-    if (!published || deadline <= performance.now()) {
+    if (published === undefined || deadline <= performance.now()) {
       return {
         status: "indeterminate",
         reason: deadline <= performance.now()
@@ -2971,6 +2984,7 @@ function defaultPublicationRunner(
       identity: request.identity,
       createdByAttempt: true,
       ownershipProven: true,
+      containerApplicationId: published,
     };
   };
 }
@@ -3663,7 +3677,7 @@ async function runEveDeployment(
   const containerApplicationName = boundedResourceName(request.name, "container");
   const stableContainerInstanceName = boundedResourceName(request.name, "instance");
   const runtimeVariableNames = candidate.runtimeVariableNames;
-  const identity: EveDeploymentIdentity = {
+  let identity: EveDeploymentIdentity = {
     projectId: collected.projectId,
     sourceDigest: candidate.sourceDigest,
     generationId: candidate.generationId,
@@ -3896,6 +3910,11 @@ async function runEveDeployment(
     };
   }
 
+  // Every record written from here on names the Container application the
+  // publish read back, so destroy can tell it from another of the same name.
+  if (publication.containerApplicationId !== undefined) {
+    identity = { ...identity, containerApplicationId: publication.containerApplicationId };
+  }
   let health: EveDeploymentHealthResult;
   try {
     eveProgress(options, `verifying health at ${stableWorkersDevOrigin}`);
@@ -5174,6 +5193,7 @@ interface EveDestroyRecord {
     readonly generationId?: unknown;
     readonly workerName?: unknown;
     readonly containerApplicationName?: unknown;
+    readonly containerApplicationId?: unknown;
     readonly stableContainerInstanceName?: unknown;
     readonly containerImage?: unknown;
     readonly deploymentId?: unknown;
@@ -5194,6 +5214,12 @@ type VerifiedEveDestroyIdentity = {
   readonly generationId?: string;
   readonly workerName: string;
   readonly containerApplicationName: string;
+  /**
+   * Undefined when the record has no such field: it is from Eden 0.15.0 or
+   * older. Null when the field is there and is not one ID: the publish
+   * ended before Eden read it, or the record is damaged.
+   */
+  readonly containerApplicationId?: string | null;
   readonly stableContainerInstanceName: string;
   readonly containerImage?: string;
   readonly deploymentId?: string;
@@ -5429,6 +5455,13 @@ async function parseEveDestroyRecord(
           (deployment.runtimeRevisionHandle !== undefined && typeof deployment.runtimeRevisionHandle !== "string")) return undefined;
     }
     Object.assign(metadata, { [key]: value });
+  }
+  const twice = namesFieldTwice(raw);
+  if (twice || "containerApplicationId" in identity) {
+    const id = identity.containerApplicationId;
+    Object.assign(metadata, {
+      containerApplicationId: !twice && typeof id === "string" && /^[0-9a-f]{32}$/u.test(id) ? id : null,
+    });
   }
   const verified: VerifiedEveDestroyIdentity = {
     ...metadata,
@@ -6672,6 +6705,26 @@ async function runEveDestroyLocked(
       if (ownership.target.state !== "owned") {
         fail("EVE_DESTROY_OWNERSHIP_UNPROVEN", "Live provider settings do not match the recorded Worker and Container identity; nothing was deleted.");
       }
+    }
+
+    // Without its Worker, a Container application has nothing on Cloudflare
+    // that proves it. The record's ID does: another application of the same
+    // name has another ID. Only a record from before IDs were written, which
+    // has no such field, lets the name alone decide, as it did then.
+    const recordedApplication = record.identity.containerApplicationId;
+    if (
+      !before.workerExists &&
+      before.containerApplicationId !== undefined &&
+      recordedApplication !== undefined &&
+      before.containerApplicationId !== recordedApplication
+    ) {
+      fail(
+        "EVE_DESTROY_OWNERSHIP_UNPROVEN",
+        recordedApplication === null
+          ? `The Worker is gone, and this deployment's record holds no usable ID for the Container application named ${expectedContainer}: the publish ended before Eden had read it, or the record is damaged. Eden cannot tell that application from another of the same name; nothing was deleted.`
+          : `The Worker is gone, and the Container application named ${expectedContainer} has the ID ${before.containerApplicationId}, not the ID ${recordedApplication} this deployment's record holds. It is not the one Eden deployed; nothing was deleted.`,
+        `Look at the Container application ${expectedContainer} in the Cloudflare dashboard of account ${record.identity.accountId}. If it is yours to remove, delete it there, then run eden destroy again with the same --project, --env, and --name to remove the rest. If it belongs to something else, leave it and keep the .eden folder.`,
+      );
     }
 
     const deleteWorker = options.deleteWorker ?? defaultWorkerDelete(cf);
