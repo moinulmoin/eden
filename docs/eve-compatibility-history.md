@@ -8,7 +8,8 @@ see [Eve compatibility](./eve-compatibility.md).
 
 Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
 Cloudflare account, with `cf` `1.0.0-rc.2` and an OAuth login, on branch
-`eden-19/cf-cli` at `874c228`. Later commits on the branch change docs only.
+`eden-19/cf-cli` at `874c228`. Later commits on the branch change docs, and at `27fdac9` the
+error handling around the temporary Worker, which this check does not run.
 
 Full run of `pnpm run check:live`, target `eden-live-20261120-2f9fbb2c`,
 `14:14:49Z` to `14:41:37Z`, Eve `0.91.0` to `1.0.2`, the World packed from
@@ -61,9 +62,10 @@ afterwards:
   source and the saved login as overridden. Preflight, a first
   deploy, an update, and destroy exited 0. The token came from Cloudflare's
   "Edit Cloudflare Workers" template, unchanged.
-- **An account with no Worker, by stand-in** (`eden19-new`, at `8afaf17`):
+- **An account with no Worker, by stand-in** (`eden19-new`, at `8afaf17`
+  and again at `27fdac9`):
   the answer to `cf workers list` was replaced with an empty list; every
-  other command was real. Eden deployed the temporary Worker in 7.9 seconds,
+  other command was real. Eden deployed the temporary Worker in about 8 seconds,
   read it, deleted it, and the deploy exited 0 with health 200. No
   temporary Worker remained.
 - **A deployment made by Eden 0.14.0** (`eden19-m1`, before the merge of
