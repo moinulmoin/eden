@@ -88,6 +88,14 @@ const cloud = vi.hoisted(() => {
     deployOutput: "",
     /** Whether "cf containers applications create" fails. */
     createFails: false,
+    /** Whether "cf containers applications create" exits 0 and creates nothing. */
+    createLost: false,
+    /** When set, what "cf containers applications get" prints for an application that exists, given its true answer. */
+    application: undefined as ((real: Readonly<Record<string, unknown>>) => unknown) | undefined,
+    /** Bindings of the Worker version beside its stamps and its Container binding. */
+    moreBindings: [] as readonly unknown[],
+    /** When set, the Worker the Container binding says its class is in. */
+    bindingScript: undefined as string | undefined,
     /** Each Worker whose triggers cf deployed, as account/worker. */
     triggers: [] as string[],
     /** Each cf command: its arguments, the cloudflare.config.ts in its folder, and its environment. */
@@ -201,7 +209,7 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
     if (command === "workers versions get") {
       return ok({
         id: args[3],
-        bindings: [...cloud.stamps, { type: "durable_object_namespace", name: "EVE_CONTAINER", class_name: "EveHostDurableContainer", namespace_id: cloud.namespace }],
+        bindings: [...cloud.stamps, { type: "durable_object_namespace", name: "EVE_CONTAINER", class_name: "EveHostDurableContainer", ...(cloud.bindingScript === undefined ? {} : { script_name: cloud.bindingScript }), namespace_id: cloud.namespace }, ...cloud.moreBindings],
       });
     }
     if (command === "workers versions list") {
@@ -220,8 +228,10 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
       return cloud.containerAnswer?.(JSON.stringify(entries)) ?? ok(entries);
     }
     if (command === "containers applications get") {
-      return [...cloud.containers].some((entry) => entry.startsWith(account + "/") && entry.endsWith("#" + args[3]))
-        ? ok({ id: args[3], scheduling_policy: "durable_object", durable_objects: { namespace_id: cloud.namespace } })
+      const present = [...cloud.containers].find((entry) => entry.startsWith(account + "/") && entry.endsWith("#" + args[3]));
+      const real = { id: args[3], name: present?.slice(account.length + 1).split("#")[0], scheduling_policy: "durable_object", durable_objects: { namespace_id: cloud.namespace } };
+      return present !== undefined
+        ? ok(cloud.application?.(real) ?? real)
         : cloud.apiError(1609, "Container application not found: " + args[3], "404 Not Found", "/accounts/" + account + "/containers/applications/" + args[3]);
     }
     if (command === "workers list") {
@@ -282,7 +292,7 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
   if (command === "containers applications create") {
     if (cloud.createFails) return cloud.apiError(1000, "Internal error", "500 Internal Server Error", "/accounts/" + account + "/containers/applications");
     const body = JSON.parse(flag("--body")) as { readonly name: string; readonly durable_objects: { readonly namespace_id: string } };
-    cloud.containers.add(account + "/" + body.name + "#" + body.durable_objects.namespace_id);
+    if (!cloud.createLost) cloud.containers.add(account + "/" + body.name + "#" + body.durable_objects.namespace_id);
     return ok({ id: body.durable_objects.namespace_id, name: body.name });
   }
   if (command === "workers secrets bulk-edit") {
@@ -463,6 +473,10 @@ beforeEach(() => {
     deployFailure: undefined,
     deployOutput: "",
     createFails: false,
+    createLost: false,
+    application: undefined,
+    moreBindings: [],
+    bindingScript: undefined,
     triggers: [],
     runs: [],
     listed: new Set<string>(),
@@ -1103,6 +1117,90 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     const { exitCode, result } = await deploy(root);
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
     expect({ containers: [...cloud.containers], triggers: cloud.triggers }).toEqual({ containers: [], triggers: [] });
+  });
+
+  test("a version Cloudflare holds but does not serve is not finished: Eden creates nothing for it", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.deployments = 0;
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect({ containers: [...cloud.containers], triggers: cloud.triggers }).toEqual({ containers: [], triggers: [] });
+  });
+
+  test.each([
+    ["another ID", (real: Readonly<Record<string, unknown>>) => ({ ...real, id: "f".repeat(32) })],
+    ["another namespace", (real: Readonly<Record<string, unknown>>) => ({ ...real, durable_objects: { namespace_id: "e".repeat(32) } })],
+    ["another name", (real: Readonly<Record<string, unknown>>) => ({ ...real, name: "another-container" })],
+    ["another scheduling policy", (real: Readonly<Record<string, unknown>>) => ({ ...real, scheduling_policy: "default" })],
+  ] as const)("a Container application that answers with %s is not this publish's: no triggers, and the last deploy stays current", async (_name, application) => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.containers.add("account-test/eve-deploy-fixture-container#" + cloud.namespace);
+    cloud.application = application;
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect(cloud.triggers).toEqual([]);
+    await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test.each([
+    ["a second binding of the Container class", { type: "durable_object_namespace", name: "OTHER", class_name: "EveHostDurableContainer", namespace_id: "e".repeat(32) }],
+    ["a second binding with the Container's name", { type: "durable_object_namespace", name: "EVE_CONTAINER", class_name: "Other", namespace_id: "e".repeat(32) }],
+    ["a second release stamp", { type: "plain_text", name: "EDEN_EVE_RELEASE_ID", text: "eve-deploy-another" }],
+  ] as const)("a Worker version with %s is not finished: Eden creates nothing for it", async (_name, binding) => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.moreBindings = [binding];
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect({ containers: [...cloud.containers], triggers: cloud.triggers }).toEqual({ containers: [], triggers: [] });
+  });
+
+  test("a Container binding that names a class in another Worker is not finished", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.bindingScript = "another-worker";
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect({ containers: [...cloud.containers], triggers: cloud.triggers }).toEqual({ containers: [], triggers: [] });
+  });
+
+  test("a create that exits 0 and leaves no Container application is not finished: no triggers", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.createLost = true;
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect(cloud.triggers).toEqual([]);
+  });
+
+  test("after a publish cf called done, a Container application with another namespace is not a publication", async () => {
+    const root = await deployableProject();
+    cloud.application = (real) => ({ ...real, durable_objects: { namespace_id: "e".repeat(32) } });
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("after a publish cf called done, a Worker serving another release is not a publication", async () => {
+    const root = await deployableProject();
+    cloud.onRead = () => {
+      if (cloud.triggers.length > 0) cloud.stamps = [{ type: "plain_text", name: "EDEN_EVE_RELEASE_ID", text: "eve-deploy-another" }];
+    };
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+  });
+
+  test("a Worker whose deployments vanish between destroy's two reads is not proven: destroy deletes nothing", async () => {
+    const { root, current } = await deployedProject();
+    cloud.workers.add("account-test/eve-destroy-fixture");
+    cloud.containers.add("account-test/eve-destroy-fixture-container#container-123");
+    cloud.onWorkerRead = (nth) => { cloud.deployments = nth === 0 ? 1 : 0; };
+    const { exitCode } = await destroy(root);
+    expect(exitCode).toBe(1);
+    expect(cloud.deleted).toEqual([]);
+    await expect(lstat(current)).resolves.toBeDefined();
   });
 
   test("a publish Eden cannot finish names the next commands, and destroy then removes the Worker it left", async () => {

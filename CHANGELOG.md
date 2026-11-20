@@ -38,7 +38,20 @@
   `eden deploy` again sets up what is missing. Cloudflare can take a while
   to show a version it just accepted, so Eden repeats its read for up to
   two minutes. What `cf` printed is kept in `worker/cf-deploy.log` in the
-  generation folder.
+  generation folder. Eden finishes only the version Cloudflare serves, with
+  one binding for the Container class, and only a Container application
+  whose ID, name, policy and namespace all match; otherwise it writes
+  nothing more.
+- **A publish counts only when the release and its Container application
+  agree.** After every publish Eden reads the release in service and the
+  target's one Container application together, for up to two minutes. If
+  they do not match, the deploy ends `DEPLOY_INDETERMINATE` with
+  `Cloudflare did not show this release in service together with its one
+  Container application after publication.` and the last promoted deploy
+  stays current.
+- **`eden destroy` stops when Cloudflare's reads of the Worker disagree.**
+  A Worker that one read shows deployed and the next shows with no
+  deployment is not proven, and nothing is deleted.
 - **`eden destroy` calls a Worker absent only when two reads agree.**
   Cloudflare's deployments read and its Worker read can disagree for a
   while after a Worker is created or deleted. Both must answer that the

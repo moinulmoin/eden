@@ -762,9 +762,13 @@ return a terminal success result.` Eden makes no further change. The failed
 [Indeterminate outcomes](#indeterminate-outcomes).
 
 If it does, Eden finishes the publish itself: it creates the Container
-application when Cloudflare answers that it does not exist, then deploys the
-triggers, trying again for up to two minutes while that fails. The deploy then continues as any other. When one of those steps
-fails, the message is `Cloudflare has this
+application when the account has none of the target's name, reads it back,
+then deploys the triggers, trying again for up to two minutes while that
+fails. The deploy then continues as any other. Eden writes nothing when the
+Worker version has no single binding for the Container class, or when a
+Container application of that name has another ID, policy or namespace.
+When one of those steps fails or one of those answers disagrees, the
+message is `Cloudflare has this
 publish's Worker version, but its Container application or triggers could
 not be set up.` The remediation is `Run eden deploy again with the same
 --project, --env, and --name: Cloudflare has this publish's Worker version,
@@ -773,6 +777,13 @@ target this project never promoted it adds `This was the target's first
 deploy. To remove it instead, run eden destroy with the same selectors.`
 `eden destroy` can remove a Worker that such a first deploy left without its
 Container application.
+
+After every publish Eden reads the release in service and the target's one
+Container application together, for up to two minutes. When they do not
+match, the message is `Cloudflare did not show this release in service
+together with its one Container application after publication.` The last
+promoted deploy stays current. Run `eden deploy` again with the same
+selectors.
 
 ### `EVE_IMAGE_IDENTITY_MISMATCH`
 

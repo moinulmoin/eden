@@ -1879,7 +1879,7 @@ async function defaultCloudflareRead(
     cf,
     request.name,
     accountId,
-    workerPresent,
+    worker,
     containerPresent ? containerEntries?.[0] : undefined,
   );
   return {
@@ -1907,15 +1907,18 @@ async function defaultCloudflareRead(
 }
 
 /**
- * The bindings of the Worker version the newest deployment serves in full,
- * as `cf workers versions get` prints them; for a Worker with no deployment,
- * those of its newest version. Undefined when the newest deployment splits
- * traffic or when a read fails or is incomplete.
+ * The bindings of one Worker version, as `cf workers versions get` prints
+ * them. For a "deployed" Worker it is the version the newest deployment
+ * serves in full. For an "undeployed" one, which serves nothing, it is the
+ * newest uploaded version. The caller says which it found; undefined when
+ * the deployments read here disagrees with that, when the newest deployment
+ * splits traffic, or when a read fails or is incomplete.
  */
 async function readLiveWorkerBindings(
   cf: CloudflareCliRunner,
   accountId: string,
   workerName: string,
+  worker: "deployed" | "undeployed",
 ): Promise<readonly Record<string, unknown>[] | undefined> {
   const listed = cloudflareCliJson(await cf({
     args: ["workers", "deployments", "list", "--worker", workerName],
@@ -1925,7 +1928,7 @@ async function readLiveWorkerBindings(
   const deployments: unknown = typeof listed === "object" && listed !== null && "deployments" in listed
     ? listed.deployments
     : undefined;
-  if (!Array.isArray(deployments)) return undefined;
+  if (!Array.isArray(deployments) || (deployments.length === 0) !== (worker === "undeployed")) return undefined;
   if (deployments.length === 0) {
     const read = await cf({
       args: ["workers", "versions", "list", "--worker", workerName],
@@ -2004,7 +2007,7 @@ async function readProviderEvidence(
   cf: CloudflareCliRunner,
   workerName: string,
   accountId: string | undefined,
-  workerPresent: boolean,
+  worker: "deployed" | "undeployed" | "absent" | undefined,
   containerEntry:
     | { readonly id: string; readonly name: string }
     | undefined,
@@ -2044,20 +2047,23 @@ async function readProviderEvidence(
       }
     }
   }
-  if (workerPresent && accountId !== undefined) {
-    const bindings = await readLiveWorkerBindings(cf, accountId, workerName);
+  if (worker !== "absent" && accountId !== undefined) {
+    // A Worker whose state the first read could not tell proves nothing.
+    const bindings = worker === undefined ? undefined : await readLiveWorkerBindings(cf, accountId, workerName, worker);
     evidence.settingsReadable = bindings !== undefined;
     const text = (name: string): string | undefined => {
-      const value = bindings?.find((binding) => binding.type === "plain_text" && binding.name === name)?.text;
+      const stamps = bindings?.filter((binding) => binding.type === "plain_text" && binding.name === name) ?? [];
+      const value = stamps.length === 1 ? stamps[0]?.text : undefined;
       return typeof value === "string" ? value : undefined;
     };
     const deploymentId = text("EDEN_EVE_DEPLOYMENT_ID");
     if (deploymentId !== undefined) evidence.workerDeploymentId = deploymentId;
     const releaseId = text("EDEN_EVE_RELEASE_ID");
     if (releaseId !== undefined) evidence.workerReleaseId = releaseId;
-    const namespaceId = bindings?.find((binding) =>
+    const containerBindings = bindings?.filter((binding) =>
       binding.type === "durable_object_namespace" && binding.name === "EVE_CONTAINER"
-    )?.namespace_id;
+    ) ?? [];
+    const namespaceId = containerBindings.length === 1 ? containerBindings[0]?.namespace_id : undefined;
     if (typeof namespaceId === "string") evidence.workerContainerNamespaceId = namespaceId;
   }
   return evidence;
@@ -2718,6 +2724,71 @@ const containerSettingsUnapplied = new WeakMap<object, string>();
  * "not-uploaded" unless the Worker version in service carries this publish's
  * release ID: nothing is created for a version that is not this publish's.
  */
+/**
+ * Where this publish stands in what the Worker serves. Undefined when the
+ * Worker's newest deployment does not serve, in full, one version that
+ * carries this publish's release ID exactly once: an uploaded version that
+ * is not in service is not the publish. Otherwise the namespace of the one
+ * binding for the Container class in this Worker, or no namespace when the
+ * version has no such binding or more than one candidate for it.
+ */
+async function readServedRelease(
+  cf: CloudflareCliRunner,
+  request: EveDeploymentPublicationRequest,
+): Promise<{ readonly namespaceId?: string } | undefined> {
+  const bindings = await readLiveWorkerBindings(cf, request.identity.accountId, request.identity.workerName, "deployed");
+  const releases = bindings?.filter((binding) => binding.type === "plain_text" && binding.name === "EDEN_EVE_RELEASE_ID");
+  if (
+    bindings === undefined || releases?.length !== 1 ||
+    releases[0]?.text !== request.hostConfig.worker.vars.EDEN_EVE_RELEASE_ID
+  ) return undefined;
+  const { bindingName, className } = request.hostConfig.container;
+  const candidates = bindings.filter((binding) =>
+    binding.type === "durable_object_namespace" && (binding.name === bindingName || binding.class_name === className)
+  );
+  const only = candidates[0];
+  return candidates.length === 1 && only !== undefined &&
+      only.name === bindingName && only.class_name === className &&
+      (only.script_name === undefined || only.script_name === request.identity.workerName) &&
+      typeof only.namespace_id === "string" && /^[0-9a-f]{32}$/u.test(only.namespace_id)
+    ? { namespaceId: only.namespace_id }
+    : {};
+}
+
+/**
+ * The publish's Container application: "matches" when the account has
+ * exactly one application of that name and its own read gives the same ID
+ * and name, the durable_object policy and the given namespace; "absent"
+ * when the account has none of that name; undefined for anything else.
+ */
+async function readPublishApplication(
+  cf: CloudflareCliRunner,
+  request: EveDeploymentPublicationRequest,
+  namespaceId: string,
+): Promise<"matches" | "absent" | undefined> {
+  const accountId = request.identity.accountId;
+  const name = request.hostConfig.container.applicationName;
+  const listed = await readTargetContainers(cf, accountId, name);
+  const entries = listed.failed ? undefined : exactContainerEntries(listed.value, name, true);
+  if (entries === undefined || entries.length > 1) return undefined;
+  const entry = entries[0];
+  if (entry === undefined) return "absent";
+  const application = cloudflareCliJson(await cf({
+    args: ["containers", "applications", "get", entry.id],
+    accountId,
+    timeoutMs: 30_000,
+  }))?.value;
+  return typeof application === "object" && application !== null &&
+      "id" in application && application.id === entry.id &&
+      "name" in application && application.name === name &&
+      "scheduling_policy" in application && application.scheduling_policy === "durable_object" &&
+      "durable_objects" in application && typeof application.durable_objects === "object" &&
+      application.durable_objects !== null && "namespace_id" in application.durable_objects &&
+      application.durable_objects.namespace_id === namespaceId
+    ? "matches"
+    : undefined;
+}
+
 async function finishPublication(
   cf: CloudflareCliRunner,
   request: EveDeploymentPublicationRequest,
@@ -2727,52 +2798,35 @@ async function finishPublication(
   // 2026-11-20 its deployments read still answered that the Worker did not
   // exist 25 seconds after cf had deployed one. So the read is repeated for
   // two minutes before the version counts as not uploaded.
-  let bindings: Awaited<ReturnType<typeof readLiveWorkerBindings>>;
+  let served: Awaited<ReturnType<typeof readServedRelease>>;
   const started = Date.now();
   for (let attempt = 0; ; attempt += 1) {
-    bindings = await readLiveWorkerBindings(cf, accountId, request.identity.workerName);
-    if (
-      bindings?.find((binding) => binding.type === "plain_text" && binding.name === "EDEN_EVE_RELEASE_ID")?.text ===
-        request.hostConfig.worker.vars.EDEN_EVE_RELEASE_ID
-    ) break;
+    served = await readServedRelease(cf, request);
+    if (served !== undefined) break;
     if (attempt === 24 || Date.now() - started > 120_000) return "not-uploaded";
     await waitForActivation(5_000);
   }
-  const namespaceId = bindings.find((binding) =>
-    binding.type === "durable_object_namespace" && binding.name === request.hostConfig.container.bindingName
-  )?.namespace_id;
-  if (typeof namespaceId !== "string" || !/^[0-9a-f]{32}$/u.test(namespaceId)) return "unfinished";
-  // A Durable Object's Container application has the namespace's ID.
-  const read = await cf({
-    args: ["containers", "applications", "get", namespaceId],
-    accountId,
-    timeoutMs: 30_000,
-  });
-  const application = cloudflareCliJson(read)?.value;
-  const name = request.hostConfig.container.applicationName;
-  if (application === undefined) {
-    if (!cloudflareApiAnswered(read, {
-      status: 404,
-      code: 1609,
-      path: `/accounts/${accountId}/containers/applications/${namespaceId}`,
-    })) return "unfinished";
+  const namespaceId = served.namespaceId;
+  if (namespaceId === undefined) return "unfinished";
+  const application = await readPublishApplication(cf, request, namespaceId);
+  if (application === undefined) return "unfinished";
+  if (application === "absent") {
     const created = await cf({
       args: [
         "containers", "applications", "create", "--body",
         JSON.stringify({
-          name,
+          name: request.hostConfig.container.applicationName,
           scheduling_policy: "durable_object",
           durable_objects: { namespace_id: namespaceId },
         }),
       ],
       accountId,
     });
-    if (created.exitCode !== 0) return "unfinished";
-  } else if (
-    typeof application !== "object" || application === null ||
-    !("name" in application) || application.name !== name ||
-    !("scheduling_policy" in application) || application.scheduling_policy !== "durable_object"
-  ) return "unfinished";
+    // cf's exit code is not the proof: the application is read back.
+    if (created.exitCode !== 0 || await readPublishApplication(cf, request, namespaceId) !== "matches") {
+      return "unfinished";
+    }
+  }
   // Applying the triggers again changes nothing, so a failure is retried for
   // two minutes: on 2026-11-20 cf answered here that the Worker did not exist
   // seconds after Cloudflare had shown its version.
@@ -2846,18 +2900,25 @@ function defaultPublicationRunner(
         };
       }
     }
-    const { containerEntries, worker } = await readExactTargetInventory(
-      cf,
-      request.identity.accountId,
-      request.identity.workerName,
-      request.hostConfig.container.applicationName,
-    );
-    // A script with no deployment serves nothing, so it is not a publication.
-    if (containerEntries?.length !== 1 || worker !== "deployed") {
+    // The publish counts only when one set of reads shows this release in
+    // service and its one Container application on the namespace that
+    // release binds. Cloudflare can lag behind a publish, so the reads are
+    // repeated for two minutes.
+    let published = false;
+    const verifying = Date.now();
+    for (let attempt = 0; attempt < 24 && (attempt === 0 || Date.now() - verifying < 120_000); attempt += 1) {
+      if (attempt > 0) await waitForActivation(5_000);
+      const namespaceId = (await readServedRelease(cf, request))?.namespaceId;
+      if (namespaceId !== undefined && await readPublishApplication(cf, request, namespaceId) === "matches") {
+        published = true;
+        break;
+      }
+    }
+    if (!published) {
       return {
         status: "indeterminate",
         reason:
-          "The exact Worker deployment and named Container could not be re-read after publication.",
+          "Cloudflare did not show this release in service together with its one Container application after publication.",
         ownershipEvidenceRetained: true,
       };
     }
@@ -5644,7 +5705,7 @@ async function defaultDestroyTargetRead(
     inventoryComplete: !account.failed && accountId !== undefined &&
       entries !== undefined && entries.length <= 1 && worker !== undefined,
     providerEvidence: await readProviderEvidence(
-      cf, request.workerName, accountId, workerExists, firstContainer,
+      cf, request.workerName, accountId, worker, firstContainer,
     ),
     ...(firstContainer === undefined
       ? {}

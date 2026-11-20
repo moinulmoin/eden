@@ -87,14 +87,21 @@ until the checks in steps 1–4 have passed.
    `workers.dev` route and the schedule. When it exits with an error, Eden
    checks whether the Worker version in service carries this publish's
    release ID. If it does not, the deploy ends `DEPLOY_INDETERMINATE` and
-   Eden creates nothing. If it does, Eden finishes the publish with `cf`
-   commands that are safe to repeat: it reads the Container application by
-   the Durable Object namespace ID (`cf containers applications get`),
-   creates it when Cloudflare answers that it does not exist
-   (`cf containers applications create`), and runs
-   `cf workers triggers deploy --prebuilt`. If one of these steps fails, the
-   deploy ends `DEPLOY_INDETERMINATE` and says that Cloudflare has the
-   Worker version; running `eden deploy` again sets up what is missing.
+   Eden creates nothing. A version Cloudflare holds but does not serve does
+   not count. If it does, the version must have exactly one binding for the
+   Container class in this Worker. Eden then finishes the publish with `cf`
+   commands: it lists the Container applications of the target's name
+   (`cf containers applications list`) and reads the one it finds
+   (`cf containers applications get`). That application must have the
+   listed ID, the name, the `durable_object` policy and the binding's
+   namespace. When the account has none of that name, Eden creates it
+   (`cf containers applications create`) and reads it back the same way.
+   Then it runs `cf workers triggers deploy --prebuilt`. If one of these
+   steps fails or one of these answers disagrees, Eden writes nothing more,
+   the deploy ends `DEPLOY_INDETERMINATE`, and the last promoted deploy
+   stays current. After every publish, finished by `cf` or by Eden, Eden
+   reads the release in service and its Container application once more,
+   together, and promotes only when they still agree.
 8. **Verify and promote** (`verifying health at <origin>`). Eden calls the
    public `/eve/v1/health` and only treats the deployment as live once it
    reports ready with the expected deployment identity. Then it removes its
