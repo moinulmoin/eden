@@ -27,8 +27,8 @@ for two minutes after it returned, with `wrangler tail` recording, target
 `eden-live-20261120-ea8b1c4d`, `10:03Z` to `10:24Z`:
 
 - Through two same-version updates and the upgrade to Eve `1.0.2`, about
-  3,150 requests were sent while a deploy ran, and about 2,500 in the two
-  minutes after each. None got HTTP 500 or `503`. The session from before
+  3,150 requests were sent while a deploy ran, and about 2,500 more in
+  the two minutes after the three deploys. None got HTTP 500 or `503`. The session from before
   each deploy answered after it, and a new session started, six session
   steps in all.
 - The tail shows three resets of a Container object, all at `10:20:30Z`
