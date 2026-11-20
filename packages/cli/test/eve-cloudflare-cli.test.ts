@@ -6,10 +6,15 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, expect, test } from "vitest";
+import { setTimeout as sleep } from "node:timers/promises";
+import { afterEach, expect, test, vi } from "vitest";
+
+import { cloudflareApiReader, cloudflareApiTokenArrives } from "../src/eve-cloudflare-api.js";
+import { cloudflareCliEnvironment, createCloudflareCliRunner, type CloudflareCliRunner } from "../src/eve-cloudflare-cli.js";
 
 const cleanups: (() => Promise<unknown>)[] = [];
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
@@ -38,3 +43,46 @@ test.each(["SIGINT", "SIGTERM"] as const)("%s while cf runs removes the folder t
   expect(await exited).toBe(signal);
   expect(folders()).toEqual([]);
 }, 30_000);
+
+test("the listener that takes cf's token keeps its port from before cf starts until cf has exited", async () => {
+  vi.stubEnv("CLOUDFLARE_API_TOKEN", "");
+  // The real cf, with a token that is no one's: it asks the address it is given who it is, three times.
+  const real = createCloudflareCliRunner((account) => ({ ...cloudflareCliEnvironment(account), CLOUDFLARE_API_TOKEN: "no-ones-token-" + "0".repeat(30) }));
+  const free = (port: number) => new Promise<boolean>((resolve) => {
+    const other = createServer();
+    other.once("error", () => resolve(false));
+    other.listen(port, "127.0.0.1", () => other.close(() => resolve(true)));
+  });
+  let port = 0;
+  let freed = 0;
+  const cf: CloudflareCliRunner = async (request) => {
+    port = Number(new URL(request.apiBaseUrl ?? "").port);
+    let running = true;
+    const result = real(request).finally(() => { running = false; });
+    // Another local program tries to take the port for as long as cf runs, and once more when it has exited.
+    while (running) {
+      if (await free(port)) freed += 1;
+      await sleep(10);
+    }
+    if (await free(port)) freed += 1;
+    return result;
+  };
+  expect(await cloudflareApiTokenArrives(cf)).toBe(true);
+  expect(freed).toBe(0);
+  expect(await free(port)).toBe(true);
+}, 30_000);
+
+test("a read of the API with 50 ms left gives the token capture no more than that", async () => {
+  vi.stubEnv("CLOUDFLARE_API_TOKEN", "");
+  const asked: (number | undefined)[] = [];
+  // A cf that takes as long as it is allowed, up to two seconds, and hands over nothing.
+  const cf: CloudflareCliRunner = async (request) => {
+    asked.push(request.timeoutMs);
+    await sleep(Math.min(request.timeoutMs ?? 2_000, 2_000));
+    return { exitCode: undefined, stdout: "", stderr: "" };
+  };
+  const started = performance.now();
+  expect(await cloudflareApiReader(cf)("/accounts/" + "1".repeat(32) + "/workers/subdomain", {}, 50)).toBeUndefined();
+  expect(performance.now() - started).toBeLessThan(1_000);
+  expect(asked.every((ms) => ms !== undefined && ms <= 50)).toBe(true);
+});

@@ -79,6 +79,7 @@ import {
   cloudflareCliError,
   cloudflareCliJson,
   runCloudflareCli,
+  type CloudflareCliResult,
   type CloudflareCliRunner,
 } from "./eve-cloudflare-cli.js";
 import {
@@ -1669,6 +1670,7 @@ async function readTargetContainers(
   const entries: unknown[] = [];
   const seenTokens = new Set<string>();
   let pageToken: string | undefined;
+  let total: number | undefined;
   // No listing of one name runs to twenty pages.
   for (let page = 0; page < 20; page += 1) {
     const read = cloudflareApiResult(await api(
@@ -1683,11 +1685,16 @@ async function readTargetContainers(
     if (count !== undefined && count !== read.result.length) return { failed: true };
     // Missing pagination metadata on a full page cannot prove absence.
     if (read.info === undefined && read.result.length >= 100) return { failed: true };
+    // Nor can a total that is not a number, or that another page gave differently.
+    const reported = read.info?.total_count;
+    if (reported !== undefined && (typeof reported !== "number" || (total !== undefined && total !== reported))) {
+      return { failed: true };
+    }
+    total ??= reported;
     entries.push(...read.result);
     pageToken = typeof next === "string" && next.length > 0 ? next : undefined;
     if (pageToken === undefined) {
-      // Nor can a total that is not the number of entries read.
-      const total = read.info?.total_count;
+      // Nor can a total, given on any page, that is not the number of entries read.
       return total !== undefined && total !== entries.length ? { failed: true } : { failed: false, value: entries };
     }
     if (seenTokens.has(pageToken)) return { failed: true };
@@ -2713,9 +2720,12 @@ async function readServedRelease(
 
 /**
  * The publish's Container application: "matches" when the account has
- * exactly one application of that name and its own read gives the same ID
- * and name, the durable_object policy and the given namespace; "absent"
- * when the account has none of that name; undefined for anything else.
+ * exactly one application of that name, its ID is the given namespace, and
+ * its own read gives the same ID and name, the durable_object policy and
+ * that namespace; "absent" when the account has none of that name;
+ * undefined for anything else. Cloudflare gives the application of a
+ * Durable Object namespace that namespace's ID, and cf deploy requires it
+ * (read in cf 1.0.0-rc.2 and on Cloudflare on 2026-11-20).
  */
 async function readPublishApplication(
   api: CloudflareApiRead,
@@ -2729,15 +2739,34 @@ async function readPublishApplication(
   if (entries === undefined || entries.length > 1) return undefined;
   const entry = entries[0];
   if (entry === undefined) return "absent";
+  if (entry.id !== namespaceId) return undefined;
   const application = await readContainerApplication(api, accountId, entry.id);
   return typeof application === "object" &&
-      application.id === entry.id && application.name === name &&
+      application.id === namespaceId && application.name === name &&
       application.scheduling_policy === "durable_object" &&
       typeof application.durable_objects === "object" &&
       application.durable_objects !== null && "namespace_id" in application.durable_objects &&
       application.durable_objects.namespace_id === namespaceId
     ? "matches"
     : undefined;
+}
+
+/**
+ * The same cf and API, for at most `ms` from now: each command and read
+ * gets what is left of that time, and none starts once it has passed.
+ */
+function withinTime(ms: number, cf: CloudflareCliRunner, api: CloudflareApiRead) {
+  const end = performance.now() + ms;
+  const left = (): number => end - performance.now();
+  return {
+    left,
+    cf: (async (step) =>
+      left() <= 0
+        ? { exitCode: undefined, stdout: "", stderr: "Not started: the time for this step had passed." }
+        : cf({ ...step, timeoutMs: Math.min(step.timeoutMs ?? 120_000, left()) })) satisfies CloudflareCliRunner,
+    api: (async (path, query, timeoutMs = 30_000) =>
+      left() <= 0 ? undefined : api(path, query, Math.min(timeoutMs, left()))) satisfies CloudflareApiRead,
+  };
 }
 
 async function finishPublication(
@@ -2753,18 +2782,25 @@ async function finishPublication(
   // exist 25 seconds after cf had deployed one. So the read is repeated for
   // two minutes before the version counts as not uploaded.
   let served: Awaited<ReturnType<typeof readServedRelease>>;
-  const started = performance.now();
+  const showing = withinTime(120_000, cf, api);
   for (let attempt = 0; ; attempt += 1) {
-    served = await readServedRelease(api, request);
+    served = await readServedRelease(showing.api, request);
     if (served !== undefined) break;
-    if (attempt === 24 || performance.now() - started > 120_000) return "not-uploaded";
+    if (attempt === 24 || showing.left() <= 5_000) return "not-uploaded";
     await pause(5_000);
   }
   const namespaceId = served.namespaceId;
   if (namespaceId === undefined) return "unfinished";
+  // Another deploy can replace this release at any time. Each write below is
+  // for this release alone, so the release in service is read again right
+  // before it. That shortens the time in which a write can reach a release
+  // that has been replaced; Cloudflare offers no write that is refused then.
+  const stillServed = async (): Promise<boolean> =>
+    (await readServedRelease(api, request))?.namespaceId === namespaceId;
   const application = await readPublishApplication(api, request, namespaceId);
   if (application === undefined) return "unfinished";
   if (application === "absent") {
+    if (!await stillServed()) return "unfinished";
     const created = await cf({
       args: [
         "containers", "applications", "create", "--body",
@@ -2784,10 +2820,11 @@ async function finishPublication(
   // Applying the triggers again changes nothing, so a failure is retried for
   // two minutes: on 2026-11-20 cf answered here that the Worker did not exist
   // seconds after Cloudflare had shown its version.
-  const applying = performance.now();
-  for (let attempt = 0; attempt < 24 && (attempt === 0 || performance.now() - applying < 120_000); attempt += 1) {
+  const applying = withinTime(120_000, cf, api);
+  for (let attempt = 0; attempt < 24 && (attempt === 0 || applying.left() > 5_000); attempt += 1) {
     if (attempt > 0) await pause(5_000);
-    const triggers = await cf({
+    if (!await stillServed()) return "unfinished";
+    const triggers = await applying.cf({
       args: ["workers", "triggers", "deploy", "--prebuilt"],
       accountId,
       files: request.buildOutput,
@@ -2798,21 +2835,19 @@ async function finishPublication(
 }
 
 /**
- * What a failed "cf deploy" printed, as far as it is safe to keep on disk.
- * When the command carried secrets, only cf's error box is kept, and every
- * secret value is cut out of it exactly, as written and as JSON writes it.
+ * What is kept on disk about a failed "cf deploy". A command that carried
+ * no secrets keeps what cf printed. One that carried secrets keeps nothing
+ * cf printed, since cf can print a value whole, wrapped over lines or
+ * escaped: only cf's exit code and, when cf's text holds a message Eden
+ * knows, that message in Eden's own words.
  */
-function publishDiagnostic(stderr: string, secrets: ReadonlyMap<string, string>): string {
-  if (secrets.size === 0) return safeText(stderr);
-  const box = stderr.indexOf("┌");
-  let text = box === -1 ? "" : stderr.slice(box);
-  for (const value of [...secrets.values()].sort((left, right) => right.length - left.length)) {
-    if (value.length === 0) continue;
-    for (const form of new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value)])) {
-      text = text.replaceAll(form, "[redacted]");
-    }
-  }
-  return safeText(text);
+function publishDiagnostic(result: CloudflareCliResult, secrets: ReadonlyMap<string, string>): string {
+  const exit = `cf deploy: exit ${result.exitCode ?? "none (cf was stopped or not started)"}`;
+  if (secrets.size === 0) return `${exit}\n${safeText(result.stderr)}`;
+  const said = /application\s+settings\s+were\s+not\s+fully\s+applied/u.test(result.stderr.replaceAll("│", " "))
+    ? "cf said the Worker version was deployed and its Container application settings were not fully applied."
+    : "What cf said is not among the messages Eden knows.";
+  return `${exit}\n${said}\nThis command carried the runtime values, so nothing cf printed is kept here.`;
 }
 
 function defaultPublicationRunner(
@@ -2831,7 +2866,8 @@ function defaultPublicationRunner(
         ? { exitCode: undefined, stdout: "", stderr: "Not started: the publish deadline had passed." }
         : run({ ...step, timeoutMs: Math.min(step.timeoutMs ?? 120_000, left) });
     };
-    const read = cloudflareApiReader(run);
+    // Taking the token of cf's login runs cf too, so it gets the same deadline.
+    const read = cloudflareApiReader(cf);
     const api: CloudflareApiRead = async (path, query, timeoutMs = 30_000) => {
       const left = deadline - performance.now();
       return left <= 0 ? undefined : read(path, query, Math.min(timeoutMs, left));
@@ -2850,7 +2886,7 @@ function defaultPublicationRunner(
     if (deployed.exitCode !== 0) {
       // What cf printed for the publish and for each finishing command, kept
       // beside the Build Output for whoever inspects the failure.
-      const log = [publishDiagnostic(deployed.stderr, secrets)];
+      const log = [publishDiagnostic(deployed, secrets)];
       const finish = await finishPublication(async (step) => {
         const result = await cf(step);
         log.push(`cf ${step.args.slice(0, 3).join(" ")}: exit ${result.exitCode}\n${safeText(result.stderr)}`);
@@ -2875,15 +2911,15 @@ function defaultPublicationRunner(
     // release binds. Cloudflare can lag behind a publish, so the reads are
     // repeated for two minutes.
     let published = false;
-    const verifying = performance.now();
+    const verifying = withinTime(120_000, cf, api);
     for (
       let attempt = 0;
-      attempt < 24 && deadline > performance.now() && (attempt === 0 || performance.now() - verifying < 120_000);
+      attempt < 24 && deadline > performance.now() && (attempt === 0 || verifying.left() > 5_000);
       attempt += 1
     ) {
       if (attempt > 0) await pause(5_000);
-      const namespaceId = (await readServedRelease(api, request))?.namespaceId;
-      if (namespaceId !== undefined && await readPublishApplication(api, request, namespaceId) === "matches") {
+      const namespaceId = (await readServedRelease(verifying.api, request))?.namespaceId;
+      if (namespaceId !== undefined && await readPublishApplication(verifying.api, request, namespaceId) === "matches") {
         published = true;
         break;
       }

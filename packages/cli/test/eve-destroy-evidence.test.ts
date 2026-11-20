@@ -86,12 +86,14 @@ const cloud = vi.hoisted(() => {
     triggerFailures: 0,
     /** When set, how "cf deploy" exits 1: before it uploads anything, or with the Worker version live and no Container application. */
     deployFailure: undefined as "before-upload" | "after-upload" | undefined,
-    /** Text cf prints before its error box and again inside it when the deploy fails after the upload. */
+    /** Text cf prints before its error box, inside it and after it when the deploy fails after the upload. */
     deployOutput: "",
     /** Whether "cf containers applications create" fails. */
     createFails: false,
     /** Whether "cf containers applications create" exits 0 and creates nothing. */
     createLost: false,
+    /** When set, the ID Cloudflare gives a Container application that cf creates, in place of its namespace. */
+    createdId: undefined as string | undefined,
     /** When set, what "cf containers applications get" prints for an application that exists, given its true answer. */
     application: undefined as ((real: Readonly<Record<string, unknown>>) => unknown) | undefined,
     /** Bindings of the Worker version beside its stamps and its Container binding. */
@@ -224,17 +226,17 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
       // What cf 1.0.0-rc.2 printed on 2026-11-20 when Cloudflare did not show the uploaded version in time.
       return {
         exitCode: 1,
-        stderr: cloud.deployOutput + "\n┌ Error\n│ The Worker version was deployed, but its Durable Object-managed Container\n│ application settings were not fully applied. Re-run the same `cf deploy`\n│ command to retry and finish deployment." + cloud.deployOutput + "\n└\n",
+        stderr: cloud.deployOutput + "\n┌ Error\n│ The Worker version was deployed, but its Durable Object-managed Container\n│ application settings were not fully applied. Re-run the same `cf deploy`\n│ command to retry and finish deployment." + cloud.deployOutput + "\n└\n" + cloud.deployOutput,
       };
     }
-    cloud.containers.add(published + "/" + worker.name + "-container#" + cloud.namespace);
+    cloud.containers.add(published + "/" + worker.name + "-container#" + (cloud.createdId ?? cloud.namespace));
     cloud.triggers.push(published + "/" + worker.name);
     return { exitCode: 0 };
   }
   if (command === "containers applications create") {
     if (cloud.createFails) return cloud.apiError(1000, "Internal error", "500 Internal Server Error", "/accounts/" + account + "/containers/applications");
     const body = JSON.parse(flag("--body")) as { readonly name: string; readonly durable_objects: { readonly namespace_id: string } };
-    if (!cloud.createLost) cloud.containers.add(account + "/" + body.name + "#" + body.durable_objects.namespace_id);
+    if (!cloud.createLost) cloud.containers.add(account + "/" + body.name + "#" + (cloud.createdId ?? body.durable_objects.namespace_id));
     return ok({ id: body.durable_objects.namespace_id, name: body.name });
   }
   if (command === "workers secrets bulk-edit") {
@@ -514,6 +516,7 @@ beforeEach(() => {
     deployOutput: "",
     createFails: false,
     createLost: false,
+    createdId: undefined,
     application: undefined,
     moreBindings: [],
     bindingScript: undefined,
@@ -972,6 +975,22 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(lstat(current)).resolves.toBeDefined();
   });
 
+  test.each([
+    ["a first page with a total of 1 and a last page with a total of 0", ['{"count":0,"total_count":1,"next_page_token":"page-2"}', '{"count":0,"total_count":0}']],
+    ["a first page with a total of 1 and a last page with none", ['{"count":0,"total_count":1,"next_page_token":"page-2"}', "{}"]],
+    ["a total that is not a number", ['{"count":0,"total_count":"0"}']],
+  ] as const)("after the deletes, empty Container pages with %s leave CURRENT in place", async (_name, pages) => {
+    const { root, current } = await deployedProject();
+    cloud.containers.add(container);
+    cloud.onMutation = () => {
+      let page = 0;
+      cloud.containerAnswer = () => listed("[]", pages[page++] ?? "{}");
+    };
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
+    await expect(lstat(current)).resolves.toBeDefined();
+  });
+
   test("a Container answer that turns ambiguous after the deletes leaves CURRENT in place", async () => {
     const { root, current } = await deployedProject();
     cloud.containers.add(container);
@@ -1063,21 +1082,21 @@ describe("eden deploy sends every cf write to the account it checked (MOI-254)",
     return deploy(root, "generation-one", { account, envFile: join(envRoot, "runtime.env"), push });
   };
 
-  test("the log of a failed publish that carried secrets holds cf's error and none of the values", async () => {
+  test("the log of a failed publish that carried secrets holds what happened in Eden's words and nothing cf printed", async () => {
     const root = await deployableProject();
     const envRoot = await mkdtemp(join(tmpdir(), "eden-moi254-"));
     roots.push(envRoot);
-    // A short value, and one that JSON writes differently.
-    await writeFile(join(envRoot, "runtime.env"), "MODEL_KEY=k9\nQUOTED=say \"hi\"\n", "utf8");
+    // A short value, one that JSON writes differently, and one long enough for cf to wrap.
+    await writeFile(join(envRoot, "runtime.env"), "MODEL_KEY=k9\nQUOTED=say \"hi\"\nLONG=wrapped-first-half-wrapped-second-half\n", "utf8");
     cloud.deployFailure = "after-upload";
     cloud.createFails = true;
-    cloud.deployOutput = "\n│ MODEL_KEY k9 QUOTED say \\\"hi\\\" and say \"hi\"";
+    cloud.deployOutput = "\n│ MODEL_KEY k9 QUOTED say \\\"hi\\\" and say \"hi\" LONG wrapped-first-half-\n│ wrapped-second-half";
     const { exitCode } = await deploy(root, "generation-one", { envFile: join(envRoot, "runtime.env") });
     expect(exitCode).toBe(1);
     const log = await readFile(join(root, ".eden", "eve-deploy", "generations", "generation-one", "worker", "cf-deploy.log"), "utf8");
-    expect(log).toContain("application settings were not fully applied");
+    expect(log).toContain("cf deploy: exit 1\ncf said the Worker version was deployed and its Container application settings were not fully applied.");
     expect(log).toContain("cf containers applications create: exit 1");
-    expect(log).not.toMatch(/k9|say/u);
+    expect(log).not.toMatch(/k9|say|wrapped|half|MODEL_KEY/u);
   });
 
   test("a login that changes after the check cannot move a secret upload or the publish", async () => {
@@ -1231,6 +1250,42 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
     expect(cloud.triggers).toEqual([]);
     await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test.each([
+    ["found before the publish", false, "after-upload"],
+    ["created by Eden", true, "after-upload"],
+    ["created by a publish cf called done", true, undefined],
+  ] as const)("a Container application %s whose ID is not the namespace the release binds is not this publish's", async (_name, created, deployFailure) => {
+    const root = await deployableProject();
+    cloud.deployFailure = deployFailure;
+    // Both of Cloudflare's reads of the application agree on the ID, and the ID is the wrong one.
+    if (created) cloud.createdId = "f".repeat(32);
+    else cloud.containers.add("account-test/eve-deploy-fixture-container#" + "f".repeat(32));
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    if (deployFailure !== undefined) expect(cloud.triggers).toEqual([]);
+    await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test.each([
+    ["the Container application is read", "/containers/applications", false, 0],
+    ["the Container application is created", "/containers/applications", true, 0],
+    ["the triggers are refused once", undefined, false, 1],
+  ] as const)("a release that another replaces while %s gets no further write from Eden", async (_name, at, absent, triggerFailures) => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.triggerFailures = triggerFailures;
+    if (!absent) cloud.containers.add("account-test/eve-deploy-fixture-container#" + cloud.namespace);
+    const replace = () => { cloud.stamps = [{ type: "plain_text", name: "EDEN_EVE_RELEASE_ID", text: "eve-deploy-another" }]; };
+    let writes = 0;
+    cloud.onRead = () => { if (at !== undefined && cloud.apiReads.at(-1)?.url.includes(at) === true) replace(); };
+    // The publish itself is the first write; the one after it is Eden's.
+    cloud.onMutation = () => { if ((writes += 1) === 2 && at === undefined) replace(); };
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect(cloud.triggers).toEqual([]);
+    expect(writes).toBe(at === undefined ? 2 : 1);
   });
 
   test.each([

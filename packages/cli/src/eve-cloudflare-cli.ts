@@ -66,7 +66,11 @@ export interface CloudflareCliRequest {
   /** Files written into the command's private folder before it runs, by relative path. */
   readonly files?: Readonly<Record<string, string | Buffer>>;
   readonly timeoutMs?: number;
-  /** Where this one command finds Cloudflare's API, in place of Cloudflare's own address. */
+  /**
+   * Where this one command finds Cloudflare's API, in place of Cloudflare's
+   * own address. Only the read of cf's login uses it, with a listener of
+   * Eden's own, so the command also gets no proxy and sends no telemetry.
+   */
   readonly apiBaseUrl?: string;
 }
 
@@ -137,6 +141,8 @@ async function runCf(
   request: CloudflareCliRequest,
   environment: (accountId: string | undefined) => NodeJS.ProcessEnv,
 ): Promise<CloudflareCliResult> {
+  // The time allowed covers the folder and its files too: a command whose time ran out there is not started.
+  const deadline = performance.now() + (request.timeoutMs ?? 120_000);
   const cwd = await mkdtemp(join(tmpdir(), "eden-cf-"));
   let child: ReturnType<typeof spawn> | undefined;
   // The folder can hold the secrets file. Ctrl-C and a plain kill must not
@@ -156,12 +162,24 @@ async function runCf(
       await mkdir(dirname(join(cwd, path)), { recursive: true });
       await writeFile(join(cwd, path), content, { mode: 0o600 });
     }
+    const left = Math.ceil(deadline - performance.now());
+    if (left <= 0) return { exitCode: undefined, stdout: "", stderr: "" };
     return await new Promise<CloudflareCliResult>((resolveResult) => {
       const started = spawn(process.execPath, [installedCloudflareCli().entrypoint, ...request.args], {
         cwd,
         env: {
           ...environment(request.accountId),
-          ...(request.apiBaseUrl === undefined ? {} : { CLOUDFLARE_API_BASE_URL: request.apiBaseUrl }),
+          ...(request.apiBaseUrl === undefined ? {} : {
+            CLOUDFLARE_API_BASE_URL: request.apiBaseUrl,
+            HTTP_PROXY: undefined,
+            HTTPS_PROXY: undefined,
+            http_proxy: undefined,
+            https_proxy: undefined,
+            NO_PROXY: "127.0.0.1",
+            no_proxy: "127.0.0.1",
+            CF_SEND_TELEMETRY: "false",
+            DO_NOT_TRACK: "1",
+          }),
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -169,6 +187,7 @@ async function runCf(
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let settled = false;
+      let timedOut = false;
       const finish = (exitCode: number | undefined): void => {
         if (settled) return;
         settled = true;
@@ -179,14 +198,16 @@ async function runCf(
           stderr: Buffer.concat(stderr).toString("utf8"),
         });
       };
+      // Out of time: cf is killed, and the result waits until it is gone.
       const timer = setTimeout(() => {
+        timedOut = true;
         started.kill("SIGKILL");
-        finish(undefined);
-      }, request.timeoutMs ?? 120_000);
+      }, left);
       started.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
       started.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
       started.on("error", () => finish(undefined));
-      started.on("close", (code) => finish(code ?? undefined));
+      started.on("exit", () => { if (timedOut) finish(undefined); });
+      started.on("close", (code) => finish(timedOut ? undefined : code ?? undefined));
     });
   } finally {
     process.removeListener("SIGINT", interrupted);

@@ -344,6 +344,9 @@ function startFakeRegistry(setup: FakeRegistrySetup): void {
   });
 }
 
+/** The time cf gets starts before its folder is written, so cf itself gets that time or a little under it. */
+const about = (ms: number) => expect.toSatisfy((given: unknown) => typeof given === "number" && given <= ms && given > ms - 5_000);
+
 async function withFakeCf(
   run: () => Promise<void>,
 ): Promise<readonly { readonly args: readonly string[]; readonly timeoutMs: unknown }[]> {
@@ -1658,9 +1661,9 @@ describe("top-level Eden Deploy commands", () => {
     });
 
     // The publish, then the reads that find no version of this publish to finish.
-    expect(calls[0]).toEqual({ args: ["deploy", "--prebuilt"], timeoutMs: 600_000 });
+    expect(calls[0]).toEqual({ args: ["deploy", "--prebuilt"], timeoutMs: about(600_000) });
     // cf gives no login token here, so nothing of Cloudflare's API is read.
-    expect(calls.slice(1)).toEqual([{ args: ["auth", "whoami"], timeoutMs: 30_000 }]);
+    expect(calls.slice(1)).toEqual([{ args: ["auth", "whoami"], timeoutMs: about(30_000) }]);
     expect(errors.join("\n")).toContain("DEPLOY_INDETERMINATE");
   });
 
@@ -3000,10 +3003,10 @@ describe("eden destroy", () => {
     expect(calls).toEqual([
       {
         args: ["workers", "delete", "eve-destroy-fixture", "--force"],
-        timeoutMs: 120_000,
+        timeoutMs: about(120_000),
       },
       // The delete did not finish, so Eden asks Cloudflare's API whether the Worker is there, and needs cf's token for it.
-      { args: ["auth", "whoami"], timeoutMs: 30_000 },
+      { args: ["auth", "whoami"], timeoutMs: about(30_000) },
     ]);
     expect(JSON.parse(output[0] as string)).toMatchObject({
       error: { code: "EVE_DESTROY_INDETERMINATE" },
