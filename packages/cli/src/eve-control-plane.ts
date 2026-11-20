@@ -2698,13 +2698,14 @@ async function finishPublication(
   // exist 25 seconds after cf had deployed one. So the read is repeated for
   // two minutes before the version counts as not uploaded.
   let bindings: Awaited<ReturnType<typeof readLiveWorkerBindings>>;
+  const started = Date.now();
   for (let attempt = 0; ; attempt += 1) {
     bindings = await readLiveWorkerBindings(cf, accountId, request.identity.workerName);
     if (
       bindings?.find((binding) => binding.type === "plain_text" && binding.name === "EDEN_EVE_RELEASE_ID")?.text ===
         request.hostConfig.worker.vars.EDEN_EVE_RELEASE_ID
     ) break;
-    if (attempt === 24) return "not-uploaded";
+    if (attempt === 24 || Date.now() - started > 120_000) return "not-uploaded";
     await waitForActivation(5_000);
   }
   const namespaceId = bindings.find((binding) =>
@@ -2745,7 +2746,8 @@ async function finishPublication(
   // Applying the triggers again changes nothing, so a failure is retried for
   // two minutes: on 2026-11-20 cf answered here that the Worker did not exist
   // seconds after Cloudflare had shown its version.
-  for (let attempt = 0; attempt < 24; attempt += 1) {
+  const applying = Date.now();
+  for (let attempt = 0; attempt < 24 && (attempt === 0 || Date.now() - applying < 120_000); attempt += 1) {
     if (attempt > 0) await waitForActivation(5_000);
     const triggers = await cf({
       args: ["workers", "triggers", "deploy", "--prebuilt"],
@@ -2781,9 +2783,10 @@ function defaultPublicationRunner(
         const result = await cf(step);
         log.push(`cf ${step.args.slice(0, 3).join(" ")}: exit ${result.exitCode}\n${safeText(result.stderr)}`);
         return result;
-      }, request);
-      await writeFile(join(request.buildOutputPath, "cf-deploy.log"), log.join("\n"), { mode: 0o600 })
-        .catch(() => undefined);
+      }, request).finally(() =>
+        writeFile(join(request.buildOutputPath, "cf-deploy.log"), log.join("\n"), { mode: 0o600 })
+          .catch(() => undefined)
+      );
       if (finish !== "finished") {
         return {
           status: "indeterminate",

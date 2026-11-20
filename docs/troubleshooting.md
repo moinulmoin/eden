@@ -724,7 +724,8 @@ to `worker/cf-deploy.log` in the generation folder under
 `.eden/eve-deploy/generations/`.
 
 If it does not, the message is `The exact Cloudflare publication did not
-return a terminal success result.` Eden creates nothing. See
+return a terminal success result.` Eden makes no further change. The failed
+`cf deploy` may already have uploaded a Worker version. See
 [Indeterminate outcomes](#indeterminate-outcomes).
 
 If it does, Eden finishes the publish itself: it creates the Container
@@ -1692,11 +1693,13 @@ folder upward and reads `.env` files beside it.
    [`tags/list` listing](#eve_registry_objects_kept) for each repository
    proved in step 4. Check that only refs with one of the three kept
    answers remain; a tag still listed after an accepted delete is unresolved.
-   Confirm the Worker is gone too; this command must fail with
-   `[10007] This Worker does not exist on your account.` and `404 Not Found`:
+   Confirm the Worker is gone too; both commands must fail with
+   `[10007] This Worker does not exist on your account.` and `404 Not Found`.
+   If they disagree, wait and run both again:
 
    ```sh
    npx cf@1.0.0-rc.2 workers deployments list --worker <name>
+   npx cf@1.0.0-rc.2 workers get <name>
    ```
 
 Match the exact names only. A name that merely starts the same way can

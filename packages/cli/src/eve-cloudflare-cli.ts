@@ -63,6 +63,8 @@ export function cloudflareCliEnvironment(accountId: string | undefined): NodeJS.
     DO_NOT_TRACK: env.DO_NOT_TRACK,
     NO_COLOR: "1",
     CF_QUIET: "1",
+    // With this set, cf never hands the command to another cf installed above its folder.
+    CF_DELEGATION: "1",
   };
 }
 

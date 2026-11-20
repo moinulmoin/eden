@@ -21,7 +21,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { serveWorldTarball } from "../eve-compat/eden-leg.mjs";
 import { registryCatalogRefs } from "./registry-catalog.mjs";
@@ -572,12 +572,16 @@ const cfRoot = join(workRoot, "cf");
 async function cf(args) {
   mkdirSync(cfRoot, { recursive: true });
   writeFileSync(join(cfRoot, "cloudflare.config.ts"), "export default {};\n");
-  const env = { ...baseEnvironment, NO_COLOR: "1", ...(registryAccount === undefined ? {} : { CLOUDFLARE_ACCOUNT_ID: registryAccount }) };
+  const env = { ...baseEnvironment, NO_COLOR: "1", CF_DELEGATION: "1", CLOUDFLARE_API_BASE_URL: "https://api.cloudflare.com/client/v4", ...(registryAccount === undefined ? {} : { CLOUDFLARE_ACCOUNT_ID: registryAccount }) };
   return run(cfCli, args, { cwd: cfRoot, env, timeoutMs: 120_000, interruptible: false });
 }
-// True when cf printed Cloudflare's answer that the Worker does not exist.
-function workerAbsent(result) {
-  return result.code === 1 && result.stderr.includes("[10007] This Worker does not exist on your account.") && result.stderr.includes("404 Not Found");
+// True when cf printed Cloudflare's one answer that the Worker does not exist, for this request's own path.
+async function workerAbsent(result, path) {
+  const { cloudflareApiAnswered } = await import(pathToFileURL(join(repoRoot, "packages/cli/dist/eve-cloudflare-cli.js")).href);
+  return cloudflareApiAnswered(
+    { exitCode: result.code, stdout: result.stdout, stderr: result.stderr },
+    { status: 404, code: 10007, path: "/accounts/" + registryAccount + path },
+  );
 }
 
 // What Cloudflare's registry itself lists for this run's repositories: each
@@ -612,9 +616,12 @@ async function verifyGone() {
     if (response === 404) notes.push("URL returns 404");
     else problems.push("URL returned " + response + ", expected 404");
   }
-  if (workerAbsent(await cf(["workers", "deployments", "list", "--worker", target]))) notes.push("no Worker");
+  if (
+    await workerAbsent(await cf(["workers", "deployments", "list", "--worker", target]), "/workers/scripts/" + target + "/deployments") &&
+    await workerAbsent(await cf(["workers", "get", target]), "/workers/workers/" + target)
+  ) notes.push("no Worker");
   else problems.push("Worker " + target + " still answers cf workers deployments list");
-  if (workerAbsent(await cf(["workers", "secrets", "list", "--worker", target]))) notes.push("no secrets");
+  if (await workerAbsent(await cf(["workers", "secrets", "list", "--worker", target]), "/workers/scripts/" + target + "/secrets")) notes.push("no secrets");
   else problems.push("Worker secrets for " + target + " can still be listed");
   const containers = await cf(["containers", "applications", "list", "--name", target + "-container"]);
   if (containers.code !== 0) problems.push("cf containers applications list failed: " + tail(containers.stderr, 3));

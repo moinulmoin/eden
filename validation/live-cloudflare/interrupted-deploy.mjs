@@ -32,6 +32,7 @@ const proxy = http.createServer((request, response) => {
     { host: "api.cloudflare.com", path: request.url, method: request.method, headers: { ...request.headers, host: "api.cloudflare.com" } },
     (answer) => {
       response.writeHead(answer.statusCode ?? 502, answer.headers);
+      answer.on("error", () => response.destroy());
       answer.pipe(response);
     },
   );

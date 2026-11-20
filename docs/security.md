@@ -255,7 +255,9 @@ login cannot act on the checked account, the command fails.
   status `404`, for the exact request path of that account and name.
   For a Worker, both `cf workers deployments list` and `cf workers get`
   must give that answer.
-  Anything else is unknown, never absent. A
+  Anything else is unknown, never absent. `cf` prints an API response's
+  messages in the same form as its errors, so Eden cannot tell which of the
+  two carried the code. A
   Container application list counts only when `cf` exits 0 and prints a JSON
   list.
   Each read asks `cf` for the account once and runs every other command on
