@@ -8,18 +8,18 @@ see [Eve compatibility](./eve-compatibility.md).
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
 account, with Wrangler `4.147.0` and an OAuth login, on the branch of
-[#27](https://github.com/moinulmoin/eden/pull/27) at `e4b7bdd`. From this
+[#27](https://github.com/moinulmoin/eden/pull/27) at `95c2ae5`. From this
 change on, Eden tags each pushed image with the release ID of its deploy
 and, after a same-version update is promoted, deletes the image it replaced
-by that tag, once the registry resolves the tag to the replaced image. It
-never deletes `candidate`.
+by that tag, once the registry resolves the tag to the replaced image. That
+tag delete is the only delete it sends. It never deletes `candidate`.
 
-Full run of `pnpm run check:live`, target `eden-live-20261120-16af6584`,
-`04:41:30Z` to `04:54:50Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+Full run of `pnpm run check:live`, target `eden-live-20261120-d68eb199`,
+`05:04:10Z` to `05:18:01Z`, Eve `0.91.0` to `1.0.2`, the World packed from
 this workspace (version `0.13.0`), a 90-second idle window. All 18 steps
 passed.
 
-- The same-version update took 101 seconds and reported `VAL-LIFE-007`
+- The same-version update took 103 seconds and reported `VAL-LIFE-007`
   passed: `The superseded image was deleted from the registry by its tag
   after promotion.` It kept nothing and carried no
   `EVE_SUPERSEDED_IMAGE_NOT_DELETED` warning. The session from before the
@@ -34,7 +34,8 @@ passed.
   application.
 
 A target made by the released `0.13.0` CLI, then updated and destroyed by
-this build at `e4b7bdd`: `eden-live-20261120-m227a793`, Eve `1.0.2`, World
+this build one commit earlier, at `e4b7bdd`, which also sent a delete by
+digest after the tag delete: `eden-live-20261120-m227a793`, Eve `1.0.2`, World
 `0.13.0` from npm, no `--env-file` and no session.
 
 - `npx @moinulmoin/eden@0.13.0 deploy` twice. After the second, the
@@ -59,8 +60,8 @@ interrupted between promotion and the delete, and a session asleep across a
 same-version update.
 
 Earlier runs on this branch, with other rules for the tag and for what to
-delete (`5ea4473`, `fbc96d2` and `0f418bc`): two full checks passed 18 of
-18 with the same result, and the `0.13.0` scenario, which then deleted
+delete (`5ea4473`, `fbc96d2`, `0f418bc` and `e4b7bdd`): three full checks
+passed 18 of 18 with the same result, and the `0.13.0` scenario, which then deleted
 `candidate` on the first update, ended with the same five kept objects.
 Two tries of that scenario stopped inside the `0.13.0` CLI: one first
 deploy ended `DEPLOY_INDETERMINATE` at the publish, and one second deploy,
