@@ -1675,10 +1675,38 @@ describe("top-level Eden Deploy commands", () => {
       ok: false,
       error: {
         code: "EVE_NODE_UNSUPPORTED",
-        message: "Eden needs Node 24.22.0 or newer and is running on Node 24.21.0.",
+        message: "Eden needs Node 24.22.0 or newer on the 24 line, or 26.12.0 or newer on the 26 line, and is running on Node 24.21.0.",
         remediation: expect.stringContaining("Install Node 24.22.0 or newer") as unknown,
       },
     });
+  });
+
+  test.each([
+    ["25.4.0", 1], ["26.11.0", 1], ["27.0.0", 1], ["24.22.0", 0], ["26.12.0", 0],
+  ])("Node %s is checked against the lines cf declares", async (nodeVersion, stops) => {
+    const output: string[] = [];
+    await runEdenCli(["destroy", "--name", "eve-node-lines", "--json"], { stdout: (line) => output.push(line), nodeVersion, cfVersion: null });
+    // A supported Node reaches the next check, which this run fails on purpose.
+    expect((JSON.parse(output[0] as string) as { readonly error: { readonly code: string } }).error.code)
+      .toBe(stops === 1 ? "EVE_NODE_UNSUPPORTED" : "EVE_CF_UNAVAILABLE");
+  });
+
+  test.each([
+    [null, "Eden runs Cloudflare's cf CLI 1.0.0-rc.2, which is installed with Eden, and could not find it."],
+    ["99.0.0", "Eden runs Cloudflare's cf CLI 1.0.0-rc.2 and found cf 99.0.0 installed in its place."],
+  ])("a missing or different cf (%s) stops every command with one JSON error and how to reinstall", async (cfVersion, message) => {
+    for (const command of ["preflight", "deploy", "destroy"]) {
+      const output: string[] = [];
+      await expect(runEdenCli([command, "--name", "eve-cf-pin", "--json"], { stdout: (line) => output.push(line), cfVersion }))
+        .resolves.toBe(1);
+      expect(output).toHaveLength(1);
+      expect(JSON.parse(output[0] as string)).toMatchObject({
+        ok: false,
+        error: { code: "EVE_CF_UNAVAILABLE", message, remediation: expect.stringContaining("Install @moinulmoin/eden again") as unknown },
+      });
+    }
+    const help: string[] = [];
+    await expect(runEdenCli(["--help"], { stdout: (line) => help.push(line), cfVersion })).resolves.toBe(0);
   });
 
   test("eden --help still prints on a Node older than 24.22", async () => {

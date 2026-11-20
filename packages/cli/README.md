@@ -34,7 +34,7 @@ Bun can install Eden, but Eden still runs on Node. Do not use `bunx --bun`.
 ## Requirements
 
 - macOS or Linux
-- Node `>=24.22.0`
+- Node `^24.22.0 || ^26.12.0`
 - a Cloudflare account on the Workers Paid plan (required for Containers)
 - a sign-in with Cloudflare's `cf` CLI, or `CLOUDFLARE_API_TOKEN` set:
 

@@ -28,6 +28,8 @@ const cloud = vi.hoisted(() => {
     /** The account "cf auth whoami" names on its nth call, from 0. */
     whoami: (() => "account-test") as (nth: number) => string,
     whoamiCalls: 0,
+    /** When set, what "cf auth whoami" prints instead. */
+    whoamiAnswer: undefined as unknown,
     /** The account cf's login names: the one whoami named last. */
     loginAccount: "account-test",
     workers: new Set<string>(),
@@ -152,6 +154,7 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
   cloud.runs.push({ args, cwd, config, env });
   if (command === "auth whoami") {
     cloud.loginAccount = cloud.whoami(cloud.whoamiCalls++);
+    if (cloud.whoamiAnswer !== undefined) return ok(cloud.whoamiAnswer);
     return ok({ authenticated: true, tokenValid: true, accounts: [{ id: cloud.loginAccount }] });
   }
   // cf acts on CLOUDFLARE_ACCOUNT_ID when it is set, else on its login's account.
@@ -431,6 +434,7 @@ beforeEach(() => {
     active: true,
     whoami: () => "account-test",
     whoamiCalls: 0,
+    whoamiAnswer: undefined,
     loginAccount: "account-test",
     workers: new Set<string>(),
     containers: new Set<string>(),
@@ -973,6 +977,26 @@ describe("eden deploy sends every cf write to the account it checked (MOI-254)",
       .toEqual({ pinned: [], pushed: [], secrets: [], workers: [] });
     expect(cloud.readAccounts.every((read) => read === account)).toBe(true);
     await expect(lstat(join(root, ".eden", "eve-deploy", "targets"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test.each([
+    // What cf 1.0.0-rc.2 printed for a token Cloudflare does not accept, on 2026-11-20.
+    ["a token Cloudflare does not accept", { authenticated: true, tokenValid: null, accounts: [] }, { CLOUDFLARE_API_TOKEN: "not-a-token" }, /CLOUDFLARE_API_TOKEN is set.*Signing in again changes nothing/u],
+    ["an account variable the login does not have", undefined, { CLOUDFLARE_ACCOUNT_ID: "2".repeat(32) }, /CLOUDFLARE_ACCOUNT_ID names an account this login does not have/u],
+    ["a signed-out cf", { authenticated: false }, {}, /auth login, or set CLOUDFLARE_API_TOKEN/u],
+  ])("%s gets its own next step", async (_name, whoamiAnswer, env, remediation) => {
+    const root = await deployableProject();
+    cloud.whoami = () => account;
+    cloud.whoamiAnswer = whoamiAnswer;
+    for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
+    vi.stubEnv("HOME", root);
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    expect(exitCode).toBe(1);
+    expect(result.checks?.find((check) => check.id === "VAL-CLI-007-CLOUDFLARE-ACCESS")).toMatchObject({
+      status: "blocked",
+      remediation: expect.stringMatching(remediation) as unknown,
+    });
+    expect({ pinned: cloud.pinned, workers: [...cloud.workers] }).toEqual({ pinned: [], workers: [] });
   });
 
   test("with Eden's own checks and a steady login, the deploy lands in the checked account", async () => {

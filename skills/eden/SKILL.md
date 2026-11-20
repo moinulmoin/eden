@@ -44,8 +44,8 @@ Docs: https://github.com/moinulmoin/eden (failure and warning codes:
 
 ## Machine and account
 
-- macOS or Linux, Node `>=24.22.0` (older stops with
-  `EVE_NODE_UNSUPPORTED`)
+- macOS or Linux, Node `^24.22.0 || ^26.12.0` (any other
+  stops with `EVE_NODE_UNSUPPORTED`)
 - Docker or OrbStack running, with linux/amd64 support
 - Cloudflare Workers Paid plan (Containers need it), and Cloudflare's `cf`
   CLI signed in: `npx cf@1.0.0-rc.2 auth login` (the user must do this in a
@@ -265,8 +265,15 @@ the agent sleeps takes about 10–15 seconds.
   Paid/Containers. It is checked before the build. The user has to fix this
   (`npx cf@1.0.0-rc.2 auth login`, then `npx cf@1.0.0-rc.2 auth whoami`),
   or set `CLOUDFLARE_API_TOKEN`.
-- `EVE_NODE_UNSUPPORTED`: Node is older than 24.22.0. Install Node 24.22.0
-  or newer (for example `nvm install 24`), then run the command again.
+- `EVE_NODE_UNSUPPORTED`: Node is not 24.22.0 or newer on the 24 line, or
+  26.12.0 or newer on the 26 line. Install Node 24 (for example
+  `nvm install 24`), then run the command again.
+- `EVE_CF_UNAVAILABLE`: the `cf` installed beside Eden is missing or is not
+  1.0.0-rc.2. Install `@moinulmoin/eden` again; do not install another `cf`
+  over it.
+- `VAL-CLI-007-CLOUDFLARE-ACCESS` with `CLOUDFLARE_API_TOKEN` or
+  `CLOUDFLARE_ACCOUNT_ID` in its remediation: signing in again does not
+  help. Correct or unset the variable it names.
 - First deploy on an account with no Worker yet: `eden deploy` deploys and
   deletes a temporary Worker `eden-origin-probe-<id>` to read the
   `workers.dev` subdomain. If check `VAL-HOST-006` fails, follow its

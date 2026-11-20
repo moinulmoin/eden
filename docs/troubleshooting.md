@@ -78,8 +78,9 @@ eden --help
 
 ### The CLI does not start on your Node version
 
-Eden needs Node `>=24.22.0` and has no upper bound on the Node major
-version. Check it with:
+Eden needs Node `^24.22.0 || ^26.12.0`: 24.22.0 or newer on the 24 line, or
+26.12.0 or newer on the 26 line. Those are the lines the `cf` CLI that Eden
+runs declares. Check it with:
 
 ```sh
 node --version
@@ -90,15 +91,28 @@ Bun can install the package, but Eden always runs on Node. Do not run it with
 
 ### `EVE_NODE_UNSUPPORTED`
 
-`Eden needs Node 24.22.0 or newer and is running on Node <version>.`
+`Eden needs Node 24.22.0 or newer on the 24 line, or 26.12.0 or newer on the
+26 line, and is running on Node <version>.`
 `preflight`, `deploy`, and `destroy` stop with this code before they read or
-change anything, because the `cf` CLI that Eden runs needs that Node. Install
-Node 24.22.0 or newer, check it, then run the command again:
+change anything, because the `cf` CLI that Eden runs declares those Node
+lines. Node 25, 26.0 to 26.11, and 27 or newer stop here too; Eden was not
+run on them. Install Node 24.22.0 or newer on the 24 line, check it, then run
+the command again:
 
 ```sh
 nvm install 24
 node --version
 ```
+
+### `EVE_CF_UNAVAILABLE`
+
+`Eden runs Cloudflare's cf CLI 1.0.0-rc.2, which is installed with Eden, and
+could not find it.` or `Eden runs Cloudflare's cf CLI 1.0.0-rc.2 and found cf
+<version> installed in its place.` `preflight`, `deploy`, and `destroy` stop
+with this code before they read or change anything. Eden runs only the `cf`
+version it was tested with. Install `@moinulmoin/eden` again with your
+package manager, which installs that `cf` beside it, and do not install
+another `cf` version over it. `eden --help` works without `cf`.
 
 ### `COMMAND_UNKNOWN`
 
@@ -217,6 +231,11 @@ other run to finish. If a run was killed, confirm no `eden` process is still
 running before you remove the lock file by hand.
 
 ### Managed registry login fails with `-25299`
+
+`cf containers push` uses your Docker credential store. When the push fails
+this way, the deploy's `DEPLOY_INDETERMINATE` message names the keychain
+entry and the command below. Eden prints nothing else of what the push
+wrote.
 
 On macOS, a stale `registry.cloudflare.com` keychain entry makes the managed
 registry login fail with `The specified item already exists in the keychain
@@ -392,6 +411,15 @@ sign-in counts only when `authenticated` and `tokenValid` are true and it
 lists exactly one account. When you set `CLOUDFLARE_ACCOUNT_ID`, it must
 name that account. A `CLOUDFLARE_API_TOKEN` that Cloudflare rejects does not
 count.
+
+Two cases get their own remediation, because signing in again changes
+nothing in either:
+
+- `CLOUDFLARE_API_TOKEN is set, and Cloudflare did not accept it or it can
+  see no account.` `cf` uses the variable before any saved login. Correct
+  the token or unset the variable.
+- `CLOUDFLARE_ACCOUNT_ID names an account this login does not have.` Unset
+  the variable or set it to the account `cf auth whoami` shows.
 
 #### Moving from the Wrangler login to cf
 

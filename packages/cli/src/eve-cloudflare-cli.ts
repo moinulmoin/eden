@@ -1,17 +1,48 @@
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-const cfEntrypoint = join(
-  dirname(createRequire(import.meta.url).resolve("cf/package.json")),
-  "bin",
-  "cf",
-);
+/** The one cf version Eden runs. Tested on Cloudflare on 2026-11-20. */
+export const CF_VERSION = "1.0.0-rc.2";
 
-/** The cf command users run by hand, at the version Eden runs. Tested on Cloudflare on 2026-11-20. */
-export const CF_COMMAND = "npx cf@1.0.0-rc.2";
+/** The cf command users run by hand, at the version Eden runs. */
+export const CF_COMMAND = `npx cf@${CF_VERSION}`;
+
+/** The cf package installed beside Eden, looked up when a command needs it, so help works without it. */
+function installedCloudflareCli(): { readonly entrypoint: string; readonly version: unknown } {
+  const manifest = createRequire(import.meta.url).resolve("cf/package.json");
+  return {
+    entrypoint: join(dirname(manifest), "bin", "cf"),
+    version: (JSON.parse(readFileSync(manifest, "utf8")) as { readonly version?: unknown }).version,
+  };
+}
+
+/**
+ * Why Eden cannot run its cf, or undefined when the pinned one is installed.
+ * `found` replaces the installed version for a test; null stands for none.
+ */
+export function pinnedCliProblem(
+  found?: string | null,
+): { readonly message: string; readonly remediation: string } | undefined {
+  let version: unknown = found ?? undefined;
+  if (found === undefined) {
+    try {
+      version = installedCloudflareCli().version;
+    } catch {
+      version = undefined;
+    }
+  }
+  if (version === CF_VERSION) return undefined;
+  return {
+    message: typeof version === "string"
+      ? `Eden runs Cloudflare's cf CLI ${CF_VERSION} and found cf ${version} installed in its place.`
+      : `Eden runs Cloudflare's cf CLI ${CF_VERSION}, which is installed with Eden, and could not find it.`,
+    remediation: `Install @moinulmoin/eden again with your package manager, which installs cf ${CF_VERSION} beside it, and do not install another cf version over that one. Then run the command again.`,
+  };
+}
 
 export interface CloudflareCliRequest {
   readonly args: readonly string[];
@@ -95,7 +126,7 @@ async function runCf(
       await writeFile(join(cwd, path), content, { mode: 0o600 });
     }
     return await new Promise<CloudflareCliResult>((resolveResult) => {
-      const child = spawn(process.execPath, [cfEntrypoint, ...request.args], {
+      const child = spawn(process.execPath, [installedCloudflareCli().entrypoint, ...request.args], {
         cwd,
         env: environment(request.accountId),
         stdio: ["ignore", "pipe", "pipe"],

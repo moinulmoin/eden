@@ -73,7 +73,7 @@ eden --version
 ```
 
 Users install only `@moinulmoin/eden`; its companion packages are resolved
-automatically. Bun is supported as an installer only. Node `>=24.22.0` remains
+automatically. Bun is supported as an installer only. Node `^24.22.0 || ^26.12.0` remains
 the Eden runtime, so do not force the CLI through `bunx --bun`.
 
 ### With a coding agent
@@ -99,7 +99,7 @@ nothing on Cloudflare.
 ## Requirements
 
 - macOS or Linux
-- Node `>=24.22.0`
+- Node `^24.22.0 || ^26.12.0`
 - a Cloudflare account on the Workers Paid plan ($5/month, required for
   Containers)
 - a sign-in with Cloudflare's `cf` CLI, or `CLOUDFLARE_API_TOKEN` set:

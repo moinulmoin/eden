@@ -8,7 +8,7 @@ Eden Deploy.
 Eden currently supports:
 
 - macOS or Linux
-- Node `>=24.22.0`
+- Node `^24.22.0 || ^26.12.0`
 - a Cloudflare account
 
 Native Windows and Bun as the JavaScript runtime are not supported. Bun may
@@ -20,8 +20,9 @@ Check Node before installing:
 node --version
 ```
 
-The result must be `v24.22.0` or newer; the `cf` CLI that Eden runs needs it.
-On an older Node, `preflight`, `deploy`, and `destroy` stop with
+The result must be `v24.22.0` or newer on the 24 line, or `v26.12.0` or newer
+on the 26 line; the `cf` CLI that Eden runs declares those lines.
+On any other Node, `preflight`, `deploy`, and `destroy` stop with
 [`EVE_NODE_UNSUPPORTED`](./troubleshooting.md#eve_node_unsupported). Eden
 intentionally has no artificial upper Node major-version bound.
 

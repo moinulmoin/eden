@@ -15,9 +15,16 @@
   command runs in a private temporary folder with a fixed environment and
   the checked account, so a project's `cloudflare.config.ts` or `.env`
   cannot choose the account or the token.
-- **Eden needs Node `24.22.0` or newer**, because `cf` does. On an older
-  Node, `preflight`, `deploy`, and `destroy` stop with the new code
-  `EVE_NODE_UNSUPPORTED`. The builder image is unchanged.
+- **Eden needs Node `^24.22.0 || ^26.12.0`**, the lines `cf` declares from
+  24 up. On any other Node, `preflight`, `deploy`, and `destroy` stop with
+  the new code `EVE_NODE_UNSUPPORTED`. The builder image is unchanged.
+- **A missing or different `cf` stops with `EVE_CF_UNAVAILABLE`** and says
+  to install Eden again. `eden --help` works without `cf`.
+- **`VAL-CLI-007-CLOUDFLARE-ACCESS` tells three cases apart**: a signed-out
+  `cf`, a `CLOUDFLARE_API_TOKEN` that Cloudflare does not accept or that
+  sees no account, and a `CLOUDFLARE_ACCOUNT_ID` the login does not have.
+  For the last two, signing in again changes nothing, and the remediation
+  says so.
 - **Eden finishes a publish that `cf deploy` left half done.** When
   `cf deploy` exits with an error after Cloudflare has the new Worker
   version, Eden creates the missing Container application and deploys the

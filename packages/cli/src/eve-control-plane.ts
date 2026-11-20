@@ -2294,8 +2294,13 @@ type EveCloudflareAccess = Pick<
   EveCloudflareReadResult,
   "accountAccess" | "containerAccess" | "accountId"
 > & {
-  /** True when cf is signed out and Wrangler, which Eden 0.14 and earlier used, has a saved login. */
-  readonly wranglerLoginOnly?: boolean;
+  /**
+   * Why there is no account, when cf's answer says: cf is signed out and
+   * Wrangler, which Eden 0.14 and earlier used, has a saved login; the API
+   * token in the environment is not accepted or sees no account; or
+   * CLOUDFLARE_ACCOUNT_ID names an account the login does not have.
+   */
+  readonly loginProblem?: "wrangler-login-only" | "token-unusable" | "account-mismatch";
 };
 
 /** The login and Container read that need no build, so they run before it. */
@@ -2303,12 +2308,23 @@ async function defaultCloudflareAccess(cf: CloudflareCliRunner, name: string): P
   const account = await readCloudflareLogin(cf);
   const accountId = authenticatedAccountId(account.value);
   if (account.failed || accountId === undefined) {
-    const signedOut = typeof account.value === "object" && account.value !== null &&
-      "authenticated" in account.value && account.value.authenticated === false;
+    const login = typeof account.value === "object" && account.value !== null
+      ? account.value as { readonly authenticated?: unknown; readonly accounts?: unknown }
+      : {};
+    const accounts = authenticatedCloudflareLogin(login) ? login.accounts as readonly unknown[] : undefined;
+    const tokenSet = (process.env.CLOUDFLARE_API_TOKEN ?? "").length > 0;
+    const loginProblem = login.authenticated === false
+      ? (!tokenSet && await wranglerLoginSaved() ? "wrangler-login-only" as const : undefined)
+      // cf calls a bad API token authenticated, with tokenValid null and no accounts.
+      : tokenSet && login.authenticated === true && (accounts === undefined || accounts.length === 0)
+      ? "token-unusable" as const
+      : accounts?.length === 1 && (process.env.CLOUDFLARE_ACCOUNT_ID ?? "").length > 0
+      ? "account-mismatch" as const
+      : undefined;
     return {
       accountAccess: "unavailable",
       containerAccess: "unavailable",
-      ...(signedOut && await wranglerLoginSaved() ? { wranglerLoginOnly: true } : {}),
+      ...(loginProblem === undefined ? {} : { loginProblem }),
     };
   }
   const containers = await readTargetContainers(cf, accountId, boundedResourceName(name, "container"));
@@ -2326,7 +2342,11 @@ function cloudflareAccessBlocked(result: EveCloudflareAccess): EvePreflightCheck
     "Authenticated Cloudflare account and Container access could not be verified without a mutating operation.",
     result.accountAccess === "available"
       ? `cf is signed in, but the account's Containers could not be read. Confirm that the account ${CF_COMMAND} auth whoami shows is on the Workers Paid plan, or switch accounts with ${CF_COMMAND} auth login, then retry.`
-      : result.wranglerLoginOnly === true
+      : result.loginProblem === "token-unusable"
+      ? `CLOUDFLARE_API_TOKEN is set, and Cloudflare did not accept it or it can see no account. Signing in again changes nothing while the variable is set. Correct the token or unset CLOUDFLARE_API_TOKEN, confirm with ${CF_COMMAND} auth whoami that it shows exactly one account, then retry.`
+      : result.loginProblem === "account-mismatch"
+      ? `CLOUDFLARE_ACCOUNT_ID names an account this login does not have. Signing in again changes nothing. Unset CLOUDFLARE_ACCOUNT_ID or set it to the account ${CF_COMMAND} auth whoami shows, then retry.`
+      : result.loginProblem === "wrangler-login-only"
       ? `Eden now uses Cloudflare's cf CLI, which does not read the Wrangler login this machine has. Run ${CF_COMMAND} auth login once, or set CLOUDFLARE_API_TOKEN, confirm the account with ${CF_COMMAND} auth whoami, then retry.`
       : `Run ${CF_COMMAND} auth login, or set CLOUDFLARE_API_TOKEN, and confirm with ${CF_COMMAND} auth whoami that it shows exactly one account. Then retry.`,
   );
@@ -2615,7 +2635,11 @@ async function publishImageWithCf(
     if (pushed.exitCode !== 0) {
       return {
         status: "indeterminate",
-        reason: "The exact Cloudflare Container image push did not complete.",
+        // cf pushes with the caller's Docker credential store. This is the
+        // one failure of it Eden names: macOS refusing a second keychain entry.
+        reason: /-25299|already exists in the keychain/u.test(pushed.stderr)
+          ? "The exact Cloudflare Container image push did not complete: Docker's credential store already holds an entry for registry.cloudflare.com. On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry."
+          : "The exact Cloudflare Container image push did not complete.",
         evidenceRetained: true,
       };
     }

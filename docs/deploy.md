@@ -24,7 +24,8 @@ exact cleanup. Eve remains the application and workflow authority.
 Before deploying, confirm:
 
 - `eden --help` starts successfully.
-- `node --version` shows `v24.22.0` or newer.
+- `node --version` shows `v24.22.0` or newer on the 24 line, or `v26.12.0` or
+  newer on the 26 line.
 - `npx cf@1.0.0-rc.2 auth whoami` shows the intended Cloudflare account, and
   only that one, on the Workers Paid plan, which Containers requires.
 - Docker or OrbStack is running with Linux/amd64 support.

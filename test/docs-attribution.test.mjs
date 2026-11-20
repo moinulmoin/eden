@@ -90,7 +90,7 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
     expect(document).toMatch(/^npm install --global @moinulmoin\/eden$/mu);
     expect(document).toMatch(/^pnpm add --global @moinulmoin\/eden$/mu);
     expect(document).toMatch(/^bun add --global @moinulmoin\/eden$/mu);
-    expect(document).toMatch(/Node `>=24\.22\.0`/u);
+    expect(document).toMatch(/Node `\^24\.22\.0 \|\| \^26\.12\.0`/u);
     expect(document).toContain("Docker or OrbStack");
     expect(document).toContain(`${CF_COMMAND} auth login`);
     expect(document).not.toMatch(/wrangler@|wrangler (?:login|whoami)/u);
@@ -104,7 +104,7 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   expect(readme).toContain("## Install");
   expect(readme).toContain("Users install only `@moinulmoin/eden`;");
   expect(readme).toMatch(/Bun is supported as an installer only/i);
-  expect(readme).toMatch(/Node `>=24\.22\.0` remains\s+the Eden runtime/i);
+  expect(readme).toMatch(/Node `\^24\.22\.0 \|\| \^26\.12\.0` remains\s+the Eden runtime/i);
   expect(workflow).toContain("permissions:\n  contents: read");
   expect(workflow).toContain("actions/checkout@11d5960a326750d5838078e36cf38b85af677262");
   expect(workflow).toContain("actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020");

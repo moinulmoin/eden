@@ -61,7 +61,7 @@ World each one needs.
 
 npm projects deploy as-is using frozen `npm ci` installs; no pnpm conversion is
 needed. Exact-pinned pnpm projects are also supported. Eden runs on Node
-`>=24.22.0` on macOS and Linux; Bun project lockfiles and native Windows are not
+`^24.22.0 || ^26.12.0` on macOS and Linux; Bun project lockfiles and native Windows are not
 supported. Bun can install the Eden CLI, but Eden itself runs on Node.
 
 `.npmrc` is excluded from build layers. Private registries and installs requiring

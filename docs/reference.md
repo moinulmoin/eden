@@ -569,7 +569,7 @@ image identity and never runs a broad Docker cleanup.
 
 | Requirement | Value |
 | --- | --- |
-| Node | `>=24.22.0`; an older Node stops `preflight`, `deploy`, and `destroy` with `EVE_NODE_UNSUPPORTED` |
+| Node | `^24.22.0 || ^26.12.0`; any other Node stops `preflight`, `deploy`, and `destroy` with `EVE_NODE_UNSUPPORTED` |
 | `cf` (Cloudflare's CLI) | `1.0.0-rc.2`, a release candidate, pinned exactly and installed as a direct dependency of the CLI |
 | Project package manager | npm defaults to `11.13.0` when `packageManager` is absent, or uses an exact `npm@<major>.<minor>.<patch>` pin with major 7 or newer. pnpm requires an exact `pnpm@<major>.<minor>.<patch>` pin; ranges and tags are rejected |
 | Project lockfile | Exactly one regular root lockfile for the selected manager; mixed locks are rejected. npm accepts `package-lock.json` v2/v3 and uses `npm ci --ignore-scripts --no-audit --no-fund` (production adds `--omit=dev`); dependency lifecycle scripts do not run. pnpm 9 and newer require `lockfileVersion: '9'`, pnpm 7 and 8 require `lockfileVersion: '6'`, older pnpm requires `lockfileVersion: '5'` |
