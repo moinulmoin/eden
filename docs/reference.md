@@ -168,7 +168,8 @@ on that account. Destroy reads nothing from an account other than the one in
 the record. It takes a Worker as absent only on Cloudflare's own single
 answer, as `cf` prints it: exit code 1, nothing on standard output, exactly
 one error with code `10007` and status `404`, for the exact request path of
-that account and Worker. Any other answer about the Worker that is not a
+that account and Worker. Both `cf workers deployments list` and
+`cf workers get` must give that answer. Any other answer about the Worker that is not a
 list of its deployments stops destroy with `EVE_DESTROY_INDETERMINATE`. It
 reads a Container application list only when `cf` exits 0 and prints a JSON
 list. `cf` runs each delete with the recorded account set. Destroy removes `CURRENT` only if the pointer is still

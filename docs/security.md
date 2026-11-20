@@ -249,6 +249,8 @@ login cannot act on the checked account, the command fails.
   code 1, nothing on standard output, exactly one error with the expected
   code (`10007` for a Worker, `1609` for a Container application) and
   status `404`, for the exact request path of that account and name.
+  For a Worker, both `cf workers deployments list` and `cf workers get`
+  must give that answer.
   Anything else is unknown, never absent. A
   Container application list counts only when `cf` exits 0 and prints a JSON
   list.

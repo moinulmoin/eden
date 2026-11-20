@@ -2,7 +2,7 @@ import type * as ChildProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import type * as Https from "node:https";
 import type * as TimersPromises from "node:timers/promises";
 import { tmpdir } from "node:os";
@@ -1001,6 +1001,11 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     expect({ exitCode: failed.exitCode, code: failed.result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
     expect((failed.result.error as { readonly remediation?: string }).remediation).toMatch(/eden deploy again.*eden destroy/u);
     expect({ workers: [...cloud.workers], containers: [...cloud.containers] }).toEqual({ workers: [worker], containers: [] });
+    const generations = join(root, ".eden", "eve-deploy", "generations");
+    const [generation] = await readdir(generations);
+    // What cf printed for the publish and for the command that failed is kept for the user.
+    await expect(readFile(join(generations, generation ?? "", "worker", "cf-deploy.log"), "utf8"))
+      .resolves.toMatch(/cf containers applications create: exit 1/u);
     const destroyed = await destroyDeployed(root);
     expect({ exitCode: destroyed.exitCode, status: destroyed.result.status }).toEqual({ exitCode: 0, status: "destroyed" });
     expect(cloud.deleted).toEqual(["worker:" + worker]);

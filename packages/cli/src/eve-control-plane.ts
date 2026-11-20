@@ -2709,10 +2709,16 @@ function defaultPublicationRunner(
       },
     });
     if (deployed.exitCode !== 0) {
-      // What cf printed, kept beside the Build Output for whoever inspects the failure.
-      await writeFile(join(request.buildOutputPath, "cf-deploy.log"), safeText(deployed.stderr), { mode: 0o600 })
+      // What cf printed for the publish and for each finishing command, kept
+      // beside the Build Output for whoever inspects the failure.
+      const log = [safeText(deployed.stderr)];
+      const finish = await finishPublication(async (step) => {
+        const result = await cf(step);
+        log.push(`cf ${step.args.slice(0, 3).join(" ")}: exit ${result.exitCode}\n${safeText(result.stderr)}`);
+        return result;
+      }, request);
+      await writeFile(join(request.buildOutputPath, "cf-deploy.log"), log.join("\n"), { mode: 0o600 })
         .catch(() => undefined);
-      const finish = await finishPublication(cf, request);
       if (finish !== "finished") {
         return {
           status: "indeterminate",

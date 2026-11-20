@@ -92,6 +92,11 @@ that login. After upgrading, run `npx cf@1.0.0-rc.2 auth login` once, or set
 [`VAL-CLI-007-CLOUDFLARE-ACCESS`](./troubleshooting.md#moving-from-the-wrangler-login-to-cf).
 The `.eden/` folder and your deployed targets need no change.
 
+Going back is not supported. On 2026-11-20, Eden 0.14.0 run against a target
+that this version had deployed exited 1 with `DEPLOY_INDETERMINATE`. The
+live deployment kept answering, and this version deployed and destroyed the
+target afterwards.
+
 On macOS, a stale `registry.cloudflare.com` keychain entry makes the managed
 registry login fail with `The specified item already exists in the keychain
 (-25299)`; remove it with

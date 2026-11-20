@@ -339,7 +339,9 @@ record, it reads nothing. `cf` prints errors as text; Eden reads them in one
 place. A Worker is absent only on Cloudflare's own single answer: `cf` exits
 with code 1, prints nothing on standard output, and prints exactly one error
 with code `10007` and status `404` for the exact request path of that
-account and Worker. A Container application list counts only when `cf`
+account and Worker. Eden asks twice, with `cf workers deployments list` and
+`cf workers get`, because the two can disagree for a while after a Worker is
+created or deleted. Both must give that answer. A Container application list counts only when `cf`
 exits 0 and prints a JSON list. A failed or unclear read of either stops
 destroy with `EVE_DESTROY_INDETERMINATE` and leaves the record alone. `cf`
 runs each delete with the recorded account set.

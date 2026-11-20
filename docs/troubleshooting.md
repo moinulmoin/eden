@@ -700,7 +700,11 @@ The publish is one `cf deploy --prebuilt`, which Eden never runs twice.
 `cf deploy` uploads the Worker version first, then sets up the Container
 application, then the `workers.dev` route and the schedule. When it exits
 with an error, Eden checks whether the Worker version in service carries
-this publish's release ID.
+this publish's release ID. Cloudflare can take a while to show a version it
+just accepted, so Eden repeats that read for up to two minutes. Eden writes
+what `cf` printed for the publish, and for each command it ran to finish it,
+to `worker/cf-deploy.log` in the generation folder under
+`.eden/eve-deploy/generations/`.
 
 If it does not, the message is `The exact Cloudflare publication did not
 return a terminal success result.` Eden creates nothing. See
@@ -1342,7 +1346,9 @@ Eden reads the Worker through `cf` (`cf workers deployments list`). When
 exists. It is absent only on Cloudflare's own single answer, as `cf` prints
 it: exit code 1, nothing on standard output, and exactly one error with code
 `10007` and status `404` for the exact request path of that account and
-Worker. Any other answer about the Worker, output Eden cannot read, and no
+Worker. `cf workers get` must then give the same answer for its own path,
+because Cloudflare's two reads can disagree for a while after a Worker is
+created or deleted. Any other answer about the Worker, output Eden cannot read, and no
 answer, are indeterminate. Eden reads a Container application list, empty or
 not, only when `cf` exits 0 and prints a JSON list; any other answer is
 indeterminate too. A delete counts as `absent` by the same rule, with code

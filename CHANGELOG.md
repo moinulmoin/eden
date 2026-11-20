@@ -24,7 +24,16 @@
   triggers itself, and never runs `cf deploy` a second time. Before, such
   a deploy ended `DEPLOY_INDETERMINATE` and Eden stopped. If Eden cannot
   finish, the deploy still ends `DEPLOY_INDETERMINATE`, and running
-  `eden deploy` again sets up what is missing.
+  `eden deploy` again sets up what is missing. Cloudflare can take a while
+  to show a version it just accepted, so Eden repeats its read for up to
+  two minutes. What `cf` printed is kept in `worker/cf-deploy.log` in the
+  generation folder.
+- **`eden destroy` calls a Worker absent only when two reads agree.**
+  Cloudflare's deployments read and its Worker read can disagree for a
+  while after a Worker is created or deleted. Both must answer that the
+  Worker does not exist.
+- Eden 0.14.0 cannot deploy a target this version deployed: it exits 1
+  with `DEPLOY_INDETERMINATE` and the live deployment keeps answering.
 - **`eden destroy` removes a first deploy that was only half published.**
   A Worker whose first publish stopped before its Container application
   existed is proven from the Worker version in service and the failed
