@@ -4,6 +4,48 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for the account binding (2026-11-20)
+
+Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
+account, with Wrangler `4.147.0` and an OAuth login, on the branch of
+[#26](https://github.com/moinulmoin/eden/pull/26) at `f1760f2`. From this
+change on, Eden runs every Wrangler command after `wrangler whoami` with
+`CLOUDFLARE_ACCOUNT_ID` set to the account it checked. The login did not
+change during the run, so the run shows the bound commands work on a real
+account. It does not show a changed login being refused.
+
+Full run of `pnpm run check:live`, target `eden-live-20261120-9c6e4e78`,
+`02:09:22Z` to `02:23:52Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+this workspace (version `0.13.0`), a 90-second idle window. All 18 steps
+passed.
+
+- `eden preflight` passed 14 checks with no warnings in 78 seconds. The
+  fresh deploy took 163 seconds, the same-version update 99 seconds, and
+  the deploy on Eve `1.0.2` 179 seconds, all on the same URL. The fresh deploy
+  pushed its image and uploaded the model key as a Worker secret, and the
+  session's model reply used that key.
+- Session `wrun_01M7VBPKQC9ZNFFPF01JD2CGZM` answered after each deploy and
+  after the sleep, with its earlier turns in its stream and its file
+  intact. After 165 seconds with no requests the first health request took
+  5 seconds, and the server process was 6 seconds old.
+- An unauthenticated session request got `401`, and the two workflow queue
+  routes answered `404`. A session on Eve `1.0.2` asked its server
+  process: no `queueAuthMode` line.
+- `eden destroy` ended with `destroyed` in 79 seconds and reported 13
+  objects in `EVE_REGISTRY_OBJECTS_KEPT`. In one repository: four snapshot
+  tags, two snapshot manifests, two chain artifacts, and one image
+  manifest (`accepted-still-listed`). In the other: two snapshot tags, one
+  snapshot manifest, and one chain artifact.
+- The check's catalog read found those 13 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+
+An earlier full run the same day, on the same branch at `bde1d48` (before
+the second account check was tied to the first), target
+`eden-live-20261120-13e6e784`, `01:49:42Z` to `02:05:47Z`, also passed all 18
+steps. Its `eden destroy` ended with `destroyed` and 13 kept objects, and
+the check found nothing else of the target.
+
 ## Live check for the Container settings message (2026-11-20)
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare

@@ -1486,15 +1486,25 @@ async function withWranglerDirectory<T>(
   }
 }
 
+/** The one Wrangler command Eden runs without an account: it names the login's. */
+function readWranglerLogin(): Promise<WranglerJsonResult> {
+  return readWranglerJson(["whoami", "--json"], undefined);
+}
+
 async function readWranglerJson(
   args: readonly string[],
+  /** Makes Wrangler read this account or fail. */
+  accountId: string | undefined,
 ): Promise<WranglerJsonResult> {
   try {
     const result = await withWranglerDirectory((cwd) => execFileAsync(
       process.execPath,
       [wranglerEntrypoint, ...args, "--config", join(cwd, "wrangler.json")],
       {
-        env: safeWranglerEnvironment(cwd),
+        env: {
+          ...safeWranglerEnvironment(cwd),
+          ...(accountId === undefined ? {} : { CLOUDFLARE_ACCOUNT_ID: accountId }),
+        },
         cwd,
         maxBuffer: 2 * 1024 * 1024,
         timeout: 30_000,
@@ -1797,9 +1807,15 @@ async function readExactTargetInventory(
 
 async function defaultCloudflareRead(
   request: EveCloudflareReadRequest,
+  /** The account the check before the build named. */
+  checkedAccountId: string | undefined,
 ): Promise<EveCloudflareReadResult> {
-  const account = await readWranglerJson(["whoami", "--json"]);
-  const accountId = authenticatedAccountId(account.value);
+  const account = await readWranglerLogin();
+  const loginAccountId = authenticatedAccountId(account.value);
+  // A login that now names another account is no access: nothing is read or written there.
+  const accountId = checkedAccountId !== undefined && loginAccountId !== checkedAccountId
+    ? undefined
+    : loginAccountId;
   const { containerEntries, worker } = await readExactTargetInventory(
     accountId,
     request.name,
@@ -1916,13 +1932,13 @@ async function readProviderEvidence(
       ? {}
       : { containerApplicationId: containerEntry.id }),
   };
-  if (containerEntry !== undefined) {
+  if (containerEntry !== undefined && accountId !== undefined) {
     const info = await readWranglerJson([
       "containers",
       "info",
       containerEntry.id,
       "--json",
-    ]);
+    ], accountId);
     if (!info.failed && typeof info.value === "object" && info.value !== null) {
       const infoRecord = info.value as {
         readonly scheduling_policy?: unknown;
@@ -2128,9 +2144,10 @@ async function resolveEveTargetOwnership(
 async function readEveCloudflareTarget(
   request: EveCloudflareReadRequest,
   options: EvePreflightOptions,
+  checkedAccountId: string | undefined,
 ): Promise<EveCloudflareReadResult> {
   const result = options.cloudflareRead === undefined
-    ? await defaultCloudflareRead(request)
+    ? await defaultCloudflareRead(request, checkedAccountId)
     : await options.cloudflareRead(request);
   return resolveEveTargetOwnership(request, result);
 }
@@ -2222,12 +2239,12 @@ async function defaultRuntimeRunner(
 
 type EveCloudflareAccess = Pick<
   EveCloudflareReadResult,
-  "accountAccess" | "containerAccess"
+  "accountAccess" | "containerAccess" | "accountId"
 >;
 
 /** The login and Container read that need no build, so they run before it. */
 async function defaultCloudflareAccess(name: string): Promise<EveCloudflareAccess> {
-  const account = await readWranglerJson(["whoami", "--json"]);
+  const account = await readWranglerLogin();
   const accountId = authenticatedAccountId(account.value);
   if (account.failed || accountId === undefined) {
     return { accountAccess: "unavailable", containerAccess: "unavailable" };
@@ -2236,6 +2253,7 @@ async function defaultCloudflareAccess(name: string): Promise<EveCloudflareAcces
   return {
     accountAccess: "available",
     containerAccess: containers.failed ? "unavailable" : "available",
+    accountId,
   };
 }
 
@@ -2471,17 +2489,17 @@ async function writeEveDeploymentArtifacts(
   return { workerSourcePath, wranglerConfigPath };
 }
 
-/** Default deadline for Wrangler secret writes and deletions. */
+/** Deadline for Wrangler secret writes and deletions. */
 const WRANGLER_OPERATION_TIMEOUT_MS = 120_000;
 /** Deadline for the image push and `wrangler deploy`; either can take minutes on a slow registry or uplink. */
 const WRANGLER_PUBLICATION_TIMEOUT_MS = 600_000;
 
 async function runWranglerWithInput(
   args: readonly string[],
+  /** Makes Wrangler act on this account or fail, whatever its login resolves to. */
+  accountId: string,
   input?: string,
   timeoutMs: number = WRANGLER_OPERATION_TIMEOUT_MS,
-  /** Makes Wrangler act on this account or fail, whatever its login resolves to. */
-  accountId?: string,
 ): Promise<{
   readonly exitCode: number;
   readonly stdout: string;
@@ -2498,10 +2516,7 @@ async function runWranglerWithInput(
         : ["--config", join(cwd, "wrangler.json")])],
       {
         cwd,
-        env: {
-          ...safeWranglerEnvironment(cwd),
-          ...(accountId === undefined ? {} : { CLOUDFLARE_ACCOUNT_ID: accountId }),
-        },
+        env: { ...safeWranglerEnvironment(cwd), CLOUDFLARE_ACCOUNT_ID: accountId },
         stdio: ["pipe", "pipe", "pipe"],
       },
     );
@@ -2555,6 +2570,7 @@ async function runWranglerWithInput(
 
 function defaultProtectedStore(
   workerName: string,
+  accountId: string,
 ): EveRuntimeProtectedStore {
   return {
     async put(request) {
@@ -2567,6 +2583,7 @@ function defaultProtectedStore(
             "--name",
             workerName,
           ],
+          accountId,
           request.values[name] === undefined ? "" : `${request.values[name]}\n`,
         );
         if (result.exitCode !== 0) {
@@ -2599,6 +2616,7 @@ async function defaultImagePublicationRunner(
     );
     const pushed = await runWranglerWithInput(
       ["containers", "push", request.localImageTag],
+      request.accountId,
       undefined,
       WRANGLER_PUBLICATION_TIMEOUT_MS,
     );
@@ -2693,6 +2711,8 @@ function defaultPublicationRunner(): EveDeploymentPublicationRunner {
         request.identity.environment,
         "--strict",
       ],
+      // The config Eden wrote names the same account, and Wrangler reads it first.
+      request.identity.accountId,
       undefined,
       WRANGLER_PUBLICATION_TIMEOUT_MS,
     );
@@ -3270,7 +3290,7 @@ async function runEveDeployment(
     Object.keys(retainedDeployments).some((id) => id !== priorIdentity.deploymentId);
   const controlToken = `${randomUUID()}${randomUUID()}`;
   if (affinityEnabled && (hasRetainedNoncurrentDeployments || Object.keys(retiringDeployments).length > 0)) {
-    await (options.protectedStore ?? defaultProtectedStore(request.name)).put({
+    await (options.protectedStore ?? defaultProtectedStore(request.name, accountId)).put({
       targetId: targetKey, revision: `eve-affinity-control-${randomUUID()}`,
       inputIdentity: {
         token: `eve-affinity-control-input-${randomUUID()}`,
@@ -3394,7 +3414,7 @@ async function runEveDeployment(
           mode: "deploy",
           targetId: targetKey,
           protectedStore: options.protectedStore ??
-            defaultProtectedStore(request.name),
+            defaultProtectedStore(request.name, accountId),
         },
       );
     } catch (error: unknown) {
@@ -4118,9 +4138,11 @@ async function collectEvePreflight(
       sandboxProvider === undefined || warning.id !== "EVE_JUST_BASH_MISSING"
     ),
   );
+  let checkedAccountId: string | undefined;
   if (options.cloudflareRead === undefined) {
     eveProgress(options, "checking Cloudflare access");
     const access = await defaultCloudflareAccess(request.name);
+    checkedAccountId = access.accountId;
     if (
       access.accountAccess === "unavailable" ||
       access.containerAccess === "unavailable"
@@ -4342,6 +4364,7 @@ async function collectEvePreflight(
           name: request.name,
         },
         options,
+        checkedAccountId,
       );
     } catch {
       await discardPackagingImage();
@@ -4624,6 +4647,7 @@ async function collectEvePreflight(
           name: request.name,
         },
         options,
+        checkedAccountId,
       );
     } catch {
       await discardPackagingImage();
@@ -5401,7 +5425,7 @@ async function defaultDestroyTargetRead(
   request: EveDestroyCloudflareReadRequest,
   registry: CloudflareRegistry,
 ): Promise<EveDestroyTargetRead> {
-  const account = await readWranglerJson(["whoami", "--json"]);
+  const account = await readWranglerLogin();
   const accountId = authenticatedAccountId(account.value);
   if (accountId !== undefined && accountId !== request.accountId) {
     // A login for another account: nothing is read, and the caller refuses on the account.
@@ -5445,9 +5469,8 @@ async function defaultWorkerDelete(
 ): Promise<"deleted" | "absent" | "indeterminate"> {
   const result = await runWranglerWithInput(
     ["delete", "--name", request.name, "--force"],
-    "y\n",
-    undefined,
     request.accountId,
+    "y\n",
   );
   if (result.exitCode === 0) return "deleted";
   if (/(?:does not exist|not found|10007)/iu.test(result.stderr)) {
@@ -5461,8 +5484,6 @@ async function defaultContainerDelete(
 ): Promise<"deleted" | "absent" | "indeterminate"> {
   const result = await runWranglerWithInput(
     ["containers", "delete", request.applicationId],
-    undefined,
-    undefined,
     request.accountId,
   );
   if (result.exitCode === 0) return "deleted";
@@ -5747,7 +5768,7 @@ function cloudflareRegistry(): CloudflareRegistry {
       const minted = await readWranglerJson([
         "containers", "registries", "credentials", CLOUDFLARE_REGISTRY_HOST,
         "--push", "--pull", "--expiration-minutes", "5", "--json",
-      ]);
+      ], accountId);
       const value = minted.failed || typeof minted.value !== "object" || minted.value === null
         ? {}
         : minted.value as Record<string, unknown>;
@@ -5883,8 +5904,6 @@ function registryRepositoryDeleter(
           const ask = () => registry.delete(accountId, repository, entry).catch(() => undefined);
           const wrangler = untagged(entry) ? undefined : await runWranglerWithInput(
             ["containers", "images", "delete", `${repository}:${entry}`, "--skip-confirmation"],
-            undefined,
-            undefined,
             accountId,
           );
           const answer = wrangler === undefined
