@@ -156,7 +156,9 @@ them. `eden destroy` then fails if anything without
 one of the registry's kept answers is still in its final listing, or if it
 cannot read that listing. `eden deploy` fails `VAL-LIFE-007` when it cannot
 prove that everything else in the repository is gone, which includes a
-listing it cannot read. A listing counts as read only when every page is
+listing it cannot read. The one exception is the image a same-version update
+replaced: when its delete cannot be shown, deploy succeeds with the warning
+`EVE_SUPERSEDED_IMAGE_NOT_DELETED`. A listing counts as read only when every page is
 exactly in the form the registry sent on 2026-11-18: the recorded account
 and the repository asked for, entries in ascending order, and a `Link`
 header that continues from the page's last entry and is empty only after
@@ -234,7 +236,12 @@ login cannot act on the checked account, the command fails.
   manifest the registry lists in a repository that the record proves this
   target owns, including one that appears while it runs. Eden never runs it
   on a repository that holds the image it just promoted or the image of a
-  version it still keeps. Eden works with one spelling of an image,
+  version it still keeps. In that repository a same-version update deletes
+  only the image it replaced, after the new deployment is healthy and
+  promoted: the tag `candidate` that Eden `0.13.x` and older pushed, the
+  tags named after this project's other generations under `.eden`, and the
+  replaced image's own `sha256:` entry. It skips this when another kept
+  version's image is in the same repository. Eden works with one spelling of an image,
   `registry.cloudflare.com/<account>/<repository>@sha256:<digest>`, and
   refuses any other reference before it changes anything on the target. A recorded image that is
   not in that form cannot be placed in a repository, so it stops every

@@ -794,6 +794,11 @@ The deployment is live. Read the check message to see which cleanup failed:
   there. A deploy is an ordinary update that builds and publishes a new
   image, so do not make one for this cleanup alone.
 
+A same-version update with deployment affinity deletes only the image it
+replaced, by its tag. When that cannot be shown, the check does not fail:
+the deploy succeeds with the warning
+[`EVE_SUPERSEDED_IMAGE_NOT_DELETED`](#eve_superseded_image_not_deleted).
+
 Kept objects alone do not fail the check. Deploy reports them in
 [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept), even when something
 else makes the check fail. Eden's own requests to `registry.cloudflare.com`
@@ -871,6 +876,22 @@ The destroy operation failed. Read the failed cleanup check and its
 remediation. Keep the project's `.eden` ownership records and retry only the
 same exact target after resolving that check.
 
+
+### `EVE_SUPERSEDED_IMAGE_NOT_DELETED`
+
+A warning on a successful same-version update: `The update is healthy and
+promoted, but Eden could not show that the superseded image
+<repository>@sha256:<digest> left Cloudflare's registry.` The deploy
+succeeded and nothing is needed now. The replaced image still has its tag,
+so it can still be removed:
+
+- The next `eden deploy` of the same Eve version from this project folder
+  deletes it by its tag. Do not deploy for this alone.
+- `eden destroy` deletes it with the target.
+
+Eden reads the registry with direct requests to `registry.cloudflare.com`
+and never uses a proxy for them. On a machine that cannot reach the registry
+that way, every same-version update carries this warning.
 
 ### `EVE_UPDATE_IN_FLIGHT`
 
@@ -1370,7 +1391,7 @@ observed on 2026-11-18:
 | --- | --- | --- |
 | `refused-snapshot` | `403` with one error: code `DENIED`, message `snapshot manifests cannot be deleted through this API` | A container snapshot: its tags, seen so far as `rootfs-snapshot-*` and `rootfs-set-*`, and its manifest. A target has them once it has slept or moved to a new Eve version. |
 | `refused-singleton-artifact` | `409` with the code `SINGLETON_ARTIFACT_EXISTS`, the artifact type `application/vnd.cloudchamber.btrfs-chain.v1` and two digests | The chain artifact that Cloudflare makes for each pushed image. Eden does not know whether either digest in the answer is the one it asked to delete. |
-| `accepted-still-listed` | A delete by digest answered `202` or `204`, and a listing Eden began at least 30 seconds later still has the entry | The earlier image of a repository that got a second push. It had no tag. |
+| `accepted-still-listed` | A delete by digest answered `202` or `204`, and a listing Eden began at least 30 seconds later still has the entry | The earlier image of a repository that got a second push under the same tag, as Eden `0.13.x` and older pushed. It had no tag. |
 
 Each accepted delete gets its own 30 seconds, so cleanup of a repository
 can take that long after its last accepted delete.
@@ -1403,6 +1424,10 @@ delete would be answered differently. What is known about the kept objects:
   accepted.
 - An image manifest names the layers that hold the project's built code.
   Cloudflare does not document what a chain artifact holds.
+- Eden now gives every pushed image a tag of its own and deletes a
+  replaced image by that tag, so an update no longer leaves an untagged
+  image. Images that Eden `0.13.x` or older left untagged stay, and destroy
+  lists them here.
 - Not known: when Cloudflare removes chain artifacts and untagged
   manifests, and whether kept objects count toward the 50 GB of image
   storage per account in Cloudflare's Containers limits.

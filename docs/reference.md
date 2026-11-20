@@ -458,7 +458,7 @@ so health checks can distinguish same-version updates.
 | Durable Object class | `EveHostDurableContainer`, plus `EdenWorldDurableObject` when the project selects the Cloudflare Durable Object World |
 | Worker secrets | One secret per `--env-file` variable of this run |
 | Cron Trigger | `* * * * *`, only when the project's compiled schedules contain at least one cron expression the trigger can evaluate |
-| Registry repository | `eden-eve-<environment>-<name>-<target-key-digest>-<generation-id>` in `registry.cloudflare.com`, tagged `candidate` |
+| Registry repository | `eden-eve-<environment>-<name>-<target-key-digest>-<generation-id>` in `registry.cloudflare.com`; with deployment affinity the last part is the affinity ID. Each pushed image is tagged with its generation ID (`candidate` up to Eden `0.13.x`) |
 
 The target key digest is the first 24 hexadecimal characters of the SHA-256
 hash of the project identity, account identity, environment, and name, so two
@@ -598,6 +598,7 @@ Human output starts with one header line, `eden <command> — <name>
 ... publishing Worker and Container application
 ... verifying health at <public origin>
 ... deleting superseded registry repository <repository>   (only on an update)
+... deleting the superseded image from registry repository <repository>   (only on a same-version update with deployment affinity)
 ```
 
 When the env file, the Eve version, the sandbox module, or Cloudflare access
@@ -606,7 +607,9 @@ problems together with the project setup warnings, without building.
 
 The update and registry-cleanup lines above describe the in-place path.
 With affinity, only unneeded images are superseded: a retained image is not
-cleanup residue. Deploy-time retirement removes drained affinity deployments;
+cleanup residue. A same-version update deletes the image it replaced by its
+tag, after promotion. When that delete cannot be shown, the deploy still
+succeeds and adds the warning `EVE_SUPERSEDED_IMAGE_NOT_DELETED`. Deploy-time retirement removes drained affinity deployments;
 destroy removes all retained deployments and their instances and repositories.
 
 `eden destroy`:
@@ -704,7 +707,7 @@ the command produced them.
 | `name` | string | The exact target name |
 | `checks` | array | `id`, `status` (`passed`, `failed`, `blocked`, `skipped`), `message`, and `remediation` when present |
 | `warnings` | array | `id`, `message`, and `remediation` when present |
-| `registryObjectsKept` | array of objects, on deploy with the warning `EVE_REGISTRY_OBJECTS_KEPT` | Each object of a superseded version's repository that Cloudflare's registry still lists after Eden's delete, with the same `ref` and `class` as on destroy |
+| `registryObjectsKept` | array of objects, on deploy with the warning `EVE_REGISTRY_OBJECTS_KEPT` | Each object of a superseded version's repository, or the superseded image of a same-version update, that Cloudflare's registry still lists after Eden's delete, with the same `ref` and `class` as on destroy |
 | `candidate` | object or `null` | `generationId`, `sourceDigest`, `outputDigest`, and `imageDigest` when the image was built |
 | `deployment` | object, on deploy | `status`, `operation` (`create` or `update`), `targetKey`, `deploymentId`, `workerName`, `containerApplicationName`, `stableContainerInstanceName`, `stableWorkersDevOrigin`, `imageReference`, `supersededGenerationId` and `supersededImageReference` on an update, `runtimeVariableNames`, and `evidenceRetained`. `reason` and `evidenceLocation` explain the outcome and where to find its local evidence; an indeterminate result may omit identity fields |
 

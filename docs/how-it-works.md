@@ -195,6 +195,22 @@ behavior and the warning that an Eve upgrade can strand sessions.
 - **Cleanup:** a session's first run stays on its original version until the
   session ends, so that version is kept even after the session moves. A later
   deploy removes versions no longer needed by sessions, work, or transfers.
+- **Registry images:** every image Eden pushes gets a tag of its own, its
+  generation ID. A same-version update pushes into the repository of the
+  image it replaces. Once the new deployment is healthy and promoted, Eden
+  deletes the replaced image by its tag, and Cloudflare's registry then
+  removes the image. Eden never deletes it earlier. If that delete cannot be
+  shown, the update still succeeds with the warning
+  [`EVE_SUPERSEDED_IMAGE_NOT_DELETED`](./troubleshooting.md#eve_superseded_image_not_deleted),
+  and the next same-version deploy from the same project folder tries again.
+- **Targets deployed with Eden `0.13.x` or older:** those versions pushed
+  every image under the tag `candidate`, so each same-version update took
+  the tag from the image before it. Cloudflare's registry does not remove an
+  image that no tag names. This version still updates and destroys such a
+  target: the first same-version update deletes `candidate` and the image
+  it names. The images that had already lost the tag stay, and
+  `eden destroy` reports them as `accepted-still-listed` in
+  [`EVE_REGISTRY_OBJECTS_KEPT`](./troubleshooting.md#eve_registry_objects_kept).
 
 If the same-version restart's conversation-file copy fails, the update still
 goes ahead and those conversations lose their sandbox files. File transfers

@@ -4,6 +4,22 @@
 
 ### Fixed
 
+- **A same-version update no longer leaves an image that Cloudflare's
+  registry cannot remove.** With deployment affinity, an update on the same
+  Eve version pushes into the repository of the image it replaces. Eden
+  pushed every image under the tag `candidate`, so the earlier image lost
+  its only tag, and Cloudflare's registry does not remove an image that no
+  tag names: `eden destroy` reported one `accepted-still-listed` object per
+  such update. Eden now tags each pushed image with its generation ID and,
+  once the new deployment is healthy and promoted, deletes the replaced
+  image by its tag. If that delete cannot be shown, the deploy still
+  succeeds with the new warning `EVE_SUPERSEDED_IMAGE_NOT_DELETED`, and the
+  next same-version deploy from the same project folder tries again.
+  A target deployed with Eden `0.13.x` or older still updates and destroys:
+  the first same-version update deletes `candidate` and the image it names.
+  Images those versions had already left untagged stay in the registry, and
+  `eden destroy` reports them as before. The deployment record's format did
+  not change.
 - `eden deploy` now says when Wrangler uploaded the Worker version and then
   failed at the Container application settings, instead of the general
   `DEPLOY_INDETERMINATE` message. From 2026-11-19 `22:31Z`, five deploys

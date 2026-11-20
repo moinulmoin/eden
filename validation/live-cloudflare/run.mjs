@@ -530,7 +530,7 @@ async function newSession(label, expectedEve) {
   return turn.sessionId + " ran bash on Eve " + turn.eveVersion;
 }
 
-async function deploy(expectUpdate) {
+async function deploy(expectUpdate, expectImageReplaced = false) {
   const started = Date.now();
   const output = await eden("deploy");
   const origin = output.deployment?.stableWorkersDevOrigin;
@@ -542,7 +542,12 @@ async function deploy(expectUpdate) {
   const deployed = seconds(Date.now() - started);
   const healthy = await waitForHealth();
   const warnings = (output.warnings ?? []).map((warning) => warning.id);
-  return origin + " in " + deployed + " s, health ready after " + healthy + " s more" + (warnings.length === 0 ? "" : ", warnings: " + warnings.join(", "));
+  const cleanup = (output.checks ?? []).find((check) => check.id === "VAL-LIFE-007");
+  // A same-version update must delete the image it replaced, by its tag.
+  if (expectImageReplaced && (cleanup?.status !== "passed" || (output.registryObjectsKept ?? []).length > 0 || warnings.includes("EVE_SUPERSEDED_IMAGE_NOT_DELETED"))) {
+    throw new Error("The update did not delete the image it replaced: VAL-LIFE-007 " + (cleanup?.status ?? "missing") + ", kept " + JSON.stringify(output.registryObjectsKept ?? []) + ", warnings " + warnings.join(", "));
+  }
+  return origin + " in " + deployed + " s, health ready after " + healthy + " s more" + (warnings.length === 0 ? "" : ", warnings: " + warnings.join(", ")) + (cleanup === undefined ? "" : "\nVAL-LIFE-007 " + cleanup.status + ": " + cleanup.message);
 }
 
 async function wrangler(args) {
@@ -656,7 +661,7 @@ try {
     settledBefore.splice(0, settledBefore.length, ...turn.settledTurns);
     return session + " answered, " + kept + " earlier turn(s) still in its stream, file intact";
   };
-  await step("eden deploy (update in place, same Eve)", () => deploy(true));
+  await step("eden deploy (update in place, same Eve)", () => deploy(true, true));
   await step("Same session continues after the update", sameSession);
   await step("New session starts after the update", () => newSession("update", options.eve));
   if (summary.upgradedTo === null) {
@@ -704,6 +709,9 @@ try {
         registryObjectsKept = output.registryObjectsKept ?? [];
         if (registryObjectsKept.length === 0) return undefined;
         summary.registryObjectsKept = registryObjectsKept;
+        // Every image had a tag when it was deleted, so the registry removes each one.
+        const stranded = registryObjectsKept.filter((object) => object.class === "accepted-still-listed");
+        if (stranded.length > 0) throw new Error("Destroy left " + stranded.length + " accepted-still-listed object(s): " + stranded.map((object) => object.ref).join(", "));
         return "Cloudflare's registry still lists " + registryObjectsKept.length + " object(s) that destroy tried to delete:\n" + registryObjectsKept.map((object) => object.ref + " (" + object.class + ")").join("\n");
       });
       await step("Nothing of the target remains", verifyGone);
