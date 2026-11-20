@@ -4413,7 +4413,11 @@ describe("eden deploy in-place update", () => {
     await writeProject(root);
     await createOwnedTargetFixture(root, { worldCloudflare: true });
     let live: { deploymentId?: string; releaseId?: string } = { deploymentId: "eve-deploy-prior" };
-    const state = { healthy: true, tagsDeletable: true, worldRetires: true, pushed: [] as string[] };
+    const state = {
+      healthy: true, tagsDeletable: true, worldRetires: true, pushed: [] as string[],
+      /** The release the live Worker reports, when a case rewrites the record's. */
+      liveReleaseId: undefined as string | undefined,
+    };
     startFakeRegistry({
       entries: {},
       deletable: (ref) => {
@@ -4462,7 +4466,8 @@ describe("eden deploy in-place update", () => {
             cloudflareRead: async () => {
               const target = (await read()).target;
               return { ...(await read()), target: { ...target, providerEvidence: {
-                ...target.providerEvidence, workerDeploymentId: live.deploymentId, workerReleaseId: live.releaseId,
+                ...target.providerEvidence, workerDeploymentId: live.deploymentId,
+                workerReleaseId: state.liveReleaseId ?? live.releaseId,
               } } };
             },
             protectedStore: { put: async () => ({ revision: "revision-test", handle: "handle-test" }) },
@@ -4500,6 +4505,7 @@ describe("eden deploy in-place update", () => {
   test.each([
     ["this build pushed under the tag of its own deploy is deleted", "own"],
     ["Eden 0.13.x pushed under the candidate tag is left tagged", "candidate"],
+    ["an older record names no release for is left tagged, and the registry is not asked", "unrecorded"],
   ] as const)("an update of the same Eve version deletes the image it replaces only by a tag of its own: the image %s", async (_name, prior) => {
     const root = await createRoot();
     const { state, images, deploy, stop } = await inPlaceUpdates(root);
@@ -4510,7 +4516,14 @@ describe("eden deploy in-place update", () => {
       // Each push has a tag of its own that Eden generated, whatever the generation is called.
       expect(state.pushed[0]).toMatch(new RegExp(`^${repository}:eve-deploy-[0-9a-f-]{36}$`, "u"));
       let priorTag = (state.pushed[0] as string).slice(repository.length + 1);
-      if (prior === "candidate") {
+      if (prior === "unrecorded") {
+        const recordPath = join(await realpath(join(root, ".eden", "eve-deploy", "targets", `preview-${updateName}`, "CURRENT")), "deployment.json");
+        const record = JSON.parse(await readFile(recordPath, "utf8")) as { identity: Record<string, unknown> };
+        record.identity.releaseId = "candidate";
+        await writeFile(recordPath, JSON.stringify(record), "utf8");
+        state.liveReleaseId = "candidate";
+      }
+      if (prior !== "own") {
         // What Eden 0.13.x left: the image under `candidate`, and an older one that lost that tag to it.
         priorTag = "candidate";
         images.set(`${repository}:candidate`, manifest("c"));
@@ -4523,10 +4536,11 @@ describe("eden deploy in-place update", () => {
       const promotedTag = (state.pushed[1] as string).slice(repository.length + 1);
       expect(promotedTag).toMatch(/^eve-deploy-[0-9a-f-]{36}$/u);
       expect(promotedTag).not.toBe(priorTag);
-      if (prior === "candidate") {
-        // The 0.13.x image keeps its tag, so destroy can still remove it. Nothing is deleted or asked.
+      if (prior !== "own") {
+        // The older image keeps its tag, so destroy can still remove it. Nothing is deleted.
         expect(fakeRegistry.wranglerDeletes).toEqual([]);
         expect(registryDeletes()).toEqual([]);
+        if (prior === "unrecorded") expect(fakeRegistry.registryRequests.slice(requestsBefore)).toEqual([]);
         expect(fakeRegistry.listed(repository)).toEqual(["candidate", promotedTag, manifest("c"), manifest("d"), manifest("e")]);
         expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).toBe("skipped");
       } else {

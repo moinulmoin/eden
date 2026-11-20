@@ -798,8 +798,8 @@ A same-version update with deployment affinity deletes only the image it
 replaced, by its release tag. When that cannot be shown, the check does not
 fail: the deploy succeeds with the warning
 [`EVE_SUPERSEDED_IMAGE_NOT_DELETED`](#eve_superseded_image_not_deleted).
-The check is `skipped` with `Nothing was deleted: the registry lists no
-release tag that names the superseded image.` when the replaced image was
+The check is `skipped` with `Nothing was deleted: no release tag names the
+superseded image.` when the replaced image was
 pushed by Eden `0.13.x` or older, under `candidate`. Nothing is needed:
 that image stays until `eden destroy` or the retirement of that Eve
 version.

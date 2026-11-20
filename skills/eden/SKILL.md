@@ -195,7 +195,8 @@ npx @moinulmoin/eden destroy --name <name> --json
   superseded version. A same-version update deletes the image it
   replaced by its tag; if that cannot be shown, deploy still succeeds with
   the warning `EVE_SUPERSEDED_IMAGE_NOT_DELETED`. Do not redeploy for it:
-  a later deploy does not try again; destroy removes the image. Cleanup needs direct access to `registry.cloudflare.com`;
+  a later deploy does not try again; destroy tries to remove the image
+  and reports anything Cloudflare keeps. Cleanup needs direct access to `registry.cloudflare.com`;
   Eden's own registry requests never use a proxy. If destroy fails to verify
   registry cleanup, it may already have removed the Worker and Container.
 

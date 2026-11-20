@@ -194,7 +194,7 @@ one { ref, class } per object, where class is the registry's answer
 Each pushed image gets a tag of its own. A same-version update deletes the
 image it replaced by its tag after promotion. When that delete cannot be
 shown, deploy still succeeds and adds the warning
-EVE_SUPERSEDED_IMAGE_NOT_DELETED; destroy removes the image later.
+EVE_SUPERSEDED_IMAGE_NOT_DELETED; destroy tries to remove the image later.
 `,
   destroy: `Usage: eden destroy --name <name> [--project <path>] [--env <preview|production>] [--json]
 

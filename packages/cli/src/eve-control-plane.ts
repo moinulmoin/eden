@@ -4011,7 +4011,6 @@ async function runEveDeployment(
   if (
     inPlaceRepository !== undefined &&
     supersededImage?.repository === inPlaceRepository &&
-    supersededTag !== undefined && supersededTag !== releaseId && EVE_RELEASE_IMAGE_TAG.test(supersededTag) &&
     priorIdentity?.containerImage !== identity.containerImage &&
     // No other image this record still names may be in this repository: not
     // a kept version's, and not one whose retirement is owed or just ran.
@@ -4033,11 +4032,14 @@ async function runEveDeployment(
     eveProgress(options, `deleting the superseded image from registry repository ${inPlaceRepository}`);
     let deleted: EveRegistryRepositoryDeleteOutcome = "indeterminate";
     try {
-      deleted = await (options.deleteRegistryRepository ?? registryRepositoryDeleter())({
-        repository: inPlaceRepository,
-        accountId,
-        image: { digest: supersededImage.digest, tag: supersededTag },
-      });
+      // A record without a release tag of that form names nothing Eden may delete here.
+      deleted = supersededTag === undefined || supersededTag === releaseId || !EVE_RELEASE_IMAGE_TAG.test(supersededTag)
+        ? "absent"
+        : await (options.deleteRegistryRepository ?? registryRepositoryDeleter())({
+          repository: inPlaceRepository,
+          accountId,
+          image: { digest: supersededImage.digest, tag: supersededTag },
+        });
     } catch {
       deleted = "indeterminate";
     }
@@ -4053,7 +4055,7 @@ async function runEveDeployment(
         ? check(
           "VAL-LIFE-007",
           "skipped",
-          "Nothing was deleted: the registry lists no release tag that names the superseded image. An image that Eden 0.13.x or older pushed stays until eden destroy or the retirement of this Eve version.",
+          "Nothing was deleted: no release tag names the superseded image. An image that Eden 0.13.x or older pushed stays until eden destroy or the retirement of this Eve version.",
         )
         : check(
           "VAL-LIFE-007",
