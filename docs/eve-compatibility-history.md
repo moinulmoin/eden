@@ -4,6 +4,47 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Requests through the version switch, run on Cloudflare (2026-11-20)
+
+Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
+account, with Wrangler `4.147.0` and an OAuth login, on the code of
+`36db4fa` before it was committed. From this change on, a Container object
+serves a Worker of the release it replaces, a Worker waits about 30 seconds
+for an object still on the old release and then answers `503`, an update
+replaces the Container once, and a World object left on an earlier release
+resets itself.
+
+Full run of `pnpm run check:live`, target `eden-live-20261120-55bc9a9b`,
+`08:30:46Z` to `08:44:58Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+this workspace (version `0.13.0`), a 90-second idle window. All 18 steps
+passed. `eden destroy` reported 12 objects in `EVE_REGISTRY_OBJECTS_KEPT`,
+and the check found nothing else of the target.
+
+A copy of the check that also sent a request every 250 ms (a health GET, an
+unauthenticated session POST and a stream GET) while each deploy ran and
+for two minutes after it returned, with `wrangler tail` recording, target
+`eden-live-20261120-5fbad530`, `08:15Z` to `08:29Z`:
+
+- Through two same-version updates and the upgrade to Eve `1.0.2`, about
+  2,700 requests were sent while a deploy ran. Two got HTTP 500, both
+  health GETs at `08:17:31Z` in the first update. The tail shows both
+  Workers threw Cloudflare's `Internal error in Durable Object storage
+  caused object to be reset`. Eden does not retry that error.
+- No request got HTTP 500 in the two minutes after each deploy returned.
+  The session from before each deploy answered after it, and a new session
+  started, six session steps in all.
+- In the first update the tail shows the Container object, still on the old
+  Worker version, reset itself for requests of the new release from
+  `08:17:28Z` for about 9 seconds. The Workers of the new release waited
+  and answered 200 after up to 19.7 seconds. In the same seconds the object
+  answered a Worker of the replaced release without a reset.
+
+The same loop on `main` at `68e1289`, target
+`eden-live-20261120-5f4ae4aa`, `05:44Z` to `06:10Z`: 5 of about 1,400
+requests through two same-version updates got Cloudflare's error 1101 page
+(HTTP 500), each within half a second of the version switch, and the tail
+shows `stale Worker version` in the Worker.
+
 ## A tag for each pushed image, run on Cloudflare (2026-11-20)
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare

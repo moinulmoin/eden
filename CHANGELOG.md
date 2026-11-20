@@ -4,6 +4,46 @@
 
 ### Fixed
 
+- **Requests around a deploy's version switch no longer get HTTP 500 from
+  version skew.** Cloudflare does not switch a Worker and its Durable
+  Objects to a new version at the same instant. On 2026-11-20 the two ran
+  different releases for between half a second and 20 seconds, in either
+  order, and the World object once stayed on the old release for more than
+  two minutes. Four things went wrong in that window, each reproduced on
+  Cloudflare with a request every 250 ms through the deploy:
+  - A Worker of the old release reached a Container object already on the
+    new one. The object reset itself for every such request, so that
+    request, and requests from new Workers in flight, got Cloudflare's
+    error 1101 page ("Worker threw exception"). The published Worker now
+    names the release it replaces (`EDEN_EVE_PREVIOUS_RELEASE_ID`), and the
+    object serves a Worker of that release. It still resets for any other
+    release, so an object on old code always restarts. If the old Worker
+    names a version the new release no longer routes, the answer is `503`
+    with `Retry-After: 1`.
+  - A Worker of the new release reached a Container object still on the
+    old code. The reset brought the object back on the old code, and the
+    one retry failed with error 1101, for up to 20 seconds. The Worker now
+    tries again for about 30 seconds, then answers `503` with
+    `Retry-After: 5`. A request with a body is still sent only once.
+  - Requests that arrived together while an update replaced the Container
+    each replaced it again, and the others got error 1101 after a few
+    seconds. The object now replaces the Container once.
+  - After an Eve upgrade the World object could keep the old release's
+    list of versions, and Eve answered `500` ("Failed to create the
+    session") for the new version although `eden deploy` had reported it
+    healthy. A container of a release the World object does not know now
+    resets it. The World object of the old release must already carry this
+    check, so it works from the second deploy made with this version.
+
+  Measured before the change: 5 of about 1,400 requests through two
+  same-version updates got error 1101. Measured after: 2 of about 2,700
+  requests through two updates and an upgrade, both with Cloudflare's own
+  "Internal error in Durable Object storage caused object to be reset", and
+  none in the two minutes after each deploy returned. Two earlier failures
+  (2026-11-18 and 2026-11-19), at least 20 seconds after a switch, had no
+  log. They fit the cases above but are not proven to share a cause.
+  `EDEN_EVE_PREVIOUS_RELEASE_ID` is now a reserved name in an environment
+  file.
 - **A same-version update no longer leaves an image that Cloudflare's
   registry cannot remove.** With deployment affinity, an update on the same
   Eve version pushes into the repository of the image it replaces. Eden
