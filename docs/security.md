@@ -156,7 +156,9 @@ them. `eden destroy` then fails if anything without
 one of the registry's kept answers is still in its final listing, or if it
 cannot read that listing. `eden deploy` fails `VAL-LIFE-007` when it cannot
 prove that everything else in the repository is gone, which includes a
-listing it cannot read. A listing counts as read only when every page is
+listing it cannot read. The one exception is the image a same-version update
+replaced: when its delete cannot be shown, deploy succeeds with the warning
+`EVE_SUPERSEDED_IMAGE_NOT_DELETED`. A listing counts as read only when every page is
 exactly in the form the registry sent on 2026-11-18: the recorded account
 and the repository asked for, entries in ascending order, and a `Link`
 header that continues from the page's last entry and is empty only after
@@ -234,7 +236,20 @@ login cannot act on the checked account, the command fails.
   manifest the registry lists in a repository that the record proves this
   target owns, including one that appears while it runs. Eden never runs it
   on a repository that holds the image it just promoted or the image of a
-  version it still keeps. Eden works with one spelling of an image,
+  version it still keeps. In that repository a same-version update deletes
+  only the image it replaced, after the new deployment is healthy and
+  promoted. The deployment record names that image's repository, its
+  digest, and its tag: the release ID of the deploy that pushed it
+  (`eve-deploy-<uuid>`). Eden deletes that tag, and nothing else, only when the registry
+  lists the tag and resolves it to that digest. It sends no delete by
+  digest here; it reads the listing until the tag and the image's
+  `sha256:` entry have left. Wrangler's delete of a tag carries no digest, so this rests
+  on a release tag being unique to one push and never moved: Eden generates
+  it and pushes it once. Do not push to or retag a release tag by hand.
+  Eden never deletes `candidate` here, the tag Eden `0.13.x` and older
+  push, because an older CLI in another checkout can move it. It deletes
+  nothing when the repository also holds the image of a kept version, or of
+  a version whose retirement the record still names. Eden works with one spelling of an image,
   `registry.cloudflare.com/<account>/<repository>@sha256:<digest>`, and
   refuses any other reference before it changes anything on the target. A recorded image that is
   not in that form cannot be placed in a repository, so it stops every

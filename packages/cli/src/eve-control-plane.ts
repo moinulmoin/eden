@@ -113,8 +113,14 @@ export const DEFAULT_EVE_NODE_IMAGE: EveNodeImage = Object.freeze({
   digest: "sha256:862263c612aa437e3037674b85419622a9d93bff80aa1eee5398dfe686375532",
 });
 
-/** The single tag Eden pushes to the managed Cloudflare registry per generation. */
-const EVE_REGISTRY_IMAGE_TAG = "candidate";
+/**
+ * The tag of a pushed image: the release ID Eden generates for that deploy.
+ * No caller chooses it and no later push reuses it. Eden 0.13.x and older
+ * pushed every image under `candidate` instead, so a later push into the
+ * same repository took the tag from the image before, and Cloudflare's
+ * registry does not remove an image that no tag names.
+ */
+const EVE_RELEASE_IMAGE_TAG = /^eve-deploy-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u;
 
 
 export type EvePreflightCheckStatus =
@@ -635,7 +641,18 @@ export type EveRegistryRepositoryDeleteOutcome =
   | { readonly kept: readonly EveRegistryObjectKept[]; readonly unproven?: true };
 
 export type EveRegistryRepositoryDeleteRunner = (
-  request: { readonly repository: string; readonly accountId: string },
+  request: {
+    readonly repository: string;
+    readonly accountId: string;
+    /**
+     * When set, only this image is deleted and the rest of the repository is
+     * left alone: the one delete is of `tag`, and only when the registry
+     * lists `tag` and resolves it to `digest`. Otherwise nothing is deleted
+     * and the outcome is `absent`. `deleted` means the tag and the image's
+     * `sha256:` entry then left the listing.
+     */
+    readonly image?: { readonly digest: string; readonly tag: string };
+  },
 ) => EveRegistryRepositoryDeleteOutcome | Promise<EveRegistryRepositoryDeleteOutcome>;
 
 
@@ -3347,7 +3364,7 @@ async function runEveDeployment(
     }
     const imageRepository =
       `eden-eve-${targetKey}-${affinityEnabled ? deploymentId : candidate.generationId}`;
-    const imageTag = `${imageRepository}:${EVE_REGISTRY_IMAGE_TAG}`;
+    const imageTag = `${imageRepository}:${releaseId}`;
     const targetImageReference =
       `registry.cloudflare.com/${accountId}/${imageRepository}@${imageDigest}`;
     const imagePublication = await (options.publishImage ??
@@ -3983,6 +4000,67 @@ async function runEveDeployment(
             : deleted === "absent"
             ? "The superseded generation's registry repository was already absent."
             : "Everything else in the superseded generation's registry repository was deleted after promotion. Cloudflare's registry still lists some of its objects; see EVE_REGISTRY_OBJECTS_KEPT.",
+        );
+    }
+  }
+  const inPlaceRepository = isUpdate && affinityEnabled
+    ? ownedRegistryRepository(identity, request.environment, request.name, accountId)
+    : undefined;
+  const supersededImage = managedImage(priorIdentity?.containerImage, accountId);
+  const supersededTag = priorIdentity?.releaseId;
+  if (
+    inPlaceRepository !== undefined &&
+    supersededImage?.repository === inPlaceRepository &&
+    priorIdentity?.containerImage !== identity.containerImage &&
+    // No other image this record still names may be in this repository: not
+    // a kept version's, and not one whose retirement is owed or just ran.
+    [...Object.values(identity.retainedDeployments ?? {}), ...Object.values(identity.pendingRetirements ?? {})]
+      .every((other) =>
+        other.image === identity.containerImage ||
+        (managedImage(other.image, accountId)?.repository ?? inPlaceRepository) !== inPlaceRepository
+      )
+  ) {
+    // An update of the same Eve version pushes into the repository of the
+    // image it replaces. Cloudflare's registry removes an image only while a
+    // tag names it, so the replaced image goes by its tag, and only now that
+    // this generation is promoted. The record proves its repository and
+    // digest, and its tag is the release ID of the deploy that pushed it,
+    // deleted only when the registry resolves it to that digest. Nothing
+    // moves a release tag, so it still names that image at the delete.
+    // An image that Eden 0.13.x or older pushed has no such tag and is left
+    // under `candidate`, which another checkout's old CLI can move.
+    eveProgress(options, `deleting the superseded image from registry repository ${inPlaceRepository}`);
+    let deleted: EveRegistryRepositoryDeleteOutcome = "indeterminate";
+    try {
+      // A record without a release tag of that form names nothing Eden may delete here.
+      deleted = supersededTag === undefined || supersededTag === releaseId || !EVE_RELEASE_IMAGE_TAG.test(supersededTag)
+        ? "absent"
+        : await (options.deleteRegistryRepository ?? registryRepositoryDeleter())({
+          repository: inPlaceRepository,
+          accountId,
+          image: { digest: supersededImage.digest, tag: supersededTag },
+        });
+    } catch {
+      deleted = "indeterminate";
+    }
+    if (deleted === "indeterminate" || typeof deleted === "object") {
+      // The deployment is promoted and healthy; a cleanup that could not be shown does not fail it.
+      resultWarnings.push({
+        id: "EVE_SUPERSEDED_IMAGE_NOT_DELETED",
+        message: `The update is healthy and promoted, but Eden could not show that the superseded image ${inPlaceRepository}@${supersededImage.digest} left Cloudflare's registry.`,
+        remediation: "Nothing is needed now, and do not redeploy for this. A later deploy does not try this image again. eden destroy tries to delete everything the registry lists for the target, and so does the retirement of this Eve version after an upgrade. Eden reads the registry with direct requests to registry.cloudflare.com and never uses a proxy for them.",
+      });
+    } else {
+      supersededImageCleanup ??= deleted === "absent"
+        ? check(
+          "VAL-LIFE-007",
+          "skipped",
+          "Nothing was deleted: no release tag names the superseded image. An image that Eden 0.13.x or older pushed stays until eden destroy or the retirement of this Eve version.",
+        )
+        : check(
+          "VAL-LIFE-007",
+          "passed",
+          "The superseded image was deleted from the registry by its tag after promotion.",
         );
     }
   }
@@ -5658,27 +5736,34 @@ function isSingletonArtifactRefusal(status: number, body: string): boolean {
  * answer resolves at its headers.
  */
 function registryRequest(
-  method: "GET" | "DELETE",
+  method: "GET" | "DELETE" | "HEAD",
   path: string,
   authorization: string,
   timeoutMs: number,
   bodyFor: readonly number[],
   maxBytes: number,
-): Promise<{ readonly status: number; readonly body: string; readonly link?: string } | undefined> {
+): Promise<{ readonly status: number; readonly body: string; readonly link?: string; readonly digest?: string } | undefined> {
   return new Promise((resolve) => {
     const request = httpsRequest({
       host: CLOUDFLARE_REGISTRY_HOST,
       port: 443,
       method,
       path,
-      headers: { Authorization: authorization, Accept: "application/json" },
+      headers: {
+        Authorization: authorization,
+        // A manifest is asked for the way Wrangler 4.147.0 asks before it deletes a tag.
+        Accept: method === "HEAD"
+          ? "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+          : "application/json",
+      },
       agent: new HttpsAgent({ keepAlive: false }),
       rejectUnauthorized: true,
       signal: AbortSignal.timeout(timeoutMs),
     }, (response) => {
       const status = response.statusCode ?? 0;
       if (!bodyFor.includes(status)) {
-        resolve({ status, body: "" });
+        const digest = response.headers["docker-content-digest"];
+        resolve({ status, body: "", ...(typeof digest === "string" ? { digest } : {}) });
         request.destroy();
         return;
       }
@@ -5724,6 +5809,11 @@ interface CloudflareRegistry {
     repository: string,
     entry: string,
   ) => Promise<"accepted" | "refused-snapshot" | "refused-singleton-artifact" | undefined>;
+  /**
+   * The digest of the manifest a tag names, from the registry's answer to a
+   * HEAD for it. Undefined for any answer but 200 with one `sha256:` digest.
+   */
+  readonly resolve: (accountId: string, repository: string, tag: string) => Promise<string | undefined>;
 }
 
 /**
@@ -5747,13 +5837,13 @@ function cloudflareRegistry(): CloudflareRegistry {
   let credentialUnavailable = false;
   let unansweredMs = 0;
   const send = async (
-    method: "GET" | "DELETE",
+    method: "GET" | "DELETE" | "HEAD",
     accountId: string,
     repository: string,
     rest: string,
     bodyFor: readonly number[],
     maxBytes: number,
-  ): Promise<{ readonly status: number; readonly body: string; readonly link?: string } | undefined> => {
+  ): Promise<{ readonly status: number; readonly body: string; readonly link?: string; readonly digest?: string } | undefined> => {
     if (
       credentialUnavailable ||
       Math.floor(REGISTRY_UNANSWERED_BUDGET_MS - unansweredMs) < 1 ||
@@ -5839,14 +5929,23 @@ function cloudflareRegistry(): CloudflareRegistry {
         ? "refused-singleton-artifact"
         : undefined;
     },
+    resolve: async (accountId, repository, tag) => {
+      if (!REGISTRY_ENTRY.test(tag) || tag.startsWith("sha256:")) return undefined;
+      const response = await send("HEAD", accountId, repository, `manifests/${tag}`, [], 0);
+      return response?.status === 200 && response.digest !== undefined && /^sha256:[0-9a-f]{64}$/u.test(response.digest)
+        ? response.digest
+        : undefined;
+    },
   };
 }
 
 /**
  * Returns a runner that deletes everything Cloudflare's registry lists for
- * an owned repository: every tag (the `candidate` tag Eden pushed, and the
- * tags Cloudflare added for container snapshots) and every `sha256:` entry,
- * which the registry lists for each manifest, tagged or not. A tag gets its
+ * an owned repository: every tag (the tags Eden pushed, and the tags
+ * Cloudflare added for container snapshots) and every `sha256:` entry,
+ * which the registry lists for each manifest, tagged or not. Given
+ * `image`, it deletes only that image's tag instead, when the registry
+ * resolves the tag to it. A tag gets its
  * own Wrangler delete, which also collects unreferenced layers. A `sha256:`
  * entry gets Eden's delete by digest, because Wrangler lists and deletes
  * tags only.
@@ -5872,11 +5971,35 @@ function cloudflareRegistry(): CloudflareRegistry {
 function registryRepositoryDeleter(
   registry: CloudflareRegistry = cloudflareRegistry(),
 ): EveRegistryRepositoryDeleteRunner {
-  return async ({ repository, accountId }) => {
+  return async ({ repository, accountId, image }) => {
     const list = async (): Promise<{ readonly at: number; readonly entries: readonly string[] | undefined }> => ({
       at: performance.now(),
       entries: await registry.list(accountId, repository),
     });
+    if (image !== undefined) {
+      // One image: the only delete is Wrangler's, of its tag. The digest is
+      // used to check what the tag names and to see the image leave.
+      const listed = await registry.list(accountId, repository);
+      if (listed === undefined) return "indeterminate";
+      if (!listed.includes(image.tag)) return "absent";
+      const named = await registry.resolve(accountId, repository, image.tag).catch(() => undefined);
+      if (named === undefined) return "indeterminate";
+      if (named !== image.digest) return "absent";
+      const deleted = await runWranglerWithInput(
+        ["containers", "images", "delete", `${repository}:${image.tag}`, "--skip-confirmation"],
+        accountId,
+      );
+      if (deleted.exitCode !== 0) return "indeterminate";
+      // A tagged image left the listing about 15 seconds after its tag was deleted.
+      const deletedAt = performance.now();
+      for (;;) {
+        const { at, entries } = await list();
+        if (entries === undefined) return "indeterminate";
+        if (!entries.includes(image.tag) && !entries.includes(image.digest)) return "deleted";
+        if (at - deletedAt >= REGISTRY_REMOVAL_WAIT_MS) return "indeterminate";
+        await waitForActivation(5_000);
+      }
+    }
     let listing = await list();
     if (listing.entries === undefined) return "indeterminate";
     if (listing.entries.length === 0) return "absent";

@@ -62,13 +62,15 @@ const fakeWrangler = vi.hoisted(() => ({
  */
 const fakeRegistry = vi.hoisted(() => {
   type Answer =
-    | { readonly status: number; readonly body: string; readonly link?: string; readonly leavesAfterMs?: number }
+    | { readonly status: number; readonly body: string; readonly link?: string; readonly digest?: string; readonly leavesAfterMs?: number }
     | "error"
     | "stall";
   const state = {
     active: false,
     /** What the registry lists per repository: tags, and one `sha256:` entry per manifest. */
     entries: new Map<string, string[]>(),
+    /** The digest the registry answers a HEAD for a listed `repository:tag` with; any other tag gets 404. */
+    digests: new Map<string, string>(),
     pageSize: 1_000,
     /** Whether Wrangler's delete of a tag succeeds; the tag then leaves the listing. */
     deletable: (() => true) as (ref: string) => boolean,
@@ -156,8 +158,11 @@ vi.mock("node:https", async (importOriginal) => {
         end: () => setImmediate(() => {
           const last = url.searchParams.get("last");
           if (kind === "tags" && last === null) fakeRegistry.listings += 1;
+          const named = fakeRegistry.listed(repository).includes(entry) ? fakeRegistry.digests.get(ref) : undefined;
           let answer = kind === "tags"
             ? fakeRegistry.listing(repository, fakeRegistry.listings - 1, last)
+            : options.method === "HEAD"
+            ? { status: named === undefined ? 404 : 200, body: "", ...(named === undefined ? {} : { digest: named }) }
             : fakeRegistry.answer(ref);
           if (answer === undefined) {
             const tags = fakeRegistry.listed(repository)
@@ -181,7 +186,10 @@ vi.mock("node:https", async (importOriginal) => {
           }
           const response = Object.assign(new EventEmitter(), {
             statusCode: answer.status,
-            headers: answer.link === undefined ? {} : { link: answer.link },
+            headers: {
+              ...(answer.link === undefined ? {} : { link: answer.link }),
+              ...(answer.digest === undefined ? {} : { "docker-content-digest": answer.digest }),
+            },
           });
           onResponse(response);
           response.emit("data", Buffer.from(answer.body));
@@ -311,6 +319,7 @@ function startFakeRegistry(setup: FakeRegistrySetup): void {
   Object.assign(fakeRegistry, {
     active: true,
     entries: new Map(Object.entries(setup.entries).map(([name, entries]) => [name, [...entries]])),
+    digests: new Map(),
     pageSize: setup.pageSize ?? 1_000,
     deletable: setup.deletable ?? (() => true),
     answer: setup.answer ?? (() => ({ status: 404, body: "" })),
@@ -4391,6 +4400,269 @@ describe("eden deploy in-place update", () => {
     expect(JSON.parse(completed ?? "[]")).toEqual(
       keptIn === "its own" ? [retiring, other] : keptIn === "the retiring" ? [other] : [],
     );
+  });
+
+  /**
+   * A target on a World with deployment affinity, deployed twice or more on
+   * one Eve version, so each update pushes into the repository of the image
+   * it replaces. The registry behaves as Cloudflare's did on 2026-11-18: an
+   * image leaves a few seconds after its tag is deleted, and one that no tag
+   * names stays whatever the registry answers to its delete.
+   */
+  async function inPlaceUpdates(root: string) {
+    await writeProject(root);
+    await createOwnedTargetFixture(root, { worldCloudflare: true });
+    let live: { deploymentId?: string; releaseId?: string } = { deploymentId: "eve-deploy-prior" };
+    const state = {
+      healthy: true, tagsDeletable: true, worldRetires: true, pushed: [] as string[],
+      /** The release the live Worker reports, when a case rewrites the record's. */
+      liveReleaseId: undefined as string | undefined,
+    };
+    startFakeRegistry({
+      entries: {},
+      deletable: (ref) => {
+        const [repository = "", tag = ""] = ref.split(":");
+        const image = images.get(ref);
+        if (state.tagsDeletable && image !== undefined) {
+          fakeRegistry.leaving.push({ repository, entry: image, at: fakeRegistry.clock + 5_000 });
+        }
+        return state.tagsDeletable && tag !== "";
+      },
+      answer: (ref) => ({ status: ref.includes("@") ? 204 : 500, body: "" }),
+    });
+    const images = fakeRegistry.digests;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => fakeRegistry.clock);
+    const stop = (): void => {
+      fakeRegistry.active = false;
+      clock.mockRestore();
+    };
+    const read = existingTargetRead();
+    const deploy = async (generation: string, digest: string) => {
+      const output: string[] = [];
+      let published: EveDeploymentPublicationRequest["identity"] | undefined;
+      const base = updateControlPlane(root, [], { builder: affinityWorldBuilder(), onPublish: (request) => { published = request.identity; } });
+      Reflect.deleteProperty(base, "deleteRegistryRepository");
+      Reflect.deleteProperty(base, "containerImageReference");
+      const code = await runEdenCli(
+        ["deploy", "--project", root, "--env", "preview", "--name", updateName, "--json"],
+        {
+          cwd: root,
+          stdout: (line) => output.push(line),
+          eveControlPlane: {
+            ...base,
+            generationId: generation,
+            runtimeRunner: async () => ({
+              ...(await base.runtimeRunner()), imageDigest: digest, imageReference: "eden-local-image",
+            }),
+            publishImage: (request) => {
+              const [repository = ""] = request.localImageTag.split(":");
+              state.pushed.push(request.localImageTag);
+              images.set(request.localImageTag, digest);
+              fakeRegistry.entries.set(repository, [
+                ...(fakeRegistry.entries.get(repository) ?? []), request.localImageTag.slice(repository.length + 1), digest,
+              ]);
+              return { status: "published" as const, imageReference: request.targetImageReference, imageDigest: digest };
+            },
+            cloudflareRead: async () => {
+              const target = (await read()).target;
+              return { ...(await read()), target: { ...target, providerEvidence: {
+                ...target.providerEvidence, workerDeploymentId: live.deploymentId,
+                workerReleaseId: state.liveReleaseId ?? live.releaseId,
+              } } };
+            },
+            protectedStore: { put: async () => ({ revision: "revision-test", handle: "handle-test" }) },
+            health: async (request: EveDeploymentHealthRequest) => state.healthy
+              ? {
+                status: "ready" as const,
+                identity: {
+                  ...request.identity,
+                  stableContainerInstanceName: `${request.identity.stableContainerInstanceName}:${request.identity.deploymentId}`,
+                },
+              }
+              : { status: "failed" as const, reason: "The new deployment did not become healthy." },
+            // The first of these deploys retires the version from before it, which had no World RPC authentication.
+            deploymentRpc: async (request: { readonly operation: string; readonly deploymentIds: readonly string[] }) =>
+              request.operation === "deployments.retire"
+                ? { retired: state.worldRetires ? request.deploymentIds : [] }
+                : Object.fromEntries(request.deploymentIds.map((id) => [id, {
+                  liveRuns: 0, liveSessions: 0, pendingMessages: 0, unfinishedTransfers: 0, drained: true,
+                }])),
+          },
+        },
+      );
+      const result = JSON.parse(output[0] as string) as {
+        readonly ok: boolean;
+        readonly warnings: readonly { readonly id: string; readonly remediation: string }[];
+        readonly checks: readonly { readonly id: string; readonly status: string; readonly message: string }[];
+        readonly registryObjectsKept?: readonly unknown[];
+      };
+      if (result.ok && published !== undefined) live = published;
+      return { code, result, repository: (state.pushed.at(-1) ?? "").split(":")[0] as string };
+    };
+    return { state, images, deploy, stop };
+  }
+
+  test.each([
+    ["this build pushed under the tag of its own deploy is deleted", "own"],
+    ["Eden 0.13.x pushed under the candidate tag is left tagged", "candidate"],
+    ["an older record names no release for is left tagged, and the registry is not asked", "unrecorded"],
+  ] as const)("an update of the same Eve version deletes the image it replaces only by a tag of its own: the image %s", async (_name, prior) => {
+    const root = await createRoot();
+    const { state, images, deploy, stop } = await inPlaceUpdates(root);
+    try {
+      const first = await deploy("generation-two", manifest("c"));
+      expect(first.code).toBe(0);
+      const repository = first.repository;
+      // Each push has a tag of its own that Eden generated, whatever the generation is called.
+      expect(state.pushed[0]).toMatch(new RegExp(`^${repository}:eve-deploy-[0-9a-f-]{36}$`, "u"));
+      let priorTag = (state.pushed[0] as string).slice(repository.length + 1);
+      if (prior === "unrecorded") {
+        const recordPath = join(await realpath(join(root, ".eden", "eve-deploy", "targets", `preview-${updateName}`, "CURRENT")), "deployment.json");
+        const record = JSON.parse(await readFile(recordPath, "utf8")) as { identity: Record<string, unknown> };
+        record.identity.releaseId = "candidate";
+        await writeFile(recordPath, JSON.stringify(record), "utf8");
+        state.liveReleaseId = "candidate";
+      }
+      if (prior !== "own") {
+        // What Eden 0.13.x left: the image under `candidate`, and an older one that lost that tag to it.
+        priorTag = "candidate";
+        images.set(`${repository}:candidate`, manifest("c"));
+        fakeRegistry.entries.set(repository, ["candidate", manifest("c"), manifest("e")]);
+      }
+      const requestsBefore = fakeRegistry.registryRequests.length;
+      const second = await deploy("generation-three", manifest("d"));
+      expect(second.code).toBe(0);
+      expect(second.result.ok).toBe(true);
+      const promotedTag = (state.pushed[1] as string).slice(repository.length + 1);
+      expect(promotedTag).toMatch(/^eve-deploy-[0-9a-f-]{36}$/u);
+      expect(promotedTag).not.toBe(priorTag);
+      if (prior !== "own") {
+        // The older image keeps its tag, so destroy can still remove it. Nothing is deleted.
+        expect(fakeRegistry.wranglerDeletes).toEqual([]);
+        expect(registryDeletes()).toEqual([]);
+        if (prior === "unrecorded") expect(fakeRegistry.registryRequests.slice(requestsBefore)).toEqual([]);
+        expect(fakeRegistry.listed(repository)).toEqual(["candidate", promotedTag, manifest("c"), manifest("d"), manifest("e")]);
+        expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).toBe("skipped");
+      } else {
+        // Every request of the cleanup: a listing, what the tag names, Wrangler's delete of
+        // that tag, and listings until the image has left. Eden sends no delete of its own.
+        expect(fakeRegistry.wranglerDeletes).toEqual([`${repository}:${priorTag}`]);
+        // A listing is two requests: its page, and the empty page that ends it.
+        const listing = [`GET ${repository}`, `GET ${repository}`];
+        expect(fakeRegistry.registryRequests.slice(requestsBefore).map((sent) => `${String(sent.method)} ${sent.ref}`)).toEqual([
+          ...listing,
+          `HEAD ${repository}:${priorTag}`,
+          ...listing,
+          ...listing,
+        ]);
+        expect(fakeRegistry.listed(repository)).toEqual([promotedTag, manifest("d")]);
+        expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")).toMatchObject({
+          status: "passed",
+          message: "The superseded image was deleted from the registry by its tag after promotion.",
+        });
+      }
+      expect(second.result.registryObjectsKept).toBeUndefined();
+      expect(second.result.warnings.map((warning) => warning.id)).not.toContain("EVE_SUPERSEDED_IMAGE_NOT_DELETED");
+    } finally {
+      stop();
+    }
+  });
+
+  test("an update that does not become healthy deletes nothing from the registry", async () => {
+    const root = await createRoot();
+    const { state, deploy, stop } = await inPlaceUpdates(root);
+    try {
+      const { repository } = await deploy("generation-two", manifest("c"));
+      state.healthy = false;
+      expect((await deploy("generation-three", manifest("d"))).code).not.toBe(0);
+      expect(fakeRegistry.wranglerDeletes).toEqual([]);
+      expect(registryDeletes()).toEqual([]);
+      expect(fakeRegistry.listed(repository)).toEqual(
+        [...state.pushed.map((pushed) => pushed.slice(repository.length + 1)), manifest("c"), manifest("d")].sort(),
+      );
+    } finally {
+      stop();
+    }
+  });
+
+  test("a superseded image that cannot be deleted does not fail the update", async () => {
+    const root = await createRoot();
+    const { state, deploy, stop } = await inPlaceUpdates(root);
+    try {
+      const { repository } = await deploy("generation-two", manifest("c"));
+      state.tagsDeletable = false;
+      const second = await deploy("generation-three", manifest("d"));
+      expect(second.code).toBe(0);
+      expect(second.result.ok).toBe(true);
+      expect(second.result.checks.filter((entry) => entry.status === "failed")).toEqual([]);
+      const warning = second.result.warnings.find((entry) => entry.id === "EVE_SUPERSEDED_IMAGE_NOT_DELETED");
+      // It promises no retry by a later deploy; destroy and the version's retirement sweep the repository.
+      expect(warning?.remediation).toContain("A later deploy does not try this image again. eden destroy tries to delete everything the registry lists for the target");
+      expect(fakeRegistry.listed(repository)).toContain((state.pushed[0] as string).slice(repository.length + 1));
+    } finally {
+      stop();
+    }
+  });
+
+  test("an update whose generation is named candidate keeps the tag of the image it just promoted", async () => {
+    const root = await createRoot();
+    const { state, deploy, stop } = await inPlaceUpdates(root);
+    try {
+      const { repository } = await deploy("generation-two", manifest("c"));
+      expect((await deploy("candidate", manifest("d"))).code).toBe(0);
+      const [, promotedTag = ""] = (state.pushed[1] as string).split(":");
+      expect(promotedTag).not.toBe("candidate");
+      expect(fakeRegistry.listed(repository)).toEqual([promotedTag, manifest("d")].sort());
+    } finally {
+      stop();
+    }
+  });
+
+  test("an update deletes no tag that it cannot tie to the image it replaced", async () => {
+    const root = await createRoot();
+    const { images, deploy, stop } = await inPlaceUpdates(root);
+    try {
+      const { repository } = await deploy("generation-two", manifest("c"));
+      // Another generation's folder in this project, and a tag of that name in the repository.
+      await mkdir(join(root, ".eden", "eve-deploy", "generations", "other-generation"), { recursive: true });
+      // A candidate tag that names some other image.
+      images.set(`${repository}:other-generation`, manifest("e"));
+      images.set(`${repository}:candidate`, manifest("e"));
+      fakeRegistry.entries.set(repository, [...fakeRegistry.listed(repository), "candidate", "other-generation", manifest("e")]);
+      expect((await deploy("generation-three", manifest("d"))).code).toBe(0);
+      expect(fakeRegistry.listed(repository)).toEqual(expect.arrayContaining(["candidate", "other-generation", manifest("e")]));
+      expect(fakeRegistry.listed(repository)).not.toContain(manifest("c"));
+    } finally {
+      stop();
+    }
+  });
+
+  test("an update deletes nothing from a repository that holds an image whose retirement the World did not confirm", async () => {
+    const root = await createRoot();
+    const { state, images, deploy, stop } = await inPlaceUpdates(root);
+    try {
+      const { repository } = await deploy("generation-two", manifest("c"));
+      // The record owes the retirement of a version whose image is in the same repository.
+      const recordPath = join(await realpath(join(root, ".eden", "eve-deploy", "targets", `preview-${updateName}`, "CURRENT")), "deployment.json");
+      const record = JSON.parse(await readFile(recordPath, "utf8")) as { identity: Record<string, unknown> };
+      record.identity.pendingRetirements = {
+        [`eden-affinity-${"9".repeat(24)}`]: {
+          image: `registry.cloudflare.com/account-test/${repository}@${manifest("e")}`, generationId: "generation-pending",
+        },
+      };
+      await writeFile(recordPath, JSON.stringify(record), "utf8");
+      await mkdir(join(root, ".eden", "eve-deploy", "generations", "generation-pending"), { recursive: true });
+      images.set(`${repository}:generation-pending`, manifest("e"));
+      fakeRegistry.entries.set(repository, [...fakeRegistry.listed(repository), "generation-pending", manifest("e")]);
+      state.worldRetires = false;
+      const second = await deploy("generation-three", manifest("d"));
+      expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).toBe("failed");
+      expect(fakeRegistry.wranglerDeletes).toEqual([]);
+      expect(registryDeletes()).toEqual([]);
+      expect(fakeRegistry.listed(repository)).toEqual(expect.arrayContaining(["generation-pending", manifest("e"), manifest("c")]));
+    } finally {
+      stop();
+    }
   });
 
   test("reads back the record of an update that gave a kept version a suffixed id", async () => {

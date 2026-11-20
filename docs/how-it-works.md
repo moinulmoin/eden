@@ -195,6 +195,33 @@ behavior and the warning that an Eve upgrade can strand sessions.
 - **Cleanup:** a session's first run stays on its original version until the
   session ends, so that version is kept even after the session moves. A later
   deploy removes versions no longer needed by sessions, work, or transfers.
+- **Registry images:** every image Eden pushes gets a tag of its own, the
+  release ID Eden generates for that deploy (`eve-deploy-<uuid>`). A
+  same-version update pushes into the repository of the image it replaces.
+  Once the new deployment is healthy and promoted, Eden deletes the
+  replaced image by its tag, and Cloudflare's registry then removes the
+  image. Eden never deletes it earlier. It takes the replaced image's
+  repository, digest and release tag from the deployment record, and
+  deletes the tag only when the registry resolves it to that digest. It deletes nothing when the
+  repository also holds the image of a kept version or of a version whose
+  retirement the record still names. If the delete cannot be shown, the
+  update still succeeds with the warning
+  [`EVE_SUPERSEDED_IMAGE_NOT_DELETED`](./troubleshooting.md#eve_superseded_image_not_deleted).
+  A later deploy does not try that image again. `eden destroy`, and the
+  retirement of that Eve version after an upgrade, try to delete everything
+  the repository lists.
+- **Targets deployed with Eden `0.13.x` or older:** those versions pushed
+  every image under the tag `candidate`, so each same-version update took
+  the tag from the image before it. Cloudflare's registry does not remove an
+  image that no tag names. This version still updates and destroys such a
+  target, and it never deletes or moves `candidate`. Its first same-version
+  update pushes under a release tag and leaves the replaced image under
+  `candidate`: `VAL-LIFE-007` is `skipped`. That image stays, still tagged,
+  until `eden destroy` or the retirement of that Eve version deletes
+  everything in the repository. From the second update on, the replaced
+  image goes at once. The images that had already lost the tag stay, and
+  `eden destroy` reports them as `accepted-still-listed` in
+  [`EVE_REGISTRY_OBJECTS_KEPT`](./troubleshooting.md#eve_registry_objects_kept).
 
 If the same-version restart's conversation-file copy fails, the update still
 goes ahead and those conversations lose their sandbox files. File transfers

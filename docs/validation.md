@@ -93,8 +93,10 @@ What it does, in order:
    posts to the two workflow queue routes with the token, which must return
    404.
 5. Starts a session whose turn runs bash and writes a file.
-6. Deploys again on the same Eve version. The URL must not change. The same
-   session must answer and still have its file. A new session must start.
+6. Deploys again on the same Eve version. The URL must not change, and
+   `VAL-LIFE-007` must pass with nothing kept: the update deleted the image
+   it replaced. The same session must answer and still have its file. A new
+   session must start.
 7. Upgrades the project's Eve version and deploys. The same session must
    continue with the same ID, its earlier turns, and its file. A new session
    must report the new Eve version.
@@ -113,7 +115,8 @@ What it does, in order:
     tries a page up to
     four times, and fails unless it reaches the first repository after
     the target's or the catalog's end. The only registry objects that may remain
-    are the exact ones destroy reported in `EVE_REGISTRY_OBJECTS_KEPT`. The
+    are the exact ones destroy reported in `EVE_REGISTRY_OBJECTS_KEPT`, and
+    none of them may be `accepted-still-listed`. The
     destroy step lists them, and the final JSON object has them in
     `registryObjectsKept`.
 

@@ -190,6 +190,11 @@ lists some of its objects, deploy adds the warning EVE_REGISTRY_OBJECTS_KEPT.
 With --json the result then lists it in warnings and adds registryObjectsKept:
 one { ref, class } per object, where class is the registry's answer
 (refused-snapshot, refused-singleton-artifact, or accepted-still-listed).
+
+Each pushed image gets a tag of its own. A same-version update deletes the
+image it replaced by its tag after promotion. When that delete cannot be
+shown, deploy still succeeds and adds the warning
+EVE_SUPERSEDED_IMAGE_NOT_DELETED; destroy tries to remove the image later.
 `,
   destroy: `Usage: eden destroy --name <name> [--project <path>] [--env <preview|production>] [--json]
 
