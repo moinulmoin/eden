@@ -47,7 +47,9 @@ How Eden handles it:
   values redacted.
 - **Uploaded as Worker secrets.** Each value is uploaded with
   `wrangler secret put`, passing the value on standard input rather than as a
-  command argument. Values are not written to command arguments, image
+  command argument. Wrangler runs it with `CLOUDFLARE_ACCOUNT_ID` set to
+  the account Eden checked, so the value goes to that account or the upload
+  fails. Values are not written to command arguments, image
   layers, generated artifacts, or normal logs.
 - **Given to the container at start.** When the Durable Object starts the
   container, it reads those secrets and passes them in as environment
@@ -166,6 +168,26 @@ Wrangler runs in a fresh, private Eden-owned temporary directory outside the
 project, with its configuration file and account cache pinned inside it.
 Project `.env` files and configuration or cache files planted in a shared
 temporary directory cannot redirect account operations or secret uploads.
+
+Eden asks `wrangler whoami` which account the login names. That is the only
+Wrangler command it runs without an account. Every other one runs with
+`CLOUDFLARE_ACCOUNT_ID` set to the account Eden checked. For destroy that is
+the account in the deployment record, which the login must name:
+
+| Wrangler command | When | Account |
+| --- | --- | --- |
+| `whoami` | preflight, deploy, destroy | The login's own; Eden requires exactly one, matching `CLOUDFLARE_ACCOUNT_ID` when you set it |
+| `containers info` | preflight, deploy, destroy | The checked account |
+| `containers push` | deploy | The checked account |
+| `secret put` | deploy | The checked account |
+| `deploy` | deploy | The checked account, also named as `account_id` in the config Eden writes, which Wrangler 4.147.0 reads first |
+| `containers registries credentials` | deploy, destroy | The checked account |
+| `containers images delete` | deploy (superseded images), destroy | The checked account |
+| `delete`, `containers delete` | destroy | The checked account |
+
+Eden reads and deletes no secret through Wrangler. A login that changes
+mid-run cannot move one of these commands to another account. If the new
+login cannot act on the checked account, the command fails.
 
 - **Exact ownership.** Eden writes a deployment record under
   `.eden/eve-deploy/` in your project. A deploy only updates a target that

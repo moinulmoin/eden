@@ -69,7 +69,9 @@ until the checks in steps 1–4 have passed.
    the check passes or fails.
    `eden preflight` runs the same checks and stops here, changing nothing on
    Cloudflare.
-5. **Push the image** to your account's Cloudflare registry.
+5. **Push the image** to your account's Cloudflare registry. From here on,
+   Wrangler runs every command with the account from step 3, so a login
+   that changes mid-deploy cannot move a write to another account.
 6. **Register runtime variables** (only with `--env-file`). Each value is
    uploaded as a Worker secret. Values never go into the image, command
    arguments, or logs. Only the names in this deploy's env file reach the

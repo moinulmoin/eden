@@ -1488,13 +1488,18 @@ async function withWranglerDirectory<T>(
 
 async function readWranglerJson(
   args: readonly string[],
+  /** Makes Wrangler read this account or fail. Only whoami, which names the account, runs without it. */
+  accountId?: string,
 ): Promise<WranglerJsonResult> {
   try {
     const result = await withWranglerDirectory((cwd) => execFileAsync(
       process.execPath,
       [wranglerEntrypoint, ...args, "--config", join(cwd, "wrangler.json")],
       {
-        env: safeWranglerEnvironment(cwd),
+        env: {
+          ...safeWranglerEnvironment(cwd),
+          ...(accountId === undefined ? {} : { CLOUDFLARE_ACCOUNT_ID: accountId }),
+        },
         cwd,
         maxBuffer: 2 * 1024 * 1024,
         timeout: 30_000,
@@ -1922,7 +1927,7 @@ async function readProviderEvidence(
       "info",
       containerEntry.id,
       "--json",
-    ]);
+    ], accountId);
     if (!info.failed && typeof info.value === "object" && info.value !== null) {
       const infoRecord = info.value as {
         readonly scheduling_policy?: unknown;
@@ -2471,17 +2476,17 @@ async function writeEveDeploymentArtifacts(
   return { workerSourcePath, wranglerConfigPath };
 }
 
-/** Default deadline for Wrangler secret writes and deletions. */
+/** Deadline for Wrangler secret writes and deletions. */
 const WRANGLER_OPERATION_TIMEOUT_MS = 120_000;
 /** Deadline for the image push and `wrangler deploy`; either can take minutes on a slow registry or uplink. */
 const WRANGLER_PUBLICATION_TIMEOUT_MS = 600_000;
 
 async function runWranglerWithInput(
   args: readonly string[],
+  /** Makes Wrangler act on this account or fail, whatever its login resolves to. */
+  accountId: string,
   input?: string,
   timeoutMs: number = WRANGLER_OPERATION_TIMEOUT_MS,
-  /** Makes Wrangler act on this account or fail, whatever its login resolves to. */
-  accountId?: string,
 ): Promise<{
   readonly exitCode: number;
   readonly stdout: string;
@@ -2498,10 +2503,7 @@ async function runWranglerWithInput(
         : ["--config", join(cwd, "wrangler.json")])],
       {
         cwd,
-        env: {
-          ...safeWranglerEnvironment(cwd),
-          ...(accountId === undefined ? {} : { CLOUDFLARE_ACCOUNT_ID: accountId }),
-        },
+        env: { ...safeWranglerEnvironment(cwd), CLOUDFLARE_ACCOUNT_ID: accountId },
         stdio: ["pipe", "pipe", "pipe"],
       },
     );
@@ -2555,6 +2557,7 @@ async function runWranglerWithInput(
 
 function defaultProtectedStore(
   workerName: string,
+  accountId: string,
 ): EveRuntimeProtectedStore {
   return {
     async put(request) {
@@ -2567,6 +2570,7 @@ function defaultProtectedStore(
             "--name",
             workerName,
           ],
+          accountId,
           request.values[name] === undefined ? "" : `${request.values[name]}\n`,
         );
         if (result.exitCode !== 0) {
@@ -2599,6 +2603,7 @@ async function defaultImagePublicationRunner(
     );
     const pushed = await runWranglerWithInput(
       ["containers", "push", request.localImageTag],
+      request.accountId,
       undefined,
       WRANGLER_PUBLICATION_TIMEOUT_MS,
     );
@@ -2693,6 +2698,8 @@ function defaultPublicationRunner(): EveDeploymentPublicationRunner {
         request.identity.environment,
         "--strict",
       ],
+      // The config Eden wrote names the same account, and Wrangler reads it first.
+      request.identity.accountId,
       undefined,
       WRANGLER_PUBLICATION_TIMEOUT_MS,
     );
@@ -3270,7 +3277,7 @@ async function runEveDeployment(
     Object.keys(retainedDeployments).some((id) => id !== priorIdentity.deploymentId);
   const controlToken = `${randomUUID()}${randomUUID()}`;
   if (affinityEnabled && (hasRetainedNoncurrentDeployments || Object.keys(retiringDeployments).length > 0)) {
-    await (options.protectedStore ?? defaultProtectedStore(request.name)).put({
+    await (options.protectedStore ?? defaultProtectedStore(request.name, accountId)).put({
       targetId: targetKey, revision: `eve-affinity-control-${randomUUID()}`,
       inputIdentity: {
         token: `eve-affinity-control-input-${randomUUID()}`,
@@ -3394,7 +3401,7 @@ async function runEveDeployment(
           mode: "deploy",
           targetId: targetKey,
           protectedStore: options.protectedStore ??
-            defaultProtectedStore(request.name),
+            defaultProtectedStore(request.name, accountId),
         },
       );
     } catch (error: unknown) {
@@ -5445,9 +5452,8 @@ async function defaultWorkerDelete(
 ): Promise<"deleted" | "absent" | "indeterminate"> {
   const result = await runWranglerWithInput(
     ["delete", "--name", request.name, "--force"],
-    "y\n",
-    undefined,
     request.accountId,
+    "y\n",
   );
   if (result.exitCode === 0) return "deleted";
   if (/(?:does not exist|not found|10007)/iu.test(result.stderr)) {
@@ -5461,8 +5467,6 @@ async function defaultContainerDelete(
 ): Promise<"deleted" | "absent" | "indeterminate"> {
   const result = await runWranglerWithInput(
     ["containers", "delete", request.applicationId],
-    undefined,
-    undefined,
     request.accountId,
   );
   if (result.exitCode === 0) return "deleted";
@@ -5747,7 +5751,7 @@ function cloudflareRegistry(): CloudflareRegistry {
       const minted = await readWranglerJson([
         "containers", "registries", "credentials", CLOUDFLARE_REGISTRY_HOST,
         "--push", "--pull", "--expiration-minutes", "5", "--json",
-      ]);
+      ], accountId);
       const value = minted.failed || typeof minted.value !== "object" || minted.value === null
         ? {}
         : minted.value as Record<string, unknown>;
@@ -5883,8 +5887,6 @@ function registryRepositoryDeleter(
           const ask = () => registry.delete(accountId, repository, entry).catch(() => undefined);
           const wrangler = untagged(entry) ? undefined : await runWranglerWithInput(
             ["containers", "images", "delete", `${repository}:${entry}`, "--skip-confirmation"],
-            undefined,
-            undefined,
             accountId,
           );
           const answer = wrangler === undefined

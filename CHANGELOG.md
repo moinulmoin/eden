@@ -49,6 +49,15 @@
   Wrangler could delete a Worker with the same name in the other account.
   Destroy now gives Wrangler the recorded account for its Worker, Container
   application, and image deletes, so a delete acts on that account or fails.
+- **A deploy's secret uploads and image push could run in another account.**
+  Wrangler chose the account again for each `wrangler secret put` and for
+  `wrangler containers push`. If the login changed after Eden checked the
+  account, a runtime value could be written to a Worker in the other
+  account, and `eden deploy` could still report success. Eden now gives
+  Wrangler the checked account for every command it runs after
+  `wrangler whoami`: the secret uploads, the image push, the publish, the
+  Container application read, the registry credential request, and
+  destroy's deletes. Each acts on that account or fails.
 - **Destroy could clear a `CURRENT` pointer it had not read.** If something
   outside Eden's lock replaced the pointer while destroy ran, destroy removed
   the replacement. Destroy now removes the pointer only if it is still the

@@ -54,12 +54,18 @@ const cloud = vi.hoisted(() => {
     stamps: [] as { readonly type: string; readonly name: string; readonly text: string }[],
     /** Called before each Wrangler command that changes the account. */
     onMutation: (() => undefined) as () => void,
+    /** Called before each Wrangler read other than whoami. */
+    onRead: (() => undefined) as () => void,
     apiAccounts: [] as string[],
     /** CLOUDFLARE_ACCOUNT_ID as each changing Wrangler command received it. */
     pinned: [] as (string | undefined)[],
     /** The registry repositories whose listing was asked for. */
     listed: new Set<string>(),
     deleted: [] as string[],
+    /** Each secret Wrangler uploaded, as account/worker/name. */
+    secrets: [] as string[],
+    /** Each image Wrangler pushed, as account/repository:tag. */
+    pushed: [] as string[],
   };
   return state;
 });
@@ -98,6 +104,15 @@ vi.mock("node:child_process", async (importOriginal) => {
     actual.execFile(...execArgs)) as typeof actual.execFile;
   Object.defineProperty(execFile, promisify.custom, {
     value: async (file: string, argv: readonly string[], options: object) => {
+      if (cloud.active && file === "docker" && argv[0] === "tag") return { stdout: "", stderr: "" };
+      if (cloud.active && file === "docker" && argv.includes("{{json .RepoDigests}}")) {
+        // Docker names the registry path the push went to.
+        const [account = "", image = ""] = (cloud.pushed.at(-1) ?? "").split("/");
+        return {
+          stdout: JSON.stringify(["registry.cloudflare.com/" + account + "/" + image.split(":")[0] + "@sha256:" + "d".repeat(64)]),
+          stderr: "",
+        };
+      }
       if (!cloud.active || !/wrangler/u.test(argv[0] ?? "")) {
         return promisify(actual.execFile)(file, argv, options);
       }
@@ -120,10 +135,13 @@ vi.mock("node:child_process", async (importOriginal) => {
             cloud.wranglerAccount + "/workers/scripts/" + args[3] + "/deployments) failed.\u001b[0m\n\n  This Worker does not exist on your account. [code: 10007]\n",
         });
       }
+      cloud.onRead();
+      // Wrangler acts on CLOUDFLARE_ACCOUNT_ID when it is set, else on its login's account.
+      const account = (options as { readonly env?: NodeJS.ProcessEnv }).env?.CLOUDFLARE_ACCOUNT_ID || cloud.wranglerAccount;
       if (args[1] === "registries" && args[2] === "credentials") {
         return {
           stdout: JSON.stringify({
-            account_id: "account-test",
+            account_id: account,
             registry_host: "registry.cloudflare.com",
             username: "v1",
             password: "registry-password",
@@ -131,7 +149,7 @@ vi.mock("node:child_process", async (importOriginal) => {
           stderr: "",
         };
       }
-      if (args[0] === "containers" && args[1] === "info") {
+      if (args[0] === "containers" && args[1] === "info" && [...cloud.containers].some((entry) => entry.startsWith(account + "/") && entry.endsWith("#" + args[2]))) {
         return {
           stdout: JSON.stringify({ scheduling_policy: "durable_object", durable_objects: { namespace_id: "namespace-test" } }),
           stderr: "",
@@ -154,12 +172,20 @@ vi.mock("node:child_process", async (importOriginal) => {
       let exitCode = 1;
       if (args[0] === "deploy") {
         // What Wrangler would publish: the plain-text vars of the config Eden wrote.
-        const config = JSON.parse(readFileSync(args[2] ?? "", "utf8")) as { readonly vars?: Readonly<Record<string, unknown>> };
+        const config = JSON.parse(readFileSync(args[2] ?? "", "utf8")) as { readonly account_id?: string; readonly vars?: Readonly<Record<string, unknown>> };
         cloud.stamps = Object.entries(config.vars ?? {}).flatMap(([name, text]) =>
           typeof text === "string" ? [{ type: "plain_text", name, text }] : []
         );
-        cloud.workers.add(account + "/" + args[4]);
-        cloud.containers.add(account + "/" + args[4] + "-container#container-new");
+        // Wrangler 4.147.0 takes a config's account_id before CLOUDFLARE_ACCOUNT_ID.
+        const published = config.account_id ?? account;
+        cloud.workers.add(published + "/" + args[4]);
+        cloud.containers.add(published + "/" + args[4] + "-container#container-new");
+        exitCode = 0;
+      } else if (args[0] === "secret" && args[1] === "put") {
+        cloud.secrets.push(account + "/" + args[4] + "/" + args[2]);
+        exitCode = 0;
+      } else if (args[0] === "containers" && args[1] === "push") {
+        cloud.pushed.push(account + "/" + args[2]);
         exitCode = 0;
       } else if (args[0] === "delete" && args[1] === "--name") {
         exitCode = cloud.workers.delete(account + "/" + args[2]) ? 0 : 1;
@@ -331,10 +357,13 @@ beforeEach(() => {
     workerAnswer: undefined,
     stamps: [{ type: "plain_text", name: "EDEN_EVE_DEPLOYMENT_ID", text: "eve-deploy-test" }],
     onMutation: () => undefined,
+    onRead: () => undefined,
     apiAccounts: [],
     pinned: [],
     listed: new Set<string>(),
     deleted: [],
+    secrets: [],
+    pushed: [],
   });
   // Keeps the reader away from this machine's Wrangler login.
   vi.stubEnv("CLOUDFLARE_API_TOKEN", "test-token");
@@ -445,11 +474,16 @@ async function writeBuild(snapshotRoot: string): Promise<void> {
 }
 
 /** A deploy that publishes through Eden's own Wrangler call and its own read afterwards. */
-async function deploy(root: string, generationId = "generation-one"): Promise<{ readonly exitCode: number; readonly result: { readonly ok?: boolean; readonly error?: { readonly code?: string } } }> {
+async function deploy(
+  root: string,
+  generationId = "generation-one",
+  /** The account the check before the deploy proved, an env file to upload, and whether Eden pushes the image itself. */
+  { account = "account-test", envFile, push = false }: { readonly account?: string; readonly envFile?: string; readonly push?: boolean } = {},
+): Promise<{ readonly exitCode: number; readonly result: { readonly ok?: boolean; readonly error?: { readonly code?: string } } }> {
   const output: string[] = [];
   const imageDigest = "sha256:" + "d".repeat(64);
   const exitCode = await runEdenCli(
-    ["deploy", "--project", root, "--env", "preview", "--name", "eve-deploy-fixture", "--json"],
+    ["deploy", "--project", root, "--env", "preview", "--name", "eve-deploy-fixture", ...(envFile === undefined ? [] : ["--env-file", envFile]), "--json"],
     {
       cwd: root,
       stdout: (line) => output.push(line),
@@ -457,9 +491,10 @@ async function deploy(root: string, generationId = "generation-one"): Promise<{ 
       eveControlPlane: {
         generationId,
         builder: { build: async (request) => { await writeBuild(request.snapshotRoot); return { eveVersion: "0.91.0" }; } },
-        containerImageReference: "registry.cloudflare.com/account-test/eve@" + imageDigest,
+        ...(push ? {} : { containerImageReference: "registry.cloudflare.com/" + account + "/eve@" + imageDigest }),
         runtimeRunner: async () => ({
           ok: true,
+          ...(push ? { imageReference: "eden-local:candidate" } : {}),
           checks: ["VAL-BUILD-005", "VAL-BUILD-006", "VAL-BUILD-007"].map((id) => ({ id, status: "passed" as const, message: "Passed." })),
           imageDigest,
           cleanup: { bootContainerId: null, bootContainerRemoved: true, imageIdentity: "exact" as const, imageRetained: true, verified: true },
@@ -467,7 +502,7 @@ async function deploy(root: string, generationId = "generation-one"): Promise<{ 
         cloudflareRead: async () => ({
           accountAccess: "available",
           containerAccess: "available",
-          accountId: "account-test",
+          accountId: account,
           workersDevSubdomain: "account",
           target: { state: "absent" },
         }),
@@ -538,6 +573,18 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     expect(cloud.pinned).toEqual(["account-test", "account-test", "account-test"]);
     expect(cloud.deleted).toEqual(["worker:" + worker, "container:" + container, "image:" + repository + ":candidate"]);
     expect([...cloud.workers]).toEqual(["account-other/eve-destroy-fixture"]);
+  });
+
+  test("a login that changes after whoami cannot move a Wrangler read to another account", async () => {
+    const { root, current } = await deployedProject();
+    cloud.workers.add(worker);
+    cloud.containers.add(container);
+    cloud.tags = ["candidate"];
+    cloud.onRead = () => { cloud.wranglerAccount = "account-other"; };
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
+    expect(cloud.deleted).toEqual(["worker:" + worker, "container:" + container, "image:" + repository + ":candidate"]);
+    await expect(lstat(current)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test("the API's own 10007 answer is an absent Worker: the rest is deleted and CURRENT is cleared", async () => {
@@ -829,5 +876,34 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     arrange();
     const { exitCode, result } = await deploy(root);
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+  });
+});
+
+describe("eden deploy sends every Wrangler write to the account it checked (MOI-254)", () => {
+  const account = "1".repeat(32);
+  /** A deploy with one runtime value, during which Wrangler's login moves to another account before the first write. */
+  const deployWhileTheLoginChanges = async (push: boolean) => {
+    const root = await deployableProject();
+    const envRoot = await mkdtemp(join(tmpdir(), "eden-moi254-"));
+    roots.push(envRoot);
+    await writeFile(join(envRoot, "runtime.env"), "MODEL_KEY=model-key-value\n", "utf8");
+    cloud.wranglerAccount = account;
+    cloud.onMutation = () => { cloud.wranglerAccount = "2".repeat(32); };
+    return deploy(root, "generation-one", { account, envFile: join(envRoot, "runtime.env"), push });
+  };
+
+  test("a login that changes after the check cannot move a secret upload or the publish", async () => {
+    const { exitCode, result } = await deployWhileTheLoginChanges(false);
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
+    expect(cloud.secrets).toEqual([account + "/eve-deploy-fixture/MODEL_KEY"]);
+    expect([...cloud.workers]).toEqual([account + "/eve-deploy-fixture"]);
+  });
+
+  test("a login that changes after the check cannot move the image push", async () => {
+    const { exitCode, result } = await deployWhileTheLoginChanges(true);
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
+    expect(cloud.pushed).toHaveLength(1);
+    expect(cloud.pushed[0]).toMatch(new RegExp("^" + account + "/eden-eve-"));
+    expect(cloud.secrets).toEqual([account + "/eve-deploy-fixture/MODEL_KEY"]);
   });
 });
