@@ -79,6 +79,7 @@ test("stopping Eden while cf pushes also stops the docker push that cf started",
     pushing,
   ], { env: { ...process.env, TMPDIR: temporary }, stdio: "ignore" });
   const exited = new Promise<NodeJS.Signals | null>((resolve) => child.on("close", (_code, by) => resolve(by)));
+  cleanups.push(async () => { child.kill("SIGKILL"); await exited; });
   await expect.poll(() => existsSync(pushing), { timeout: 20_000 }).toBe(true);
   const push = Number(readFileSync(pushing, "utf8"));
   cleanups.push(async () => { try { process.kill(push, "SIGKILL"); } catch { /* already gone */ } });

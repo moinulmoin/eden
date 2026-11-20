@@ -542,7 +542,9 @@ on Cloudflare. The message says which of three things happened:
   <account id> ... Cloudflare's API did not say that the account has none.`
   The read got no answer, an error such as an authentication error, or an
   answer Eden could not use. Confirm the login with
-  `npx cf@1.0.0-rc.2 auth whoami` and run `eden deploy` again.
+  `npx cf@1.0.0-rc.2 auth whoami --profile default`, or with the profile in
+  `CLOUDFLARE_AUTH_PROFILE`, and run `eden deploy` again. The remediation
+  prints the command with the profile.
 - `The authenticated Cloudflare read did not prove the exact workers.dev
   origin before Eve initialization.` Any other case, such as an account
   that could not be read; the `VAL-CLI-007-CLOUDFLARE-ACCESS` check beside
@@ -791,6 +793,7 @@ delete what it lists with
 | The message goes on | What happened |
 | --- | --- |
 | `cf containers push ended without an exit code. Eden stops it after ten minutes.` | The push took longer than ten minutes, or `cf` was killed. Run `eden deploy` again. |
+| `cf containers push ran past Eden's ten minutes and did not stop when Eden killed it. It and its docker push may still be running.` | The system did not deliver Eden's kill. Check for a `cf` or `docker push` process before you run `eden deploy` again. This case was not run. |
 | `Docker's credential store already holds an entry for registry.cloudflare.com.` | See [Managed registry login fails with `-25299`](#managed-registry-login-fails-with--25299). |
 | `docker login to registry.cloudflare.com failed. cf signs Docker in to the registry, and Docker saves that in its credential store.` | `docker login` exited with an error. The log has Docker's reason. |
 | `Docker signed in to registry.cloudflare.com, and its tag or push command then failed.` | `docker tag` or `docker push` exited with an error. The log has Docker's reason. |

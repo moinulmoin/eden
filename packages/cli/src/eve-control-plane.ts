@@ -2613,13 +2613,15 @@ async function publishImageWithCf(
       const log = join(request.generationRoot, "cf-push.log");
       const kept = await writeFile(
         log,
-        `cf containers push: exit ${pushed.exitCode ?? "none (cf was stopped)"}\n${safeText(pushed.stderr.slice(-2_000))}`,
+        `cf containers push: exit ${pushed.exitCode ?? (pushed.running === true ? "none (cf did not stop when killed)" : "none (cf was stopped)")}\n${safeText(pushed.stderr.slice(-2_000))}`,
         { mode: 0o600 },
       ).then(() => true, () => false);
       // cf signs Docker in, then runs docker tag and docker push. How it
       // failed is read from cf's own two messages, seen on 2026-11-20.
       const how = /-25299|already exists in the keychain/u.test(pushed.stderr)
         ? "Docker's credential store already holds an entry for registry.cloudflare.com. On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry."
+        : pushed.running === true
+        ? "cf containers push ran past Eden's ten minutes and did not stop when Eden killed it. It and its docker push may still be running."
         : pushed.exitCode === undefined
         ? "cf containers push ended without an exit code. Eden stops it, and the docker push under it, after ten minutes."
         : /Login failed with code: \d+/u.test(pushed.stderr)
