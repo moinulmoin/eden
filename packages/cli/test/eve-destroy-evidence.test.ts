@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import type * as Https from "node:https";
+import type * as TimersPromises from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { promisify } from "node:util";
@@ -34,6 +35,10 @@ const cloud = vi.hoisted(() => {
     tags: [] as string[],
     /** When set, what "cf workers deployments list" prints and exits with. */
     workerFailure: undefined as CfResult | undefined,
+    /** When set, what "cf workers get" prints and exits with. */
+    workerGet: undefined as CfResult | undefined,
+    /** How many reads of the Worker's deployments answer that it does not exist before they show it. */
+    hiddenReads: 0,
     /** Called before each read of the Worker's deployments, with the read's number from 0. */
     onWorkerRead: (() => undefined) as (nth: number) => unknown,
     workerReads: 0,
@@ -79,6 +84,12 @@ const cloud = vi.hoisted(() => {
   return state;
 });
 
+vi.mock("node:timers/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof TimersPromises>();
+  // Eden's waits between reads of Cloudflare end at once.
+  return { ...actual, setTimeout: ((...waitArgs: Parameters<typeof actual.setTimeout>) => cloud.active ? Promise.resolve() : actual.setTimeout(...waitArgs)) as typeof actual.setTimeout };
+});
+
 vi.mock("node:https", async (importOriginal) => {
   const actual = await importOriginal<typeof Https>();
   return {
@@ -112,7 +123,7 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
   const ok = (value: unknown) => ({ exitCode: 0, stdout: JSON.stringify(value, null, 2) + "\n" });
   const line = args.join(" ");
   const command = [
-    "auth whoami", "workers deployments list", "workers versions get", "workers versions list", "workers list",
+    "auth whoami", "workers deployments list", "workers versions get", "workers versions list", "workers list", "workers get",
     "workers delete", "workers secrets bulk-edit", "workers triggers deploy", "containers applications list",
     "containers applications get", "containers applications create", "containers applications delete",
     "containers registries credentials", "containers images delete", "containers push", "deploy",
@@ -136,7 +147,7 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
     cloud.readAccounts.push(account);
     await cloud.onWorkerRead(cloud.workerReads++);
     if (cloud.workerFailure !== undefined) return cloud.workerFailure;
-    if (!cloud.workers.has(account + "/" + flag("--worker"))) {
+    if (cloud.hiddenReads-- > 0 || !cloud.workers.has(account + "/" + flag("--worker"))) {
       return cloud.apiError(10007, "This Worker does not exist on your account.", "404 Not Found", "/accounts/" + account + "/workers/scripts/" + flag("--worker") + "/deployments");
     }
     return ok({
@@ -148,11 +159,17 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
       })),
     });
   }
-  const reads = ["workers versions get", "workers versions list", "containers applications list", "containers applications get", "workers list", "containers registries credentials"];
+  const reads = ["workers get", "workers versions get", "workers versions list", "containers applications list", "containers applications get", "workers list", "containers registries credentials"];
   if (reads.includes(command)) {
     cloud.onRead();
     const account = pinned ?? cloud.loginAccount;
     cloud.readAccounts.push(account);
+    if (command === "workers get") {
+      if (cloud.workerGet !== undefined) return cloud.workerGet;
+      return cloud.workers.has(account + "/" + args[2])
+        ? ok({ name: args[2] })
+        : cloud.apiError(10007, "This Worker does not exist on your account.", "404 Not Found", "/accounts/" + account + "/workers/workers/" + args[2]);
+    }
     if (command === "workers versions get") {
       return ok({
         id: args[3],
@@ -378,6 +395,8 @@ beforeEach(() => {
     containers: new Set<string>(),
     tags: [],
     workerFailure: undefined,
+    workerGet: undefined,
+    hiddenReads: 0,
     onWorkerRead: () => undefined,
     workerReads: 0,
     deployments: 1,
@@ -935,6 +954,25 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     expect([...cloud.containers]).toEqual(["account-test/eve-deploy-fixture-container#" + cloud.namespace]);
     expect(cloud.triggers).toEqual([worker]);
     await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))).resolves.toBeDefined();
+  });
+
+  test("a Worker that Cloudflare shows only after several reads is still finished", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.hiddenReads = 6;
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
+    expect(cloud.triggers).toEqual([worker]);
+  });
+
+  test("a Worker that one of Cloudflare's two reads still shows is not absent: destroy stops", async () => {
+    const { root, current } = await deployedProject();
+    cloud.containers.add("account-test/eve-destroy-fixture-container#container-123");
+    cloud.workerGet = { exitCode: 0, stdout: '{"name":"eve-destroy-fixture"}' };
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
+    expect(cloud.deleted).toEqual([]);
+    await expect(lstat(current)).resolves.toBeDefined();
   });
 
   test("when cf deploy fails before it uploads, Eden creates nothing and ends DEPLOY_INDETERMINATE", async () => {

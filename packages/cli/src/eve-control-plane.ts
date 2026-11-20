@@ -1690,7 +1690,7 @@ async function readTargetContainers(
  * its deployments, "absent" only for Cloudflare's own answer that it does
  * not exist. That answer, read through cf on 2026-11-20, is one API error
  * with code 10007 and status 404 for this account's and Worker's exact
- * deployments path. Undefined for anything else, which proves nothing
+ * path, given by both the deployments read and the Worker read. Undefined for anything else, which proves nothing
  * either way: no answer, another status, code, or path, a second error or
  * message beside it, or output Eden cannot read.
  */
@@ -1717,11 +1717,17 @@ async function readWorkerPresence(
       ? listed.deployments.length > 0 ? "deployed" : "undeployed"
       : undefined;
   }
-  return cloudflareApiAnswered(result, {
-      status: 404,
-      code: 10007,
-      path: `/accounts/${accountId}/workers/scripts/${workerName}/deployments`,
-    })
+  if (!cloudflareApiAnswered(result, {
+    status: 404,
+    code: 10007,
+    path: `/accounts/${accountId}/workers/scripts/${workerName}/deployments`,
+  })) return undefined;
+  // Cloudflare's two reads of a Worker can disagree for a while after it is
+  // created or deleted (seen on 2026-11-20), so both must say it is absent.
+  return cloudflareApiAnswered(
+      await cf({ args: ["workers", "get", workerName], accountId, timeoutMs: 30_000 }),
+      { status: 404, code: 10007, path: `/accounts/${accountId}/workers/workers/${workerName}` },
+    )
     ? "absent"
     : undefined;
 }
@@ -2629,11 +2635,20 @@ async function finishPublication(
   request: EveDeploymentPublicationRequest,
 ): Promise<"finished" | "unfinished" | "not-uploaded"> {
   const accountId = request.identity.accountId;
-  const bindings = await readLiveWorkerBindings(cf, accountId, request.identity.workerName);
-  if (
-    bindings?.find((binding) => binding.type === "plain_text" && binding.name === "EDEN_EVE_RELEASE_ID")?.text !==
-      request.hostConfig.worker.vars.EDEN_EVE_RELEASE_ID
-  ) return "not-uploaded";
+  // Cloudflare can take a while to show a Worker version it just accepted. On
+  // 2026-11-20 its deployments read still answered that the Worker did not
+  // exist 25 seconds after cf had deployed one. So the read is repeated for
+  // two minutes before the version counts as not uploaded.
+  let bindings: Awaited<ReturnType<typeof readLiveWorkerBindings>>;
+  for (let attempt = 0; ; attempt += 1) {
+    bindings = await readLiveWorkerBindings(cf, accountId, request.identity.workerName);
+    if (
+      bindings?.find((binding) => binding.type === "plain_text" && binding.name === "EDEN_EVE_RELEASE_ID")?.text ===
+        request.hostConfig.worker.vars.EDEN_EVE_RELEASE_ID
+    ) break;
+    if (attempt === 24) return "not-uploaded";
+    await waitForActivation(5_000);
+  }
   const namespaceId = bindings.find((binding) =>
     binding.type === "durable_object_namespace" && binding.name === request.hostConfig.container.bindingName
   )?.namespace_id;
@@ -2694,6 +2709,9 @@ function defaultPublicationRunner(
       },
     });
     if (deployed.exitCode !== 0) {
+      // What cf printed, kept beside the Build Output for whoever inspects the failure.
+      await writeFile(join(request.buildOutputPath, "cf-deploy.log"), safeText(deployed.stderr), { mode: 0o600 })
+        .catch(() => undefined);
       const finish = await finishPublication(cf, request);
       if (finish !== "finished") {
         return {

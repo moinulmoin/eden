@@ -128,6 +128,7 @@ vi.mock("node:timers/promises", async (importOriginal) => {
     ...actual,
     // While the fake registry runs, a wait only moves its clock.
     setTimeout: ((...waitArgs: Parameters<typeof actual.setTimeout>) => {
+      if (fakeCf.intercept) return Promise.resolve();
       if (!fakeRegistry.active) return actual.setTimeout(...waitArgs);
       fakeRegistry.clock += waitArgs[0] ?? 0;
       return Promise.resolve();
@@ -245,6 +246,12 @@ vi.mock("node:child_process", async (importOriginal) => {
       return { exitCode: 0 };
     }
     if (line.startsWith("containers applications list ")) return { exitCode: 0, stdout: "[]" };
+    if (line.startsWith("workers get ")) {
+      return {
+        exitCode: 1,
+        stderr: `\n┌ APIError\n│ [10007] This Worker does not exist on your account.\n│ 404 Not Found · HTTP /accounts/${env.CLOUDFLARE_ACCOUNT_ID}/workers/workers/${args[2]}\n└\n`,
+      };
+    }
     if (line.startsWith("workers deployments list --worker ")) {
       fakeRegistry.onRead(fakeRegistry.reads++);
       return {
@@ -1649,11 +1656,11 @@ describe("top-level Eden Deploy commands", () => {
       ).resolves.toBe(1);
     });
 
-    // The publish, then the read that finds no version of this publish to finish.
-    expect(calls).toEqual([
-      { args: ["deploy", "--prebuilt"], timeoutMs: 600_000 },
+    // The publish, then the reads that find no version of this publish to finish.
+    expect(calls[0]).toEqual({ args: ["deploy", "--prebuilt"], timeoutMs: 600_000 });
+    expect(calls.slice(1)).toEqual(Array(25).fill(
       { args: ["workers", "deployments", "list", "--worker", "eve-publish-deadline"], timeoutMs: 30_000 },
-    ]);
+    ));
     expect(errors.join("\n")).toContain("DEPLOY_INDETERMINATE");
   });
 
