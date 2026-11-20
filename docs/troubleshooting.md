@@ -1334,6 +1334,12 @@ A Worker that a first deploy left without its Container application does
 not fail here: destroy proves it from the version in service and the failed
 attempt's record, and removes it.
 
+A Worker that holds only secrets fails here. Eden 0.14 and earlier set
+secrets before the first publish, so a first deploy that failed there left
+such a Worker. This version uploads the secrets with the Worker version and
+creates no Worker before that upload. Such a Worker carries nothing that
+names Eden, so destroy does not delete it; the steps below apply.
+
 If the account is right, wait a minute and rerun `eden destroy`. If it keeps
 refusing, Eden cannot prove ownership and will not delete the Worker. Only
 the person who owns the Cloudflare account can decide to. Open

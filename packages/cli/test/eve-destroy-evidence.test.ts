@@ -686,6 +686,17 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(lstat(current)).resolves.toBeDefined();
   });
 
+  test("a Worker that holds only secrets, as Eden 0.14's failed first deploy left one, is not deleted", async () => {
+    const { root, current } = await deployedProject();
+    cloud.workers.add(worker);
+    cloud.stamps = [{ type: "secret_text", name: "MODEL_KEY" }];
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_OWNERSHIP_UNPROVEN" });
+    expect(result.error?.remediation).toContain("docs/troubleshooting.md");
+    expect({ deleted: cloud.deleted, workers: [...cloud.workers] }).toEqual({ deleted: [], workers: [worker] });
+    await expect(lstat(current)).resolves.toBeDefined();
+  });
+
   test("a login for another account reads nothing and deletes nothing", async () => {
     const { root, current } = await deployedProject();
     cloud.containers.add(container);
