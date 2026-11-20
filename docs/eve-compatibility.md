@@ -90,7 +90,7 @@ all three.
   project to a temporary target with the Cloudflare World built from this
   repository, runs bash in a session, updates in place, upgrades Eve, lets
   the container sleep and wakes it, then destroys the target. It needs the
-  maintainer's Wrangler login, so it does not run in CI.
+  maintainer's `cf` sign-in or `CLOUDFLARE_API_TOKEN`, so it does not run in CI.
   See [validation](./validation.md#live-check-on-cloudflare).
 
 ## Session behavior across Eve upgrades

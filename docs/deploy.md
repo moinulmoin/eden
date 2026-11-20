@@ -24,8 +24,10 @@ exact cleanup. Eve remains the application and workflow authority.
 Before deploying, confirm:
 
 - `eden --help` starts successfully.
-- `npx wrangler@4.147.0 whoami` shows the intended Cloudflare account on the
-  Workers Paid plan, which Containers requires.
+- `node --version` shows `v24.22.0` or newer on the 24 line, or `v26.12.0` or
+  newer on the 26 line.
+- `npx cf@1.0.0-rc.2 auth whoami` shows the intended Cloudflare account, and
+  only that one, on the Workers Paid plan, which Containers requires.
 - Docker or OrbStack is running with Linux/amd64 support.
 - The selected Eve root contains `package.json` and one `package-lock.json`
   (npm), or `pnpm-lock.yaml` with an exact `packageManager: "pnpm@..."` pin.
@@ -338,7 +340,7 @@ Also compare the Cloudflare Workers list and the Container inventory before and
 after the run:
 
 ```sh
-npx wrangler@4.147.0 containers list
+npx cf@1.0.0-rc.2 containers applications list
 ```
 
 The exact Worker and Container must be gone. Use the

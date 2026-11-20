@@ -57,7 +57,7 @@ fixture.
    `packages/world-cloudflare/package.json`. Run
    `pnpm install --no-frozen-lockfile`.
 3. Run the checks above. When the change needs the live check, run
-   `pnpm run check:live -- --env-file <file>` on a machine with the Wrangler
+   `pnpm run check:live -- --env-file <file>` on a machine with the `cf`
    login and add the dated result to `docs/eve-compatibility-history.md`.
 4. Get the maintainer's approval. Commit explicit paths, push `main`, then
    push the tag `vX.Y.Z`. The Publish workflow tests, publishes to npm with

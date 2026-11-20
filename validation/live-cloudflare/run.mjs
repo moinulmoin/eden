@@ -1,7 +1,7 @@
-/* global AbortController, console, fetch, process, setTimeout, clearTimeout, TextDecoder, URL */
+/* global AbortController, console, fetch, process, setTimeout, clearTimeout, TextDecoder */
 
 // Live Cloudflare check: runs Eden's whole life cycle against the real
-// Cloudflare account this machine's Wrangler is logged in to, on one temporary
+// Cloudflare account this machine's cf CLI is signed in to, on one temporary
 // target. Once a deploy has started, eden destroy runs at the end, when a step
 // fails, and on Ctrl-C. If destroy fails, the retry command is printed and the
 // target stays. A killed process (SIGKILL) cleans up nothing. See
@@ -11,11 +11,9 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
-  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
-  openSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -23,14 +21,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { serveWorldTarball } from "../eve-compat/eden-leg.mjs";
 import { registryCatalogRefs } from "./registry-catalog.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const edenCli = join(repoRoot, "packages/cli/dist/index.js");
-const wranglerCli = join(repoRoot, "node_modules/.bin/wrangler");
+const cfCli = join(repoRoot, "node_modules/.bin/cf");
+const interruptedDeploy = join(repoRoot, "validation/live-cloudflare/interrupted-deploy.mjs");
 const TARGET_PATTERN = /^eden-live-\d{8}-[0-9a-f]{8}$/u;
 const WORLD = "@moinulmoin/eden-world-cloudflare";
 const MODEL_KEY = "AI_GATEWAY_API_KEY";
@@ -44,7 +43,7 @@ const usage = [
   "Deploys a fresh Eve project to a temporary Cloudflare target with the locally",
   "built CLI and the Cloudflare World packed from this workspace, checks sessions",
   "across an update, an Eve upgrade, and a sleep, then destroys the target. Uses",
-  "this machine's Wrangler login and Docker.",
+  "this machine's cf login (or CLOUDFLARE_API_TOKEN) and Docker.",
   "",
   "Options:",
   "  --env-file <path>     File holding " + MODEL_KEY + "=<key> (required)",
@@ -242,11 +241,12 @@ async function step(title, body) {
 
 // Every Eden command goes through here, so nothing but this run's generated
 // temporary target can be deployed to or destroyed.
-async function eden(command, { withEnvFile = true, interruptible = true } = {}) {
+async function eden(command, { withEnvFile = true, interruptible = true, interrupted = false } = {}) {
   if (!TARGET_PATTERN.test(target) || !project.endsWith("/" + target)) {
     throw new Error("Refusing to run eden " + command + ": " + target + " is not this run's temporary target.");
   }
-  const args = [edenCli, command, "--project", project, "--env", "preview", "--name", target, "--json"];
+  // interrupted-deploy.mjs is eden deploy with cf deploy made to fail halfway.
+  const args = [...(interrupted ? [interruptedDeploy] : [edenCli, command]), "--project", project, "--env", "preview", "--name", target, "--json"];
   if (withEnvFile) args.push("--env-file", envFile);
   const result = await run(process.execPath, args, { env: edenEnvironment, timeoutMs: 1_800_000, interruptible });
   let output;
@@ -260,6 +260,10 @@ async function eden(command, { withEnvFile = true, interruptible = true } = {}) 
   if (result.code !== 0 || output.ok !== true) {
     const failed = (output.checks ?? []).filter((check) => check.status === "failed").map((check) => check.id + ": " + check.message);
     throw new Error(["eden " + command + " failed (exit " + result.code + "): " + (output.error?.code ?? "no error code") + " " + (output.error?.message ?? ""), ...failed, tail(result.stderr, 15)].filter(Boolean).join("\n"));
+  }
+  if (interrupted) {
+    const line = result.stderr.split("\n").find((entry) => entry.startsWith("interrupted-deploy: "));
+    output.interrupted = line === undefined ? undefined : JSON.parse(line.slice("interrupted-deploy: ".length));
   }
   return output;
 }
@@ -532,59 +536,19 @@ async function newSession(label, expectedEve) {
   return turn.sessionId + " ran bash on Eve " + turn.eveVersion;
 }
 
-// The deployed Worker keeps no logs, so wrangler tail records every
-// invocation of the target into the work folder. It is restarted before each
-// update and read only when a step fails.
-let tailChild;
-const tailFiles = [];
-function startTail() {
-  tailChild?.kill("SIGTERM");
-  const file = join(workRoot, "tail-" + (tailFiles.length + 1) + ".json");
-  tailFiles.push(file);
-  const out = openSync(file, "a");
-  tailChild = spawn(wranglerCli, ["tail", target, "--format", "json"], { cwd: workRoot, env: baseEnvironment, stdio: ["ignore", out, "ignore"] });
-  tailChild.on("error", () => {});
-  closeSync(out);
-}
-
-// Invocations that threw or were reset, oldest first.
-function tailExceptions() {
-  const lines = [];
-  for (const file of tailFiles) {
-    let text = "";
-    try {
-      text = readFileSync(file, "utf8");
-    } catch {
-      continue;
-    }
-    // Wrangler prints one indented JSON object per invocation. Diagnostics
-    // only: a part that cannot be read is skipped, never a failure.
-    for (const part of text.split(/\n(?=\{\n)/u)) {
-      try {
-        const event = JSON.parse(part);
-        if (event.outcome === "ok" || event.outcome === "canceled") continue;
-        const request = event.event?.request;
-        lines.push([
-          new Date(event.eventTimestamp).toISOString(),
-          event.entrypoint ?? "Worker",
-          "version " + String(event.scriptVersion?.id).slice(0, 8),
-          event.outcome,
-          request === undefined ? "" : request.method + " " + new URL(request.url).pathname,
-          (event.exceptions ?? []).map((exception) => exception.name + ": " + exception.message).join("; "),
-        ].join(" "));
-      } catch {
-        continue;
-      }
-    }
-  }
-  return lines;
-}
-
-async function deploy(expectUpdate, expectImageReplaced = false) {
+async function deploy(expectUpdate, expectImageReplaced = false, interrupted = false) {
   const started = Date.now();
-  if (expectUpdate) startTail();
-  const output = await eden("deploy");
-  if (!expectUpdate) startTail();
+  const output = await eden("deploy", { interrupted });
+  let finished = "";
+  if (interrupted) {
+    // cf deploy must have failed after its upload, and Eden must have set up the rest itself.
+    const commands = output.interrupted?.commands ?? [];
+    const ran = (command, exitCode) => commands.some((entry) => entry.command.startsWith(command) && entry.exitCode === exitCode);
+    if (!(output.interrupted?.injected > 0) || !ran("deploy --prebuilt", 1)) throw new Error("cf deploy was not interrupted: " + JSON.stringify(output.interrupted));
+    if (commands.filter((entry) => entry.command.startsWith("deploy --prebuilt")).length !== 1) throw new Error("cf deploy ran more than once: " + JSON.stringify(commands));
+    if (!ran("containers applications create", 0) || !ran("workers triggers deploy", 0)) throw new Error("Eden did not finish the publish itself: " + JSON.stringify(commands));
+    finished = "\ncf deploy exited 1 after " + output.interrupted.injected + " refused read(s) of the uploaded version; Eden then ran containers applications create and workers triggers deploy, both exit 0";
+  }
   const origin = output.deployment?.stableWorkersDevOrigin;
   if (typeof origin !== "string" || !origin.startsWith("https://")) throw new Error("The deploy result has no deployment.stableWorkersDevOrigin.");
   if (output.name !== target) throw new Error("The deploy result names " + output.name + ", not " + target + ".");
@@ -599,27 +563,52 @@ async function deploy(expectUpdate, expectImageReplaced = false) {
   if (expectImageReplaced && (cleanup?.status !== "passed" || (output.registryObjectsKept ?? []).length > 0 || warnings.includes("EVE_SUPERSEDED_IMAGE_NOT_DELETED"))) {
     throw new Error("The update did not delete the image it replaced: VAL-LIFE-007 " + (cleanup?.status ?? "missing") + ", kept " + JSON.stringify(output.registryObjectsKept ?? []) + ", warnings " + warnings.join(", "));
   }
-  return origin + " in " + deployed + " s, health ready after " + healthy + " s more" + (warnings.length === 0 ? "" : ", warnings: " + warnings.join(", ")) + (cleanup === undefined ? "" : "\nVAL-LIFE-007 " + cleanup.status + ": " + cleanup.message);
+  return origin + " in " + deployed + " s, health ready after " + healthy + " s more" + (warnings.length === 0 ? "" : ", warnings: " + warnings.join(", ")) + (cleanup === undefined ? "" : "\nVAL-LIFE-007 " + cleanup.status + ": " + cleanup.message) + finished;
 }
 
-async function wrangler(args) {
-  return run(wranglerCli, args, { timeoutMs: 120_000, interruptible: false });
+// cf runs in a folder of its own, where no project file can choose the
+// account, and on the account a deploy result named once there is one.
+const cfRoot = join(workRoot, "cf");
+async function cf(args) {
+  mkdirSync(cfRoot, { recursive: true });
+  writeFileSync(join(cfRoot, "cloudflare.config.ts"), "export default {};\n");
+  const env = { ...baseEnvironment, NO_COLOR: "1", CF_DELEGATION: "1", CLOUDFLARE_API_BASE_URL: "https://api.cloudflare.com/client/v4", ...(registryAccount === undefined ? {} : { CLOUDFLARE_ACCOUNT_ID: registryAccount }) };
+  return run(cfCli, args, { cwd: cfRoot, env, timeoutMs: 120_000, interruptible: false });
+}
+// True when Cloudflare's API itself answers that the Worker does not exist:
+// 404, one error with code 10007, and nothing beside it. Read as Eden reads
+// it, with CLOUDFLARE_API_TOKEN or the token of cf's login.
+let readApi;
+async function workerAbsent(path) {
+  if (readApi === undefined) {
+    const load = (file) => import(pathToFileURL(join(repoRoot, "packages/cli/dist", file)).href);
+    readApi = (await load("eve-cloudflare-api.js")).cloudflareApiReader((await load("eve-cloudflare-cli.js")).runCloudflareCli);
+  }
+  const answer = await readApi("/accounts/" + registryAccount + path);
+  if (answer?.status !== 404) return false;
+  try {
+    const body = JSON.parse(answer.body);
+    return body.success === false && body.result === null && Array.isArray(body.errors) && body.errors.length === 1 &&
+      body.errors[0].code === 10007 && (body.messages ?? []).length === 0;
+  } catch {
+    return false;
+  }
 }
 
 // What Cloudflare's registry itself lists for this run's repositories: each
-// tag, and one sha256 entry per manifest. Wrangler's image list leaves the
+// tag, and one sha256 entry per manifest. cf's image list leaves the
 // sha256 entries out.
 // Every repository of this target starts with the same name. The credential
 // can only read, and must be for the account a deploy result named; when no
 // deploy got far enough to name one, the credential's own account is read.
 async function registryRefs() {
-  const minted = await wrangler(["containers", "registries", "credentials", "registry.cloudflare.com", "--pull", "--expiration-minutes", "5", "--json"]);
-  if (minted.code !== 0) throw new Error("wrangler containers registries credentials exited with code " + minted.code);
+  const minted = await cf(["containers", "registries", "credentials", "generate", "registry.cloudflare.com", "--permissions", "pull", "--expiration-minutes", "5"]);
+  if (minted.code !== 0) throw new Error("cf containers registries credentials generate exited with code " + minted.code);
   let credential;
   try {
     credential = JSON.parse(minted.stdout);
   } catch {
-    throw new Error("wrangler containers registries credentials did not print JSON");
+    throw new Error("cf containers registries credentials generate did not print JSON");
   }
   if (typeof credential?.password === "string") secrets.push(credential.password);
   return registryCatalogRefs({
@@ -638,15 +627,16 @@ async function verifyGone() {
     if (response === 404) notes.push("URL returns 404");
     else problems.push("URL returned " + response + ", expected 404");
   }
-  const worker = await wrangler(["deployments", "list", "--name", target, "--json"]);
-  if (worker.code !== 0 && /10007|does not exist|not found/iu.test(worker.stdout + worker.stderr)) notes.push("no Worker");
-  else problems.push("Worker " + target + " still answers wrangler deployments list");
-  const secretList = await wrangler(["secret", "list", "--name", target]);
-  if (secretList.code !== 0 && /10007|does not exist|not found/iu.test(secretList.stdout + secretList.stderr)) notes.push("no secrets");
+  if (
+    await workerAbsent("/workers/scripts/" + target + "/deployments") &&
+    await workerAbsent("/workers/workers/" + target)
+  ) notes.push("no Worker");
+  else problems.push("Cloudflare's API does not say that Worker " + target + " is gone");
+  if (await workerAbsent("/workers/scripts/" + target + "/secrets")) notes.push("no secrets");
   else problems.push("Worker secrets for " + target + " can still be listed");
-  const containers = await wrangler(["containers", "list", "--json"]);
-  if (containers.code !== 0) problems.push("wrangler containers list failed: " + tail(containers.stderr, 3));
-  else if (containers.stdout.includes(target)) problems.push("a Container application for " + target + " remains");
+  const containers = await cf(["containers", "applications", "list", "--name", target + "-container"]);
+  if (containers.code !== 0) problems.push("cf containers applications list failed: " + tail(containers.stderr, 3));
+  else if (containers.stdout.trim() !== "[]") problems.push("a Container application for " + target + " remains");
   else notes.push("no Container application");
   // Only the exact objects destroy reported as kept may remain.
   const refs = await registryRefs().catch((error) => String(error.message ?? error));
@@ -679,9 +669,10 @@ try {
     const warnings = (output.warnings ?? []).map((warning) => warning.id);
     return output.checks.length + " checks passed" + (warnings.length === 0 ? ", no warnings" : ", warnings: " + warnings.join(", "));
   });
-  await step("eden deploy (fresh)", () => {
+  // The first publish is interrupted on purpose: see interrupted-deploy.mjs.
+  await step("eden deploy (fresh, cf deploy interrupted after its upload)", () => {
     deployStarted = true;
-    return deploy(false);
+    return deploy(false, false, true);
   });
   await step("Unauthenticated session is refused", async () => {
     const response = await request("/eve/v1/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "hello" }) });
@@ -751,17 +742,8 @@ try {
   }
 } catch (error) {
   failure = error;
-  if (tailFiles.length > 0) {
-    // Tail delivers an invocation a moment after it ends.
-    await wait(3_000);
-    const exceptions = tailExceptions();
-    log(exceptions.length === 0
-      ? "wrangler tail recorded no invocation that threw or was reset."
-      : "Invocations that threw or were reset, from wrangler tail (last " + Math.min(exceptions.length, 30) + " of " + exceptions.length + "):\n    " + exceptions.slice(-30).join("\n    "));
-  }
 } finally {
   cleaning = true;
-  tailChild?.kill("SIGTERM");
   let cleaned = !deployStarted;
   if (deployStarted) {
     try {

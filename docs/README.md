@@ -8,7 +8,7 @@ Cloudflare account without rewriting it. Start with
 ## Get started
 
 - [Install Eden](./install.md): Node, npm/pnpm/Bun installation, Cloudflare
-  and Wrangler login, Docker or OrbStack, project requirements, updating and
+  and `cf` sign-in, Docker or OrbStack, project requirements, updating and
   uninstalling.
 - [Deploy an existing Eve project](./deploy.md): the env file, preflight,
   deploy, updates, destroy, preview and production, schedules, and the

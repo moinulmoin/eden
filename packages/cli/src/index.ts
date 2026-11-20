@@ -29,6 +29,7 @@ import {
   type EveCliInvocation,
   type ParsedEveInvocation,
 } from "./eve.js";
+import { pinnedCliProblem } from "./eve-cloudflare-cli.js";
 import {
   EveRuntimeConfigError,
   readEveRuntimeConfig,
@@ -180,6 +181,10 @@ export interface EdenCliRunOptions {
    * Runtime values and remote-provider mutations never cross this boundary.
    */
   readonly eveControlPlane?: EvePreflightOptions;
+  /** The Node version to check instead of the running one. */
+  readonly nodeVersion?: string;
+  /** The installed cf version to check instead of the real one; null for none installed. */
+  readonly cfVersion?: string | null;
 }
 
 
@@ -469,6 +474,19 @@ export async function runEdenCli(
       if (json) flushJson();
       return 0;
     }
+    // The CLI that Eden runs for deploys needs this Node.
+    const node = options.nodeVersion ?? process.versions.node;
+    const [major = 0, minor = 0] = node.split(".").map(Number);
+    // The Node lines cf 1.0.0-rc.2 declares, from 24 up.
+    if (!((major === 24 && minor >= 22) || (major === 26 && minor >= 12))) {
+      throw new EveCliError({
+        code: "EVE_NODE_UNSUPPORTED",
+        message: `Eden needs Node 24.22.0 or newer on the 24 line, or 26.12.0 or newer on the 26 line, and is running on Node ${node}.`,
+        remediation: "Install Node 24.22.0 or newer on the 24 line (for example: nvm install 24), check it with node --version, then run the command again.",
+      });
+    }
+    const pin = pinnedCliProblem(options.cfVersion);
+    if (pin !== undefined) throw new EveCliError({ code: "EVE_CF_UNAVAILABLE", ...pin });
     await runEveInvocation(parsed, {
       ...options,
       stdout,

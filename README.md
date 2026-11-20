@@ -31,7 +31,7 @@ What you get on your own account:
 From inside an npm or pnpm Eve project, with Docker running:
 
 ```sh
-npx wrangler@4.147.0 login
+npx cf@1.0.0-rc.2 auth login
 npx @moinulmoin/eden preflight --env-file ~/.config/my-agent/preview.env
 npx @moinulmoin/eden deploy --env-file ~/.config/my-agent/preview.env
 ```
@@ -73,7 +73,7 @@ eden --version
 ```
 
 Users install only `@moinulmoin/eden`; its companion packages are resolved
-automatically. Bun is supported as an installer only. Node `>=24.17.0` remains
+automatically. Bun is supported as an installer only. Node `^24.22.0 || ^26.12.0` remains
 the Eden runtime, so do not force the CLI through `bunx --bun`.
 
 ### With a coding agent
@@ -99,14 +99,17 @@ nothing on Cloudflare.
 ## Requirements
 
 - macOS or Linux
-- Node `>=24.17.0`
+- Node `^24.22.0 || ^26.12.0`
 - a Cloudflare account on the Workers Paid plan ($5/month, required for
   Containers)
-- Wrangler authentication:
+- a sign-in with Cloudflare's `cf` CLI, or `CLOUDFLARE_API_TOKEN` set:
 
   ```sh
-  npx wrangler@4.147.0 login
+  npx cf@1.0.0-rc.2 auth login
   ```
+
+  Eden 0.14 and earlier used the Wrangler login. `cf` does not read it, so
+  sign in once after upgrading.
 
 - Docker or OrbStack with Linux/amd64 container support
 - an Eve project with one root `package-lock.json`, or an exact

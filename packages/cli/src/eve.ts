@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { CF_COMMAND, cfAuthCommand } from "./eve-cloudflare-cli.js";
 
 export const EVE_CLI_COMMANDS = [
   "preflight",
@@ -120,7 +121,7 @@ function eveErrorRemediation(code: string): string {
     case "EVE_UPDATE_RECORD_UNAVAILABLE":
       return "Re-run the last successful deploy generation, or destroy the exact target with eden destroy.";
     case "EVE_ORIGIN_UNAVAILABLE":
-      return "Run npx wrangler@4.147.0 whoami to confirm the account, log in with npx wrangler@4.147.0 login if needed, then retry.";
+      return `Eden reads the account's workers.dev subdomain from the URL of a Worker of the account. Confirm the account with ${cfAuthCommand("whoami")} and that it has a workers.dev subdomain (Cloudflare dashboard, Workers & Pages), then retry.`;
     case "EVE_HOST_CONFIG_INVALID":
       return "Correct the value the message names, then rerun eden deploy.";
     case "EVE_PROJECT_ROOT_INVALID":
@@ -143,12 +144,12 @@ function eveErrorRemediation(code: string): string {
     case "EVE_DESTROY_RECORD_MISMATCH":
       return "Rerun eden destroy with the exact --env and --name the deploy printed.";
     case "EVE_DESTROY_OWNERSHIP_UNPROVEN":
-      return "Run npx wrangler@4.147.0 whoami and sign in to the account that owns this deployment if it names another. If the account is right and the last eden deploy ended DEPLOY_INDETERMINATE, its publish may have stopped partway: wait a minute and rerun eden destroy. If it still refuses, stop and read EVE_DESTROY_OWNERSHIP_UNPROVEN in docs/troubleshooting.md. Eden will not delete a different Worker that now uses this name.";
+      return `Run ${cfAuthCommand("whoami")} and sign in to the account that owns this deployment if it names another. If the account is right, wait a minute and rerun eden destroy. If it still refuses, stop and read EVE_DESTROY_OWNERSHIP_UNPROVEN in docs/troubleshooting.md. Eden will not delete a different Worker that now uses this name.`;
     case "EVE_DESTROY_INDETERMINATE":
     case "EVE_DESTROY_ABSENCE_UNPROVEN":
       return "Wait a minute for Cloudflare to settle, then rerun eden destroy with the same --project, --env, and --name. Keep the .eden folder; never delete resources by name prefix.";
     case "EVE_DESTROY_IMAGES_RETAINED":
-      return "Rerun eden destroy with the same --project, --env, and --name: it deletes what the registry still lists, verifies the registry, and clears the target's CURRENT pointer. A rerun that finds nothing left reports absent; nothing more is needed then. Deleting tags by hand with npx wrangler@4.147.0 containers images delete <repository:tag> removes no sha256: entry, so rerun eden destroy afterwards. An object with one of the three kept answers (refused-snapshot, refused-singleton-artifact, accepted-still-listed) is reported as EVE_REGISTRY_OBJECTS_KEPT and does not count here. Eden reads the registry's listing and each answer with direct requests to registry.cloudflare.com and never uses a proxy for them; if this machine cannot reach the registry directly, rerun eden destroy from one that can.";
+      return `Rerun eden destroy with the same --project, --env, and --name: it deletes what the registry still lists, verifies the registry, and clears the target's CURRENT pointer. A rerun that finds nothing left reports absent; nothing more is needed then. Deleting tags by hand with ${CF_COMMAND} containers images delete <repository:tag> removes no sha256: entry, so rerun eden destroy afterwards. An object with one of the three kept answers (refused-snapshot, refused-singleton-artifact, accepted-still-listed) is reported as EVE_REGISTRY_OBJECTS_KEPT and does not count here. Eden reads the registry's listing and each answer with direct requests to registry.cloudflare.com and never uses a proxy for them; if this machine cannot reach the registry directly, rerun eden destroy from one that can.`;
     case "EVE_DESTROY_POINTER_UNCLEARED":
       return "The Cloudflare resources are gone; only the local .eden/eve-deploy/targets/<env>-<name>/CURRENT pointer is left. Check that the .eden folder is writable, then rerun eden destroy with the same --project, --env, and --name.";
     case "EVE_EXECUTION_FAILED":

@@ -4,6 +4,109 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for the move to cf (2026-11-20)
+
+Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
+Cloudflare account, with `cf` `1.0.0-rc.2` and an OAuth login, on branch
+`eden-19/cf-cli`. From `331ff53` on, Eden reads Cloudflare's API itself and
+takes the login's token from `cf`. `CLOUDFLARE_API_TOKEN` was not set, so
+every API read in these runs used that token.
+
+At `8612338`, where the listener that takes the token keeps its port until
+`cf` has exited, and with Eve `1.1.0` as the latest fixture:
+
+- Full run of `pnpm run check:live`, target `eden-live-20261120-e2e38459`,
+  `17:41:53Z` to `17:55:44Z`, Eve `0.91.0` to `1.1.0`. All 18 steps
+  passed. Preflight passed 14 checks in 75 seconds. `cf deploy` was
+  interrupted and exited 1 after 5 refused reads; Eden ran
+  `cf containers applications create` and `cf workers triggers deploy`,
+  both exit 0, and the fresh deploy took 170 seconds. The update took 119
+  seconds and the deploy on Eve `1.1.0` 170 seconds. `eden destroy` took 52
+  seconds and reported 15 kept registry objects; nothing else of the target
+  remained.
+- The run before it at the same commit failed
+  (`eden-live-20261120-a33b677f`, `17:31:34Z` to `17:37:56Z`). The fresh
+  deploy passed. The update stopped before the build with
+  `VAL-CLI-007-TARGET-CONFLICT` (`did not return a complete exact-target
+  result`) and `VAL-HOST-006`, and published nothing. Destroy then passed.
+  Which read failed was not recorded. Afterwards 40 rounds of taking the
+  token, `cf auth whoami`, and one API read all succeeded, and the rerun
+  above passed.
+- **A first deploy of a new name** (`eden19-f4`, `17:55Z` to `18:00Z`):
+  deploy exited 0 with health 200, a second deploy exited 0, destroy exited
+  0, and health was 404. The same sequence passed on `eden19-f3`
+  (`17:26Z` to `17:31Z`).
+
+At `331ff53`, full run of `pnpm run check:live`, target `eden-live-20261120-11615232`,
+`16:27:03Z` to `16:42:14Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+this workspace (version `0.14.0`), a 90-second idle window. All 18 steps
+passed on the first run.
+
+- `eden preflight` passed 14 checks with no warnings in 95 seconds.
+- The check interrupts its first `cf deploy` after the upload. `cf deploy`
+  exited 1 after 5 refused reads of the uploaded version. Eden then ran
+  `cf containers applications create` and `cf workers triggers deploy`, both
+  exit 0, and the fresh deploy ended in 168 seconds with health ready.
+- The same-version update took 123 seconds and the deploy on Eve `1.0.2`
+  202 seconds, on the same URL. Both carried `EVE_UPDATE_IN_FLIGHT`. The
+  update reported `VAL-LIFE-007` passed: `The superseded image was deleted
+  from the registry by its tag after promotion.`
+- The first session answered after each deploy and after the sleep, with its
+  earlier turns in its stream and its file intact. After 165 seconds with no
+  requests the first health request took 5 seconds, and the server process
+  was 10 seconds old.
+- No `queueAuthMode` line on Eve `1.0.2`. An unauthenticated session request
+  got `401`, and the two workflow queue routes answered `404`.
+- `eden destroy` ended in 58 seconds and reported 18 objects in
+  `EVE_REGISTRY_OBJECTS_KEPT`. The check then read Cloudflare's API as Eden
+  does and found the URL at 404, no Worker, no secrets, no Container
+  application, and nothing in the registry's listing except those 18.
+
+Other runs at `331ff53`, each on a disposable target that was destroyed
+afterwards:
+
+- **A half-published target** (`eden19-m3`, `16:19Z` to `16:21Z`):
+  `cf deploy` was interrupted after its upload and Container application
+  creation was blocked. The deploy ended `DEPLOY_INDETERMINATE` with the
+  Worker present and no Container application. `eden destroy` exited 0,
+  and `cf workers get` and `cf workers deployments list` then printed code
+  `10007`.
+- **Planted files** (`eden19-m3`, `16:21Z` to `16:26Z`): with a `.env` naming
+  another account and a token, and a `cloudflare.config.ts` that writes a
+  file, in the project and in its parent folder, deploy exited 0 with health
+  200. The Worker and the Container application were in the checked account,
+  and the planted config had not run. Destroy exited 0 and health was 404.
+- **A first deploy of a new name** (`eden19-f3`, `16:12Z` to `16:17Z`, on the
+  working tree that was then committed as `331ff53`): deploy exited 0 with
+  health 200, a second deploy exited 0, destroy exited 0, and health was
+  404.
+
+Earlier the same day, before Eden read the API itself:
+
+- The full check passed at `874c228` (`14:14:49Z` to `14:41:37Z`, target
+  `eden-live-20261120-2f9fbb2c`) and at `8afaf17` (`13:48:13Z` to
+  `14:03:26Z`, target `eden-live-20261120-218e40a3`).
+- **Cloudflare was slow to show new Workers.** Its reads answered `This
+  Worker does not exist` for up to about 25 seconds after `cf` had uploaded
+  one. `cf deploy` itself failed that way without the check's interruption,
+  and so did `cf workers triggers deploy`. At `19a0723` and `8afaf17` Eden
+  got waits for these reads and steps; before them, deploys of
+  `eden19-m2` and `eden19-m3` ended `DEPLOY_INDETERMINATE`.
+- **API token login** (`eden19-tok`, at `0c3710e`): with
+  `CLOUDFLARE_API_TOKEN` set, `cf auth whoami` reported the token as its
+  source and the saved login as overridden. Preflight, a first
+  deploy, an update, and destroy exited 0. The token came from Cloudflare's
+  "Edit Cloudflare Workers" template, unchanged. At that commit `cf` made
+  the reads. The token was revoked afterwards, so this was not run again at
+  `331ff53`.
+- **A deployment made by Eden 0.14.0** (`eden19-m1`, before the merge of
+  `0.14.0` into the branch): this build updated it (health 200) and later
+  destroyed it (health 404). Eden `0.14.0` run on the target after this
+  build had deployed it exited 1 with `DEPLOY_INDETERMINATE`; health stayed
+  200.
+
+Not run: an API token against Eden's own API reads, an account that has no
+`workers.dev` subdomain, and an account that has no Worker.
 ## Live check with Eve 1.1.0 (2026-11-20)
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare

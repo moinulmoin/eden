@@ -44,10 +44,13 @@ Docs: https://github.com/moinulmoin/eden (failure and warning codes:
 
 ## Machine and account
 
-- macOS or Linux, Node `>=24.17.0`
+- macOS or Linux, Node `^24.22.0 || ^26.12.0` (any other
+  stops with `EVE_NODE_UNSUPPORTED`)
 - Docker or OrbStack running, with linux/amd64 support
-- Cloudflare Workers Paid plan (Containers need it), and Wrangler logged in:
-  `npx wrangler@4.147.0 login` (the user must do this in a browser)
+- Cloudflare Workers Paid plan (Containers need it), and Cloudflare's `cf`
+  CLI signed in: `npx cf@1.0.0-rc.2 auth login` (the user must do this in a
+  browser), or `CLOUDFLARE_API_TOKEN` set. `cf` does not read a Wrangler
+  login, which Eden 0.14 and earlier used.
 
 ## Project setup Cloudflare needs
 
@@ -257,10 +260,28 @@ the agent sleeps takes about 10–15 seconds.
 - `VAL-CLI-007-TARGET-CONFLICT`: a resource with that name exists that Eden
   cannot prove it owns. For a brand-new agent, pick another `--name`; never
   delete the resource to make room.
-- `VAL-CLI-007-CLOUDFLARE-ACCESS`: Wrangler is not logged in or the account
-  lacks Workers Paid/Containers. It is checked before the build. The user has
-  to fix this (`npx wrangler@4.147.0 login`, then
-  `npx wrangler@4.147.0 whoami`).
+- `VAL-CLI-007-CLOUDFLARE-ACCESS`: `cf` is not signed in, its sign-in does
+  not show exactly one account, or the account lacks Workers
+  Paid/Containers. It is checked before the build. The user has to fix this
+  (`npx cf@1.0.0-rc.2 auth login --profile default`, then
+  `npx cf@1.0.0-rc.2 auth whoami --profile default`; name the profile in
+  `CLOUDFLARE_AUTH_PROFILE` in place of `default` when one is set), or set
+  `CLOUDFLARE_API_TOKEN`.
+- `EVE_NODE_UNSUPPORTED`: Node is not 24.22.0 or newer on the 24 line, or
+  26.12.0 or newer on the 26 line. Install Node 24 (for example
+  `nvm install 24`), then run the command again.
+- `EVE_CF_UNAVAILABLE`: the `cf` installed beside Eden is missing or is not
+  1.0.0-rc.2. Install `@moinulmoin/eden` again; do not install another `cf`
+  over it.
+- `VAL-CLI-007-CLOUDFLARE-ACCESS` with `CLOUDFLARE_API_TOKEN` or
+  `CLOUDFLARE_ACCOUNT_ID` in its remediation: signing in again does not
+  help. Correct or unset the variable it names.
+- `VAL-CLI-007-CLOUDFLARE-ACCESS` saying Eden `could not take its login's
+  token`, or `EVE_CF_LOGIN_TOKEN_UNAVAILABLE` from destroy: Eden reads
+  Cloudflare's API with the token of the `cf` login, which it takes from
+  `cf` on `127.0.0.1` for one command. Confirm the login with
+  `npx cf@1.0.0-rc.2 auth whoami` and retry, or have the user set
+  `CLOUDFLARE_API_TOKEN`, which Eden then uses and asks `cf` for nothing.
 - `node: <path>: not found` with exit status 9 and no JSON: the `--env-file`
   path does not exist. `npx` stopped before Eden started. Correct the path.
   With `--` before the package name (`npx -- @moinulmoin/eden preflight
@@ -273,9 +294,10 @@ the agent sleeps takes about 10–15 seconds.
   same `--project`, `--env`, and `--name`. Never switch to a new name to get
   past it, never delete resources by prefix, and never delete the project's
   `.eden/` folder: it is the ownership proof `destroy` needs.
-  One exception: when the message says Wrangler did not finish applying
-  the Container application settings, do not retry. Do what the printed
-  remediation says and nothing more. It names `eden destroy` only for a
-  target's first deploy; for a target that was deployed before, inspect and
-  stop. Never delete a Worker yourself.
+  When the message says Cloudflare has this publish's Worker version but
+  its Container application or triggers could not be set up, run
+  `eden deploy` again with the same selectors, as the printed remediation
+  says. For a target's first deploy the remediation also names
+  `eden destroy` as the way to remove it instead. Never delete a Worker
+  yourself.
 - Look up any other code in `docs/troubleshooting.md`.

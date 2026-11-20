@@ -1,6 +1,8 @@
 export {
   EDEN_AFFINITY_CONTRACT,
   callDeploymentControlRpc,
+  EVE_HOST_BUNDLE_MODULE,
+  createEveHostBuildOutput,
   createEveHostConfig,
   generateEveHostWorkerSource,
   parseEveScheduleCron,
