@@ -1,6 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 — 2026-11-20
+
+Eden now runs Cloudflare's `cf` CLI, pinned to `1.0.0-rc.2`, instead of
+Wrangler, and Eve `1.1.0` is the latest tested Eve. A publish that
+`cf deploy` leaves half done is finished by Eden, and `eden destroy`
+removes a first deploy that was only half published. Update
+`@moinulmoin/eden`.
+
+The full live check passed on Cloudflare at the commit this release was cut
+from, through the `cf` OAuth login: a fresh deploy with `cf deploy`
+interrupted on purpose, a same-version update, an upgrade from Eve `0.91.0`
+to `1.1.0`, a sleep and wake, and a destroy. The record is in
+`docs/eve-compatibility-history.md`.
+
+### Upgrading from 0.14.0
+
+- Eden needs Node `24.22` or newer (`^24.22.0 || ^26.12.0`). On any other
+  Node, `preflight`, `deploy`, and `destroy` stop with
+  `EVE_NODE_UNSUPPORTED`.
+- `cf` does not read the Wrangler login. Run
+  `npx cf@1.0.0-rc.2 auth login` once, unless `CLOUDFLARE_API_TOKEN` is
+  set. Until then `preflight` and `deploy` stop with
+  `VAL-CLI-007-CLOUDFLARE-ACCESS`.
+- No project change is needed, for Eve `1.1.0` or for `cf`. The `.eden/`
+  folder and deployed targets need no change.
+- Going back is not supported. Eden `0.14.0` run against a target that
+  this version deployed exits 1 with `DEPLOY_INDETERMINATE`, and the live
+  deployment keeps answering.
 
 ### Changed
 
@@ -82,8 +109,6 @@
   list that runs past twenty pages, is no proof of absence. `eden deploy`
   stops before it publishes when the account has two Container applications
   of the target's name.
-- Eden 0.14.0 cannot deploy a target this version deployed: it exits 1
-  with `DEPLOY_INDETERMINATE` and the live deployment keeps answering.
 - **`eden destroy` removes a first deploy that was only half published.**
   A Worker whose first publish stopped before its Container application
   existed is proven from the Worker version in service and the failed
