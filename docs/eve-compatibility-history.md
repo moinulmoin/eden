@@ -8,29 +8,31 @@ see [Eve compatibility](./eve-compatibility.md).
 
 Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
 Cloudflare account, with `cf` `1.0.0-rc.2` and an OAuth login, on branch
-`eden-19/cf-cli` at `8afaf17`. Later commits on the branch change docs only.
+`eden-19/cf-cli` at `874c228`. Later commits on the branch change docs only.
 
-Full run of `pnpm run check:live`, target `eden-live-20261120-218e40a3`,
-`13:48:13Z` to `14:03:26Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+Full run of `pnpm run check:live`, target `eden-live-20261120-2f9fbb2c`,
+`14:14:49Z` to `14:41:37Z`, Eve `0.91.0` to `1.0.2`, the World packed from
 this workspace (version `0.14.0`), a 90-second idle window. All 18 steps
-passed on the first run.
+passed on the first run. The same check had passed at `8afaf17` from
+`13:48:13Z` to `14:03:26Z` on target `eden-live-20261120-218e40a3`, with
+preflight in 75 seconds and the fresh deploy in 158 seconds.
 
-- `eden preflight` passed 14 checks with no warnings in 75 seconds.
+- `eden preflight` passed 14 checks with no warnings in 361 seconds.
 - The check interrupts its first `cf deploy` after the upload. `cf deploy`
   exited 1 after 5 refused reads of the uploaded version. Eden then ran
   `cf containers applications create` and `cf workers triggers deploy`, both
-  exit 0, and the fresh deploy ended in 158 seconds with health ready.
-- The same-version update took 126 seconds and the deploy on Eve `1.0.2`
-  227 seconds, on the same URL. Both carried `EVE_UPDATE_IN_FLIGHT`. The
+  exit 0, and the fresh deploy ended in 483 seconds with health ready.
+- The same-version update took 200 seconds and the deploy on Eve `1.0.2`
+  221 seconds, on the same URL. Both carried `EVE_UPDATE_IN_FLIGHT`. The
   update reported `VAL-LIFE-007` passed: `The superseded image was deleted
   from the registry by its tag after promotion.`
 - The first session answered after each deploy and after the sleep, with its
   earlier turns in its stream and its file intact. After 165 seconds with no
-  requests the first health request took 4.6 seconds, and the server process
-  was 6 seconds old.
+  requests the first health request took 4 seconds, and the server process
+  was 5 seconds old.
 - No `queueAuthMode` line on Eve `1.0.2`. An unauthenticated session request
   got `401`, and the two workflow queue routes answered `404`.
-- `eden destroy` ended in 54 seconds and reported 15 objects in
+- `eden destroy` ended in 55 seconds and reported 15 objects in
   `EVE_REGISTRY_OBJECTS_KEPT`. The check then found the URL at 404, no
   Worker, no secrets, no Container application, and nothing in the
   registry's listing except those 15.
@@ -55,8 +57,8 @@ afterwards:
   Worker and the Container application were in the checked account, and the
   planted config had not run.
 - **API token login** (`eden19-tok`, at `0c3710e`): with
-  `CLOUDFLARE_API_TOKEN` set and an empty `cf` config folder,
-  `cf auth whoami` reported the token as its source. Preflight, a first
+  `CLOUDFLARE_API_TOKEN` set, `cf auth whoami` reported the token as its
+  source and the saved login as overridden. Preflight, a first
   deploy, an update, and destroy exited 0. The token came from Cloudflare's
   "Edit Cloudflare Workers" template, unchanged.
 - **An account with no Worker, by stand-in** (`eden19-new`, at `8afaf17`):
