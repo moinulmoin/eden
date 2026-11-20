@@ -1,7 +1,7 @@
 import type * as ChildProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import type * as Https from "node:https";
 import type * as TimersPromises from "node:timers/promises";
@@ -65,6 +65,17 @@ const cloud = vi.hoisted(() => {
     secrets: [] as string[],
     /** Each image cf pushed, as account/repository:tag. */
     pushed: [] as string[],
+    /**
+     * A stand-in for an account that has no Worker: "cf workers list" prints an
+     * empty list. No such account was available to capture.
+     */
+    newAccount: false,
+    /** A stand-in for an account with no workers.dev subdomain: a Worker's subdomain carries no URL. Not captured. */
+    noSubdomain: false,
+    /** Whether Cloudflare fails to delete the temporary Worker. */
+    probeStays: false,
+    /** Each temporary Worker cf deployed, as account/worker. */
+    probes: [] as string[],
     /** When set, how "cf deploy" exits 1: before it uploads anything, or with the Worker version live and no Container application. */
     deployFailure: undefined as "before-upload" | "after-upload" | undefined,
     /** Whether "cf containers applications create" fails. */
@@ -167,7 +178,15 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
     if (command === "workers get") {
       if (cloud.workerGet !== undefined) return cloud.workerGet;
       return cloud.workers.has(account + "/" + args[2])
-        ? ok({ name: args[2] })
+        // The subdomain object as cf printed it for a Worker deployed with no URL on 2026-11-20.
+        ? ok({
+          name: args[2],
+          subdomain: {
+            enabled: false,
+            previews_enabled: false,
+            ...(cloud.noSubdomain ? {} : { url: "https://" + String(args[2]) + ".account.workers.dev" }),
+          },
+        })
         : cloud.apiError(10007, "This Worker does not exist on your account.", "404 Not Found", "/accounts/" + account + "/workers/workers/" + args[2]);
     }
     if (command === "workers versions get") {
@@ -196,7 +215,9 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
         ? ok({ id: args[3], scheduling_policy: "durable_object", durable_objects: { namespace_id: cloud.namespace } })
         : cloud.apiError(1609, "Container application not found: " + args[3], "404 Not Found", "/accounts/" + account + "/containers/applications/" + args[3]);
     }
-    if (command === "workers list") return ok([{ name: "another", subdomain: { enabled: true, url: "https://another.account.workers.dev" } }]);
+    if (command === "workers list") {
+      return ok(cloud.newAccount ? [] : [{ name: "another", subdomain: { enabled: true, url: "https://another.account.workers.dev" } }]);
+    }
     return ok({ account_id: account, registry_host: "registry.cloudflare.com", username: "v1", password: "registry-password" });
   }
   cloud.onMutation();
@@ -211,6 +232,11 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
     };
     // cf takes the Build Output's account before CLOUDFLARE_ACCOUNT_ID.
     const published = config.settings?.accountId ?? account;
+    if (worker.name.startsWith("eden-origin-probe-")) {
+      cloud.probes.push(published + "/" + worker.name + (existsSync(join(cwd, "cloudflare.config.ts")) ? "" : " without an inert config"));
+      cloud.workers.add(published + "/" + worker.name);
+      return { exitCode: 0 };
+    }
     if (command === "workers triggers deploy") {
       cloud.triggers.push(published + "/" + worker.name);
       return { exitCode: 0 };
@@ -253,6 +279,9 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
     return { exitCode: 0 };
   }
   if (command === "workers delete") {
+    if (cloud.probeStays && String(args[2]).startsWith("eden-origin-probe-")) {
+      return cloud.apiError(10013, "An unknown error has occurred.", "500 Internal Server Error", "/accounts/" + account + "/workers/workers/" + args[2]);
+    }
     if (!cloud.workers.delete(account + "/" + args[2])) {
       return cloud.apiError(10007, "This Worker does not exist on your account.", "404 Not Found", "/accounts/" + account + "/workers/workers/" + args[2]);
     }
@@ -407,6 +436,10 @@ beforeEach(() => {
     onRead: () => undefined,
     readAccounts: [],
     pinned: [],
+    newAccount: false,
+    noSubdomain: false,
+    probeStays: false,
+    probes: [],
     deployFailure: undefined,
     createFails: false,
     triggers: [],
@@ -506,7 +539,7 @@ async function writeBuild(snapshotRoot: string): Promise<void> {
   await symlink("../eve/bin/eve.js", join(snapshotRoot, "node_modules/.bin/eve"));
 }
 
-type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly remediation?: string }[] };
+type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly message?: string; readonly remediation?: string }[] };
 
 /** A deploy that publishes through Eden's own cf calls and its own read afterwards. */
 async function deploy(
@@ -1045,5 +1078,53 @@ describe("cf runs where nothing of the user's can choose the account or the cred
       "utf8",
     )) as unknown;
     expect(config).toMatchObject({ settings: { accountId: account } });
+  });
+});
+
+describe("the first deploy on a Cloudflare account that has no Worker yet", () => {
+  const account = "1".repeat(32);
+  const origin = (result: DeployResult) => result.checks?.find((check) => check.id === "VAL-HOST-006");
+
+  test("deploys, after a temporary Worker with no URL showed the workers.dev subdomain and was deleted", async () => {
+    const root = await deployableProject();
+    cloud.whoami = () => account;
+    cloud.newAccount = true;
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
+    expect(cloud.probes).toEqual([expect.stringMatching(new RegExp("^" + account + "/eden-origin-probe-[0-9a-f]{8}$", "u"))]);
+    expect(cloud.deleted).toEqual(["worker:" + String(cloud.probes[0])]);
+    expect([...cloud.workers]).toEqual([account + "/eve-deploy-fixture"]);
+    expect(cloud.stamps).toContainEqual({ type: "plain_text", name: "EVE_PUBLIC_ORIGIN", text: "https://eve-deploy-fixture.account.workers.dev" });
+  });
+
+  test("an account with no workers.dev subdomain stops the deploy with the page that registers one", async () => {
+    const root = await deployableProject();
+    cloud.whoami = () => account;
+    cloud.newAccount = true;
+    cloud.noSubdomain = true;
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DEPLOY_CHECKS_FAILED" });
+    expect(origin(result)).toMatchObject({
+      status: "failed",
+      message: "Cloudflare gave no workers.dev URL for a Worker of this account.",
+      remediation: "Register the account's workers.dev subdomain at https://dash.cloudflare.com/" + account +
+        "/workers/onboarding, then run the command again.",
+    });
+    expect({ workers: [...cloud.workers], pushed: cloud.pushed }).toEqual({ workers: [], pushed: [] });
+  });
+
+  test("a temporary Worker that Cloudflare does not delete is named with the command that deletes it", async () => {
+    const root = await deployableProject();
+    cloud.whoami = () => account;
+    cloud.newAccount = true;
+    cloud.probeStays = true;
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    const name = String(cloud.probes[0]).split("/")[1];
+    expect(exitCode).toBe(1);
+    expect(origin(result)).toMatchObject({
+      status: "failed",
+      remediation: "Run npx cf@1.0.0-rc.2 workers delete " + String(name) + " --force, then run the command again.",
+    });
+    expect(cloud.pushed).toEqual([]);
   });
 });

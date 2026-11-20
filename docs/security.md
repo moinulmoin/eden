@@ -131,10 +131,11 @@ never switches accounts silently. For each target it creates one Worker, one
 Container application, its Durable Objects, registry images, and, only when
 your project has schedules, one Cron Trigger. The exact names are listed in
 the [reference](./reference.md).
+On an account with no Worker yet, `eden deploy` also deploys and deletes one
+temporary Worker named `eden-origin-probe-<8 hex characters>`, which has no
+URL and no bindings, to read the account's `workers.dev` subdomain.
 Eden reads the target's state through `cf`. Eden sends requests of its own
-to two places only: `registry.cloudflare.com`, and Cloudflare's API for the
-[`workers.dev` subdomain](#what-eden-can-and-cannot-read) of an account that
-has no Worker yet. Its own requests to `registry.cloudflare.com` can change
+to one place only: `registry.cloudflare.com`. Those requests can change
 something. They name only repositories that the deployment record proves
 this target owns. When `eden destroy` or an update cleans up such a
 repository, Eden:
@@ -183,13 +184,14 @@ from disk. Eden 0.14 and earlier read Wrangler's saved token; this version
 only checks whether Wrangler's login file exists, to explain a signed-out
 `cf`, and never opens it.
 
-Eden itself uses `CLOUDFLARE_API_TOKEN` for one request only. `cf` has no
+Eden itself never reads or sends `CLOUDFLARE_API_TOKEN`; only `cf` uses it,
+as its login. `cf` has no
 command for the account's `workers.dev` subdomain, so Eden reads it from the
 URL of any Worker the account already has (`cf workers list --per-page 1`).
-When the account has no Worker yet, Eden asks Cloudflare's API directly with
-`CLOUDFLARE_API_TOKEN`, following no redirect. With neither, deploy stops
-with [`EVE_ORIGIN_UNAVAILABLE`](./troubleshooting.md#eve_origin_unavailable).
-`cf` also uses the variable as its login.
+When the account has no Worker yet, `eden deploy` deploys one temporary
+Worker with no URL, reads its `workers.dev` URL, and deletes it, as
+[`EVE_ORIGIN_UNAVAILABLE`](./troubleshooting.md#eve_origin_unavailable)
+describes.
 
 Every `cf` command runs in a fresh, private temporary folder that Eden
 creates outside the project and deletes afterwards. The folder holds an

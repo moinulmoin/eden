@@ -121,7 +121,7 @@ function eveErrorRemediation(code: string): string {
     case "EVE_UPDATE_RECORD_UNAVAILABLE":
       return "Re-run the last successful deploy generation, or destroy the exact target with eden destroy.";
     case "EVE_ORIGIN_UNAVAILABLE":
-      return `Eden reads the account's workers.dev subdomain from a Worker the account already has, or directly with CLOUDFLARE_API_TOKEN. Confirm the account with ${CF_COMMAND} auth whoami and that it has a workers.dev subdomain (Cloudflare dashboard, Workers & Pages). If the account has no Worker yet, set CLOUDFLARE_API_TOKEN for this one deploy, then retry.`;
+      return `Eden reads the account's workers.dev subdomain from the URL of a Worker of the account. Confirm the account with ${CF_COMMAND} auth whoami and that it has a workers.dev subdomain (Cloudflare dashboard, Workers & Pages), then retry.`;
     case "EVE_HOST_CONFIG_INVALID":
       return "Correct the value the message names, then rerun eden deploy.";
     case "EVE_PROJECT_ROOT_INVALID":

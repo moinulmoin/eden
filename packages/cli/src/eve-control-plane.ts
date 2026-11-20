@@ -260,6 +260,8 @@ export interface EveCloudflareReadResult {
   readonly containerAccess: "available" | "unavailable";
   readonly accountId?: string;
   readonly workersDevSubdomain?: string;
+  /** Why there is no subdomain, when the read knows and the user can act on it. */
+  readonly originProblem?: { readonly message: string; readonly remediation: string };
   readonly stableWorkersDevOrigin?: string;
   readonly target: {
     readonly state: EveCloudflareTargetState;
@@ -1586,52 +1588,93 @@ async function wranglerLoginSaved(): Promise<boolean> {
  * yet can only be asked directly, which needs CLOUDFLARE_API_TOKEN: cf keeps
  * its own login's token where Eden cannot read it.
  */
+interface WorkersDevRead {
+  readonly subdomain?: string;
+  /** Why there is no subdomain, when Eden knows and the user can act on it. */
+  readonly problem?: { readonly message: string; readonly remediation: string };
+}
+
+/**
+ * The account's workers.dev subdomain. cf has no command for it, so Eden
+ * reads it from the URL Cloudflare gives for any Worker of the account. For
+ * a deploy, an account with no Worker gets a temporary one: it is deployed
+ * with no URL, read, and deleted in this same call. Preflight changes nothing
+ * and needs no origin, so it reads no subdomain there.
+ */
 async function readWorkersDevSubdomain(
   cf: CloudflareCliRunner,
   accountId: string | undefined,
-): Promise<string | undefined> {
-  if (accountId === undefined) return undefined;
+  progress: ((stage: string) => void) | undefined,
+): Promise<WorkersDevRead> {
+  if (accountId === undefined) return {};
+  const unregistered = {
+    message: "Cloudflare gave no workers.dev URL for a Worker of this account.",
+    remediation:
+      `Register the account's workers.dev subdomain at https://dash.cloudflare.com/${accountId}/workers/onboarding, then run the command again.`,
+  };
+  const subdomainOf = (worker: unknown): WorkersDevRead => {
+    const url = typeof worker === "object" && worker !== null && "subdomain" in worker &&
+        typeof worker.subdomain === "object" && worker.subdomain !== null && "url" in worker.subdomain
+      ? worker.subdomain.url
+      : undefined;
+    const subdomain = typeof url === "string"
+      ? /^https:\/\/[^./]+\.([^./]+)\.workers\.dev$/u.exec(url)?.[1]
+      : undefined;
+    return subdomain !== undefined && EVE_NAME_PATTERN.test(subdomain) ? { subdomain } : { problem: unregistered };
+  };
   const listed = cloudflareCliJson(
     await cf({ args: ["workers", "list", "--per-page", "1"], accountId, timeoutMs: 30_000 }),
+  )?.value;
+  if (!Array.isArray(listed)) return {};
+  if (listed.length > 0) return subdomainOf(listed[0]);
+  if (progress === undefined) return {};
+
+  const name = `eden-origin-probe-${randomUUID().slice(0, 8)}`;
+  progress(
+    `this Cloudflare account has no Worker yet: deploying the temporary Worker ${name}, which gets no URL, to read the account's workers.dev subdomain, then deleting it`,
   );
-  const first: unknown = Array.isArray(listed?.value) ? listed.value[0] : undefined;
-  const url = typeof first === "object" && first !== null && "subdomain" in first &&
-      typeof first.subdomain === "object" && first.subdomain !== null && "url" in first.subdomain
-    ? first.subdomain.url
-    : undefined;
-  const fromWorker = typeof url === "string"
-    ? /^https:\/\/[^./]+\.([^./]+)\.workers\.dev$/u.exec(url)?.[1]
-    : undefined;
-  if (fromWorker !== undefined && EVE_NAME_PATTERN.test(fromWorker)) return fromWorker;
-  const token = process.env.CLOUDFLARE_API_TOKEN;
-  if (token === undefined || token.length === 0) return undefined;
-  try {
-    const response = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/json",
-        },
-        redirect: "error",
-        signal: AbortSignal.timeout(30_000),
-      },
-    );
-    if (!response.ok) return undefined;
-    const body = await response.json() as unknown;
-    const result = typeof body === "object" && body !== null
-      ? (body as { readonly result?: unknown }).result
-      : undefined;
-    const subdomain = typeof result === "object" && result !== null
-      ? (result as { readonly subdomain?: unknown }).subdomain
-      : undefined;
-    return typeof subdomain === "string" &&
-        EVE_NAME_PATTERN.test(subdomain)
-      ? subdomain
-      : undefined;
-  } catch {
-    return undefined;
+  const output = ".cloudflare/output/v1";
+  const deployed = await cf({
+    args: ["deploy", "--prebuilt"],
+    accountId,
+    timeoutMs: 120_000,
+    files: {
+      [`${output}/config.json`]: JSON.stringify({ settings: { accountId }, buildContext: { isPreview: false } }),
+      [`${output}/workers/default/worker.config.json`]: JSON.stringify({
+        name,
+        compatibilityDate: "2026-04-01",
+        workersDev: false,
+        manifest: { type: "complete", mainModule: "worker.js", modules: { "worker.js": { type: "esm" } } },
+      }),
+      [`${output}/workers/default/bundle/worker.js`]:
+        "export default { fetch() { return new Response(null, { status: 404 }); } };\n",
+    },
+  });
+  let worker: unknown;
+  // Cloudflare can take a while to show a Worker it just accepted.
+  for (let attempt = 0; deployed.exitCode === 0 && worker === undefined && attempt < 12; attempt += 1) {
+    if (attempt > 0) await waitForActivation(5_000);
+    worker = cloudflareCliJson(
+      await cf({ args: ["workers", "get", name], accountId, timeoutMs: 30_000 }),
+    )?.value;
   }
+  if (await defaultWorkerDelete(cf)({ accountId, name }) === "indeterminate") {
+    return {
+      problem: {
+        message: `Eden deployed the temporary Worker ${name} to read the account's workers.dev subdomain and could not delete it.`,
+        remediation: `Run ${CF_COMMAND} workers delete ${name} --force, then run the command again.`,
+      },
+    };
+  }
+  if (worker !== undefined) return subdomainOf(worker);
+  return {
+    problem: {
+      message:
+        "This Cloudflare account has no Worker yet, and the temporary Worker Eden deploys to read the account's workers.dev subdomain could not be deployed or read.",
+      remediation:
+        `Run the command again. If it fails the same way, check that the account has a workers.dev subdomain at https://dash.cloudflare.com/${accountId}/workers/onboarding.`,
+    },
+  };
 }
 
 /**
@@ -1756,6 +1799,8 @@ async function defaultCloudflareRead(
   request: EveCloudflareReadRequest,
   /** The account the check before the build named. */
   checkedAccountId: string | undefined,
+  /** Given by deploy only: with it, an account with no Worker gets the temporary one. */
+  progress: ((stage: string) => void) | undefined,
 ): Promise<EveCloudflareReadResult> {
   const account = await readCloudflareLogin(cf);
   const loginAccountId = authenticatedAccountId(account.value);
@@ -1775,7 +1820,11 @@ async function defaultCloudflareRead(
   const containerAccess = containerEntries === undefined
     ? "unavailable"
     : "available";
-  const workersDevSubdomain = await readWorkersDevSubdomain(cf, accountId);
+  const { subdomain: workersDevSubdomain, problem: originProblem } = await readWorkersDevSubdomain(
+    cf,
+    accountId,
+    progress,
+  );
   if (
     accountAccess === "unavailable" ||
     containerAccess === "unavailable" ||
@@ -1812,6 +1861,7 @@ async function defaultCloudflareRead(
       ...(workersDevSubdomain === undefined
         ? {}
         : { workersDevSubdomain }),
+      ...(originProblem === undefined ? {} : { originProblem }),
       target: { state: "absent" },
     };
   }
@@ -2135,9 +2185,15 @@ async function readEveCloudflareTarget(
   request: EveCloudflareReadRequest,
   options: EvePreflightOptions,
   checkedAccountId: string | undefined,
+  forDeploy = false,
 ): Promise<EveCloudflareReadResult> {
   const result = options.cloudflareRead === undefined
-    ? await defaultCloudflareRead(options.cloudflareCli ?? runCloudflareCli, request, checkedAccountId)
+    ? await defaultCloudflareRead(
+      options.cloudflareCli ?? runCloudflareCli,
+      request,
+      checkedAccountId,
+      forDeploy ? (stage) => eveProgress(options, stage) : undefined,
+    )
     : await options.cloudflareRead(request);
   return resolveEveTargetOwnership(request, result);
 }
@@ -4438,6 +4494,7 @@ async function collectEvePreflight(
         },
         options,
         checkedAccountId,
+        true,
       );
     } catch {
       await discardPackagingImage();
@@ -4497,8 +4554,10 @@ async function collectEvePreflight(
         check(
           "VAL-HOST-006",
           "failed",
-          "The authenticated Cloudflare read did not prove the exact workers.dev origin before Eve initialization.",
-          "Return one authenticated account ID, one workers.dev subdomain, and the exact Worker-origin binding.",
+          cloudflare.originProblem?.message ??
+            "The authenticated Cloudflare read did not prove the exact workers.dev origin before Eve initialization.",
+          cloudflare.originProblem?.remediation ??
+            "Return one authenticated account ID, one workers.dev subdomain, and the exact Worker-origin binding.",
         ),
       );
     }
@@ -4818,7 +4877,7 @@ export async function runEveControlPlane(
           : "EVE_PREFLIGHT_FAILED",
         message:
           request.command === "deploy"
-            ? "The inline Eve deploy checks failed; no remote mutation was attempted."
+            ? "The inline Eve deploy checks failed; nothing was published for this target."
             : "The Eve preflight checks failed; no remote mutation or active-state promotion was attempted.",
       });
     }

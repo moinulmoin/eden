@@ -46,9 +46,13 @@
   does not name stay.
 - **The `workers.dev` subdomain is read from a Worker the account already
   has.** `cf` has no command for it. On an account with no Worker yet,
-  Eden asks Cloudflare's API directly, which needs `CLOUDFLARE_API_TOKEN`.
-  With neither, deploy stops with `EVE_ORIGIN_UNAVAILABLE` and a
-  remediation that says to set the token for that one deploy.
+  `eden deploy` deploys a temporary Worker with no URL, named
+  `eden-origin-probe-<id>`, reads its `workers.dev` URL, and deletes it
+  before the build. `eden preflight` never does this. Eden no longer sends
+  `CLOUDFLARE_API_TOKEN` itself. When this fails, check `VAL-HOST-006` names
+  the page that registers a subdomain or the command that deletes the
+  temporary Worker. The message of `EVE_DEPLOY_CHECKS_FAILED` now ends
+  `nothing was published for this target`.
 - The generation folder holds a Build Output
   (`worker/.cloudflare/output/v1/`) instead of `worker/worker.ts` and
   `worker/wrangler.jsonc`.

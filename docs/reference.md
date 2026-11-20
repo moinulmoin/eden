@@ -48,9 +48,9 @@ Preflight changes nothing in your Cloudflare account: it performs read-only
 `cf` commands (`cf auth whoami`, `cf containers applications list --name`
 and `get`, `cf workers deployments list`, `cf workers versions get`, and
 `cf workers list --per-page 1` for the `workers.dev` subdomain) and never
-uploads, publishes, or deletes. When the account has no Worker yet, Eden
-reads the subdomain with one direct request to Cloudflare's API, which needs
-`CLOUDFLARE_API_TOKEN`. The login and Container reads run once before
+uploads, publishes, or deletes. When the account has no Worker yet,
+preflight reads no subdomain, and `eden deploy` learns it from a
+[temporary Worker](./troubleshooting.md#eve_origin_unavailable). The login and Container reads run once before
 the build and again with the target reads after it. Locally it writes one generation directory
 under `.eden/eve-deploy/generations/` and removes the Docker images it built.
 
@@ -386,11 +386,11 @@ in the account.
 | Variable | Read by | Effect |
 | --- | --- | --- |
 | `EDEN_EVE_CONTAINER_SLEEP_AFTER` | `eden deploy` | Sets the container idle sleep window. Format: a number with an optional `ms`, `s`, `m`, `h`, or `d` suffix, where a bare number means seconds (`90s`, `3h`). Default `1h`; the maximum is `345m` (5 h 45 min), because Cloudflare stops a container within six hours of its Durable Object going idle and Eden must snapshot before that. A larger value fails the publish step with `EVE_HOST_CONFIG_INVALID`; the Worker-side check is `HOST_READINESS_UNPROVEN` |
-| `CLOUDFLARE_API_TOKEN` | `cf` and Eden | `cf` uses it as its login instead of `cf auth login`. Eden itself uses it for one request only: reading the account's `workers.dev` subdomain from Cloudflare's API when the account has no Worker yet |
+| `CLOUDFLARE_API_TOKEN` | `cf` and Eden | `cf` uses it as its login instead of `cf auth login`. Eden itself never sends it |
 | `CLOUDFLARE_AUTH_PROFILE` | `cf` | Passed from your shell to `cf` unchanged |
 | `WRANGLER_HOME` | Eden | No longer used for credentials. Eden only checks whether a Wrangler login file (`config/default.toml`) exists there, to say so in `VAL-CLI-007-CLOUDFLARE-ACCESS` when `cf` is signed out. Otherwise it looks in `~/.wrangler` when present, then `$XDG_CONFIG_HOME/.wrangler`, or `~/Library/Preferences/.wrangler` on macOS and `~/.config/.wrangler` elsewhere. Eden never reads the file's contents |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY` | Eden and `cf` | Passed from your shell to the Docker CLI and the `cf` image push, so both use the same daemon and credentials |
-| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and `cf` | Passed from your shell to Docker and `cf`. Eden's one direct request to Cloudflare's API (the `workers.dev` subdomain) uses Node's `fetch`, which used these variables only with `NODE_USE_ENV_PROXY=1` set when tested on Node 24.21.0. [Eden's own registry requests](./security.md#what-eden-can-change-in-your-cloudflare-account) never use a proxy |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and `cf` | Passed from your shell to Docker and `cf`. [Eden's own registry requests](./security.md#what-eden-can-change-in-your-cloudflare-account) never use a proxy |
 | `NODE_EXTRA_CA_CERTS`, `XDG_CONFIG_HOME`, `CLOUDFLARE_ACCOUNT_ID` | `cf` (configuration/account selection also checked by Eden) | Trusted shell settings for certificate trust, configuration location, and account selection; Eden still requires exactly one authenticated account, matching `CLOUDFLARE_ACCOUNT_ID` when set. After that check Eden sets `CLOUDFLARE_ACCOUNT_ID` to the checked account for every other `cf` command it runs |
 | `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `CF_SEND_TELEMETRY`, `DO_NOT_TRACK` | `cf` | Passed from your shell to `cf` unchanged. `cf` gets no other variable of yours: Eden also sets `CLOUDFLARE_API_BASE_URL` to `https://api.cloudflare.com/client/v4`, `NO_COLOR=1`, and `CF_QUIET=1` for every `cf` command |
 

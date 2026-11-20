@@ -459,11 +459,25 @@ declarations.
 
 ### `VAL-HOST-006` — the public origin could not be proven
 
-`The authenticated Cloudflare read did not prove the exact workers.dev origin
-before Eve initialization.` The read must return one account id, one
-`workers.dev` subdomain, and the exact Worker-origin binding. Eden reads the
-subdomain as [`EVE_ORIGIN_UNAVAILABLE`](#eve_origin_unavailable) describes;
-follow the steps there, then retry.
+Deploy could not learn the account's `workers.dev` subdomain, which is part
+of the deployment's URL. The check carries one of these messages:
+
+- `Cloudflare gave no workers.dev URL for a Worker of this account.` Register
+  the account's `workers.dev` subdomain at
+  `https://dash.cloudflare.com/<account id>/workers/onboarding`, then run the
+  command again. No account without a subdomain was available to test, so
+  this message has not been seen against Cloudflare.
+- `Eden deployed the temporary Worker <name> to read the account's
+  workers.dev subdomain and could not delete it.` Run
+  `npx cf@1.0.0-rc.2 workers delete <name> --force`, then run the command
+  again. The Worker has no URL and serves nothing.
+- `This Cloudflare account has no Worker yet, and the temporary Worker Eden
+  deploys to read the account's workers.dev subdomain could not be deployed
+  or read.` Run the command again. If it fails the same way, check the
+  onboarding page above.
+- `The authenticated Cloudflare read did not prove the exact workers.dev
+  origin before Eve initialization.` A `cf` read failed. Confirm the login
+  with `npx cf@1.0.0-rc.2 auth whoami` and retry.
 
 ### `EVE_ORIGIN_UNAVAILABLE`
 
@@ -472,17 +486,20 @@ the read-only resolver, or the authenticated origin did not match the exact
 Worker target.
 
 `cf` has no command for the account's `workers.dev` subdomain. Eden reads it
-from the URL of any Worker the account already has. When the account has no
-Worker yet, Eden asks Cloudflare's API directly, which needs
-`CLOUDFLARE_API_TOKEN`: Eden cannot read the token `cf auth login` saved.
-With neither, deploy stops here. To fix it:
+from the URL Cloudflare gives for any Worker the account already has
+(`cf workers list --per-page 1`).
 
-1. Confirm the account with `npx cf@1.0.0-rc.2 auth whoami`.
-2. Check in the Cloudflare dashboard, under Workers & Pages, that the
-   account has a `workers.dev` subdomain.
-3. If the account has no Worker yet, set `CLOUDFLARE_API_TOKEN` for this one
-   deploy, then retry. `cf` uses the same variable as its login for that
-   deploy.
+When the account has no Worker yet, `eden deploy` deploys a temporary Worker
+named `eden-origin-probe-<8 hex characters>` with `cf deploy --prebuilt`. It
+has no URL, no route, and no bindings, and answers nothing. Eden reads its
+`workers.dev` URL with `cf workers get` and deletes it with
+`cf workers delete --force`, all before the build. Human output shows one
+line that names it. On 2026-11-20 those three commands took about 20 seconds
+against Cloudflare. The account used for that run had other Workers, so the
+empty list itself was a stand-in. `eden preflight` never does this: it needs
+no origin and changes nothing.
+
+If this fails, the `VAL-HOST-006` check above says why and what to run.
 
 If the origin resolver rejects the Worker name or account subdomain
 (`HOST_ORIGIN_UNAVAILABLE`), the CLI reports its message under this code.
@@ -778,10 +795,11 @@ gate on the public URL, and the promotion of the generation.
 
 ### `EVE_DEPLOY_CHECKS_FAILED`
 
-`The inline Eve deploy checks failed; no remote mutation was attempted.`
+`The inline Eve deploy checks failed; nothing was published for this target.`
 The summary names the first failing check. Fix that check and retry. `eden
 preflight` runs the same checks and only reads remote state; it never mutates
-it.
+it. On a Cloudflare account with no Worker yet, deploy's checks deploy and
+delete one [temporary Worker](#eve_origin_unavailable).
 
 ### `EVE_PREFLIGHT_FAILED`
 

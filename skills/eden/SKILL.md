@@ -267,10 +267,11 @@ the agent sleeps takes about 10–15 seconds.
   or set `CLOUDFLARE_API_TOKEN`.
 - `EVE_NODE_UNSUPPORTED`: Node is older than 24.22.0. Install Node 24.22.0
   or newer (for example `nvm install 24`), then run the command again.
-- `EVE_ORIGIN_UNAVAILABLE` on an account with no Worker yet: Eden reads the
-  `workers.dev` subdomain from an existing Worker, or directly with
-  `CLOUDFLARE_API_TOKEN`. Ask the user to set `CLOUDFLARE_API_TOKEN` for
-  this one deploy.
+- First deploy on an account with no Worker yet: `eden deploy` deploys and
+  deletes a temporary Worker `eden-origin-probe-<id>` to read the
+  `workers.dev` subdomain. If check `VAL-HOST-006` fails, follow its
+  remediation: it names the page that registers a subdomain, or the command
+  that deletes a leftover temporary Worker.
 - `node: <path>: not found` with exit status 9 and no JSON: the `--env-file`
   path does not exist. `npx` stopped before Eden started. Correct the path.
   With `--` before the package name (`npx -- @moinulmoin/eden preflight
