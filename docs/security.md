@@ -238,12 +238,17 @@ login cannot act on the checked account, the command fails.
   on a repository that holds the image it just promoted or the image of a
   version it still keeps. In that repository a same-version update deletes
   only the image it replaced, after the new deployment is healthy and
-  promoted. The deployment record names that image's repository and digest.
-  Eden deletes its `sha256:` entry, and of the two tags it can have (the
-  release ID of the deploy that pushed it, or `candidate` from Eden
-  `0.13.x` and older) only one the registry lists and resolves to that
-  digest. It deletes nothing when the repository also holds the image of a
-  kept version, or of a version whose retirement the record still names. Eden works with one spelling of an image,
+  promoted. The deployment record names that image's repository, its
+  digest, and its tag: the release ID of the deploy that pushed it
+  (`eve-deploy-<uuid>`). Eden deletes that tag, and then the image's
+  `sha256:` entry, only when the registry lists the tag and resolves it to
+  that digest. Wrangler's delete of a tag carries no digest, so this rests
+  on a release tag being unique to one push and never moved: Eden generates
+  it and pushes it once. Do not push to or retag a release tag by hand.
+  Eden never deletes `candidate` here, the tag Eden `0.13.x` and older
+  push, because an older CLI in another checkout can move it. It deletes
+  nothing when the repository also holds the image of a kept version, or of
+  a version whose retirement the record still names. Eden works with one spelling of an image,
   `registry.cloudflare.com/<account>/<repository>@sha256:<digest>`, and
   refuses any other reference before it changes anything on the target. A recorded image that is
   not in that form cannot be placed in a repository, so it stops every

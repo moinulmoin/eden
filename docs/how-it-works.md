@@ -201,8 +201,8 @@ behavior and the warning that an Eve upgrade can strand sessions.
   Once the new deployment is healthy and promoted, Eden deletes the
   replaced image by its tag, and Cloudflare's registry then removes the
   image. Eden never deletes it earlier. It takes the replaced image's
-  repository and digest from the deployment record, and deletes a tag only
-  when the registry resolves it to that digest. It deletes nothing when the
+  repository, digest and release tag from the deployment record, and
+  deletes the tag only when the registry resolves it to that digest. It deletes nothing when the
   repository also holds the image of a kept version or of a version whose
   retirement the record still names. If the delete cannot be shown, the
   update still succeeds with the warning
@@ -214,8 +214,12 @@ behavior and the warning that an Eve upgrade can strand sessions.
   every image under the tag `candidate`, so each same-version update took
   the tag from the image before it. Cloudflare's registry does not remove an
   image that no tag names. This version still updates and destroys such a
-  target: the first same-version update deletes `candidate` when the
-  registry resolves it to the image being replaced, and with it that image. The images that had already lost the tag stay, and
+  target, and it never deletes or moves `candidate`. Its first same-version
+  update pushes under a release tag and leaves the replaced image under
+  `candidate`: `VAL-LIFE-007` is `skipped`. That image stays, still tagged,
+  until `eden destroy` or the retirement of that Eve version deletes
+  everything in the repository. From the second update on, the replaced
+  image goes at once. The images that had already lost the tag stay, and
   `eden destroy` reports them as `accepted-still-listed` in
   [`EVE_REGISTRY_OBJECTS_KEPT`](./troubleshooting.md#eve_registry_objects_kept).
 

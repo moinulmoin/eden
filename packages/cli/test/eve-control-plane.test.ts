@@ -4498,9 +4498,9 @@ describe("eden deploy in-place update", () => {
   }
 
   test.each([
-    ["this build pushed under the tag of its own deploy", "own"],
-    ["Eden 0.13.x pushed under the candidate tag", "candidate"],
-  ] as const)("an update of the same Eve version deletes the image it replaces, which %s", async (_name, prior) => {
+    ["this build pushed under the tag of its own deploy is deleted", "own"],
+    ["Eden 0.13.x pushed under the candidate tag is left tagged", "candidate"],
+  ] as const)("an update of the same Eve version deletes the image it replaces only by a tag of its own: the image %s", async (_name, prior) => {
     const root = await createRoot();
     const { state, images, deploy, stop } = await inPlaceUpdates(root);
     try {
@@ -4522,16 +4522,21 @@ describe("eden deploy in-place update", () => {
       const promotedTag = (state.pushed[1] as string).slice(repository.length + 1);
       expect(promotedTag).toMatch(/^eve-deploy-[0-9a-f-]{36}$/u);
       expect(promotedTag).not.toBe(priorTag);
-      expect(fakeRegistry.wranglerDeletes).toEqual([`${repository}:${priorTag}`]);
-      // Only the promoted image is left, and the image 0.13.x had already stranded.
-      expect(fakeRegistry.listed(repository)).toEqual([
-        promotedTag, manifest("d"), ...(prior === "candidate" ? [manifest("e")] : []),
-      ]);
-      expect(registryDeletes()).toEqual([`${repository}@${manifest("c")}`]);
-      expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")).toMatchObject({
-        status: "passed",
-        message: "The superseded image was deleted from the registry by its tag after promotion.",
-      });
+      if (prior === "candidate") {
+        // The 0.13.x image keeps its tag, so destroy can still remove it. Nothing is deleted or asked.
+        expect(fakeRegistry.wranglerDeletes).toEqual([]);
+        expect(registryDeletes()).toEqual([]);
+        expect(fakeRegistry.listed(repository)).toEqual(["candidate", promotedTag, manifest("c"), manifest("d"), manifest("e")]);
+        expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).toBe("skipped");
+      } else {
+        expect(fakeRegistry.wranglerDeletes).toEqual([`${repository}:${priorTag}`]);
+        expect(fakeRegistry.listed(repository)).toEqual([promotedTag, manifest("d")]);
+        expect(registryDeletes()).toEqual([`${repository}@${manifest("c")}`]);
+        expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")).toMatchObject({
+          status: "passed",
+          message: "The superseded image was deleted from the registry by its tag after promotion.",
+        });
+      }
       expect(second.result.registryObjectsKept).toBeUndefined();
       expect(second.result.warnings.map((warning) => warning.id)).not.toContain("EVE_SUPERSEDED_IMAGE_NOT_DELETED");
     } finally {

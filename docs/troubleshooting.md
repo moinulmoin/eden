@@ -795,9 +795,14 @@ The deployment is live. Read the check message to see which cleanup failed:
   image, so do not make one for this cleanup alone.
 
 A same-version update with deployment affinity deletes only the image it
-replaced, by its tag. When that cannot be shown, the check does not fail:
-the deploy succeeds with the warning
+replaced, by its release tag. When that cannot be shown, the check does not
+fail: the deploy succeeds with the warning
 [`EVE_SUPERSEDED_IMAGE_NOT_DELETED`](#eve_superseded_image_not_deleted).
+The check is `skipped` with `Nothing was deleted: the registry lists no
+release tag that names the superseded image.` when the replaced image was
+pushed by Eden `0.13.x` or older, under `candidate`. Nothing is needed:
+that image stays until `eden destroy` or the retirement of that Eve
+version.
 
 Kept objects alone do not fail the check. Deploy reports them in
 [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept), even when something
@@ -891,8 +896,9 @@ the registry, with or without its tag.
 - After an Eve upgrade, the retirement of this Eve version does the same
   for this repository.
 
-Eden deletes a tag here only when the registry resolves it to the digest
-the deployment record names for the replaced image. The same happens when
+Eden deletes only the release tag the deployment record names for the
+replaced image, and only when the registry resolves it to that image's
+digest. It never deletes `candidate`. The same happens when
 an update is interrupted after promotion and before the delete: the
 replaced image stays until destroy or that retirement.
 
@@ -1434,7 +1440,8 @@ delete would be answered differently. What is known about the kept objects:
 - Eden now gives every pushed image a tag of its own and deletes a
   replaced image by that tag, so a completed update no longer leaves an
   untagged image. Images that Eden `0.13.x` or older left untagged stay, and destroy
-  lists them here.
+  lists them here. The last image such a version pushed keeps `candidate`,
+  so destroy can still remove it.
 - Not known: when Cloudflare removes chain artifacts and untagged
   manifests, and whether kept objects count toward the 50 GB of image
   storage per account in Cloudflare's Containers limits.
