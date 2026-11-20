@@ -208,12 +208,6 @@ vi.mock("node:child_process", async (importOriginal) => {
           stderr: "",
         });
       }
-      if (args[0] === "deployments" && args[1] === "list") {
-        fakeRegistry.onRead(fakeRegistry.reads++);
-        return Promise.reject(Object.assign(new Error("Wrangler failed."), {
-          stderr: "This Worker does not exist on your account. [code: 10007]",
-        }));
-      }
       if (args[1] === "registries" && args[2] === "credentials") {
         fakeRegistry.credentialCalls += 1;
         return Promise.resolve({
@@ -651,7 +645,7 @@ describe("top-level Eden Deploy commands", () => {
           cwd: root,
           stdout: (line) => output.push(line),
           eveControlPlane: {
-            artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+            generationId: "generation-one",
             builder: fakeBuilder(),
             hostRequirements: {
               architecture: "linux/amd64",
@@ -774,7 +768,7 @@ describe("top-level Eden Deploy commands", () => {
           cwd: root,
           stdout: (line) => output.push(line),
           eveControlPlane: {
-            artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+            generationId: "generation-one",
             builder: fakeBuilder(),
             hostRequirements: {
               architecture: "linux/amd64",
@@ -861,7 +855,7 @@ describe("top-level Eden Deploy commands", () => {
           stdout: (line) => output.push(line),
           stderr: (line) => errors.push(line),
           eveControlPlane: {
-            artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+            generationId: "generation-one",
             builder: fakeBuilder(),
             hostRequirements: {
               architecture: "linux/amd64",
@@ -958,7 +952,7 @@ describe("top-level Eden Deploy commands", () => {
         {
           cwd: root,
           eveControlPlane: {
-            artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+            generationId: "generation-one",
             builder: fakeBuilder(async () => {
               await writeFile(sourcePath, "export const value = 2;\n", "utf8");
             }),
@@ -1017,7 +1011,7 @@ describe("top-level Eden Deploy commands", () => {
         {
           cwd: root,
           eveControlPlane: {
-            artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+            generationId: "generation-one",
             builder: fakeBuilder(),
             hostRequirements: {
               architecture: "linux/amd64",
@@ -1336,7 +1330,7 @@ describe("top-level Eden Deploy commands", () => {
           stdout: (line) => output.push(line),
           stderr: (line) => errors.push(line),
           eveControlPlane: {
-            artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+            generationId: "generation-one",
             builder: fakeBuilder(),
             containerImageReference:
               `registry.cloudflare.com/account-test/eve@${imageDigest}`,
@@ -1496,7 +1490,7 @@ describe("top-level Eden Deploy commands", () => {
           cwd: root,
           stderr: (line) => errors.push(line),
           eveControlPlane: {
-            artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+            generationId: "generation-one",
             builder: fakeBuilder(),
             containerImageReference:
               `registry.cloudflare.com/account-test/eve@sha256:${"e".repeat(64)}`,
@@ -1589,7 +1583,7 @@ describe("top-level Eden Deploy commands", () => {
             cwd: root,
             stderr: (line) => errors.push(line),
             eveControlPlane: {
-              artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+              generationId: "generation-one",
               builder: fakeBuilder(),
               containerImageReference:
                 `registry.cloudflare.com/account-test/eve@sha256:${"e".repeat(64)}`,
@@ -1697,7 +1691,7 @@ describe("top-level Eden Deploy commands", () => {
           cwd: root,
           stdout: (line) => output.push(line),
           eveControlPlane: {
-            artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+            generationId: "generation-one",
             builder: fakeBuilder(),
             hostRequirements: {
               architecture: "linux/amd64",
@@ -2214,12 +2208,23 @@ describe("eden destroy", () => {
     });
     const output: string[] = [];
     const clock = vi.spyOn(performance, "now").mockImplementation(() => fakeRegistry.clock);
-    // The Container application read goes to Cloudflare's API with a token; it finds none.
+    // Eden reads the target from Cloudflare's API with a token: no Container application, and no Worker.
     vi.stubEnv("CLOUDFLARE_API_TOKEN", "test-token");
-    vi.stubGlobal("fetch", () => Promise.resolve({
-      ok: true,
-      json: () => Promise.resolve({ success: true, result: [], result_info: {} }),
-    }));
+    vi.stubGlobal("fetch", (input: string | URL) => {
+      const worker = String(input).endsWith("/deployments");
+      if (worker) fakeRegistry.onRead(fakeRegistry.reads++);
+      return Promise.resolve(new Response(
+        JSON.stringify(worker
+          ? {
+            result: null,
+            success: false,
+            errors: [{ code: 10007, message: "This Worker does not exist on your account." }],
+            messages: [],
+          }
+          : { success: true, result: [], errors: [], messages: [], result_info: {} }),
+        { status: worker ? 404 : 200 },
+      ));
+    });
     try {
       const exitCode = await runEdenCli(
         ["destroy", "--project", root, "--env", "preview", "--name", "eve-destroy-fixture",
@@ -2482,8 +2487,8 @@ describe("eden destroy", () => {
     });
     expect(exitCode).toBe(1);
     expect(fakeRegistry.wranglerDeletes).toEqual([destroyRegistryImage]);
-    // The credential for the first account is not used to list the other one.
-    expect(fakeRegistry.credentialCalls).toBe(2);
+    // Nothing is read from the other account, so no second credential is asked for.
+    expect(fakeRegistry.credentialCalls).toBe(1);
     expect(JSON.parse(output[0] as string)).toMatchObject({
       ok: false,
       status: "indeterminate",
@@ -3091,7 +3096,7 @@ describe("Workflow World warnings", () => {
 
   function passingControlPlane(root: string, builder = fakeBuilder()) {
     return {
-      artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+      generationId: "generation-one",
       builder,
       hostRequirements: {
         architecture: "linux/amd64",
@@ -3845,7 +3850,7 @@ describe("eden deploy in-place update", () => {
   ) {
     const newDigest = `sha256:${"d".repeat(64)}`;
     return {
-      artifactRoot: join(root, ".eden", "eve-artifacts", "generation-two"),
+      generationId: "generation-two",
       builder: options.builder ?? fakeBuilder(),
       containerImageReference: `registry.cloudflare.com/account-test/eve@${newDigest}`,
       hostRequirements: {
@@ -4306,7 +4311,7 @@ describe("eden deploy in-place update", () => {
               }),
               onPublish: (request) => { published = request.identity; },
             }),
-            artifactRoot: join(root, ".eden", "eve-deploy", "generations", generation),
+            generationId: generation,
             cloudflareRead: async () => {
               const base = await read();
               return { ...base, target: { ...base.target, providerEvidence: {
