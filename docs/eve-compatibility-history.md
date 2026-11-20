@@ -4,6 +4,61 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## A tag for each pushed image, run on Cloudflare (2026-11-20)
+
+Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
+account, with Wrangler `4.147.0` and an OAuth login, on the branch of the
+change at `fbc96d2`. From this change on, Eden tags each pushed image with
+its generation ID and, after a same-version update is promoted, deletes the
+image it replaced by its tag.
+
+Full run of `pnpm run check:live`, target `eden-live-20261120-6aa0bacc`,
+`03:22:42Z` to `03:36:41Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+this workspace (version `0.13.0`), a 90-second idle window. All 18 steps
+passed.
+
+- The same-version update took 103 seconds and reported `VAL-LIFE-007`
+  passed: `The superseded image was deleted from the registry by its tag
+  after promotion.` It kept nothing and carried no
+  `EVE_SUPERSEDED_IMAGE_NOT_DELETED` warning. The session from before the
+  update answered after it with its file intact.
+- `eden destroy` ended with `destroyed` in 43 seconds and reported 12
+  objects in `EVE_REGISTRY_OBJECTS_KEPT`, none of them
+  `accepted-still-listed`. In one repository: four snapshot tags, two
+  snapshot manifests, and two chain artifacts. In the other: two snapshot
+  tags, one snapshot manifest, and one chain artifact. The run before this
+  change, below, left one `accepted-still-listed` image manifest more.
+- The check's catalog read found those 12 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+
+A target made by the released `0.13.0` CLI, then updated and destroyed by
+this build: `eden-live-20261120-m22729ed`, Eve `1.0.2`, World `0.13.0`
+from npm, no `--env-file` and no session.
+
+- `npx @moinulmoin/eden@0.13.0 deploy` twice. After the second, the
+  registry listed `candidate` and four `sha256:` entries: the first image
+  had lost its tag.
+- This build's first `eden deploy` pushed under the tag
+  `preflight-4a62ec73-…`, passed `VAL-LIFE-007` with the message above, and
+  the registry no longer listed `candidate` or the image `0.13.0` had
+  pushed second. Its second `eden deploy` did the same for the image of its
+  first.
+- This build's `eden destroy` ended with `destroyed` and reported five kept
+  objects: four chain artifacts, one per push, and one
+  `accepted-still-listed` image manifest, the one `0.13.0` had left
+  untagged. A listing after it showed those five entries and no tag.
+
+Not shown by these runs: a failed delete of the replaced image, and a
+session asleep across a same-version update. Two earlier tries of the
+second scenario stopped inside the `0.13.0` CLI: one first deploy ended
+`DEPLOY_INDETERMINATE` at the publish, and one second deploy, started right
+after the first, failed `VAL-CLI-007-TARGET-CONFLICT`. An earlier full run
+of the check on this branch at `5ea4473` passed every step up to destroy;
+its `eden destroy` ended `EVE_DESTROY_ABSENCE_UNPROVEN` once, and a rerun
+ended `destroyed` with 12 kept objects, none `accepted-still-listed`. Each
+of these targets was destroyed by this build.
+
 ## Live check for the account binding (2026-11-20)
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
