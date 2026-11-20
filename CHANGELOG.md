@@ -18,6 +18,57 @@
   Docker's selected builder uses the `docker-container` driver. That builder
   keeps a built image in its own cache, so Docker never received it. Eden now
   runs `docker build --load` when Docker Buildx is installed.
+- **`eden destroy` could report success while the Worker kept running.**
+  Destroy read the Worker with `wrangler deployments list` and took a failed
+  command as "the Worker is gone" whenever its error text contained
+  `not found`, `does not exist`, or `10007`. A failure for another reason
+  could match: a missing Wrangler configuration file, a proxy's
+  `404 Not Found` page, or any API error on an account whose id contains
+  `10007`, because Wrangler prints the account id in the error. Destroy then
+  deleted the Container application and images, reported `destroyed` or
+  `absent`, and left the Worker. Eden now asks Cloudflare's API for the
+  Worker and takes only its answer for a missing Worker as absence: status
+  `404`, `success` false, a null `result`, and one error with code `10007`.
+  It follows no redirect. Any other answer about the Worker stops destroy
+  with `EVE_DESTROY_INDETERMINATE` before anything is deleted.
+  `eden preflight` and `eden deploy` read the Worker the same way. Eden
+  reads a Container application list only from status `200` with `success`
+  true, an empty `errors` list, and no field named twice. After a publish,
+  each deployment the API lists must have an id. Destroy removes `CURRENT`
+  only when it is the symlink that named the record.
+- **Destroy could read the Container application from another account.**
+  The Container read asked Wrangler for the account a second time. If the
+  login changed in between, destroy missed a Container application in the
+  recorded account and could clear the target's `CURRENT` pointer. Each read
+  now asks once and sends every request to that account, and destroy reads
+  nothing from an account other than the recorded one.
+- **Destroy's deletes could run in another account.** Wrangler chose the
+  account again for each delete. If the login changed after destroy's reads,
+  Wrangler could delete a Worker with the same name in the other account.
+  Destroy now gives Wrangler the recorded account for its Worker, Container
+  application, and image deletes, so a delete acts on that account or fails.
+- **Destroy could clear a `CURRENT` pointer it had not read.** If something
+  outside Eden's lock replaced the pointer while destroy ran, destroy removed
+  the replacement. Destroy now removes the pointer only if it is still the
+  file it read at the start. Otherwise it leaves it and fails with
+  `EVE_DESTROY_POINTER_UNCLEARED`.
+- **Destroy followed a symlinked target directory into another project.**
+  It then read that project's record and cleared that project's pointer.
+  Destroy now stops with `EVE_DESTROY_RECORD_UNPROVEN`, before it reads
+  Cloudflare or writes its lock, when a folder on the way to the record, or
+  the generation `CURRENT` names, is not inside the project's own `.eden`
+  folder. It also reads no record file that is a symlink.
+
+### Changed
+
+- Eden reads the Worker's deployments from Cloudflare's API itself, in
+  preflight, deploy, and destroy, instead of running
+  `wrangler deployments list`. Like Eden's other API reads, this request
+  uses a proxy only when `NODE_USE_ENV_PROXY=1` is set; with
+  `HTTPS_PROXY` alone it goes direct.
+- After publishing, `eden deploy` still requires the Worker to have a
+  deployment. Preflight and destroy now also count a Worker script that has
+  none as an existing Worker.
 
 ## 0.13.0 — 2026-11-19
 

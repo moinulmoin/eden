@@ -1178,6 +1178,15 @@ guess or broaden cleanup.` Eden keeps its deployment records under
 records, or select that root with `--project`. If the folder no longer
 exists anywhere, see [The `.eden/` folder is lost](#the-eden-folder-is-lost).
 
+`The target's deployment record is not inside this project's own .eden
+folder: a folder on the way to it is a symlink or could not be checked.`
+`.eden`, `.eden/eve-deploy`, its `locks`, `generations`, or target folder,
+or the generation `CURRENT` names, is a symlink to somewhere else or cannot
+be read. Destroy reads nothing from Cloudflare and writes no lock. A record
+file that is itself a symlink is not read either, and destroy then reports
+that no record matched. Run `eden destroy` with `--project` set to the
+project that deployed the target.
+
 Eden `0.11.2` through `0.12.0` could write a record that they could not read
 back. It happened when an update kept the Eve version and retired a kept
 version whose World had no RPC authentication; that update warned
@@ -1234,6 +1243,20 @@ Container deletion did not complete with a terminal result. Eden never treats
 an authentication, permission, network, malformed or incomplete inventory
 result as absence. Inspect the retained deployment record and Cloudflare
 inventory, then retry the exact target.
+Eden reads the Worker from Cloudflare's API and follows no redirect. Status
+`200` with `success` true and a list of deployments, each with an id, means
+the Worker exists. Status `404` with `success` false, a null result, and
+the single error code `10007` means it is absent. Any other answer about
+the Worker, an answer that names a field twice, and no answer, are
+indeterminate. Eden reads a Container application list, empty or not, only
+from status `200` with `success` true, an empty `errors` list, and no field
+named twice; any other answer is indeterminate too. An
+unreadable registry listing is reported separately, as
+`EVE_DESTROY_IMAGES_RETAINED`. Rerun `eden destroy` with the same selectors;
+if it keeps failing, check the login with `npx wrangler@4.147.0 whoami`. On
+a machine that reaches Cloudflare only through a proxy, set
+`NODE_USE_ENV_PROXY=1` beside `HTTPS_PROXY`: Eden's own API reads use
+Node's `fetch`, which otherwise goes direct.
 Wrangler's JSON Container listing omits pagination metadata, so Eden instead
 uses the name-filtered Container applications API and follows its page tokens.
 A full response without pagination metadata or a failed page read is
@@ -1398,6 +1421,15 @@ superseded version's registry repository.
 `The target CURRENT pointer could not be cleared after verified absence.`
 The remote resources are already gone; only the local pointer under
 `<project>/.eden/eve-deploy/targets/<environment>-<name>/CURRENT` is left.
+
+`The target's CURRENT pointer changed while destroy ran, so it was left in
+place.` Something outside Eden's lock replaced or created the pointer during
+the run, for example another tool or a restore of the folder. Destroy
+finished its deletes for the record it read at the start; its checks list
+them. `CURRENT` now names another deployment record. Look at where it points
+and confirm that deployment is one you mean to remove. Only then rerun
+`eden destroy` with the same `--project`, `--env`, and `--name`: it destroys
+what that record names.
 
 ### `EVE_DEPLOY_LOCK_RELEASE_UNPROVEN`
 
