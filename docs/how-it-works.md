@@ -372,6 +372,11 @@ ones the local records name. This also covers a target whose first publish
 stopped before its Container application existed: destroy removes that
 Worker alone, using the record of the failed attempt.
 
+When the Worker does not exist and a Container application of the recorded
+name does, destroy deletes that application on the record and the name
+alone: the record does not hold the application's ID. See
+[Security](./security.md).
+
 Destroy Destroy reads everything again after its deletes and clears
 the `CURRENT` pointer only if it is the symlink that named the record and
 is still the file it read at the start. That check and the removal are two steps, not one atomic step. Destroy
