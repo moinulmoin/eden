@@ -7,45 +7,43 @@ see [Eve compatibility](./eve-compatibility.md).
 ## Requests through the version switch, run on Cloudflare (2026-11-20)
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
-account, with Wrangler `4.147.0` and an OAuth login, at `8fb17fa`. From
-this change on, an object serves its own release and the one it replaced,
-resets only for the release that names it as the one it replaced, and
-answers `503` to any other. A Worker repeats only a read while an object
-is still on the old release, for at most 30 seconds, and a write is sent
-once.
+account, with Wrangler `4.147.0` and an OAuth login, at `544c4ee`. From
+this change on, an object resets only for the release that names it as the
+one it replaced. A Container object serves a Worker of the release it
+replaced as the version that Worker names, and answers `503` to any other
+release. A Worker repeats only a read while an object is still on the old
+release, for at most 30 seconds, and a write is sent once.
 
-Full run of `pnpm run check:live`, target `eden-live-20261120-3f15d7a6`,
-`09:36:48Z` to `09:51:01Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+Full run of `pnpm run check:live`, target `eden-live-20261120-3346ecd0`,
+`10:24:25Z` to `10:39:13Z`, Eve `0.91.0` to `1.0.2`, the World packed from
 this workspace (version `0.13.0`), a 90-second idle window. All 18 steps
-passed. `eden destroy` reported 12 objects in `EVE_REGISTRY_OBJECTS_KEPT`,
-and the check found nothing else of the target.
+passed. `eden destroy` reported 18 objects in `EVE_REGISTRY_OBJECTS_KEPT`,
+15 `refused-snapshot` and 3 `refused-singleton-artifact`, and the check
+found nothing else of the target.
 
 A copy of the check that also sent a request every 250 ms (a health GET, a
 session POST without a token and a stream GET) while each deploy ran and
 for two minutes after it returned, with `wrangler tail` recording, target
-`eden-live-20261120-380367b7`, `09:21Z` to `09:35Z`:
+`eden-live-20261120-ea8b1c4d`, `10:03Z` to `10:24Z`:
 
 - Through two same-version updates and the upgrade to Eve `1.0.2`, about
-  3,150 requests were sent while a deploy ran. Four got HTTP 500: three
-  health GETs and one POST between `09:27:06Z` and `09:27:08Z` in the
-  second update. The tail shows each Worker threw Cloudflare's `Internal
-  error in Durable Object storage caused object to be reset`. Eden does
-  not retry that error. They came in the seconds the Container object was
-  resetting itself for the new release, as the two in the earlier run did.
-- No request got `503`, and none got HTTP 500 in the two minutes after
-  each deploy returned. The session from before each deploy answered after
-  it, and a new session started, six session steps in all.
-- The tail shows the Container object on the old Worker version reset
-  itself nine times in the second update, from `09:27:02Z` to
-  `09:27:10Z`. No Worker threw `stale Worker version`. The longest
-  request took 21.1 seconds in an update and 55.6 seconds in the upgrade,
-  where the new version's Container also starts.
+  3,150 requests were sent while a deploy ran, and about 2,500 in the two
+  minutes after each. None got HTTP 500 or `503`. The session from before
+  each deploy answered after it, and a new session started, six session
+  steps in all.
+- The tail shows three resets of a Container object, all at `10:20:30Z`
+  in the upgrade, and no Worker that threw. The longest request took 9.3
+  seconds in an update and 36.1 seconds in the upgrade, where the new
+  version's Container also starts.
 
-The same loop before this rule had a reset for every release but two, a
-wait counted in pauses and not in elapsed time, and a retry of any request
-without a body. At `36db4fa`, target `eden-live-20261120-5fbad530`,
-`08:15Z` to `08:29Z`: 2 of about 2,700 requests got HTTP 500, both with
-the same Cloudflare storage error.
+Two earlier runs of the same loop on earlier commits of this change each
+had requests that got HTTP 500 with Cloudflare's `Internal error in Durable
+Object storage caused object to be reset`, which Eden does not retry: 2 of
+about 2,700 at `36db4fa` (`08:17:31Z`) and 4 of about 3,150 at `8fb17fa`
+(`09:27:06Z` to `09:27:08Z`). Each time they came in the seconds a
+Container object was resetting itself for the new release, nine resets in
+both runs. Whether the resets cause that error is not known. One run
+without it does not show it is gone.
 
 The same loop on `main` at `68e1289`, target
 `eden-live-20261120-5f4ae4aa`, `05:44Z` to `06:10Z`: 5 of about 1,400
