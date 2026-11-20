@@ -49,6 +49,11 @@
   `Cloudflare did not show this release in service together with its one
   Container application after publication.` and the last promoted deploy
   stays current.
+- **A publish has one deadline of 15 minutes.** It runs from the start of
+  `cf deploy` to the end of the last read that confirms the publish. Every
+  `cf` command and every wait gets what is left of it, and Eden starts no
+  command after it. Before, each step had its own limit, and a slow read
+  could be followed by another write.
 - **`eden destroy` stops when Cloudflare's reads of the Worker disagree.**
   A Worker that one read shows deployed and the next shows with no
   deployment is not proven, and nothing is deleted.

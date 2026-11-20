@@ -1203,6 +1203,32 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     await expect(lstat(current)).resolves.toBeDefined();
   });
 
+  test("a publish deadline that passes during a read stops Eden before its next write", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    const real = performance.now.bind(performance);
+    let skipped = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => real() + skipped);
+    // The first read of the Worker version answers after the deadline.
+    cloud.onRead = () => { skipped = 16 * 60_000; };
+    const { exitCode, result } = await deploy(root).finally(() => clock.mockRestore());
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect({ containers: [...cloud.containers], triggers: cloud.triggers }).toEqual({ containers: [], triggers: [] });
+    expect(cloud.runs.at(-1)?.args.slice(0, 3)).toEqual(["workers", "versions", "get"]);
+  });
+
+  test("a publish cf called done after the deadline is not promoted, and Eden starts no other command", async () => {
+    const root = await deployableProject();
+    const real = performance.now.bind(performance);
+    let skipped = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => real() + skipped);
+    cloud.onMutation = () => { skipped = 16 * 60_000; };
+    const { exitCode, result } = await deploy(root).finally(() => clock.mockRestore());
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect(cloud.runs.at(-1)?.args[0]).toBe("deploy");
+    await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("a publish Eden cannot finish names the next commands, and destroy then removes the Worker it left", async () => {
     const root = await deployableProject();
     cloud.deployFailure = "after-upload";

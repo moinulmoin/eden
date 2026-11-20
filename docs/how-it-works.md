@@ -101,7 +101,11 @@ until the checks in steps 1–4 have passed.
    the deploy ends `DEPLOY_INDETERMINATE`, and the last promoted deploy
    stays current. After every publish, finished by `cf` or by Eden, Eden
    reads the release in service and its Container application once more,
-   together, and promotes only when they still agree.
+   together, and promotes only when they still agree. The whole publish has
+   one deadline of 15 minutes, from the start of `cf deploy` to the end of
+   that last read. Every `cf` command and every wait gets what is left of
+   it. Once it has passed Eden starts no other command, and the deploy ends
+   `DEPLOY_INDETERMINATE`.
 8. **Verify and promote** (`verifying health at <origin>`). Eden calls the
    public `/eve/v1/health` and only treats the deployment as live once it
    reports ready with the expected deployment identity. Then it removes its

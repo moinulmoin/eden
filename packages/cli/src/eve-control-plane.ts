@@ -2564,6 +2564,8 @@ async function writeEveDeploymentArtifacts(
 
 /** Deadline for the image push and `cf deploy`; either can take minutes on a slow registry or uplink. */
 const CLOUDFLARE_PUBLICATION_TIMEOUT_MS = 600_000;
+/** From the start of `cf deploy` to the end of the last read that confirms the publish. */
+const CLOUDFLARE_PUBLISH_DEADLINE_MS = 900_000;
 
 /**
  * Sets secrets on a Worker that exists, at once. The values travel in a file
@@ -2792,6 +2794,8 @@ async function readPublishApplication(
 async function finishPublication(
   cf: CloudflareCliRunner,
   request: EveDeploymentPublicationRequest,
+  /** Waits that long, or until the publish deadline if that comes first. */
+  pause: (ms: number) => Promise<unknown>,
 ): Promise<"finished" | "unfinished" | "not-uploaded"> {
   const accountId = request.identity.accountId;
   // Cloudflare can take a while to show a Worker version it just accepted. On
@@ -2799,12 +2803,12 @@ async function finishPublication(
   // exist 25 seconds after cf had deployed one. So the read is repeated for
   // two minutes before the version counts as not uploaded.
   let served: Awaited<ReturnType<typeof readServedRelease>>;
-  const started = Date.now();
+  const started = performance.now();
   for (let attempt = 0; ; attempt += 1) {
     served = await readServedRelease(cf, request);
     if (served !== undefined) break;
-    if (attempt === 24 || Date.now() - started > 120_000) return "not-uploaded";
-    await waitForActivation(5_000);
+    if (attempt === 24 || performance.now() - started > 120_000) return "not-uploaded";
+    await pause(5_000);
   }
   const namespaceId = served.namespaceId;
   if (namespaceId === undefined) return "unfinished";
@@ -2830,9 +2834,9 @@ async function finishPublication(
   // Applying the triggers again changes nothing, so a failure is retried for
   // two minutes: on 2026-11-20 cf answered here that the Worker did not exist
   // seconds after Cloudflare had shown its version.
-  const applying = Date.now();
-  for (let attempt = 0; attempt < 24 && (attempt === 0 || Date.now() - applying < 120_000); attempt += 1) {
-    if (attempt > 0) await waitForActivation(5_000);
+  const applying = performance.now();
+  for (let attempt = 0; attempt < 24 && (attempt === 0 || performance.now() - applying < 120_000); attempt += 1) {
+    if (attempt > 0) await pause(5_000);
     const triggers = await cf({
       args: ["workers", "triggers", "deploy", "--prebuilt"],
       accountId,
@@ -2862,11 +2866,22 @@ function publishDiagnostic(stderr: string, secrets: ReadonlyMap<string, string>)
 }
 
 function defaultPublicationRunner(
-  cf: CloudflareCliRunner,
+  run: CloudflareCliRunner,
   /** Uploaded as the Worker's secrets with this version. */
   secrets: ReadonlyMap<string, string>,
 ): EveDeploymentPublicationRunner {
   return async (request) => {
+    // One deadline for the whole publish, on a clock that only moves forward.
+    // Every cf command and every wait gets what is left of it, and no
+    // command starts once it has passed.
+    const deadline = performance.now() + CLOUDFLARE_PUBLISH_DEADLINE_MS;
+    const cf: CloudflareCliRunner = async (step) => {
+      const left = deadline - performance.now();
+      return left <= 0
+        ? { exitCode: undefined, stdout: "", stderr: "Not started: the publish deadline had passed." }
+        : run({ ...step, timeoutMs: Math.min(step.timeoutMs ?? 120_000, left) });
+    };
+    const pause = (ms: number) => waitForActivation(Math.max(0, Math.min(ms, deadline - performance.now())));
     // The Build Output names the same account, and cf reads it before the variable.
     const deployed = await cf({
       args: ["deploy", "--prebuilt", ...(secrets.size === 0 ? [] : ["--secrets-file", "secrets.json"])],
@@ -2885,7 +2900,7 @@ function defaultPublicationRunner(
         const result = await cf(step);
         log.push(`cf ${step.args.slice(0, 3).join(" ")}: exit ${result.exitCode}\n${safeText(result.stderr)}`);
         return result;
-      }, request).finally(() =>
+      }, request, pause).finally(() =>
         writeFile(join(request.buildOutputPath, "cf-deploy.log"), log.join("\n"), { mode: 0o600 })
           .catch(() => undefined)
       );
@@ -2905,20 +2920,26 @@ function defaultPublicationRunner(
     // release binds. Cloudflare can lag behind a publish, so the reads are
     // repeated for two minutes.
     let published = false;
-    const verifying = Date.now();
-    for (let attempt = 0; attempt < 24 && (attempt === 0 || Date.now() - verifying < 120_000); attempt += 1) {
-      if (attempt > 0) await waitForActivation(5_000);
+    const verifying = performance.now();
+    for (
+      let attempt = 0;
+      attempt < 24 && deadline > performance.now() && (attempt === 0 || performance.now() - verifying < 120_000);
+      attempt += 1
+    ) {
+      if (attempt > 0) await pause(5_000);
       const namespaceId = (await readServedRelease(cf, request))?.namespaceId;
       if (namespaceId !== undefined && await readPublishApplication(cf, request, namespaceId) === "matches") {
         published = true;
         break;
       }
     }
-    if (!published) {
+    // A check that ended after the deadline does not count either.
+    if (!published || deadline <= performance.now()) {
       return {
         status: "indeterminate",
-        reason:
-          "Cloudflare did not show this release in service together with its one Container application after publication.",
+        reason: deadline <= performance.now()
+          ? "The publish was not finished and checked within its 15 minutes."
+          : "Cloudflare did not show this release in service together with its one Container application after publication.",
         ownershipEvidenceRetained: true,
       };
     }

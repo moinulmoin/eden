@@ -785,6 +785,12 @@ together with its one Container application after publication.` The last
 promoted deploy stays current. Run `eden deploy` again with the same
 selectors.
 
+The whole publish has one deadline of 15 minutes, from the start of
+`cf deploy` to the end of that last read. `cf deploy` itself gets at most
+ten of them. Once the deadline has passed Eden starts no other command, and
+the message is `The publish was not finished and checked within its 15
+minutes.` Run `eden deploy` again with the same selectors.
+
 ### `EVE_IMAGE_IDENTITY_MISMATCH`
 
 `The exact Container image reference did not match the verified local image
