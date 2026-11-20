@@ -224,11 +224,14 @@ explicit --name.` Preview `preflight` and `deploy` derive the name from the
 
 ### `EVE_DEPLOY_BUSY`
 
-`Another Eve deployment owns the exact target; retry after it finishes.`
-Eden locks a target for the duration of a deploy. The lock lives at
-`<project>/.eden/eve-deploy/locks/<environment>-<name>.lock`. Wait for the
-other run to finish. If a run was killed, confirm no `eden` process is still
-running before you remove the lock file by hand.
+`Another eden run in this project folder holds the lock for this name, which
+is one Worker in both environments; retry after it finishes.` Eden locks a
+name for the duration of a deploy or a destroy. The lock lives at
+`<project>/.eden/eve-deploy/locks/<name>.lock` and covers both environments,
+because `--env preview` and `--env production` of one name are the same
+Worker. Wait for the other run to finish, then rerun the same `eden`
+command. If a run was killed, confirm no `eden` process is still running
+before you remove the lock file by hand.
 
 ### Managed registry login fails with `-25299`
 
@@ -1626,8 +1629,8 @@ what that record names.
 
 `The Eve deployment lock could not be released with exact ownership proof;
 local residue was retained.` Confirm no `eden` process is still running
-against the target, then remove the stale lock file at
-`<project>/.eden/eve-deploy/locks/<environment>-<name>.lock`.
+against the name, then remove the stale lock file at
+`<project>/.eden/eve-deploy/locks/<name>.lock`.
 
 ### The `.eden/` folder is lost
 

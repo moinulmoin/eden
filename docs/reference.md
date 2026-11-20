@@ -523,7 +523,7 @@ Everything Eden writes stays under `<project root>/.eden/eve-deploy/`:
     deployment-attempt.json      retained evidence of an indeterminate attempt
   targets/<environment>-<name>/
     CURRENT                      a symlink to the promoted generation
-  locks/<environment>-<name>.lock
+  locks/<name>.lock
 ```
 
 The generation id is the name of the generation directory, and the CLI
@@ -544,9 +544,11 @@ revision handle), the published Worker configuration, the Container
 configuration, and the Durable Object bindings and migrations. It is the
 immutable ownership proof: `destroy` refuses to act without it.
 
-The lock file keeps one deploy or destroy per target at a time; a second run
-fails with `EVE_DEPLOY_BUSY`. It is removed when the run ends, and local
-residue is kept if its removal cannot be proven.
+The lock file keeps one deploy or destroy per name at a time; a second run
+fails with `EVE_DEPLOY_BUSY`. The lock has no environment in it, because
+`preview` and `production` of one name are the same Worker. It is removed
+when the run ends, and local residue is kept if its removal cannot be
+proven.
 
 The generation directories are never deleted by Eden. Destroy keeps them and
 says so in its summary.

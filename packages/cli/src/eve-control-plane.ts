@@ -3073,10 +3073,8 @@ async function acquireEveTargetLock(
 ): Promise<EveTargetLock> {
   const lockRoot = join(projectRoot, ".eden", "eve-deploy", "locks");
   await mkdir(lockRoot, { recursive: true });
-  const lockPath = join(
-    lockRoot,
-    `${environment}-${name}.lock`,
-  );
+  // One lock per name: both environments of a name publish the same Worker.
+  const lockPath = join(lockRoot, `${name}.lock`);
   const serialized = `${JSON.stringify({
     kind: "eden.eve.deploy.lock",
     version: 1,
@@ -3097,7 +3095,7 @@ async function acquireEveTargetLock(
       throw new EveCliError({
         code: "EVE_DEPLOY_BUSY",
         message:
-          "Another Eve deployment owns the exact target; retry after it finishes.",
+          "Another eden run in this project folder holds the lock for this name, which is one Worker in both environments; retry after it finishes.",
         source: "deployment-lock",
       });
     }

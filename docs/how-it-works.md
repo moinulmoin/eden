@@ -254,8 +254,9 @@ behavior and the warning that an Eve upgrade can strand sessions.
   Two deploys of one target that overlap can both name the same replaced
   release. The Container objects of the one published last then answer
   `503` to the other's Workers until Cloudflare has switched them all.
-  A second deploy from the same project folder is refused with
-  `EVE_DEPLOY_BUSY`; that lock does not cover another checkout or machine.
+  A second deploy of the same name from the same project folder, in either
+  environment, is refused with `EVE_DEPLOY_BUSY`; that lock does not cover
+  another checkout or machine.
 
   What can still return Cloudflare's error 1101 page (HTTP 500) around a
   switch: Cloudflare's own Durable Object errors, such as "Internal error
