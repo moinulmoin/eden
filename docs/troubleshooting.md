@@ -1339,7 +1339,9 @@ A Worker that holds only secrets fails here. Eden 0.14 and earlier set
 secrets before the first publish, so a first deploy that failed there left
 such a Worker. This version uploads the secrets with the Worker version and
 creates no Worker before that upload. Such a Worker carries nothing that
-names Eden, so destroy does not delete it; the steps below apply.
+names Eden, so destroy does not delete it; the steps below apply. Its
+deployment history is not empty: it holds the secret changes that failed
+deploy made.
 
 If the account is right, wait a minute and rerun `eden destroy`. If it keeps
 refusing, Eden cannot prove ownership and will not delete the Worker. Only

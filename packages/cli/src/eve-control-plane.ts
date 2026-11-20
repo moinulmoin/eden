@@ -1634,31 +1634,36 @@ async function readWorkersDevSubdomain(
     `this Cloudflare account has no Worker yet: deploying the temporary Worker ${name}, which gets no URL, to read the account's workers.dev subdomain, then deleting it`,
   );
   const output = ".cloudflare/output/v1";
-  await cf({
-    args: ["deploy", "--prebuilt"],
-    accountId,
-    timeoutMs: 120_000,
-    files: {
-      [`${output}/config.json`]: JSON.stringify({ settings: { accountId }, buildContext: { isPreview: false } }),
-      [`${output}/workers/default/worker.config.json`]: JSON.stringify({
-        name,
-        compatibilityDate: "2026-04-01",
-        workersDev: false,
-        manifest: { type: "complete", mainModule: "worker.js", modules: { "worker.js": { type: "esm" } } },
-      }),
-      [`${output}/workers/default/bundle/worker.js`]:
-        "export default { fetch() { return new Response(null, { status: 404 }); } };\n",
-    },
-  });
   let worker: unknown;
-  // Cloudflare can take a while to show a Worker it just accepted. On
-  // 2026-11-20 cf uploaded the Worker and then exited 1 because Cloudflare
-  // answered that it did not exist, so a failed deploy is read as well.
-  for (let attempt = 0; worker === undefined && attempt < 12; attempt += 1) {
-    if (attempt > 0) await waitForActivation(5_000);
-    worker = cloudflareCliJson(
-      await cf({ args: ["workers", "get", name], accountId, timeoutMs: 30_000 }),
-    )?.value;
+  // A command that throws must not skip the delete below.
+  try {
+    await cf({
+      args: ["deploy", "--prebuilt"],
+      accountId,
+      timeoutMs: 120_000,
+      files: {
+        [`${output}/config.json`]: JSON.stringify({ settings: { accountId }, buildContext: { isPreview: false } }),
+        [`${output}/workers/default/worker.config.json`]: JSON.stringify({
+          name,
+          compatibilityDate: "2026-04-01",
+          workersDev: false,
+          manifest: { type: "complete", mainModule: "worker.js", modules: { "worker.js": { type: "esm" } } },
+        }),
+        [`${output}/workers/default/bundle/worker.js`]:
+          "export default { fetch() { return new Response(null, { status: 404 }); } };\n",
+      },
+    });
+    // Cloudflare can take a while to show a Worker it just accepted. On
+    // 2026-11-20 cf uploaded the Worker and then exited 1 because Cloudflare
+    // answered that it did not exist, so a failed deploy is read as well.
+    for (let attempt = 0; worker === undefined && attempt < 12; attempt += 1) {
+      if (attempt > 0) await waitForActivation(5_000);
+      worker = cloudflareCliJson(
+        await cf({ args: ["workers", "get", name], accountId, timeoutMs: 30_000 }),
+      )?.value;
+    }
+  } catch {
+    worker = undefined;
   }
   if (await defaultWorkerDelete(cf)({ accountId, name }) === "indeterminate") {
     return {
