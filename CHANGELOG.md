@@ -46,10 +46,142 @@
 - `pnpm run check:live` uses `cf`, interrupts its first `cf deploy` on
   purpose to check that Eden finishes it, and no longer records a tail.
 
-## Unreleased
+## 0.14.0 — 2026-11-20
+
+`eden destroy` now clears a target's record only on Cloudflare's own
+unambiguous answer, read from the recorded account, and every Wrangler
+command after the access check runs in the checked account. Each pushed image
+gets its own tag, so a same-version update no longer leaves an image that the
+registry cannot remove. A publish that stops halfway has its own message and
+recovery, requests around a deploy's version switch no longer get HTTP 500
+from version skew, and image builds work with a `docker-container` builder.
+Update `@moinulmoin/eden`. `@moinulmoin/eden-world-cloudflare` `0.14.0` has
+the same code as `0.13.0`.
+
+The full live check passed on Cloudflare at the commit this release was cut
+from: a fresh deploy, a same-version update, an upgrade from Eve `0.91.0` to
+`1.0.2`, a sleep and wake, and a destroy. That run sent no requests while a
+deploy switched versions, so it does not test the version-switch fixes.
+Those were measured in a separate run on 2026-11-20, on the branch of the
+fix. Both records are in `docs/eve-compatibility-history.md`.
+
+### Upgrading from 0.13.0
+
+- No project change is needed, and the deployment record's format did not
+  change. A target deployed with `0.13.x` updates and destroys with this
+  version.
+- The first same-version update of such a target leaves the image it
+  replaced in the registry under the tag `candidate`, and `VAL-LIFE-007` is
+  `skipped`. `eden destroy`, or the retirement of that Eve version after an
+  upgrade, removes it. Images that `0.13.x` had already left without a tag
+  stay, and `eden destroy` still reports them as `accepted-still-listed`.
+- The first Eve upgrade of such a target can still answer new sessions with
+  Eve's `500` ("Failed to create the session") after `eden deploy` reported
+  it healthy, until Cloudflare moves the World object. That took 2 minutes
+  20 seconds when measured.
+- Around a deploy's version switch a request can now get `503` with
+  `Retry-After`. A POST, PUT, PATCH or DELETE that got it may have run, so
+  check its outcome before sending it again. Cloudflare's own Durable Object
+  errors can still return error 1101.
+- `eden destroy` now stops with `EVE_DESTROY_INDETERMINATE`,
+  `EVE_DESTROY_POINTER_UNCLEARED`, or `EVE_DESTROY_RECORD_UNPROVEN` in
+  cases where it used to go on. Each is in `docs/troubleshooting.md`.
+- `EDEN_EVE_PREVIOUS_RELEASE_ID` is now a reserved name in an environment
+  file.
+- Eden's read of the Worker uses a proxy only when `NODE_USE_ENV_PROXY=1`
+  is set; with `HTTPS_PROXY` alone it goes direct.
 
 ### Fixed
 
+- **`eden destroy` could report success while the Worker kept running.**
+  Destroy read the Worker with `wrangler deployments list` and took a failed
+  command as "the Worker is gone" whenever its error text contained
+  `not found`, `does not exist`, or `10007`. A failure for another reason
+  could match: a missing Wrangler configuration file, a proxy's
+  `404 Not Found` page, or any API error on an account whose id contains
+  `10007`, because Wrangler prints the account id in the error. Destroy then
+  deleted the Container application and images, reported `destroyed` or
+  `absent`, and left the Worker. Eden now asks Cloudflare's API for the
+  Worker and takes only its answer for a missing Worker as absence: status
+  `404`, `success` false, a null `result`, and one error with code `10007`.
+  It follows no redirect. Any other answer about the Worker stops destroy
+  with `EVE_DESTROY_INDETERMINATE` before anything is deleted.
+  `eden preflight` and `eden deploy` read the Worker the same way. Eden
+  reads a Container application list only from status `200` with `success`
+  true, an empty `errors` list, and no field named twice. After a publish,
+  each deployment the API lists must have an id. Destroy removes `CURRENT`
+  only when it is the symlink that named the record.
+- **Destroy could clear a `CURRENT` pointer it had not read.** If something
+  outside Eden's lock replaced the pointer while destroy ran, destroy removed
+  the replacement. Destroy now removes the pointer only if it is still the
+  file it read at the start. Otherwise it leaves it and fails with
+  `EVE_DESTROY_POINTER_UNCLEARED`.
+- **Destroy followed a symlinked target directory into another project.**
+  It then read that project's record and cleared that project's pointer.
+  Destroy now stops with `EVE_DESTROY_RECORD_UNPROVEN`, before it reads
+  Cloudflare or writes its lock, when a folder on the way to the record, or
+  the generation `CURRENT` names, is not inside the project's own `.eden`
+  folder. It also reads no record file that is a symlink.
+- **Destroy could read the Container application from another account.**
+  The Container read asked Wrangler for the account a second time. If the
+  login changed in between, destroy missed a Container application in the
+  recorded account and could clear the target's `CURRENT` pointer. Each read
+  now asks once and sends every request to that account, and destroy reads
+  nothing from an account other than the recorded one.
+- **Destroy's deletes could run in another account.** Wrangler chose the
+  account again for each delete. If the login changed after destroy's reads,
+  Wrangler could delete a Worker with the same name in the other account.
+  Destroy now gives Wrangler the recorded account for its Worker, Container
+  application, and image deletes, so a delete acts on that account or fails.
+- **A deploy's secret uploads and image push could run in another account.**
+  Wrangler chose the account again for each `wrangler secret put` and for
+  `wrangler containers push`. If the login changed after Eden checked the
+  account, a runtime value could be written to a Worker in the other
+  account, and `eden deploy` could still report success. Eden now gives
+  Wrangler the checked account for every command it runs after
+  `wrangler whoami`: the secret uploads, the image push, the publish, the
+  Container application read, the registry credential request, and
+  destroy's deletes. Each acts on that account or fails.
+  Deploy also asked `wrangler whoami` twice, before the build and after it,
+  and used the second answer. If the two named different accounts, the
+  deploy went to the second. It now stops at the Cloudflare access check
+  before any write. Both effects were seen with a stand-in for Cloudflare,
+  not on a real account.
+- **A same-version update no longer leaves an image that Cloudflare's
+  registry cannot remove.** With deployment affinity, an update on the same
+  Eve version pushes into the repository of the image it replaces. Eden
+  pushed every image under the tag `candidate`, so the earlier image lost
+  its only tag, and Cloudflare's registry does not remove an image that no
+  tag names: `eden destroy` reported one `accepted-still-listed` object per
+  such update. Eden now tags each pushed image with the release ID it
+  generates for that deploy (`eve-deploy-<uuid>`) and, once the new
+  deployment is healthy and promoted, deletes the replaced image by its
+  tag. It deletes only that release tag, and only when the registry
+  resolves it to the digest the deployment record names for the replaced
+  image. If the delete cannot
+  be shown, the deploy still succeeds with the new warning
+  `EVE_SUPERSEDED_IMAGE_NOT_DELETED`. A later deploy does not try that
+  image again; `eden destroy`, or the retirement of that Eve version after
+  an upgrade, tries to delete everything in the repository.
+  A target deployed with Eden `0.13.x` or older still updates and destroys.
+  Eden never deletes `candidate` during an update: the first same-version
+  update leaves the image it replaced under that tag (`VAL-LIFE-007` is
+  `skipped`), and `eden destroy` or the retirement of that Eve version
+  removes it. Images those versions had already left untagged stay in the
+  registry, and `eden destroy` reports them as before. The deployment record's format did
+  not change.
+- `eden deploy` now says when Wrangler uploaded the Worker version and then
+  failed at the Container application settings, instead of the general
+  `DEPLOY_INDETERMINATE` message. From 2026-11-19 `22:31Z`, five deploys
+  ended this way after Cloudflare answered `404` when Wrangler read the
+  version it had just uploaded. Eden does not run the publish again by itself. For a
+  target's first deploy the remediation names `eden destroy`: on
+  2026-11-20 `eden deploy` refused such a target twice, and `eden destroy`
+  cleared it on its second run. A deploy after that destroy was not run on
+  that target. For a target that was deployed before, the remediation stops
+  at inspection.
+- `EVE_DESTROY_OWNERSHIP_UNPROVEN` now says what to do when the account is
+  right but a failed deploy left a half-published Worker.
 - **Requests around a deploy's version switch no longer get HTTP 500 from
   version skew.** Cloudflare does not switch a Worker and its Durable
   Objects to a new version at the same instant. On 2026-11-20 the two ran
@@ -99,99 +231,10 @@
   switch, had no log. They fit the cases above but are not proven to
   share a cause. `EDEN_EVE_PREVIOUS_RELEASE_ID` is now a reserved name in
   an environment file.
-- **A same-version update no longer leaves an image that Cloudflare's
-  registry cannot remove.** With deployment affinity, an update on the same
-  Eve version pushes into the repository of the image it replaces. Eden
-  pushed every image under the tag `candidate`, so the earlier image lost
-  its only tag, and Cloudflare's registry does not remove an image that no
-  tag names: `eden destroy` reported one `accepted-still-listed` object per
-  such update. Eden now tags each pushed image with the release ID it
-  generates for that deploy (`eve-deploy-<uuid>`) and, once the new
-  deployment is healthy and promoted, deletes the replaced image by its
-  tag. It deletes only that release tag, and only when the registry
-  resolves it to the digest the deployment record names for the replaced
-  image. If the delete cannot
-  be shown, the deploy still succeeds with the new warning
-  `EVE_SUPERSEDED_IMAGE_NOT_DELETED`. A later deploy does not try that
-  image again; `eden destroy`, or the retirement of that Eve version after
-  an upgrade, tries to delete everything in the repository.
-  A target deployed with Eden `0.13.x` or older still updates and destroys.
-  Eden never deletes `candidate` during an update: the first same-version
-  update leaves the image it replaced under that tag (`VAL-LIFE-007` is
-  `skipped`), and `eden destroy` or the retirement of that Eve version
-  removes it. Images those versions had already left untagged stay in the
-  registry, and `eden destroy` reports them as before. The deployment record's format did
-  not change.
-- `eden deploy` now says when Wrangler uploaded the Worker version and then
-  failed at the Container application settings, instead of the general
-  `DEPLOY_INDETERMINATE` message. From 2026-11-19 `22:31Z`, five deploys
-  ended this way after Cloudflare answered `404` when Wrangler read the
-  version it had just uploaded. Eden does not run the publish again by itself. For a
-  target's first deploy the remediation names `eden destroy`: on
-  2026-11-20 `eden deploy` refused such a target twice, and `eden destroy`
-  cleared it on its second run. A deploy after that destroy was not run on
-  that target. For a target that was deployed before, the remediation stops
-  at inspection.
-- `EVE_DESTROY_OWNERSHIP_UNPROVEN` now says what to do when the account is
-  right but a failed deploy left a half-published Worker.
 - `eden preflight` and `eden deploy` no longer fail at `VAL-BUILD-005` when
   Docker's selected builder uses the `docker-container` driver. That builder
   keeps a built image in its own cache, so Docker never received it. Eden now
   runs `docker build --load` when Docker Buildx is installed.
-- **`eden destroy` could report success while the Worker kept running.**
-  Destroy read the Worker with `wrangler deployments list` and took a failed
-  command as "the Worker is gone" whenever its error text contained
-  `not found`, `does not exist`, or `10007`. A failure for another reason
-  could match: a missing Wrangler configuration file, a proxy's
-  `404 Not Found` page, or any API error on an account whose id contains
-  `10007`, because Wrangler prints the account id in the error. Destroy then
-  deleted the Container application and images, reported `destroyed` or
-  `absent`, and left the Worker. Eden now asks Cloudflare's API for the
-  Worker and takes only its answer for a missing Worker as absence: status
-  `404`, `success` false, a null `result`, and one error with code `10007`.
-  It follows no redirect. Any other answer about the Worker stops destroy
-  with `EVE_DESTROY_INDETERMINATE` before anything is deleted.
-  `eden preflight` and `eden deploy` read the Worker the same way. Eden
-  reads a Container application list only from status `200` with `success`
-  true, an empty `errors` list, and no field named twice. After a publish,
-  each deployment the API lists must have an id. Destroy removes `CURRENT`
-  only when it is the symlink that named the record.
-- **Destroy could read the Container application from another account.**
-  The Container read asked Wrangler for the account a second time. If the
-  login changed in between, destroy missed a Container application in the
-  recorded account and could clear the target's `CURRENT` pointer. Each read
-  now asks once and sends every request to that account, and destroy reads
-  nothing from an account other than the recorded one.
-- **Destroy's deletes could run in another account.** Wrangler chose the
-  account again for each delete. If the login changed after destroy's reads,
-  Wrangler could delete a Worker with the same name in the other account.
-  Destroy now gives Wrangler the recorded account for its Worker, Container
-  application, and image deletes, so a delete acts on that account or fails.
-- **A deploy's secret uploads and image push could run in another account.**
-  Wrangler chose the account again for each `wrangler secret put` and for
-  `wrangler containers push`. If the login changed after Eden checked the
-  account, a runtime value could be written to a Worker in the other
-  account, and `eden deploy` could still report success. Eden now gives
-  Wrangler the checked account for every command it runs after
-  `wrangler whoami`: the secret uploads, the image push, the publish, the
-  Container application read, the registry credential request, and
-  destroy's deletes. Each acts on that account or fails.
-  Deploy also asked `wrangler whoami` twice, before the build and after it,
-  and used the second answer. If the two named different accounts, the
-  deploy went to the second. It now stops at the Cloudflare access check
-  before any write. Both effects were seen with a stand-in for Cloudflare,
-  not on a real account.
-- **Destroy could clear a `CURRENT` pointer it had not read.** If something
-  outside Eden's lock replaced the pointer while destroy ran, destroy removed
-  the replacement. Destroy now removes the pointer only if it is still the
-  file it read at the start. Otherwise it leaves it and fails with
-  `EVE_DESTROY_POINTER_UNCLEARED`.
-- **Destroy followed a symlinked target directory into another project.**
-  It then read that project's record and cleared that project's pointer.
-  Destroy now stops with `EVE_DESTROY_RECORD_UNPROVEN`, before it reads
-  Cloudflare or writes its lock, when a folder on the way to the record, or
-  the generation `CURRENT` names, is not inside the project's own `.eden`
-  folder. It also reads no record file that is a symlink.
 
 ### Changed
 
