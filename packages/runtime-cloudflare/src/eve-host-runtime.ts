@@ -396,6 +396,14 @@ export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnviro
   }
 
   override async fetch(request: Request): Promise<Response> {
+    // Cloudflare can keep this object on an earlier release after a deploy,
+    // with that release's route table. A caller of a release this object does
+    // not know resets it; the caller sends the request once more.
+    const caller = request.headers.get("x-eden-eve-release-id");
+    if (caller !== null && caller !== this.env.EDEN_EVE_PREVIOUS_RELEASE_ID &&
+      caller !== (this.env.EDEN_EVE_RELEASE_ID ?? this.env.EDEN_EVE_DEPLOYMENT_ID)) {
+      this.ctx.abort(EVE_HOST_STALE_WORKER_REASON);
+    }
     if (request.method !== "POST") return new Response(null, { status: 405 });
     const result = await this.core.handleRpc(new Uint8Array(await request.arrayBuffer()));
     return new Response(result as Uint8Array<ArrayBuffer>, {
@@ -477,7 +485,17 @@ export async function routeEveOutboundRequest(
       get(id: unknown): { fetch(request: Request): Promise<Response> };
     } | undefined;
     if (world === undefined) return new Response(null, { status: 404 });
-    return world.get(world.idFromName("world")).fetch(request);
+    const release = env.EDEN_EVE_RELEASE_ID ?? env.EDEN_EVE_DEPLOYMENT_ID;
+    const headers = new Headers(request.headers);
+    if (release === undefined) headers.delete("x-eden-eve-release-id");
+    else headers.set("x-eden-eve-release-id", release);
+    const body = request.method === "POST" ? await request.arrayBuffer() : undefined;
+    const send = () => world.get(world.idFromName("world")).fetch(new Request(request.url, {
+      method: request.method,
+      headers,
+      ...(body === undefined ? {} : { body }),
+    }));
+    return retryWhileStale(send);
   }
   if (env.EDEN_EVE_WORLD_CLOUDFLARE && isEveWorkflowInternalRoute(new URL(request.url).pathname)) {
     return new Response(null, { status: 403 });

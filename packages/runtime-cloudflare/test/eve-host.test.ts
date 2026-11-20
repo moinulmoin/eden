@@ -360,6 +360,71 @@ describe("durable World queue acknowledgements", () => {
   );
 });
 
+describe("World object after a deploy", () => {
+  test("a World object left on an earlier release restarts for the new release's container and still serves the replaced one", async () => {
+    const sql = new NodeSqliteAdapter();
+    const { encode } = createRequire(
+      import.meta.resolve("@moinulmoin/eden-world-cloudflare"),
+    )("cbor-x") as { encode(value: unknown): Uint8Array };
+    const origin = "https://eden-eve-preview.account.workers.dev";
+    const resets: string[] = [];
+    const worldOn = (release: string, previous?: string): EdenWorldDurableObject => new EdenWorldDurableObject({
+      storage: {
+        sql,
+        transactionSync: sql.transactionSync.bind(sql),
+        setAlarm: async () => undefined,
+        deleteAlarm: async () => undefined,
+      },
+      blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(),
+      waitUntil: () => undefined,
+      // Cloudflare starts the reset object on the newest release.
+      abort: (reason?: string) => {
+        resets.push(release);
+        live = worldOn("release-3", "release-2");
+        throw new Error(`remote exception: ${reason}`);
+      },
+    } as never, {
+      EVE_PUBLIC_ORIGIN: origin,
+      EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+      EDEN_EVE_DEPLOYMENT_ID: "dep-test",
+      EDEN_EVE_RELEASE_ID: release,
+      ...(previous === undefined ? {} : { EDEN_EVE_PREVIOUS_RELEASE_ID: previous }),
+      EVE_CONTAINER: { getByName: () => ({ loopbackFetch: async () => Response.json({}) }) },
+    });
+    let live = worldOn("release-1");
+    // Workers have crypto.subtle.timingSafeEqual; Node does not.
+    const subtle = crypto.subtle as unknown as Record<string, unknown>;
+    subtle.timingSafeEqual = (a: Uint8Array, b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b));
+    const fromContainerOn = (release: string): Promise<Response> => routeEveOutboundRequest(
+      new Request(`${origin}/__eden/world/rpc`, {
+        method: "POST",
+        headers: { "x-eden-world-token": "token" },
+        body: encode({ op: "queue.enqueue", args: ["workflow", { runId: "proof" }] }) as Uint8Array<ArrayBuffer>,
+      }),
+      {
+        EVE_PUBLIC_ORIGIN: origin,
+        EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+        EDEN_EVE_DEPLOYMENT_ID: "dep-test",
+        EDEN_EVE_RELEASE_ID: release,
+        EDEN_WORLD: { idFromName: () => "world", get: () => ({ fetch: (request: Request) => live.fetch(request) }) },
+      } as never,
+      "dep-test",
+      "token",
+    );
+    try {
+      expect((await fromContainerOn("release-3")).status).toBe(200);
+      expect(resets).toEqual(["release-1"]);
+      expect((await fromContainerOn("release-2")).status).toBe(200);
+      expect((await fromContainerOn("release-3")).status).toBe(200);
+      expect(resets).toEqual(["release-1"]);
+      expect(sql.exec("SELECT COUNT(*) AS n FROM workflow_queue_messages").toArray()[0]?.n).toBe(3);
+    } finally {
+      delete subtle.timingSafeEqual;
+      sql.close();
+    }
+  });
+});
+
 describe("generic Eve Cloudflare host", () => {
   test("builds one private named Worker/Container graph with one stable identity", () => {
     const config = createEveHostConfig({
