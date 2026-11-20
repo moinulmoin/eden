@@ -1694,6 +1694,8 @@ async function readTargetContainers(
     entries.push(...read.result);
     pageToken = typeof next === "string" && next.length > 0 ? next : undefined;
     if (pageToken === undefined) {
+      // Nor can a full last page that gives no total: nothing says it is the last.
+      if (total === undefined && read.result.length >= 100) return { failed: true };
       // Nor can a total, given on any page, that is not the number of entries read.
       return total !== undefined && total !== entries.length ? { failed: true } : { failed: false, value: entries };
     }
@@ -1846,7 +1848,9 @@ async function defaultCloudflareRead(
   }
   const workerPresent = worker !== "absent";
   const containerPresent = (containerEntries?.length ?? 0) > 0;
-  const providerEvidence = await readProviderEvidence(
+  // Two applications of the target's name prove nothing about either: no
+  // evidence is read, and the target stays one Eden cannot prove it owns.
+  const providerEvidence = (containerEntries?.length ?? 0) > 1 ? undefined : await readProviderEvidence(
     api,
     request.name,
     accountId,
@@ -2918,8 +2922,14 @@ function defaultPublicationRunner(
       attempt += 1
     ) {
       if (attempt > 0) await pause(5_000);
+      // The release is read again after the application: one that was
+      // replaced while the application was read is not in service.
       const namespaceId = (await readServedRelease(verifying.api, request))?.namespaceId;
-      if (namespaceId !== undefined && await readPublishApplication(verifying.api, request, namespaceId) === "matches") {
+      if (
+        namespaceId !== undefined &&
+        await readPublishApplication(verifying.api, request, namespaceId) === "matches" &&
+        (await readServedRelease(verifying.api, request))?.namespaceId === namespaceId
+      ) {
         published = true;
         break;
       }

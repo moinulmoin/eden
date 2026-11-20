@@ -950,6 +950,7 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     ["the live application and a total of 2", 200, (entries: string) => listed(entries, '{"count":1,"total_count":2}')],
     ["paging facts that are a list", 200, () => listed("[]", "[]")],
     ["100 other applications and no paging facts", 200, () => '{"success":true,"errors":[],"messages":[],"result":' + JSON.stringify(Array.from({ length: 100 }, (_, nth) => ({ id: "other-" + nth, name: "another-container" }))) + "}"],
+    ["100 other applications and empty paging facts", 200, () => listed(JSON.stringify(Array.from({ length: 100 }, (_, nth) => ({ id: "other-" + nth, name: "another-container" }))))],
     ["a body that is not JSON", 200, () => "<html>"],
   ] as const)("a Container answer of %s is no proof of absence and names nothing to delete", async (_name, status, answer) => {
     const { root, current } = await deployedProject();
@@ -1150,6 +1151,18 @@ describe("eden deploy sends every cf write to the account it checked (MOI-254)",
     expect([...cloud.workers]).toEqual([account + "/eve-deploy-fixture"]);
   });
 
+  test("a second Container application of the target's name stops the next deploy before it publishes", async () => {
+    const root = await deployableProject();
+    cloud.whoami = () => account;
+    expect((await deploy(root, "generation-one", { account, push: true, ownChecks: true })).exitCode).toBe(0);
+    const publishes = () => cloud.runs.filter((run) => run.args[0] === "deploy").length;
+    expect(publishes()).toBe(1);
+    cloud.containers.add(account + "/eve-deploy-fixture-container#" + "f".repeat(32));
+    const { exitCode, result } = await deploy(root, "generation-two", { account, push: true, ownChecks: true });
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DEPLOY_CHECKS_FAILED" });
+    expect(publishes()).toBe(1);
+  });
+
   test("a login that changes after the check cannot move the image push", async () => {
     const { exitCode, result } = await deployWhileTheLoginChanges(true);
     expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
@@ -1270,7 +1283,7 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
 
   test.each([
     ["the Container application is read", "/containers/applications", false, 0],
-    ["the Container application is created", "/containers/applications", true, 0],
+    ["the Container application is found missing", "/containers/applications", true, 0],
     ["the triggers are refused once", undefined, false, 1],
   ] as const)("a release that another replaces while %s gets no further write from Eden", async (_name, at, absent, triggerFailures) => {
     const root = await deployableProject();
@@ -1322,6 +1335,19 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
   test("after a publish cf called done, a Container application with another namespace is not a publication", async () => {
     const root = await deployableProject();
     cloud.application = (real) => ({ ...real, durable_objects: { namespace_id: "e".repeat(32) } });
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("after a publish cf called done, a release replaced while its Container application is read is not a publication", async () => {
+    const root = await deployableProject();
+    cloud.onRead = () => {
+      // The read of the one application, by its ID, comes after the read of the release in service.
+      if (cloud.apiReads.at(-1)?.url.endsWith("/containers/applications/" + cloud.namespace) === true) {
+        cloud.stamps = [{ type: "plain_text", name: "EDEN_EVE_RELEASE_ID", text: "eve-deploy-another" }];
+      }
+    };
     const { exitCode, result } = await deploy(root);
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
     await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });

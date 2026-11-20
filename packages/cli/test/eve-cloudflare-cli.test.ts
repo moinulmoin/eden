@@ -116,5 +116,6 @@ test("a read of the API with 50 ms left gives the token capture no more than tha
   const started = performance.now();
   expect(await cloudflareApiReader(cf)("/accounts/" + "1".repeat(32) + "/workers/subdomain", {}, 50)).toBeUndefined();
   expect(performance.now() - started).toBeLessThan(1_000);
-  expect(asked.every((ms) => ms !== undefined && ms <= 50)).toBe(true);
+  expect(asked).toHaveLength(1);
+  expect(asked[0]).toBeLessThanOrEqual(50);
 });
