@@ -4,6 +4,26 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Postgres World 5.3.0 checks (2026-11-20)
+
+Run on macOS with Docker, without Cloudflare credentials. No live Cloudflare
+run was made: the Eden leg removes `@workflow/world-postgres` from the
+project, so the Cloudflare path does not load it.
+
+- The compatibility gate passed both legs for both fixtures: Eve `0.91.0`
+  with `@workflow/world-postgres` `5.0.5`, and Eve `1.0.2` with `5.3.0`.
+- The published `5.3.0` and `5.2.1` packages were unpacked and compared.
+  Only `package.json` differs: the version, and the pins of
+  `@workflow/errors` (`5.1.3`), `@workflow/utils` (`5.1.1`),
+  `@workflow/world` (`5.2.2`), and `@workflow/world-local` (`5.4.1`). The
+  `deploymentId` option and migration `0031` that the `5.3.0` release notes
+  name are already in the `5.2.1` package.
+- Both versions declare `queueAuthMode: "skip"`, and declare deployment
+  affinity only when `deploymentId` or `WORKFLOW_POSTGRES_DEPLOYMENT_ID` is
+  set. Eden sets neither. Eden reads deployment affinity from
+  `eden.capabilities` in the World's `package.json`, which the Postgres World
+  does not have, so an update still replaces the running Container.
+
 ## Requests through the version switch, run on Cloudflare (2026-11-20)
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
