@@ -75,7 +75,10 @@ until the checks in steps 1–4 have passed.
    arguments, or logs. Only the names in this deploy's env file reach the
    container, so pass the same `--env-file` on every deploy. See
    [Security](./security.md).
-7. **Publish** the Worker and Container application.
+7. **Publish** the Worker and Container application. Eden runs
+   `wrangler deploy` once. When Wrangler uploads the Worker version and
+   then fails at the Container application settings, the deploy ends
+   `DEPLOY_INDETERMINATE` and says so.
 8. **Verify and promote** (`verifying health at <origin>`). Eden calls the
    public `/eve/v1/health` and only treats the deployment as live once it
    reports ready with the expected deployment identity. Then it removes its

@@ -269,4 +269,9 @@ the agent sleeps takes about 10–15 seconds.
   same `--project`, `--env`, and `--name`. Never switch to a new name to get
   past it, never delete resources by prefix, and never delete the project's
   `.eden/` folder: it is the ownership proof `destroy` needs.
+  One exception: when the message says Wrangler did not finish applying
+  the Container application settings, do not retry. Do what the printed
+  remediation says and nothing more. It names `eden destroy` only for a
+  target's first deploy; for a target that was deployed before, inspect and
+  stop. Never delete a Worker yourself.
 - Look up any other code in `docs/troubleshooting.md`.

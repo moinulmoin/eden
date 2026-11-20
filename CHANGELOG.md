@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- `eden deploy` now says when Wrangler uploaded the Worker version and then
+  failed at the Container application settings, instead of the general
+  `DEPLOY_INDETERMINATE` message. From 2026-11-19 `22:31Z`, five deploys
+  ended this way after Cloudflare answered `404` when Wrangler read the
+  version it had just uploaded. Eden does not run the publish again by itself. For a
+  target's first deploy the remediation names `eden destroy`: on
+  2026-11-20 `eden deploy` refused such a target twice, and `eden destroy`
+  cleared it on its second run. A deploy after that destroy was not run on
+  that target. For a target that was deployed before, the remediation stops
+  at inspection.
+- `EVE_DESTROY_OWNERSHIP_UNPROVEN` now says what to do when the account is
+  right but a failed deploy left a half-published Worker.
 - `eden preflight` and `eden deploy` no longer fail at `VAL-BUILD-005` when
   Docker's selected builder uses the `docker-container` driver. That builder
   keeps a built image in its own cache, so Docker never received it. Eden now

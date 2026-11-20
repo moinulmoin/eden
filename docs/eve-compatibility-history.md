@@ -4,6 +4,50 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for the Container settings message (2026-11-20)
+
+Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
+account, with Wrangler `4.147.0` and an OAuth login, on the branch of
+[#24](https://github.com/moinulmoin/eden/pull/24) at `ca83a0a`. That
+branch holds main at `50528b5`, so this is also the first full run with
+the destroy evidence change of
+[#21](https://github.com/moinulmoin/eden/pull/21) merged.
+
+Full run of `pnpm run check:live`, target `eden-live-20261120-3f6652c1`,
+`01:11:53Z` to `01:26:22Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+this workspace (version `0.13.0`), a 90-second idle window. All 18 steps
+passed.
+
+- `eden preflight` passed 14 checks with no warnings in 74 seconds. The
+  fresh deploy took 156 seconds, the same-version update 104 seconds, and
+  the deploy on Eve `1.0.2` 181 seconds, all on the same URL. Each
+  `wrangler deploy` ran once and succeeded.
+- Session `wrun_01M7V8D7S39K2VD4W3JN339EZQ` answered after each deploy and
+  after the sleep, with its earlier turns in its stream and its file
+  intact. After 165 seconds with no requests the first health request took
+  5.5 seconds, and the server process was 6 seconds old.
+- An unauthenticated session request got `401`, and the two workflow queue
+  routes answered `404`. A session on Eve `1.0.2` asked its server
+  process: no `queueAuthMode` line.
+- `eden destroy` ended with `destroyed` in 76 seconds and reported 13
+  objects in `EVE_REGISTRY_OBJECTS_KEPT`. In one repository: four snapshot
+  tags, two snapshot manifests, two chain artifacts, and one image
+  manifest (`accepted-still-listed`). In the other: two snapshot tags, one
+  snapshot manifest, and one chain artifact.
+- The check's catalog read found those 13 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+
+An earlier run the same day, on the same branch at `3f07e59` (before the
+last two commits), target `eden-live-20261120-baa4014a`, started at
+`00:42:52Z` and failed at the fresh deploy. Wrangler exited with its
+Container settings error. Eden ran `wrangler deploy` once and ended with
+`DEPLOY_INDETERMINATE` and the reason "Wrangler uploaded the Worker version
+but did not finish applying its Container application settings." The
+check's own `eden destroy` ended with `EVE_DESTROY_ABSENCE_UNPROVEN`. The
+same `eden destroy` at `00:47:42Z` ended with `destroyed` and one kept
+object. No `eden deploy` was run on that target afterwards.
+
 ## Live check for the destroy evidence change (2026-11-20)
 
 Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare

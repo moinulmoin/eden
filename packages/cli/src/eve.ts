@@ -143,7 +143,7 @@ function eveErrorRemediation(code: string): string {
     case "EVE_DESTROY_RECORD_MISMATCH":
       return "Rerun eden destroy with the exact --env and --name the deploy printed.";
     case "EVE_DESTROY_OWNERSHIP_UNPROVEN":
-      return "Sign in to the Cloudflare account that owns this deployment (npx wrangler@4.147.0 whoami, then login if needed) and rerun eden destroy. If a different Worker now uses this name, Eden will not delete it.";
+      return "Run npx wrangler@4.147.0 whoami and sign in to the account that owns this deployment if it names another. If the account is right and the last eden deploy ended DEPLOY_INDETERMINATE, its publish may have stopped partway: wait a minute and rerun eden destroy. If it still refuses, stop and read EVE_DESTROY_OWNERSHIP_UNPROVEN in docs/troubleshooting.md. Eden will not delete a different Worker that now uses this name.";
     case "EVE_DESTROY_INDETERMINATE":
     case "EVE_DESTROY_ABSENCE_UNPROVEN":
       return "Wait a minute for Cloudflare to settle, then rerun eden destroy with the same --project, --env, and --name. Keep the .eden folder; never delete resources by name prefix.";

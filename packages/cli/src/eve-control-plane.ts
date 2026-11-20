@@ -448,6 +448,8 @@ export type EveDeploymentPublicationResult =
     readonly status: "indeterminate";
     readonly reason: string;
     readonly ownershipEvidenceRetained: true;
+    /** Wrangler uploaded the Worker version, then failed at the Container application settings. */
+    readonly containerSettingsUnapplied?: true;
   };
 
 export type EveDeploymentPublicationRunner = (
@@ -2480,7 +2482,13 @@ async function runWranglerWithInput(
   timeoutMs: number = WRANGLER_OPERATION_TIMEOUT_MS,
   /** Makes Wrangler act on this account or fail, whatever its login resolves to. */
   accountId?: string,
-): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
+): Promise<{
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+  /** Read from all of stderr, before it is cut for display. */
+  readonly containerSettingsUnapplied: boolean;
+}> {
   // The project's TypeScript lib predates Promise.withResolvers.
   return withWranglerDirectory((cwd) => new Promise((resolveResult) => {
     const child = spawn(
@@ -2497,43 +2505,48 @@ async function runWranglerWithInput(
         stdio: ["pipe", "pipe", "pipe"],
       },
     );
-    let stdout = "";
-    let stderr = "";
+    // Decoded whole: a character can arrive split across two chunks.
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let settled = false;
     const finish = (result: {
       readonly exitCode: number;
-      readonly stdout: string;
+      readonly stdout?: string;
       readonly stderr: string;
+      /** True when Wrangler itself exited with this code. */
+      readonly exited?: boolean;
     }): void => {
       if (settled) return;
       settled = true;
       resolveResult({
         exitCode: result.exitCode,
-        stdout: safeText(result.stdout),
+        stdout: safeText(result.stdout ?? Buffer.concat(stdoutChunks).toString()),
         stderr: safeText(result.stderr),
+        containerSettingsUnapplied: result.exited === true && result.exitCode !== 0 &&
+          WRANGLER_CONTAINER_SETTINGS_UNAPPLIED.test(result.stderr.replace(TERMINAL_COLOR, "")),
       });
     };
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
-      finish({
-        exitCode: 1,
-        stdout,
-        stderr: "The bounded Wrangler operation timed out.",
-      });
+      finish({ exitCode: 1, stderr: "The bounded Wrangler operation timed out." });
     }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdoutChunks.push(chunk);
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      stderrChunks.push(chunk);
     });
     child.once("error", () => {
       clearTimeout(timeout);
-      finish({ exitCode: 1, stdout, stderr: "Wrangler could not be started." });
+      finish({ exitCode: 1, stderr: "Wrangler could not be started." });
     });
     child.once("close", (code) => {
       clearTimeout(timeout);
-      finish({ exitCode: code ?? 1, stdout, stderr });
+      finish({
+        exitCode: code ?? 1,
+        stderr: Buffer.concat(stderrChunks).toString(),
+        exited: code !== null,
+      });
     });
     if (input === undefined) child.stdin.end();
     else child.stdin.end(input);
@@ -2651,6 +2664,22 @@ async function defaultImagePublicationRunner(
   }
 }
 
+/**
+ * The whole error Wrangler 4.147.0 prints, on a line of its own, when it
+ * uploaded the Worker version and then failed while setting up the
+ * Container application, whatever the cause.
+ */
+const WRANGLER_CONTAINER_SETTINGS_UNAPPLIED =
+  /(?:^|\n)✘ \[ERROR\] The Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings\. Re-run the same `wrangler deploy` command to retry and finish deployment\.[ \t]*(?:\r?\n|$)/u;
+const TERMINAL_COLOR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "gu");
+const CONTAINER_SETTINGS_UNAPPLIED_INSPECTION =
+  "Eden did not run the publish again. Check the deployment URL's /eve/v1/health and inspect the Worker, the Container application, and the retained .eden evidence. Keep the .eden folder.";
+/** Only for a target this project never promoted; run on Cloudflare on 2026-11-20. */
+const CONTAINER_SETTINGS_UNAPPLIED_FIRST_DEPLOY =
+  " This was the target's first deploy. It can leave a Worker without its Container application, which eden deploy refuses with VAL-CLI-007-TARGET-CONFLICT. Run eden destroy with the same --project, --env, and --name, again after a minute if it answers EVE_DESTROY_OWNERSHIP_UNPROVEN. Run eden deploy only after destroy ends destroyed or absent.";
+/** The remediation of each deployment whose publish stopped at the Container application settings. */
+const containerSettingsUnapplied = new WeakMap<object, string>();
+
 function defaultPublicationRunner(): EveDeploymentPublicationRunner {
   return async (request) => {
     const result = await runWranglerWithInput(
@@ -2668,11 +2697,15 @@ function defaultPublicationRunner(): EveDeploymentPublicationRunner {
       WRANGLER_PUBLICATION_TIMEOUT_MS,
     );
     if (result.exitCode !== 0) {
+      // A timeout replaces stderr, so it never matches.
+      const unapplied = result.containerSettingsUnapplied;
       return {
         status: "indeterminate",
-        reason:
-          "The exact Cloudflare publication did not return a terminal success result.",
+        reason: unapplied
+          ? "Wrangler uploaded the Worker version but did not finish applying its Container application settings."
+          : "The exact Cloudflare publication did not return a terminal success result.",
         ownershipEvidenceRetained: true,
+        ...(unapplied ? { containerSettingsUnapplied: true } : {}),
       };
     }
     const { containerEntries, worker } = await readExactTargetInventory(
@@ -3510,10 +3543,20 @@ async function runEveDeployment(
   }
   if (publication.status === "indeterminate") {
     await writeFailureRecord("indeterminate", safeText(publication.reason));
+    const deployment = deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(publication.reason), evidenceLocation: candidate.generationRoot });
+    if (publication.containerSettingsUnapplied === true) {
+      // A first deploy: Cloudflare had no such target, and this project never
+      // promoted one. A CURRENT that exists or cannot be checked is not that.
+      const neverPromoted = operation === "create" && await lstat(
+        join(request.projectRoot, ".eden", "eve-deploy", "targets", `${request.environment}-${request.name}`, "CURRENT"),
+      ).then(() => false, (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+      containerSettingsUnapplied.set(deployment, CONTAINER_SETTINGS_UNAPPLIED_INSPECTION +
+        (neverPromoted ? CONTAINER_SETTINGS_UNAPPLIED_FIRST_DEPLOY : ""));
+    }
     return {
       ...collected.result,
       ok: false,
-      deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(publication.reason), evidenceLocation: candidate.generationRoot }),
+      deployment,
     };
   }
   if (
@@ -4696,7 +4739,9 @@ export async function runEveControlPlane(
           // One instruction: the failed checks' own, so none contradicts another.
           ...(retirementPending
             ? { remediation: failedCleanup.flatMap((value) => value.remediation ?? []).join(" ") }
-            : {}),
+            : deploymentResult.deployment !== undefined && containerSettingsUnapplied.has(deploymentResult.deployment)
+              ? { remediation: containerSettingsUnapplied.get(deploymentResult.deployment) as string }
+              : {}),
           code: status === "indeterminate"
             ? "DEPLOY_INDETERMINATE"
             : status === "deployed"
