@@ -84,9 +84,9 @@ silently.
 Instead of signing in, you can set `CLOUDFLARE_API_TOKEN`. `cf` uses it as
 its login, and `npx cf@1.0.0-rc.2 auth whoami` then reports
 `"authSource": "CLOUDFLARE_API_TOKEN environment variable"`. On 2026-11-20
-preflight, a first deploy, an update, and destroy passed with a token made
-from Cloudflare's "Edit Cloudflare Workers" template and no saved login.
-Which of that token's permissions Eden needs has not been narrowed down.
+a token made from Cloudflare's "Edit Cloudflare Workers" template,
+unchanged, ran preflight, a first deploy, an update, and a destroy with no
+saved login. A narrower set of permissions was not tested.
 
 ### Moving from the Wrangler login
 

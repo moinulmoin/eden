@@ -72,6 +72,10 @@ const cloud = vi.hoisted(() => {
     newAccount: false,
     /** A stand-in for an account with no workers.dev subdomain: a Worker's subdomain carries no URL. Not captured. */
     noSubdomain: false,
+    /** How many times "cf workers triggers deploy" answers that the Worker does not exist. */
+    triggerFailures: 0,
+    /** How "cf deploy" of the temporary Worker exits, after it uploaded the Worker. */
+    probeDeployExits: 0,
     /** Whether Cloudflare fails to delete the temporary Worker. */
     probeStays: false,
     /** Each temporary Worker cf deployed, as account/worker. */
@@ -235,9 +239,17 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
     if (worker.name.startsWith("eden-origin-probe-")) {
       cloud.probes.push(published + "/" + worker.name + (existsSync(join(cwd, "cloudflare.config.ts")) ? "" : " without an inert config"));
       cloud.workers.add(published + "/" + worker.name);
-      return { exitCode: 0 };
+      // What cf 1.0.0-rc.2 printed on 2026-11-20 after it had uploaded the temporary Worker.
+      return cloud.probeDeployExits === 0 ? { exitCode: 0 } : {
+        exitCode: 1,
+        stderr: "├  Deploy\n│  Total Upload: 0.07 KiB / gzip: 0.09 KiB\n│  Uploaded " + worker.name + " (3.43 sec)\n\n┌ APIError\n│ [10007] This Worker does not exist on your account. [code: 10007]\n│ 404 Not Found\n└\n\n",
+      };
     }
     if (command === "workers triggers deploy") {
+      // What cf 1.0.0-rc.2 printed on 2026-11-20, seconds after Cloudflare had shown the Worker's version.
+      if (cloud.triggerFailures-- > 0) {
+        return { exitCode: 1, stderr: "├  Deploy triggers\n\n┌ APIError\n│ [10007] This Worker does not exist on your account. [code: 10007]\n│ 404 Not Found\n└\n\n" };
+      }
       cloud.triggers.push(published + "/" + worker.name);
       return { exitCode: 0 };
     }
@@ -438,6 +450,8 @@ beforeEach(() => {
     pinned: [],
     newAccount: false,
     noSubdomain: false,
+    triggerFailures: 0,
+    probeDeployExits: 0,
     probeStays: false,
     probes: [],
     deployFailure: undefined,
@@ -1009,6 +1023,15 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     expect(cloud.triggers).toEqual([worker]);
   });
 
+  test("triggers that Cloudflare refuses at first, saying the Worker does not exist, are applied again", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.triggerFailures = 3;
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
+    expect(cloud.triggers).toEqual([worker]);
+  });
+
   test("a Worker that one of Cloudflare's two reads still shows is not absent: destroy stops", async () => {
     const { root, current } = await deployedProject();
     cloud.containers.add("account-test/eve-destroy-fixture-container#container-123");
@@ -1106,6 +1129,16 @@ describe("the first deploy on a Cloudflare account that has no Worker yet", () =
     expect(cloud.deleted).toEqual(["worker:" + String(cloud.probes[0])]);
     expect([...cloud.workers]).toEqual([account + "/eve-deploy-fixture"]);
     expect(cloud.stamps).toContainEqual({ type: "plain_text", name: "EVE_PUBLIC_ORIGIN", text: "https://eve-deploy-fixture.account.workers.dev" });
+  });
+
+  test("deploys when cf uploaded the temporary Worker and then exited 1", async () => {
+    const root = await deployableProject();
+    cloud.whoami = () => account;
+    cloud.newAccount = true;
+    cloud.probeDeployExits = 1;
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
+    expect([...cloud.workers]).toEqual([account + "/eve-deploy-fixture"]);
   });
 
   test("an account with no workers.dev subdomain stops the deploy with the page that registers one", async () => {

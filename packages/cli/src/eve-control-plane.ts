@@ -1634,7 +1634,7 @@ async function readWorkersDevSubdomain(
     `this Cloudflare account has no Worker yet: deploying the temporary Worker ${name}, which gets no URL, to read the account's workers.dev subdomain, then deleting it`,
   );
   const output = ".cloudflare/output/v1";
-  const deployed = await cf({
+  await cf({
     args: ["deploy", "--prebuilt"],
     accountId,
     timeoutMs: 120_000,
@@ -1651,8 +1651,10 @@ async function readWorkersDevSubdomain(
     },
   });
   let worker: unknown;
-  // Cloudflare can take a while to show a Worker it just accepted.
-  for (let attempt = 0; deployed.exitCode === 0 && worker === undefined && attempt < 12; attempt += 1) {
+  // Cloudflare can take a while to show a Worker it just accepted. On
+  // 2026-11-20 cf uploaded the Worker and then exited 1 because Cloudflare
+  // answered that it did not exist, so a failed deploy is read as well.
+  for (let attempt = 0; worker === undefined && attempt < 12; attempt += 1) {
     if (attempt > 0) await waitForActivation(5_000);
     worker = cloudflareCliJson(
       await cf({ args: ["workers", "get", name], accountId, timeoutMs: 30_000 }),
@@ -2740,12 +2742,19 @@ async function finishPublication(
     !("name" in application) || application.name !== name ||
     !("scheduling_policy" in application) || application.scheduling_policy !== "durable_object"
   ) return "unfinished";
-  const triggers = await cf({
-    args: ["workers", "triggers", "deploy", "--prebuilt"],
-    accountId,
-    files: request.buildOutput,
-  });
-  return triggers.exitCode === 0 ? "finished" : "unfinished";
+  // Applying the triggers again changes nothing, so a failure is retried for
+  // two minutes: on 2026-11-20 cf answered here that the Worker did not exist
+  // seconds after Cloudflare had shown its version.
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    if (attempt > 0) await waitForActivation(5_000);
+    const triggers = await cf({
+      args: ["workers", "triggers", "deploy", "--prebuilt"],
+      accountId,
+      files: request.buildOutput,
+    });
+    if (triggers.exitCode === 0) return "finished";
+  }
+  return "unfinished";
 }
 
 function defaultPublicationRunner(

@@ -185,7 +185,9 @@ only checks whether Wrangler's login file exists, to explain a signed-out
 `cf`, and never opens it.
 
 Eden itself never reads or sends `CLOUDFLARE_API_TOKEN`; only `cf` uses it,
-as its login. `cf` has no
+as its login. A token made from Cloudflare's "Edit Cloudflare Workers"
+template, unchanged, ran preflight, a first deploy, an update, and a destroy
+on 2026-11-20. A narrower set of permissions was not tested. `cf` has no
 command for the account's `workers.dev` subdomain, so Eden reads it from the
 URL of any Worker the account already has (`cf workers list --per-page 1`).
 When the account has no Worker yet, `eden deploy` deploys one temporary

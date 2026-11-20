@@ -729,7 +729,7 @@ return a terminal success result.` Eden creates nothing. See
 
 If it does, Eden finishes the publish itself: it creates the Container
 application when Cloudflare answers that it does not exist, then deploys the
-triggers. The deploy then continues as any other. When one of those steps
+triggers, trying again for up to two minutes while that fails. The deploy then continues as any other. When one of those steps
 fails, the message is `Cloudflare has this
 publish's Worker version, but its Container application or triggers could
 not be set up.` The remediation is `Run eden deploy again with the same
