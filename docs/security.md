@@ -298,7 +298,11 @@ keeps nothing that `cf deploy` printed, because `cf` can print a value
 whole, wrapped over two lines, or escaped. It keeps `cf`'s exit code and a
 sentence of Eden's own that says which known `cf` message was seen, if any.
 What `cf` printed for the commands Eden ran afterwards to finish the
-publish is kept; those commands are not given the values.
+publish is kept; those commands are not given the values. When the image
+push fails, `cf-push.log` in the generation folder keeps `cf`'s exit code
+and the last 2,000 characters `cf` and Docker wrote to standard error, with
+mode `0600`. The push is not given the values either. `cf` hands Docker
+the registry password on standard input, not in a command line.
 
 ### Which account each command uses
 

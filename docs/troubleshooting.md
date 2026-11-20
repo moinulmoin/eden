@@ -259,8 +259,8 @@ before you remove the lock file by hand.
 
 `cf containers push` uses your Docker credential store. When the push fails
 this way, the deploy's `DEPLOY_INDETERMINATE` message names the keychain
-entry and the command below. Eden prints nothing else of what the push
-wrote.
+entry and the command below. The end of what `cf` and Docker printed is in
+the `cf-push.log` file the message names.
 
 On macOS, a stale `registry.cloudflare.com` keychain entry makes the managed
 registry login fail with `The specified item already exists in the keychain
@@ -771,6 +771,27 @@ success, or the published image does not match the exact target repository
 and digest identity, the deploy ends as indeterminate. The push may take ten
 minutes; Eden stops waiting after that. See
 [Indeterminate outcomes](#indeterminate-outcomes) below.
+
+`cf containers push` signs Docker in to the registry, then runs
+`docker tag` and `docker push`. When it fails, the message starts with
+`The exact Cloudflare Container image push did not complete:` and says how:
+
+| The message goes on | What happened |
+| --- | --- |
+| `cf containers push ended without an exit code. Eden stops it after ten minutes.` | The push took longer than ten minutes, or `cf` was killed. Run `eden deploy` again. |
+| `Docker's credential store already holds an entry for registry.cloudflare.com.` | See [Managed registry login fails with `-25299`](#managed-registry-login-fails-with--25299). |
+| `docker login to registry.cloudflare.com failed. cf signs Docker in to the registry, and Docker saves that in its credential store.` | `docker login` exited with an error. The log has Docker's reason. |
+| `Docker signed in to registry.cloudflare.com, and its tag or push command then failed.` | `docker tag` or `docker push` exited with an error. The log has Docker's reason. |
+| `cf containers push exited <code>.` | `cf` failed another way, for example before it reached Docker. |
+
+The message ends with `What cf and Docker printed is in <path>.` The file
+is `cf-push.log` in the generation folder under
+`.eden/eve-deploy/generations/`. It holds `cf`'s exit code and the last
+2,000 characters `cf` and Docker wrote to standard error, readable by you
+alone. The push is not given the runtime values. The `cf` messages behind
+the first four rows were read from `cf` `1.0.0-rc.2` run with a stand-in
+`docker` that failed at each step, not from a failed push to Cloudflare's
+registry.
 
 The publish is one `cf deploy --prebuilt`, which Eden never runs twice.
 `cf deploy` uploads the Worker version first, then sets up the Container

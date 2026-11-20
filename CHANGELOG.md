@@ -33,6 +33,13 @@
   "return" an account ID and a subdomain. The no-subdomain answer is the one
   `cf` `1.0.0-rc.2` reads; no account without a subdomain was available to
   test it on Cloudflare.
+- A failed image push now says how it failed. The `DEPLOY_INDETERMINATE`
+  message tells apart a push Eden stopped after ten minutes, a
+  `docker login` that failed, a `docker tag` or `docker push` that failed
+  after the login, and any other `cf containers push` failure. The end of
+  what `cf` and Docker printed is kept in `cf-push.log` in the generation
+  folder, and the message names the file. Until now every one of these read
+  `The exact Cloudflare Container image push did not complete.`
 
 ## 0.15.0 — 2026-11-20
 

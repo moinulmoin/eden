@@ -2608,13 +2608,28 @@ async function publishImageWithCf(
       timeoutMs: CLOUDFLARE_PUBLICATION_TIMEOUT_MS,
     });
     if (pushed.exitCode !== 0) {
+      // The push carries no runtime values, so the end of what cf and
+      // Docker printed is kept beside the generation, as for the publish.
+      const log = join(request.generationRoot, "cf-push.log");
+      const kept = await writeFile(
+        log,
+        `cf containers push: exit ${pushed.exitCode ?? "none (cf was stopped)"}\n${safeText(pushed.stderr.slice(-2_000))}`,
+        { mode: 0o600 },
+      ).then(() => true, () => false);
+      // cf signs Docker in, then runs docker tag and docker push. How it
+      // failed is read from cf's own two messages, seen on 2026-11-20.
+      const how = /-25299|already exists in the keychain/u.test(pushed.stderr)
+        ? "Docker's credential store already holds an entry for registry.cloudflare.com. On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry."
+        : pushed.exitCode === undefined
+        ? "cf containers push ended without an exit code. Eden stops it after ten minutes."
+        : /Login failed with code: \d+/u.test(pushed.stderr)
+        ? "docker login to registry.cloudflare.com failed. cf signs Docker in to the registry, and Docker saves that in its credential store."
+        : /Docker command exited with code: \d+/u.test(pushed.stderr)
+        ? "Docker signed in to registry.cloudflare.com, and its tag or push command then failed."
+        : `cf containers push exited ${pushed.exitCode}.`;
       return {
         status: "indeterminate",
-        // cf pushes with the caller's Docker credential store. This is the
-        // one failure of it Eden names: macOS refusing a second keychain entry.
-        reason: /-25299|already exists in the keychain/u.test(pushed.stderr)
-          ? "The exact Cloudflare Container image push did not complete: Docker's credential store already holds an entry for registry.cloudflare.com. On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry."
-          : "The exact Cloudflare Container image push did not complete.",
+        reason: `The exact Cloudflare Container image push did not complete: ${how}${kept ? ` What cf and Docker printed is in ${log}.` : ""}`,
         evidenceRetained: true,
       };
     }

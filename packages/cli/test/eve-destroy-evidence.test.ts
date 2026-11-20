@@ -82,6 +82,8 @@ const cloud = vi.hoisted(() => {
     secrets: [] as string[],
     /** Each image cf pushed, as account/repository:tag. */
     pushed: [] as string[],
+    /** When set, how "cf containers push" ends, in place of exit 0. A null exit code is a cf that Eden stopped. */
+    pushResult: undefined as CfResult | undefined,
     /** When set, the API's answer to the read of the account's workers.dev subdomain. */
     subdomainAnswer: undefined as { readonly status: number; readonly body: string } | undefined,
     /** How many times "cf workers triggers deploy" answers that the Worker does not exist. */
@@ -249,7 +251,7 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
   }
   if (command === "containers push") {
     cloud.pushed.push(account + "/" + flag("--tag"));
-    return { exitCode: 0 };
+    return cloud.pushResult ?? { exitCode: 0 };
   }
   if (command === "workers delete") {
     if (!cloud.workers.delete(account + "/" + args[2])) {
@@ -530,6 +532,7 @@ beforeEach(() => {
     deleted: [],
     secrets: [],
     pushed: [],
+    pushResult: undefined,
     subdomainAnswer: undefined,
   });
   vi.stubEnv("CLOUDFLARE_API_TOKEN", "");
@@ -643,7 +646,7 @@ async function writeBuild(snapshotRoot: string): Promise<void> {
   await symlink("../eve/bin/eve.js", join(snapshotRoot, "node_modules/.bin/eve"));
 }
 
-type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly message?: string; readonly remediation?: string }[] };
+type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string; readonly message?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly message?: string; readonly remediation?: string }[] };
 
 /** A deploy that publishes through Eden's own cf calls and its own read afterwards. */
 async function deploy(
@@ -1492,6 +1495,52 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     const destroyed = await destroyDeployed(root);
     expect({ exitCode: destroyed.exitCode, status: destroyed.result.status }).toEqual({ exitCode: 0, status: "destroyed" });
     expect(cloud.deleted).toEqual(["worker:" + worker]);
+    expect([...cloud.workers]).toEqual([]);
+  });
+});
+
+describe("a failed image push says how it failed and keeps what cf and Docker printed (MOI-312)", () => {
+  // The boxes are what cf 1.0.0-rc.2 printed on 2026-11-20 around a stand-in docker that failed at each step; the lines before them stand for Docker's own.
+  test.each([
+    [
+      "that Eden stopped",
+      { exitCode: null, stderr: "" },
+      /push did not complete: cf containers push ended without an exit code\. Eden stops it after ten minutes\./u,
+    ],
+    [
+      "whose docker login failed",
+      { exitCode: 1, stderr: "Error saving credentials: error storing credentials - err: exit status 1, out: `not implemented`\n\n┌ Error\n│ Login failed with code: 1\n└\n" },
+      /push did not complete: docker login to registry\.cloudflare\.com failed\. cf signs Docker in to the registry, and Docker saves that in its credential store\./u,
+    ],
+    [
+      "whose docker login found a stale keychain entry",
+      { exitCode: 1, stderr: "Error saving credentials: error storing credentials - err: exit status 1, out: `The specified item already exists in the keychain. (-25299)`\n\n┌ Error\n│ Login failed with code: 1\n└\n" },
+      /push did not complete: Docker's credential store already holds an entry for registry\.cloudflare\.com\. On macOS, run security delete-internet-password -s registry\.cloudflare\.com, then retry\./u,
+    ],
+    [
+      "whose docker push failed",
+      { exitCode: 1, stdout: "Login Succeeded\n", stderr: "denied: stand-in refusal\n\n┌ Error\n│ Docker command exited with code: 1\n└\n" },
+      /push did not complete: Docker signed in to registry\.cloudflare\.com, and its tag or push command then failed\./u,
+    ],
+    [
+      "that failed another way",
+      { exitCode: 1, stderr: "\n┌ Error\n│ fetch failed\n└\n" },
+      /push did not complete: cf containers push exited 1\./u,
+    ],
+  ] as const)("a cf containers push %s", async (_name, pushResult, message) => {
+    const root = await deployableProject();
+    const account = "1".repeat(32);
+    cloud.whoami = () => account;
+    cloud.pushResult = pushResult;
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect(result.error?.message).toMatch(message);
+    const log = join(root, ".eden", "eve-deploy", "generations", "generation-one", "cf-push.log");
+    expect(result.error?.message).toContain("What cf and Docker printed is in " + log + ".");
+    expect(await readFile(log, "utf8")).toBe(
+      "cf containers push: exit " + (pushResult.exitCode ?? "none (cf was stopped)") + "\n" + pushResult.stderr,
+    );
+    expect((await lstat(log)).mode & 0o777).toBe(0o600);
     expect([...cloud.workers]).toEqual([]);
   });
 });
