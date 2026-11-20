@@ -49,8 +49,8 @@ const fakeWrangler = vi.hoisted(() => ({
   intercept: false,
   pending: undefined as readonly string[] | undefined,
   calls: [] as { readonly args: readonly string[]; readonly timeoutMs: unknown }[],
-  /** What each spawn in turn prints on stderr and exits with; then exit 1 with no output. */
-  answers: [] as { readonly exitCode: number | null; readonly stderr?: string }[],
+  /** What each spawn in turn prints on stderr, a Buffer per chunk, and exits with; then exit 1 with no output. */
+  answers: [] as { readonly exitCode: number | null; readonly stderr?: string | readonly Buffer[] }[],
 }));
 
 /**
@@ -268,7 +268,9 @@ vi.mock("node:child_process", async (importOriginal) => {
       });
       const answer = fakeWrangler.answers.shift() ?? { exitCode: 1 };
       setImmediate(() => {
-        if (answer.stderr !== undefined) child.stderr.emit("data", Buffer.from(answer.stderr));
+        for (const chunk of typeof answer.stderr === "string" ? [Buffer.from(answer.stderr)] : answer.stderr ?? []) {
+          child.stderr.emit("data", chunk);
+        }
         child.emit("close", answer.exitCode);
       });
       return child;
@@ -1658,6 +1660,8 @@ describe("top-level Eden Deploy commands", () => {
   test.each([
     ["its Container settings error", containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1, false],
     ["its Container settings error on a target this project promoted before", containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", false, 1, true],
+    // The three bytes of ✘ start at byte 5.
+    ["its Container settings error with ✘ split across two chunks", [Buffer.from(containerSettingsUnapplied).subarray(0, 6), Buffer.from(containerSettingsUnapplied).subarray(6)], "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1, false],
     ["its Container settings error after long warnings", "warning ".repeat(300) + "\n" + containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1, false],
     ["another error", "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API failed.\u001b[0m\n\n", "The exact Cloudflare publication did not return a terminal success result.", false, 1, false],
     ["a warning that quotes its Container settings error, then another error", "\u001b[33m▲ \u001b[43;33m[\u001b[43;30mWARNING\u001b[43;33m]\u001b[0m \u001b[1mAn earlier run said: The Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings.\u001b[0m\n\n\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API failed.\u001b[0m\n\n", "The exact Cloudflare publication did not return a terminal success result.", false, 1, false],

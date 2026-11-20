@@ -2505,12 +2505,13 @@ async function runWranglerWithInput(
         stdio: ["pipe", "pipe", "pipe"],
       },
     );
-    let stdout = "";
-    let stderr = "";
+    // Decoded whole: a character can arrive split across two chunks.
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let settled = false;
     const finish = (result: {
       readonly exitCode: number;
-      readonly stdout: string;
+      readonly stdout?: string;
       readonly stderr: string;
       /** True when Wrangler itself exited with this code. */
       readonly exited?: boolean;
@@ -2519,7 +2520,7 @@ async function runWranglerWithInput(
       settled = true;
       resolveResult({
         exitCode: result.exitCode,
-        stdout: safeText(result.stdout),
+        stdout: safeText(result.stdout ?? Buffer.concat(stdoutChunks).toString()),
         stderr: safeText(result.stderr),
         containerSettingsUnapplied: result.exited === true && result.exitCode !== 0 &&
           WRANGLER_CONTAINER_SETTINGS_UNAPPLIED.test(result.stderr.replace(TERMINAL_COLOR, "")),
@@ -2527,25 +2528,25 @@ async function runWranglerWithInput(
     };
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
-      finish({
-        exitCode: 1,
-        stdout,
-        stderr: "The bounded Wrangler operation timed out.",
-      });
+      finish({ exitCode: 1, stderr: "The bounded Wrangler operation timed out." });
     }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdoutChunks.push(chunk);
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      stderrChunks.push(chunk);
     });
     child.once("error", () => {
       clearTimeout(timeout);
-      finish({ exitCode: 1, stdout, stderr: "Wrangler could not be started." });
+      finish({ exitCode: 1, stderr: "Wrangler could not be started." });
     });
     child.once("close", (code) => {
       clearTimeout(timeout);
-      finish({ exitCode: code ?? 1, stdout, stderr, exited: code !== null });
+      finish({
+        exitCode: code ?? 1,
+        stderr: Buffer.concat(stderrChunks).toString(),
+        exited: code !== null,
+      });
     });
     if (input === undefined) child.stdin.end();
     else child.stdin.end(input);
