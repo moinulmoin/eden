@@ -169,8 +169,12 @@ project, with its configuration file and account cache pinned inside it.
 Project `.env` files and configuration or cache files planted in a shared
 temporary directory cannot redirect account operations or secret uploads.
 
-Eden asks `wrangler whoami` which account the login names. That is the only
-Wrangler command it runs without an account. Every other one runs with
+Eden asks `wrangler whoami` which account the login names. Eden does not
+pin that command; it receives `CLOUDFLARE_ACCOUNT_ID` only when you set it.
+`eden preflight` and `eden deploy` ask before the build and again after it.
+If the second answer names another account, the command stops at the
+[Cloudflare access check](./troubleshooting.md#val-cli-007-cloudflare-access--cloudflare-access-is-blocked)
+before it reads or writes anything there. Every other Wrangler command runs with
 `CLOUDFLARE_ACCOUNT_ID` set to the account Eden checked. For destroy that is
 the account in the deployment record, which the login must name:
 

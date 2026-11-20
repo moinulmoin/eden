@@ -375,6 +375,11 @@ npx wrangler@4.147.0 login
 npx wrangler@4.147.0 whoami
 ```
 
+The same check and remediation appear after the build when the login then
+names a different account than it did before the build. Eden reads and
+writes nothing in the second account. Confirm the account you intend with
+`whoami`, then run the command again.
+
 When Wrangler is logged in but the account's Containers cannot be read, the
 remediation says so. The account must be on the Workers Paid plan, which
 Cloudflare Containers requires. Review the account that `whoami` returns

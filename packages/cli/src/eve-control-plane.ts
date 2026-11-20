@@ -1486,10 +1486,15 @@ async function withWranglerDirectory<T>(
   }
 }
 
+/** The one Wrangler command Eden runs without an account: it names the login's. */
+function readWranglerLogin(): Promise<WranglerJsonResult> {
+  return readWranglerJson(["whoami", "--json"], undefined);
+}
+
 async function readWranglerJson(
   args: readonly string[],
-  /** Makes Wrangler read this account or fail. Only whoami, which names the account, runs without it. */
-  accountId?: string,
+  /** Makes Wrangler read this account or fail. */
+  accountId: string | undefined,
 ): Promise<WranglerJsonResult> {
   try {
     const result = await withWranglerDirectory((cwd) => execFileAsync(
@@ -1802,9 +1807,15 @@ async function readExactTargetInventory(
 
 async function defaultCloudflareRead(
   request: EveCloudflareReadRequest,
+  /** The account the check before the build named. */
+  checkedAccountId: string | undefined,
 ): Promise<EveCloudflareReadResult> {
-  const account = await readWranglerJson(["whoami", "--json"]);
-  const accountId = authenticatedAccountId(account.value);
+  const account = await readWranglerLogin();
+  const loginAccountId = authenticatedAccountId(account.value);
+  // A login that now names another account is no access: nothing is read or written there.
+  const accountId = checkedAccountId !== undefined && loginAccountId !== checkedAccountId
+    ? undefined
+    : loginAccountId;
   const { containerEntries, worker } = await readExactTargetInventory(
     accountId,
     request.name,
@@ -1921,7 +1932,7 @@ async function readProviderEvidence(
       ? {}
       : { containerApplicationId: containerEntry.id }),
   };
-  if (containerEntry !== undefined) {
+  if (containerEntry !== undefined && accountId !== undefined) {
     const info = await readWranglerJson([
       "containers",
       "info",
@@ -2133,9 +2144,10 @@ async function resolveEveTargetOwnership(
 async function readEveCloudflareTarget(
   request: EveCloudflareReadRequest,
   options: EvePreflightOptions,
+  checkedAccountId: string | undefined,
 ): Promise<EveCloudflareReadResult> {
   const result = options.cloudflareRead === undefined
-    ? await defaultCloudflareRead(request)
+    ? await defaultCloudflareRead(request, checkedAccountId)
     : await options.cloudflareRead(request);
   return resolveEveTargetOwnership(request, result);
 }
@@ -2227,12 +2239,12 @@ async function defaultRuntimeRunner(
 
 type EveCloudflareAccess = Pick<
   EveCloudflareReadResult,
-  "accountAccess" | "containerAccess"
+  "accountAccess" | "containerAccess" | "accountId"
 >;
 
 /** The login and Container read that need no build, so they run before it. */
 async function defaultCloudflareAccess(name: string): Promise<EveCloudflareAccess> {
-  const account = await readWranglerJson(["whoami", "--json"]);
+  const account = await readWranglerLogin();
   const accountId = authenticatedAccountId(account.value);
   if (account.failed || accountId === undefined) {
     return { accountAccess: "unavailable", containerAccess: "unavailable" };
@@ -2241,6 +2253,7 @@ async function defaultCloudflareAccess(name: string): Promise<EveCloudflareAcces
   return {
     accountAccess: "available",
     containerAccess: containers.failed ? "unavailable" : "available",
+    accountId,
   };
 }
 
@@ -4125,9 +4138,11 @@ async function collectEvePreflight(
       sandboxProvider === undefined || warning.id !== "EVE_JUST_BASH_MISSING"
     ),
   );
+  let checkedAccountId: string | undefined;
   if (options.cloudflareRead === undefined) {
     eveProgress(options, "checking Cloudflare access");
     const access = await defaultCloudflareAccess(request.name);
+    checkedAccountId = access.accountId;
     if (
       access.accountAccess === "unavailable" ||
       access.containerAccess === "unavailable"
@@ -4349,6 +4364,7 @@ async function collectEvePreflight(
           name: request.name,
         },
         options,
+        checkedAccountId,
       );
     } catch {
       await discardPackagingImage();
@@ -4631,6 +4647,7 @@ async function collectEvePreflight(
           name: request.name,
         },
         options,
+        checkedAccountId,
       );
     } catch {
       await discardPackagingImage();
@@ -5408,7 +5425,7 @@ async function defaultDestroyTargetRead(
   request: EveDestroyCloudflareReadRequest,
   registry: CloudflareRegistry,
 ): Promise<EveDestroyTargetRead> {
-  const account = await readWranglerJson(["whoami", "--json"]);
+  const account = await readWranglerLogin();
   const accountId = authenticatedAccountId(account.value);
   if (accountId !== undefined && accountId !== request.accountId) {
     // A login for another account: nothing is read, and the caller refuses on the account.

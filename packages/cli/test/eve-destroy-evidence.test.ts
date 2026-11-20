@@ -233,6 +233,7 @@ async function cloudflareApi(input: string | URL | Request, init?: RequestInit):
     return json(cloud.containerStatus, cloud.containerAnswer?.(JSON.stringify(entries)) ??
       { success: true, errors: [], messages: [], result: entries, result_info: {} });
   }
+  if (rest.join("/") === "workers/subdomain") return json(200, { success: true, errors: [], messages: [], result: { subdomain: "account" } });
   if (rest[0] === "workers" && rest[1] === "scripts" && rest[3] === "deployments") {
     await cloud.onWorkerRead(cloud.workerReads++);
     if (cloud.workerFailure?.api === "network") throw new TypeError("fetch failed");
@@ -473,13 +474,15 @@ async function writeBuild(snapshotRoot: string): Promise<void> {
   await symlink("../eve/bin/eve.js", join(snapshotRoot, "node_modules/.bin/eve"));
 }
 
+type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly remediation?: string }[] };
+
 /** A deploy that publishes through Eden's own Wrangler call and its own read afterwards. */
 async function deploy(
   root: string,
   generationId = "generation-one",
   /** The account the check before the deploy proved, an env file to upload, and whether Eden pushes the image itself. */
-  { account = "account-test", envFile, push = false }: { readonly account?: string; readonly envFile?: string; readonly push?: boolean } = {},
-): Promise<{ readonly exitCode: number; readonly result: { readonly ok?: boolean; readonly error?: { readonly code?: string } } }> {
+  { account = "account-test", envFile, push = false, ownChecks = false }: { readonly account?: string; readonly envFile?: string; readonly push?: boolean; /** Eden's own account checks run, not a supplied result. */ readonly ownChecks?: boolean } = {},
+): Promise<{ readonly exitCode: number; readonly result: DeployResult }> {
   const output: string[] = [];
   const imageDigest = "sha256:" + "d".repeat(64);
   const exitCode = await runEdenCli(
@@ -499,19 +502,21 @@ async function deploy(
           imageDigest,
           cleanup: { bootContainerId: null, bootContainerRemoved: true, imageIdentity: "exact" as const, imageRetained: true, verified: true },
         }),
-        cloudflareRead: async () => ({
-          accountAccess: "available",
-          containerAccess: "available",
-          accountId: account,
-          workersDevSubdomain: "account",
-          target: { state: "absent" },
+        ...(ownChecks ? {} : {
+          cloudflareRead: async () => ({
+            accountAccess: "available" as const,
+            containerAccess: "available" as const,
+            accountId: account,
+            workersDevSubdomain: "account",
+            target: { state: "absent" as const },
+          }),
         }),
         health: async (request) => ({ status: "ready", identity: request.identity }),
         discardRuntimeImage: async () => true,
       },
     },
   );
-  return { exitCode, result: JSON.parse(output.at(-1) ?? "") as { readonly ok?: boolean; readonly error?: { readonly code?: string } } };
+  return { exitCode, result: JSON.parse(output.at(-1) ?? "") as DeployResult };
 }
 
 describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => {
@@ -896,6 +901,29 @@ describe("eden deploy sends every Wrangler write to the account it checked (MOI-
     const { exitCode, result } = await deployWhileTheLoginChanges(false);
     expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
     expect(cloud.secrets).toEqual([account + "/eve-deploy-fixture/MODEL_KEY"]);
+    expect([...cloud.workers]).toEqual([account + "/eve-deploy-fixture"]);
+  });
+
+  test("a login that names another account at the second check stops the deploy before any write", async () => {
+    const root = await deployableProject();
+    cloud.whoami = (nth) => nth === 0 ? account : "2".repeat(32);
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 1, ok: false });
+    expect(result.checks?.find((check) => check.id === "VAL-CLI-007-CLOUDFLARE-ACCESS")).toMatchObject({
+      status: "blocked",
+      remediation: expect.stringContaining("whoami") as unknown,
+    });
+    expect({ pinned: cloud.pinned, pushed: cloud.pushed, secrets: cloud.secrets, workers: [...cloud.workers] })
+      .toEqual({ pinned: [], pushed: [], secrets: [], workers: [] });
+    expect(cloud.apiAccounts.every((read) => read === account)).toBe(true);
+    await expect(lstat(join(root, ".eden", "eve-deploy", "targets"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("with Eden's own checks and a steady login, the deploy lands in the checked account", async () => {
+    const root = await deployableProject();
+    cloud.whoami = () => account;
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
     expect([...cloud.workers]).toEqual([account + "/eve-deploy-fixture"]);
   });
 

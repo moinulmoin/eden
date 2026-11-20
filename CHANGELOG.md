@@ -58,6 +58,11 @@
   `wrangler whoami`: the secret uploads, the image push, the publish, the
   Container application read, the registry credential request, and
   destroy's deletes. Each acts on that account or fails.
+  Deploy also asked `wrangler whoami` twice, before the build and after it,
+  and used the second answer. If the two named different accounts, the
+  deploy went to the second. It now stops at the Cloudflare access check
+  before any write. Both effects were seen with a stand-in for Cloudflare,
+  not on a real account.
 - **Destroy could clear a `CURRENT` pointer it had not read.** If something
   outside Eden's lock replaced the pointer while destroy ran, destroy removed
   the replacement. Destroy now removes the pointer only if it is still the
