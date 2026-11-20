@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### Changed
+
+- **Eden runs Cloudflare's `cf` CLI instead of Wrangler.** `cf`
+  `1.0.0-rc.2`, a release candidate, is pinned exactly and installed with
+  Eden. Wrangler is no longer a dependency. `cf` does not read the Wrangler
+  login, so after upgrading run `npx cf@1.0.0-rc.2 auth login` once, or set
+  `CLOUDFLARE_API_TOKEN`. Until then `preflight` and `deploy` stop with
+  `VAL-CLI-007-CLOUDFLARE-ACCESS`, and its remediation says so when this
+  machine has a Wrangler login. Eden no longer reads any OAuth token from
+  disk, and `WRANGLER_HOME` is no longer used for credentials. Every `cf`
+  command runs in a private temporary folder with a fixed environment and
+  the checked account, so a project's `cloudflare.config.ts` or `.env`
+  cannot choose the account or the token.
+- **Eden needs Node `24.22.0` or newer**, because `cf` does. On an older
+  Node, `preflight`, `deploy`, and `destroy` stop with the new code
+  `EVE_NODE_UNSUPPORTED`. The builder image is unchanged.
+- **Eden finishes a publish that `cf deploy` left half done.** When
+  `cf deploy` exits with an error after Cloudflare has the new Worker
+  version, Eden creates the missing Container application and deploys the
+  triggers itself, and never runs `cf deploy` a second time. Before, such
+  a deploy ended `DEPLOY_INDETERMINATE` and Eden stopped. If Eden cannot
+  finish, the deploy still ends `DEPLOY_INDETERMINATE`, and running
+  `eden deploy` again sets up what is missing.
+- **`eden destroy` removes a first deploy that was only half published.**
+  A Worker whose first publish stopped before its Container application
+  existed is proven from the Worker version in service and the failed
+  attempt's record. The remediation of `EVE_DESTROY_OWNERSHIP_UNPROVEN`
+  changed with it.
+- **Runtime variables are uploaded with the Worker version.** The values
+  from `--env-file` are no longer set one by one before the publish. They
+  are uploaded as secrets in the same publish as the code, so both change
+  together and a first deploy needs no Worker beforehand. Secrets the file
+  does not name stay.
+- **The `workers.dev` subdomain is read from a Worker the account already
+  has.** `cf` has no command for it. On an account with no Worker yet,
+  Eden asks Cloudflare's API directly, which needs `CLOUDFLARE_API_TOKEN`.
+  With neither, deploy stops with `EVE_ORIGIN_UNAVAILABLE` and a
+  remediation that says to set the token for that one deploy.
+- The generation folder holds a Build Output
+  (`worker/.cloudflare/output/v1/`) instead of `worker/worker.ts` and
+  `worker/wrangler.jsonc`.
+- `pnpm run check:live` uses `cf`, interrupts its first `cf deploy` on
+  purpose to check that Eden finishes it, and no longer records a tail.
+
+## Unreleased
+
 ### Fixed
 
 - **Requests around a deploy's version switch no longer get HTTP 500 from

@@ -45,12 +45,16 @@ How Eden handles it:
   boot-check port is not exposed to other machines. If Eve exits during the
   boot check, the failure shows the last lines Eve printed, with env-file
   values redacted.
-- **Uploaded as Worker secrets.** Each value is uploaded with
-  `wrangler secret put`, passing the value on standard input rather than as a
-  command argument. Wrangler runs it with `CLOUDFLARE_ACCOUNT_ID` set to
-  the account Eden checked, so the value goes to that account or the upload
-  fails. Values are not written to command arguments, image
-  layers, generated artifacts, or normal logs.
+- **Uploaded as Worker secrets.** The values are uploaded together with the
+  Worker version (`cf deploy --prebuilt --secrets-file`), so code and values
+  change together. Eden writes them to one file, readable only by your user,
+  in the private temporary folder that command runs in, and deletes the
+  folder when the command ends. `cf` runs with `CLOUDFLARE_ACCOUNT_ID` set to
+  the account Eden checked, so the values go to that account or the upload
+  fails. Secrets the file does not name stay as they are. On an update Eden
+  may also set its own deployment-control token at once with
+  `cf workers secrets bulk-edit`, again from a file. Values are not written
+  to command arguments, image layers, generated artifacts, or normal logs.
 - **Given to the container at start.** When the Durable Object starts the
   container, it reads those secrets and passes them in as environment
   variables. Only the names from the current deploy's env file are passed, so
@@ -121,28 +125,32 @@ agent's commands and the rest of the container.
 
 ## What Eden can change in your Cloudflare account
 
-Eden acts through your Wrangler login (`npx wrangler@4.147.0 whoami`) and
+Eden acts through your `cf` sign-in (`npx cf@1.0.0-rc.2 auth whoami`), or
+through `CLOUDFLARE_API_TOKEN` when you set it, and
 never switches accounts silently. For each target it creates one Worker, one
 Container application, its Durable Objects, registry images, and, only when
 your project has schedules, one Cron Trigger. The exact names are listed in
 the [reference](./reference.md).
-Eden also reads the target's state from Cloudflare's API with requests of
-its own. Its own requests to `registry.cloudflare.com` can change
+Eden reads the target's state through `cf`. Eden sends requests of its own
+to two places only: `registry.cloudflare.com`, and Cloudflare's API for the
+[`workers.dev` subdomain](#what-eden-can-and-cannot-read) of an account that
+has no Worker yet. Its own requests to `registry.cloudflare.com` can change
 something. They name only repositories that the deployment record proves
 this target owns. When `eden destroy` or an update cleans up such a
 repository, Eden:
 
-- reads the registry's listing of the repository, because Wrangler lists
+- reads the registry's listing of the repository, because `cf` lists
   tags only;
-- deletes each `sha256:` entry of the listing by digest, because Wrangler
+- deletes each `sha256:` entry of the listing by digest, because `cf`
   deletes tags only. The registry lists one such entry for every manifest,
   with or without a tag;
-- repeats the delete of a tag when the registry answered Wrangler's delete
-  of that tag with `403`, to read the registry's answer, because Wrangler
+- repeats the delete of a tag when the registry answered `cf`'s delete
+  of that tag with `403`, to read the registry's answer, because `cf`
   prints only the status. Eden repeats no tag delete after any other
-  Wrangler failure.
+  `cf` failure.
 
-For these, Eden asks Wrangler for a registry credential
+For these, Eden asks `cf` for a registry credential
+(`cf containers registries credentials generate`)
 (push and pull on your account's registry, valid for five minutes), checks
 that it names the account in the deployment record, and reuses it for that
 account only, within one command, until four minutes have passed since it
@@ -166,32 +174,60 @@ an empty page, within 100 pages. An answer that names a field twice is
 refused, for a listing and for a refusal alike. Eden cannot tell a stale answer from a
 current one when both pass these checks.
 Eden does not store or print the credential.
-Wrangler runs in a fresh, private Eden-owned temporary directory outside the
-project, with its configuration file and account cache pinned inside it.
-Project `.env` files and configuration or cache files planted in a shared
-temporary directory cannot redirect account operations or secret uploads.
 
-Eden asks `wrangler whoami` which account the login names. Eden does not
+### What Eden can and cannot read
+
+`cf auth login` keeps its OAuth token in the operating system's keychain
+when one is available. Eden cannot read it there and reads no OAuth token
+from disk. Eden 0.14 and earlier read Wrangler's saved token; this version
+only checks whether Wrangler's login file exists, to explain a signed-out
+`cf`, and never opens it.
+
+Eden itself uses `CLOUDFLARE_API_TOKEN` for one request only. `cf` has no
+command for the account's `workers.dev` subdomain, so Eden reads it from the
+URL of any Worker the account already has (`cf workers list --per-page 1`).
+When the account has no Worker yet, Eden asks Cloudflare's API directly with
+`CLOUDFLARE_API_TOKEN`, following no redirect. With neither, deploy stops
+with [`EVE_ORIGIN_UNAVAILABLE`](./troubleshooting.md#eve_origin_unavailable).
+`cf` also uses the variable as its login.
+
+Every `cf` command runs in a fresh, private temporary folder that Eden
+creates outside the project and deletes afterwards. The folder holds an
+empty `cloudflare.config.ts` and the files that one command needs, nothing
+else. `cf` gets a fixed list of your shell's variables (see the
+[reference](./reference.md#variables-eden-reads)), and
+`CLOUDFLARE_API_BASE_URL` is always `https://api.cloudflare.com/client/v4`.
+So a project's `cloudflare.config.ts` or `.env` file cannot choose the
+account or the token.
+
+### Which account each command uses
+
+Eden asks `cf auth whoami` which account the login names. That command exits
+0 signed in or not, so Eden reads its JSON: `authenticated` and `tokenValid`
+must be true, and it must list exactly one account. Eden does not
 pin that command; it receives `CLOUDFLARE_ACCOUNT_ID` only when you set it.
 `eden preflight` and `eden deploy` ask before the build and again after it.
 If the second answer names another account, the command stops at the
 [Cloudflare access check](./troubleshooting.md#val-cli-007-cloudflare-access--cloudflare-access-is-blocked)
-before it reads or writes anything there. Every other Wrangler command runs with
+before it reads or writes anything there. Every other `cf` command runs with
 `CLOUDFLARE_ACCOUNT_ID` set to the account Eden checked. For destroy that is
 the account in the deployment record, which the login must name:
 
-| Wrangler command | When | Account |
+| `cf` command | When | Account |
 | --- | --- | --- |
-| `whoami` | preflight, deploy, destroy | The login's own; Eden requires exactly one, matching `CLOUDFLARE_ACCOUNT_ID` when you set it |
-| `containers info` | preflight, deploy, destroy | The checked account |
-| `containers push` | deploy | The checked account |
-| `secret put` | deploy | The checked account |
-| `deploy` | deploy | The checked account, also named as `account_id` in the config Eden writes, which Wrangler 4.147.0 reads first |
-| `containers registries credentials` | deploy, destroy | The checked account |
-| `containers images delete` | deploy (superseded images), destroy | The checked account |
-| `delete`, `containers delete` | destroy | The checked account |
+| `auth whoami` | preflight, deploy, destroy | The login's own; Eden requires exactly one, matching `CLOUDFLARE_ACCOUNT_ID` when you set it |
+| `containers applications list --name`, `containers applications get` | preflight, deploy, destroy | The checked account |
+| `workers deployments list`, `workers versions get`, `workers versions list` | preflight, deploy, destroy | The checked account |
+| `workers list --per-page 1` | preflight, deploy | The checked account |
+| `containers push --tag` | deploy | The checked account |
+| `workers secrets bulk-edit` | deploy (an update, for Eden's deployment-control token) | The checked account |
+| `deploy --prebuilt` | deploy | The checked account, also named as `settings.accountId` in the Build Output's `config.json`, which `cf` reads before the variable |
+| `containers applications create`, `workers triggers deploy --prebuilt` | deploy, only to finish a publish that `cf deploy` left half done | The checked account |
+| `containers registries credentials generate` | deploy, destroy | The checked account |
+| `containers images delete --force` | deploy (superseded images), destroy | The checked account |
+| `workers delete --force`, `containers applications delete --force` | destroy | The checked account |
 
-Eden reads and deletes no secret through Wrangler. A login that changes
+Eden reads and deletes no secret through `cf`. A login that changes
 mid-run cannot move one of these commands to another account. If the new
 login cannot act on the checked account, the command fails.
 
@@ -201,20 +237,24 @@ login cannot act on the checked account, the command fails.
   `VAL-CLI-007-TARGET-CONFLICT` instead of being overwritten.
 - **Exact cleanup.** `destroy` requires the recorded Worker and derived
   Container name and the authenticated account. When the Worker exists, Eden
-  compares its authenticated provider settings with the recorded deployment
-  and per-publish release IDs and verifies the Container's namespace matches
-  its binding.
+  reads the bindings of the Worker version in service, compares them with
+  the recorded deployment and per-publish release IDs, and verifies the
+  Container's namespace matches its binding. A Worker whose first publish
+  stopped before its Container application existed is proven the same way,
+  from that version and the failed attempt's record.
   If the Worker is already gone, the record, account, and exact names still
   permit cleanup of leftover Containers and images. Failed inventory reads
-  are indeterminate, not proof of absence. A Worker counts as absent only
-  when Cloudflare's API answers status `404` with `success` false, a null
-  result, the single error code `10007`, and no field named twice. A
-  Container application list counts only with status `200`, `success` true,
-  an empty `errors` list, and no field named twice. Eden follows no redirect
-  on its API reads.
-  Each read asks Wrangler for the account once and sends every request to
+  are indeterminate, not proof of absence. A Worker or a Container application counts
+  as absent only on Cloudflare's own single answer, as `cf` prints it: exit
+  code 1, nothing on standard output, exactly one error with the expected
+  code (`10007` for a Worker, `1609` for a Container application) and
+  status `404`, for the exact request path of that account and name.
+  Anything else is unknown, never absent. A
+  Container application list counts only when `cf` exits 0 and prints a JSON
+  list.
+  Each read asks `cf` for the account once and runs every other command on
   that account, and destroy reads nothing from an account other than the
-  recorded one. Wrangler runs destroy's Worker, Container application, and
+  recorded one. `cf` runs destroy's Worker, Container application, and
   image deletes with `CLOUDFLARE_ACCOUNT_ID` set to the recorded account, so
   a login that changes mid-run cannot move a delete to another account. Eden removes only that target and
   checks its registry repositories for anything other than
@@ -243,7 +283,7 @@ login cannot act on the checked account, the command fails.
   (`eve-deploy-<uuid>`). Eden deletes that tag, and nothing else, only when the registry
   lists the tag and resolves it to that digest. It sends no delete by
   digest here; it reads the listing until the tag and the image's
-  `sha256:` entry have left. Wrangler's delete of a tag carries no digest, so this rests
+  `sha256:` entry have left. `cf`'s delete of a tag carries no digest, so this rests
   on a release tag being unique to one push and never moved: Eden generates
   it and pushes it once. Do not push to or retag a release tag by hand.
   Eden never deletes `candidate` here, the tag Eden `0.13.x` and older

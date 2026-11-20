@@ -66,8 +66,8 @@ docker stop eden-compat-postgres
 ## Live check on Cloudflare
 
 Run this before a release that changes deploy, update, destroy, runtime, or
-World behavior. It uses the real Cloudflare account that Wrangler on this
-machine is logged in to, Docker, and direct access to
+World behavior. It uses the real Cloudflare account that the `cf` CLI on this
+machine is signed in to (or the one `CLOUDFLARE_API_TOKEN` names), Docker, and direct access to
 `registry.cloudflare.com` for the catalog read; that read never uses a
 proxy. It does not run in CI.
 
@@ -88,7 +88,13 @@ What it does, in order:
    and served over local HTTP until the run ends, as in the gate's Eden leg,
    so the run checks the World in this checkout, published or not. This
    makes the project a pnpm project; see Safety below.
-3. Runs `eden preflight`, then `eden deploy`, and waits for health.
+3. Runs `eden preflight`, then `eden deploy`, and waits for health. This
+   first deploy is interrupted on purpose. A local proxy in front of
+   `cf deploy` refuses the read of the Worker version it just uploaded, so
+   `cf deploy` exits 1 after the upload and before the Container application
+   exists. The step fails unless `cf deploy` ran exactly once and Eden then
+   ran `cf containers applications create` and `cf workers triggers deploy`,
+   both with exit code 0. Every other request reaches Cloudflare unchanged.
 4. Sends a session request without the token, which must return 401, and
    posts to the two workflow queue routes with the token, which must return
    404.
@@ -120,11 +126,9 @@ What it does, in order:
     destroy step lists them, and the final JSON object has them in
     `registryObjectsKept`.
 
-The deployed Worker keeps no logs. From the first deploy on, the script
-records `wrangler tail` for the target into the work folder and restarts it
-before each later deploy. When a step fails, it prints the invocations that
-threw or were reset, with their exception messages. A passing run prints
-nothing from it.
+The deployed Worker keeps no logs, and the script records none. `cf`'s tail
+needs Workers logs enabled, which Eden's Worker does not have. So when a
+step fails there is no tail output; the step's own error is what you get.
 
 Each step prints `✓`, `✗`, or `-` (skipped) with its time. The last output
 is one JSON object with `ok`, the target, and every step. The exit code is

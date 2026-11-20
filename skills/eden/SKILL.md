@@ -44,10 +44,13 @@ Docs: https://github.com/moinulmoin/eden (failure and warning codes:
 
 ## Machine and account
 
-- macOS or Linux, Node `>=24.17.0`
+- macOS or Linux, Node `>=24.22.0` (older stops with
+  `EVE_NODE_UNSUPPORTED`)
 - Docker or OrbStack running, with linux/amd64 support
-- Cloudflare Workers Paid plan (Containers need it), and Wrangler logged in:
-  `npx wrangler@4.147.0 login` (the user must do this in a browser)
+- Cloudflare Workers Paid plan (Containers need it), and Cloudflare's `cf`
+  CLI signed in: `npx cf@1.0.0-rc.2 auth login` (the user must do this in a
+  browser), or `CLOUDFLARE_API_TOKEN` set. `cf` does not read a Wrangler
+  login, which Eden 0.14 and earlier used.
 
 ## Project setup Cloudflare needs
 
@@ -257,10 +260,17 @@ the agent sleeps takes about 10–15 seconds.
 - `VAL-CLI-007-TARGET-CONFLICT`: a resource with that name exists that Eden
   cannot prove it owns. For a brand-new agent, pick another `--name`; never
   delete the resource to make room.
-- `VAL-CLI-007-CLOUDFLARE-ACCESS`: Wrangler is not logged in or the account
-  lacks Workers Paid/Containers. It is checked before the build. The user has
-  to fix this (`npx wrangler@4.147.0 login`, then
-  `npx wrangler@4.147.0 whoami`).
+- `VAL-CLI-007-CLOUDFLARE-ACCESS`: `cf` is not signed in, its sign-in does
+  not show exactly one account, or the account lacks Workers
+  Paid/Containers. It is checked before the build. The user has to fix this
+  (`npx cf@1.0.0-rc.2 auth login`, then `npx cf@1.0.0-rc.2 auth whoami`),
+  or set `CLOUDFLARE_API_TOKEN`.
+- `EVE_NODE_UNSUPPORTED`: Node is older than 24.22.0. Install Node 24.22.0
+  or newer (for example `nvm install 24`), then run the command again.
+- `EVE_ORIGIN_UNAVAILABLE` on an account with no Worker yet: Eden reads the
+  `workers.dev` subdomain from an existing Worker, or directly with
+  `CLOUDFLARE_API_TOKEN`. Ask the user to set `CLOUDFLARE_API_TOKEN` for
+  this one deploy.
 - `node: <path>: not found` with exit status 9 and no JSON: the `--env-file`
   path does not exist. `npx` stopped before Eden started. Correct the path.
   With `--` before the package name (`npx -- @moinulmoin/eden preflight
@@ -273,9 +283,10 @@ the agent sleeps takes about 10–15 seconds.
   same `--project`, `--env`, and `--name`. Never switch to a new name to get
   past it, never delete resources by prefix, and never delete the project's
   `.eden/` folder: it is the ownership proof `destroy` needs.
-  One exception: when the message says Wrangler did not finish applying
-  the Container application settings, do not retry. Do what the printed
-  remediation says and nothing more. It names `eden destroy` only for a
-  target's first deploy; for a target that was deployed before, inspect and
-  stop. Never delete a Worker yourself.
+  When the message says Cloudflare has this publish's Worker version but
+  its Container application or triggers could not be set up, run
+  `eden deploy` again with the same selectors, as the printed remediation
+  says. For a target's first deploy the remediation also names
+  `eden destroy` as the way to remove it instead. Never delete a Worker
+  yourself.
 - Look up any other code in `docs/troubleshooting.md`.

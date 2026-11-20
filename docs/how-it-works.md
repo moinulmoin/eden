@@ -70,19 +70,31 @@ until the checks in steps 1–4 have passed.
    `eden preflight` runs the same checks and stops here, changing nothing on
    Cloudflare.
 5. **Push the image** to your account's Cloudflare registry. From here on,
-   Wrangler runs every command with the account from step 3, so a login
+   `cf` runs every command with the account from step 3, so a login
    that changes mid-deploy cannot move a write to another account. Step 3
    itself runs before the build and again after it, and the deploy stops if
    the two name different accounts.
-6. **Register runtime variables** (only with `--env-file`). Each value is
-   uploaded as a Worker secret. Values never go into the image, command
-   arguments, or logs. Only the names in this deploy's env file reach the
-   container, so pass the same `--env-file` on every deploy. See
-   [Security](./security.md).
-7. **Publish** the Worker and Container application. Eden runs
-   `wrangler deploy` once. When Wrangler uploads the Worker version and
-   then fails at the Container application settings, the deploy ends
-   `DEPLOY_INDETERMINATE` and says so.
+6. **Stage runtime variables** (only with `--env-file`). The values are
+   held for the publish, which uploads them as Worker secrets with the
+   Worker version, so code and values change together. Values never go into
+   the image, command arguments, or logs. Only the names in this deploy's
+   env file reach the container, so pass the same `--env-file` on every
+   deploy. See [Security](./security.md).
+7. **Publish** the Worker and Container application. Eden writes a Build
+   Output folder under the generation's `worker/` folder and runs
+   `cf deploy --prebuilt` once, never twice. `cf deploy` uploads the Worker
+   version first, then sets up the Container application, then the
+   `workers.dev` route and the schedule. When it exits with an error, Eden
+   checks whether the Worker version in service carries this publish's
+   release ID. If it does not, the deploy ends `DEPLOY_INDETERMINATE` and
+   Eden creates nothing. If it does, Eden finishes the publish with `cf`
+   commands that are safe to repeat: it reads the Container application by
+   the Durable Object namespace ID (`cf containers applications get`),
+   creates it when Cloudflare answers that it does not exist
+   (`cf containers applications create`), and runs
+   `cf workers triggers deploy --prebuilt`. If one of these steps fails, the
+   deploy ends `DEPLOY_INDETERMINATE` and says that Cloudflare has the
+   Worker version; running `eden deploy` again sets up what is missing.
 8. **Verify and promote** (`verifying health at <origin>`). Eden calls the
    public `/eve/v1/health` and only treats the deployment as live once it
    reports ready with the expected deployment identity. Then it removes its
@@ -320,16 +332,25 @@ prefix or searches your account, so similarly named resources are never
 touched. Data in the Durable Object (including the experimental Cloudflare
 World) is deleted with the Worker; your Postgres database is not touched.
 
-Destroy acts only on evidence it read itself. It asks Wrangler which account
-is signed in, and reads the Worker and the Container application from
-Cloudflare's API under that account. If that is not the account in the
-record, it reads nothing. A Worker is absent only when the API answers
-status `404` with `success` false, a null result, the single error code
-`10007`, and no field named twice. A Container application list counts
-only with status `200`, `success` true, an empty `errors` list, and no
-field named twice. A failed or unclear read of either stops destroy with
-`EVE_DESTROY_INDETERMINATE` and leaves the record alone. Wrangler runs each delete with the recorded
-account set. Destroy reads everything again after its deletes and clears
+Destroy acts only on evidence it read itself. It asks `cf` which account
+is signed in, and reads the Worker and the Container application through
+`cf` under that account. If that is not the account in the
+record, it reads nothing. `cf` prints errors as text; Eden reads them in one
+place. A Worker is absent only on Cloudflare's own single answer: `cf` exits
+with code 1, prints nothing on standard output, and prints exactly one error
+with code `10007` and status `404` for the exact request path of that
+account and Worker. A Container application list counts only when `cf`
+exits 0 and prints a JSON list. A failed or unclear read of either stops
+destroy with `EVE_DESTROY_INDETERMINATE` and leaves the record alone. `cf`
+runs each delete with the recorded account set.
+
+When a Worker exists, destroy proves it from the bindings of the Worker
+version in service: the deployment ID and release ID Eden stamped must be
+ones the local records name. This also covers a target whose first publish
+stopped before its Container application existed: destroy removes that
+Worker alone, using the record of the failed attempt.
+
+Destroy Destroy reads everything again after its deletes and clears
 the `CURRENT` pointer only if it is the symlink that named the record and
 is still the file it read at the start. That check and the removal are two steps, not one atomic step. Destroy
 also cannot stop a deploy of the same Worker from another folder or machine,

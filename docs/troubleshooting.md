@@ -78,7 +78,7 @@ eden --help
 
 ### The CLI does not start on your Node version
 
-Eden needs Node `>=24.17.0` and has no upper bound on the Node major
+Eden needs Node `>=24.22.0` and has no upper bound on the Node major
 version. Check it with:
 
 ```sh
@@ -87,6 +87,18 @@ node --version
 
 Bun can install the package, but Eden always runs on Node. Do not run it with
 `bunx --bun`.
+
+### `EVE_NODE_UNSUPPORTED`
+
+`Eden needs Node 24.22.0 or newer and is running on Node <version>.`
+`preflight`, `deploy`, and `destroy` stop with this code before they read or
+change anything, because the `cf` CLI that Eden runs needs that Node. Install
+Node 24.22.0 or newer, check it, then run the command again:
+
+```sh
+nvm install 24
+node --version
+```
 
 ### `COMMAND_UNKNOWN`
 
@@ -212,7 +224,6 @@ registry login fail with `The specified item already exists in the keychain
 
 ```sh
 security delete-internet-password -s registry.cloudflare.com
-npx wrangler@4.147.0 login
 ```
 
 ## Project checks
@@ -366,24 +377,43 @@ inventory through a read-only adapter and never mutates during preflight.
 `preflight` and `deploy` run this check before the build, so a missing login
 fails in a few seconds.
 
-When Wrangler is not logged in, the remediation is
-`Run npx wrangler@4.147.0 login, confirm the account with npx wrangler@4.147.0
-whoami, then retry.`:
+When `cf` is not signed in, or its sign-in does not show exactly one
+account, the remediation is `Run npx cf@1.0.0-rc.2 auth login, or set
+CLOUDFLARE_API_TOKEN, and confirm with npx cf@1.0.0-rc.2 auth whoami that it
+shows exactly one account. Then retry.`:
 
 ```sh
-npx wrangler@4.147.0 login
-npx wrangler@4.147.0 whoami
+npx cf@1.0.0-rc.2 auth login
+npx cf@1.0.0-rc.2 auth whoami
 ```
+
+`cf auth whoami` exits 0 signed in or not, so Eden reads its JSON. The
+sign-in counts only when `authenticated` and `tokenValid` are true and it
+lists exactly one account. When you set `CLOUDFLARE_ACCOUNT_ID`, it must
+name that account. A `CLOUDFLARE_API_TOKEN` that Cloudflare rejects does not
+count.
+
+#### Moving from the Wrangler login to cf
+
+Eden 0.14 and earlier used Wrangler and its saved login. Eden now runs
+Cloudflare's `cf` CLI, which does not read that login. When `cf` is signed
+out and this machine has a Wrangler login file, the remediation says so:
+`Eden now uses Cloudflare's cf CLI, which does not read the Wrangler login
+this machine has. Run npx cf@1.0.0-rc.2 auth login once, or set
+CLOUDFLARE_API_TOKEN, confirm the account with npx cf@1.0.0-rc.2 auth
+whoami, then retry.` Sign in once; the `.eden/` folder and your deployed
+targets need no change. Eden only checks that the Wrangler file exists and
+never opens it.
 
 The same check and remediation appear after the build when the login then
 names a different account than it did before the build. Eden reads and
 writes nothing in the second account. Confirm the account you intend with
-`whoami`, then run the command again.
+`auth whoami`, then run the command again.
 
-When Wrangler is logged in but the account's Containers cannot be read, the
+When `cf` is signed in but the account's Containers cannot be read, the
 remediation says so. The account must be on the Workers Paid plan, which
-Cloudflare Containers requires. Review the account that `whoami` returns
-before you retry; Eden never selects a different Cloudflare account silently.
+Cloudflare Containers requires. Review the account that `auth whoami` returns
+before you retry, or switch accounts with `npx cf@1.0.0-rc.2 auth login`; Eden never selects a different Cloudflare account silently.
 
 When the read-only adapter itself fails, the check reports
 `The exact read-only Cloudflare adapter failed without a safe result.` and no
@@ -431,14 +461,29 @@ declarations.
 
 `The authenticated Cloudflare read did not prove the exact workers.dev origin
 before Eve initialization.` The read must return one account id, one
-`workers.dev` subdomain, and the exact Worker-origin binding. Re-authenticate
-with `npx wrangler@4.147.0 login` and confirm the account, then retry.
+`workers.dev` subdomain, and the exact Worker-origin binding. Eden reads the
+subdomain as [`EVE_ORIGIN_UNAVAILABLE`](#eve_origin_unavailable) describes;
+follow the steps there, then retry.
 
 ### `EVE_ORIGIN_UNAVAILABLE`
 
 The authenticated account and `workers.dev` subdomain were not returned by
 the read-only resolver, or the authenticated origin did not match the exact
-Worker target. The same `wrangler whoami` and `wrangler login` check applies.
+Worker target.
+
+`cf` has no command for the account's `workers.dev` subdomain. Eden reads it
+from the URL of any Worker the account already has. When the account has no
+Worker yet, Eden asks Cloudflare's API directly, which needs
+`CLOUDFLARE_API_TOKEN`: Eden cannot read the token `cf auth login` saved.
+With neither, deploy stops here. To fix it:
+
+1. Confirm the account with `npx cf@1.0.0-rc.2 auth whoami`.
+2. Check in the Cloudflare dashboard, under Workers & Pages, that the
+   account has a `workers.dev` subdomain.
+3. If the account has no Worker yet, set `CLOUDFLARE_API_TOKEN` for this one
+   deploy, then retry. `cf` uses the same variable as its login for that
+   deploy.
+
 If the origin resolver rejects the Worker name or account subdomain
 (`HOST_ORIGIN_UNAVAILABLE`), the CLI reports its message under this code.
 
@@ -651,24 +696,28 @@ and digest identity, the deploy ends as indeterminate. The push may take ten
 minutes; Eden stops waiting after that. See
 [Indeterminate outcomes](#indeterminate-outcomes) below.
 
-`Wrangler uploaded the Worker version but did not finish applying its
-Container application settings.` Wrangler prints one error for every failure
-at that step, so the message does not say why. Eden does not run the publish
-again. Check the deployment URL's `/eve/v1/health`, and inspect the Worker,
-the Container application, and the retained `.eden` evidence.
+The publish is one `cf deploy --prebuilt`, which Eden never runs twice.
+`cf deploy` uploads the Worker version first, then sets up the Container
+application, then the `workers.dev` route and the schedule. When it exits
+with an error, Eden checks whether the Worker version in service carries
+this publish's release ID.
 
-Between 2026-11-19 `22:31Z` and 2026-11-20 `00:47Z`, five deploys ended
-this way after Wrangler read the version it had just uploaded and
-Cloudflare answered `404`: to five reads in three of them, to a single read
-in two. After that failure on one target's first deploy, the Worker
-existed without its Container application, and `eden deploy` refused it
-twice with `VAL-CLI-007-TARGET-CONFLICT`. `eden destroy` with the same
-`--project`, `--env`, and `--name` answered `EVE_DESTROY_OWNERSHIP_UNPROVEN`
-once, then ended `destroyed` 80 seconds later. `eden deploy` is the next
-command once destroy ends `destroyed` or `absent`; it was not run on that
-target. Recovery was not run for a target that had been deployed before:
-stop at inspection there. Eden names `eden destroy` only when Cloudflare
-had no such target and this project has no `CURRENT` for it.
+If it does not, the message is `The exact Cloudflare publication did not
+return a terminal success result.` Eden creates nothing. See
+[Indeterminate outcomes](#indeterminate-outcomes).
+
+If it does, Eden finishes the publish itself: it creates the Container
+application when Cloudflare answers that it does not exist, then deploys the
+triggers. The deploy then continues as any other. When one of those steps
+fails, the message is `Cloudflare has this
+publish's Worker version, but its Container application or triggers could
+not be set up.` The remediation is `Run eden deploy again with the same
+--project, --env, and --name: Cloudflare has this publish's Worker version,
+and the next deploy sets up what is missing. Keep the .eden folder.` For a
+target this project never promoted it adds `This was the target's first
+deploy. To remove it instead, run eden destroy with the same selectors.`
+`eden destroy` can remove a Worker that such a first deploy left without its
+Container application.
 
 ### `EVE_IMAGE_IDENTITY_MISMATCH`
 
@@ -1245,25 +1294,27 @@ exact name and environment from the deployment.
 ### `EVE_DESTROY_OWNERSHIP_UNPROVEN`
 
 `The authenticated account does not own the recorded deployment account.`
-Authenticate with the account that owns the deployment:
+Sign in to the account that owns the deployment:
 
 ```sh
-npx wrangler@4.147.0 whoami
-npx wrangler@4.147.0 login
+npx cf@1.0.0-rc.2 auth whoami
+npx cf@1.0.0-rc.2 auth login
 ```
 
-This also fails when the live Worker's authenticated provider settings do
-not match the recorded deployment identities, or its Container namespace
-does not match the Worker binding. Eden refuses to delete a same-name
-replacement.
+`Live provider settings do not match the recorded Worker and Container
+identity; nothing was deleted.` Eden reads the bindings of the Worker
+version in service. This fails when that version cannot be read, when its
+deployment ID or release ID is not one the local records name, or when the
+Container application's namespace does not match the Worker's binding. Eden
+refuses to delete a same-name replacement.
 
-A deploy that ended `DEPLOY_INDETERMINATE` can leave a Worker that does not
-carry the deployment's settings yet. Wait a minute and rerun `eden destroy`.
-On 2026-11-19 and 2026-11-20 that worked for two such targets.
+A Worker that a first deploy left without its Container application does
+not fail here: destroy proves it from the version in service and the failed
+attempt's record, and removes it.
 
-A third kept refusing, and its Worker was deleted by hand. Eden cannot prove
-ownership in that state and will not delete the Worker. Only the person who
-owns the Cloudflare account can decide to. Open
+If the account is right, wait a minute and rerun `eden destroy`. If it keeps
+refusing, Eden cannot prove ownership and will not delete the Worker. Only
+the person who owns the Cloudflare account can decide to. Open
 `<project>/.eden/eve-deploy/generations/<generation>/deployment-intent.json`
 and the Cloudflare dashboard, and stop unless every one of these holds:
 
@@ -1275,9 +1326,9 @@ and the Cloudflare dashboard, and stop unless every one of these holds:
 4. No other project or person deploys a Worker with that name.
 
 Then delete that Worker in the dashboard, and rerun `eden destroy` to clear
-the rest. Do not use `wrangler delete` for this: Wrangler takes the account
-from a `wrangler` config file it finds before it reads
-`CLOUDFLARE_ACCOUNT_ID`.
+the rest. Do not run `cf workers delete` from a project folder for this:
+`cf` runs the nearest `cloudflare.config.ts` it finds from its folder upward
+and reads `.env` files beside it, so a file can choose another account.
 
 ### `EVE_DESTROY_INDETERMINATE`
 
@@ -1286,26 +1337,26 @@ Container deletion did not complete with a terminal result. Eden never treats
 an authentication, permission, network, malformed or incomplete inventory
 result as absence. Inspect the retained deployment record and Cloudflare
 inventory, then retry the exact target.
-Eden reads the Worker from Cloudflare's API and follows no redirect. Status
-`200` with `success` true and a list of deployments, each with an id, means
-the Worker exists. Status `404` with `success` false, a null result, and
-the single error code `10007` means it is absent. Any other answer about
-the Worker, an answer that names a field twice, and no answer, are
-indeterminate. Eden reads a Container application list, empty or not, only
-from status `200` with `success` true, an empty `errors` list, and no field
-named twice; any other answer is indeterminate too. An
+Eden reads the Worker through `cf` (`cf workers deployments list`). When
+`cf` exits 0 and prints a list of deployments, each with an id, the Worker
+exists. It is absent only on Cloudflare's own single answer, as `cf` prints
+it: exit code 1, nothing on standard output, and exactly one error with code
+`10007` and status `404` for the exact request path of that account and
+Worker. Any other answer about the Worker, output Eden cannot read, and no
+answer, are indeterminate. Eden reads a Container application list, empty or
+not, only when `cf` exits 0 and prints a JSON list; any other answer is
+indeterminate too. A delete counts as `absent` by the same rule, with code
+`10007` for the Worker and `1609` for the Container application. An
 unreadable registry listing is reported separately, as
 `EVE_DESTROY_IMAGES_RETAINED`. Rerun `eden destroy` with the same selectors;
-if it keeps failing, check the login with `npx wrangler@4.147.0 whoami`. On
-a machine that reaches Cloudflare only through a proxy, set
-`NODE_USE_ENV_PROXY=1` beside `HTTPS_PROXY`: Eden's own API reads use
-Node's `fetch`, which otherwise goes direct.
-Wrangler's JSON Container listing omits pagination metadata, so Eden instead
-uses the name-filtered Container applications API and follows its page tokens.
+if it keeps failing, check the login with `npx cf@1.0.0-rc.2 auth whoami`.
+Eden lists Container applications by exact name
+(`cf containers applications list --name`) and follows the page tokens
+Cloudflare returns.
 A full response without pagination metadata or a failed page read is
 indeterminate, never proof that the named application is absent.
 
-Destroy also fails with this code after its deletes when Wrangler is signed
+Destroy also fails with this code after its deletes when `cf` is signed
 in to another account by the time destroy verifies. A read of another
 account proves nothing about the recorded one, so the `CURRENT` pointer is
 left unchanged.
@@ -1330,14 +1381,14 @@ only for a target that exists on Cloudflare.
 You can delete a listed tag by hand first:
 
 ```sh
-npx wrangler@4.147.0 containers images delete <repository:tag>
+npx cf@1.0.0-rc.2 containers images delete <repository:tag>
 ```
 
 That removes no `sha256:` entry, so run `eden destroy` again afterwards. Never filter by prefix. An object with one
 of the three kept answers is not counted here; see
 [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept). Destroy fails
 with this code for anything else the registry still lists, including a tag
-that is still listed after Wrangler deleted it and an object whose delete
+that is still listed after `cf` deleted it and an object whose delete
 got any other answer, and when it could not read the registry's listing.
 
 Eden reads the listing and sends its own deletes straight to
@@ -1392,8 +1443,8 @@ each one as `{ "ref", "class" }`. A `ref` is `<repository>:<tag>`, or
 
 Cloudflare's registry lists every tag of a repository, and one `sha256:`
 entry for every manifest, with or without a tag.
-`wrangler containers images list` shows only the tags. Eden reads the
-registry's own listing, asks Wrangler to delete each tag, and sends its own
+`cf containers images list` shows only the tags. Eden reads the
+registry's own listing, asks `cf` to delete each tag, and sends its own
 delete for each `sha256:` entry. It does not check which manifests have a
 tag. An object is listed here only on the registry's own answer to the
 delete of that exact object; its name is never enough. The class says what
@@ -1409,7 +1460,7 @@ observed on 2026-11-18:
 Each accepted delete gets its own 30 seconds, so cleanup of a repository
 can take that long after its last accepted delete.
 
-When the registry answers Wrangler's delete of a tag with `403`, Eden
+When the registry answers `cf`'s delete of a tag with `403`, Eden
 repeats the delete for that same tag against the registry and reads the
 answer. An object still listed without a kept answer, or an unreadable
 final listing, fails destroy with
@@ -1453,7 +1504,7 @@ command: curl asks for it, and you paste the `password` value at its
 prompt.
 
 ```sh
-npx wrangler@4.147.0 containers registries credentials registry.cloudflare.com --push --pull --expiration-minutes 5 --json
+npx cf@1.0.0-rc.2 containers registries credentials generate registry.cloudflare.com --permissions push --permissions pull --expiration-minutes 5
 curl --noproxy '*' -u '<username>' 'https://registry.cloudflare.com/v2/<account_id>/<repository>/tags/list?n=1000'
 ```
 
@@ -1494,25 +1545,27 @@ stops with `EVE_DESTROY_RECORD_UNPROVEN`. The deployment keeps running and
 the Container is billed while it is awake. Look for the folder first: on the
 machine that deployed, in backups, or in another clone. If it is gone, remove
 the deployment by hand. These are the resources Eden creates for a target
-(see [What Eden creates](./reference.md#what-eden-creates)) and the Wrangler
-commands `eden destroy` itself runs.
+(see [What Eden creates](./reference.md#what-eden-creates)) and the `cf`
+commands `eden destroy` itself runs. Run them from an empty folder outside
+any project: `cf` runs the nearest `cloudflare.config.ts` it finds from its
+folder upward and reads `.env` files beside it.
 
 1. Confirm the account and the exact target name the deploy printed. A derived
    preview name uses a sanitized, possibly shortened `package.json` name
    plus a dash and eight hexadecimal characters:
 
    ```sh
-   npx wrangler@4.147.0 whoami
-   npx wrangler@4.147.0 deployments list --name <name>
+   npx cf@1.0.0-rc.2 auth whoami
+   npx cf@1.0.0-rc.2 workers deployments list --worker <name>
    ```
 
 2. Delete the Worker. It is named exactly `<name>`. Its secrets (one per
    env-file variable), its Cron Trigger, and its Durable Object data are part
    of the Worker; with the Cloudflare World that data includes every stored
-   session. Wrangler asks you to confirm the deletion.
+   session. `cf` asks you to confirm the deletion.
 
    ```sh
-   npx wrangler@4.147.0 delete --name <name>
+   npx cf@1.0.0-rc.2 workers delete <name>
    ```
 
 3. Delete the Container application. Its whole name is `<name>-container`.
@@ -1522,13 +1575,13 @@ commands `eden destroy` itself runs.
    needs it. Then delete by ID:
 
    ```sh
-   npx wrangler@4.147.0 containers list
-   npx wrangler@4.147.0 containers delete <application-id>
+   npx cf@1.0.0-rc.2 containers applications list
+   npx cf@1.0.0-rc.2 containers applications delete <application-id>
    ```
 
    If the Container application is already gone, the list cannot give you
    its ID. Use the ID only if you have it from a record made while the
-   application existed, such as saved output of `containers list`. Without
+   application existed, such as saved output of `containers applications list`. Without
    it, skip step 4 and leave the registry alone: a repository's name is not
    proof that it belongs to this target.
 
@@ -1540,7 +1593,7 @@ commands `eden destroy` itself runs.
    `foo-bar`. The digest comes from the original project name, account ID,
    environment, and target name. It helps find candidates, not prove ownership.
 
-   The proof Cloudflare keeps is in a snapshot. Use Wrangler's tag list below
+   The proof Cloudflare keeps is in a snapshot. Use `cf`'s tag list below
    to find a `rootfs-snapshot-*` tag, not as the full registry inventory.
    The snapshot's configuration names the Container application it came from.
    Get a registry credential (valid
@@ -1551,8 +1604,8 @@ commands `eden destroy` itself runs.
    makes curl connect to the registry directly, as Eden does.
 
    ```sh
-   npx wrangler@4.147.0 containers images list
-   npx wrangler@4.147.0 containers registries credentials registry.cloudflare.com --push --pull --expiration-minutes 5 --json
+   npx cf@1.0.0-rc.2 containers images list
+   npx cf@1.0.0-rc.2 containers registries credentials generate registry.cloudflare.com --permissions push --permissions pull --expiration-minutes 5
    curl --noproxy '*' -u '<username>' -H 'Accept: application/vnd.oci.image.manifest.v1+json' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<rootfs-snapshot-tag>
    curl --noproxy '*' -L -u '<username>' https://registry.cloudflare.com/v2/<account_id>/<repository>/blobs/<config digest>
    ```
@@ -1568,17 +1621,17 @@ commands `eden destroy` itself runs.
    gone.
 
    In each repository you proved, delete every tag, whatever its name.
-   Wrangler asks you to confirm each deletion.
+   `cf` asks you to confirm each deletion.
 
    ```sh
-   npx wrangler@4.147.0 containers images delete <repository>:<tag>
+   npx cf@1.0.0-rc.2 containers images delete <repository>:<tag>
    ```
 
    Cloudflare's registry refuses to delete a container snapshot (seen so far
-   as tags named `rootfs-snapshot-*` and `rootfs-set-*`), and Wrangler then
+   as tags named `rootfs-snapshot-*` and `rootfs-set-*`), and `cf` then
    prints only `403 Forbidden`. That line does not say why: a missing
    permission prints the same. A tag's name does not say why either. Treat
-   a refused tag as unresolved. Only repeat the delete when Wrangler reports a
+   a refused tag as unresolved. Only repeat the delete when `cf` reports a
    registry `403` for that exact tag. Read the answer using the same
    credential, again without the password in the command:
 
@@ -1598,22 +1651,22 @@ commands `eden destroy` itself runs.
    the delete, not that the entry is gone. Check the listing in step 5.
    Any other answer leaves the tag unresolved if it is still listed.
 
-   Wrangler lists and deletes tags only. The registry also lists one
+   `cf` lists and deletes tags only. The registry also lists one
    `sha256:` entry for each manifest; the `tags/list` command under
    [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept) prints them. To delete one, send the same `DELETE` with
    `sha256:<digest>` in place of the tag. That entry also names the three
    answers with which Cloudflare keeps an object.
 
-5. Run `npx wrangler@4.147.0 containers list` again to check the Container
+5. Run `npx cf@1.0.0-rc.2 containers applications list` again to check the Container
    application is gone. Read the full
    [`tags/list` listing](#eve_registry_objects_kept) for each repository
    proved in step 4. Check that only refs with one of the three kept
    answers remain; a tag still listed after an accepted delete is unresolved.
    Confirm the Worker is gone too; this command must fail with
-   `This Worker does not exist on your account. [code: 10007]`:
+   `[10007] This Worker does not exist on your account.` and `404 Not Found`:
 
    ```sh
-   npx wrangler@4.147.0 deployments list --name <name>
+   npx cf@1.0.0-rc.2 workers deployments list --worker <name>
    ```
 
 Match the exact names only. A name that merely starts the same way can
@@ -1623,7 +1676,7 @@ of this.
 ### Checking for leftovers yourself
 
 ```sh
-npx wrangler@4.147.0 containers list
+npx cf@1.0.0-rc.2 containers applications list
 ```
 
 Confirm the exact Worker and Container are gone and that the registry lists
@@ -1633,7 +1686,7 @@ For a known repository, read the full
 
 A failed destroy names the repositories it could not verify, and each kept
 object's `ref` starts with its repository. The deployment records under
-`.eden/eve-deploy/` hold each image reference. `npx wrangler@4.147.0 containers images list`
+`.eden/eve-deploy/` hold each image reference. `npx cf@1.0.0-rc.2 containers images list`
 also shows them, but only for repositories that still have a tag, and it
 shows no `sha256:` entry. A failed or incomplete listing is not proof of
 cleanup, and a matching name prefix is not proof of ownership.
@@ -1662,8 +1715,8 @@ What to do:
    an attempt ended indeterminate, the attempt evidence is
    `deployment-attempt.json` in the same generation directory.
 2. Inspect the exact target in Cloudflare, and only the exact target:
-   `npx wrangler@4.147.0 deployments list --name <name> --json`,
-   `npx wrangler@4.147.0 containers list`, and a full
+   `npx cf@1.0.0-rc.2 workers deployments list --worker <name>`,
+   `npx cf@1.0.0-rc.2 containers applications list`, and a full
    [`tags/list` listing](#eve_registry_objects_kept) for the exact
    repositories the evidence names.
 3. Retry the same exact target with the same `--project`, `--env`, and

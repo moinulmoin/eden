@@ -8,7 +8,7 @@ Eden Deploy.
 Eden currently supports:
 
 - macOS or Linux
-- Node `>=24.17.0`
+- Node `>=24.22.0`
 - a Cloudflare account
 
 Native Windows and Bun as the JavaScript runtime are not supported. Bun may
@@ -20,8 +20,10 @@ Check Node before installing:
 node --version
 ```
 
-The result must be `v24.17.0` or newer. Eden intentionally has no artificial
-upper Node major-version bound.
+The result must be `v24.22.0` or newer; the `cf` CLI that Eden runs needs it.
+On an older Node, `preflight`, `deploy`, and `destroy` stop with
+[`EVE_NODE_UNSUPPORTED`](./troubleshooting.md#eve_node_unsupported). Eden
+intentionally has no artificial upper Node major-version bound.
 
 ## Install the CLI
 
@@ -59,22 +61,36 @@ eden --help
 The help output must list `preflight`, `deploy`, and `destroy`.
 
 ## Authenticate with Cloudflare
-Deploying to Cloudflare uses Wrangler `4.147.0`. The account must be on the
-Workers Paid plan, which Cloudflare Containers requires. Authenticate the
+
+Deploying to Cloudflare uses Cloudflare's `cf` CLI, version `1.0.0-rc.2`, a
+release candidate. It is installed with Eden. The account must be on the
+Workers Paid plan, which Cloudflare Containers requires. Sign in to the
 Cloudflare account that owns the target Workers:
 
 ```sh
-npx wrangler@4.147.0 login
+npx cf@1.0.0-rc.2 auth login
 ```
 
 Confirm the selected account:
 
 ```sh
-npx wrangler@4.147.0 whoami
+npx cf@1.0.0-rc.2 auth whoami
 ```
 
-Review the returned account before deploying. Eden never selects a different
-Cloudflare account silently.
+Review the returned account before deploying. Eden needs the sign-in to show
+exactly one account, and never selects a different Cloudflare account
+silently.
+
+Instead of signing in, you can set `CLOUDFLARE_API_TOKEN`. `cf` uses it as
+its login.
+
+### Moving from the Wrangler login
+
+Eden 0.14 and earlier used Wrangler and its saved login. `cf` does not read
+that login. After upgrading, run `npx cf@1.0.0-rc.2 auth login` once, or set
+`CLOUDFLARE_API_TOKEN`. Until then `preflight` and `deploy` stop with
+[`VAL-CLI-007-CLOUDFLARE-ACCESS`](./troubleshooting.md#moving-from-the-wrangler-login-to-cf).
+The `.eden/` folder and your deployed targets need no change.
 
 On macOS, a stale `registry.cloudflare.com` keychain entry makes the managed
 registry login fail with `The specified item already exists in the keychain

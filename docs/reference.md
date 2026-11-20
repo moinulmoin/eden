@@ -45,15 +45,17 @@ deployment records under `.eden/eve-deploy/`, the Docker daemon, and the
 Cloudflare account.
 
 Preflight changes nothing in your Cloudflare account: it performs read-only
-calls (`wrangler whoami --json`, the name-filtered Container applications API,
-the Worker's deployments endpoint, the account's
-`workers/subdomain` endpoint, and the Worker's script settings) and never
-uploads, publishes, or deletes. The login and Container reads run once before
+`cf` commands (`cf auth whoami`, `cf containers applications list --name`
+and `get`, `cf workers deployments list`, `cf workers versions get`, and
+`cf workers list --per-page 1` for the `workers.dev` subdomain) and never
+uploads, publishes, or deletes. When the account has no Worker yet, Eden
+reads the subdomain with one direct request to Cloudflare's API, which needs
+`CLOUDFLARE_API_TOKEN`. The login and Container reads run once before
 the build and again with the target reads after it. Locally it writes one generation directory
 under `.eden/eve-deploy/generations/` and removes the Docker images it built.
 
-The account is resolved only when the Wrangler login names exactly one
-account, so Eden cannot pick between several.
+The account is resolved only when `cf auth whoami` reports a valid sign-in
+that names exactly one account, so Eden cannot pick between several.
 
 | Flag | Value | Default | Required |
 | --- | --- | --- | --- |
@@ -161,16 +163,15 @@ with each object and the registry's answer for it. Anything else left
 behind, and a final listing that cannot be read in full, fails destroy with
 `EVE_DESTROY_IMAGES_RETAINED`.
 
-Each read asks Wrangler for the account once and sends every request to that
-account. Destroy reads nothing from an account other than the one in the
-record. It takes a Worker as absent only when Cloudflare's API answers
-status `404` with `success` false, a null result, the single error code
-`10007`, and no field named twice; any other answer about the Worker that
-is not a list of its deployments stops destroy with
-`EVE_DESTROY_INDETERMINATE`. It reads a Container application list only
-from status `200` with `success` true, an empty `errors` list, and no field
-named twice. Wrangler runs each delete with the
-recorded account set. Destroy removes `CURRENT` only if the pointer is still
+Each read asks `cf` for the account once and runs every other `cf` command
+on that account. Destroy reads nothing from an account other than the one in
+the record. It takes a Worker as absent only on Cloudflare's own single
+answer, as `cf` prints it: exit code 1, nothing on standard output, exactly
+one error with code `10007` and status `404`, for the exact request path of
+that account and Worker. Any other answer about the Worker that is not a
+list of its deployments stops destroy with `EVE_DESTROY_INDETERMINATE`. It
+reads a Container application list only when `cf` exits 0 and prints a JSON
+list. `cf` runs each delete with the recorded account set. Destroy removes `CURRENT` only if the pointer is still
 the file it read at the start; that check is not atomic.
 
 Destroy reads the local deployment records and the Cloudflare account, and
@@ -360,9 +361,12 @@ boot container only, and nothing is uploaded to Cloudflare.
 
 `eden deploy` moves the values through two steps:
 
-1. Each value is written as a Worker secret with `wrangler secret put`. The
-   value is passed on standard input, never in the command line, the image, or
-   the logs.
+1. The values are uploaded as Worker secrets together with the Worker
+   version (`cf deploy --prebuilt --secrets-file`), so code and values
+   change in one publish and a first deploy needs no Worker beforehand. They
+   travel in a file in the private temporary folder `cf` runs in, never in
+   the command line, the image, or the logs. Eden deletes the folder when
+   the command ends. Secrets the file does not name stay as they are.
 2. When the container starts, the Worker's Durable Object reads the secrets
    and passes them in the container's environment.
 
@@ -381,11 +385,13 @@ in the account.
 | Variable | Read by | Effect |
 | --- | --- | --- |
 | `EDEN_EVE_CONTAINER_SLEEP_AFTER` | `eden deploy` | Sets the container idle sleep window. Format: a number with an optional `ms`, `s`, `m`, `h`, or `d` suffix, where a bare number means seconds (`90s`, `3h`). Default `1h`; the maximum is `345m` (5 h 45 min), because Cloudflare stops a container within six hours of its Durable Object going idle and Eden must snapshot before that. A larger value fails the publish step with `EVE_HOST_CONFIG_INVALID`; the Worker-side check is `HOST_READINESS_UNPROVEN` |
-| `CLOUDFLARE_API_TOKEN` | Eden | Used instead of the Wrangler OAuth token for Eden's own reads of Cloudflare's API: the Worker, the Container applications, and the subdomain |
-| `WRANGLER_HOME` | Eden | Directory that holds the Wrangler OAuth token for direct API reads. Otherwise Eden follows Wrangler's legacy `~/.wrangler` directory when present, then `$XDG_CONFIG_HOME/.wrangler`, or `~/Library/Preferences/.wrangler` on macOS and `~/.config/.wrangler` elsewhere |
-| `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY` | Eden and Wrangler | Passed from your shell to the Docker CLI and Wrangler image push, so both use the same daemon and credentials |
-| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and Wrangler | Passed from your shell to Docker and Wrangler. Eden's own reads of Cloudflare's API (the Worker, the Container applications, the subdomain, the Worker's settings) use Node's `fetch`, which used these variables only with `NODE_USE_ENV_PROXY=1` set when tested on Node 24.21.0. [Eden's own registry requests](./security.md#what-eden-can-change-in-your-cloudflare-account) never use a proxy |
-| `NODE_EXTRA_CA_CERTS`, `XDG_CONFIG_HOME`, `CLOUDFLARE_ACCOUNT_ID` | Wrangler (configuration/account selection also checked by Eden) | Trusted shell settings for certificate trust, configuration location, and account selection; Eden still requires exactly one authenticated account, matching `CLOUDFLARE_ACCOUNT_ID` when set. After that check Eden sets `CLOUDFLARE_ACCOUNT_ID` to the checked account for every other Wrangler command it runs |
+| `CLOUDFLARE_API_TOKEN` | `cf` and Eden | `cf` uses it as its login instead of `cf auth login`. Eden itself uses it for one request only: reading the account's `workers.dev` subdomain from Cloudflare's API when the account has no Worker yet |
+| `CLOUDFLARE_AUTH_PROFILE` | `cf` | Passed from your shell to `cf` unchanged |
+| `WRANGLER_HOME` | Eden | No longer used for credentials. Eden only checks whether a Wrangler login file (`config/default.toml`) exists there, to say so in `VAL-CLI-007-CLOUDFLARE-ACCESS` when `cf` is signed out. Otherwise it looks in `~/.wrangler` when present, then `$XDG_CONFIG_HOME/.wrangler`, or `~/Library/Preferences/.wrangler` on macOS and `~/.config/.wrangler` elsewhere. Eden never reads the file's contents |
+| `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY` | Eden and `cf` | Passed from your shell to the Docker CLI and the `cf` image push, so both use the same daemon and credentials |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and `cf` | Passed from your shell to Docker and `cf`. Eden's one direct request to Cloudflare's API (the `workers.dev` subdomain) uses Node's `fetch`, which used these variables only with `NODE_USE_ENV_PROXY=1` set when tested on Node 24.21.0. [Eden's own registry requests](./security.md#what-eden-can-change-in-your-cloudflare-account) never use a proxy |
+| `NODE_EXTRA_CA_CERTS`, `XDG_CONFIG_HOME`, `CLOUDFLARE_ACCOUNT_ID` | `cf` (configuration/account selection also checked by Eden) | Trusted shell settings for certificate trust, configuration location, and account selection; Eden still requires exactly one authenticated account, matching `CLOUDFLARE_ACCOUNT_ID` when set. After that check Eden sets `CLOUDFLARE_ACCOUNT_ID` to the checked account for every other `cf` command it runs |
+| `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `CF_SEND_TELEMETRY`, `DO_NOT_TRACK` | `cf` | Passed from your shell to `cf` unchanged. `cf` gets no other variable of yours: Eden also sets `CLOUDFLARE_API_BASE_URL` to `https://api.cloudflare.com/client/v4`, `NO_COLOR=1`, and `CF_QUIET=1` for every `cf` command |
 
 ### Variables Eden sets in the container
 
@@ -475,7 +481,7 @@ that it removes a snapshot 30 days after it was created or last restored.
 Cloudflare also adds one artifact of type
 `application/vnd.cloudchamber.btrfs-chain.v1` for each pushed image, and
 its registry refuses to delete that too. The artifact has no tag, so
-`wrangler containers images list` does not show it.
+`cf containers images list` does not show it.
 
 The Worker is published with `compatibility_date` `2026-04-01`, the
 `enable_ctx_exports` compatibility flag, and `workers_dev` enabled. The
@@ -506,9 +512,12 @@ Everything Eden writes stays under `<project root>/.eden/eve-deploy/`:
     runtime-manifest.json        the built runtime metadata
     image-id                     the packaged candidate image identity
     runtime-image-id             the runtime image identity
-    worker/worker.ts             the published Worker source
-    worker/wrangler.jsonc        the published Wrangler configuration
-    worker/eden-eve-host-worker.mjs
+    worker/.cloudflare/output/v1/   the Build Output that cf deploy publishes
+      config.json                   names the checked account
+      workers/default/worker.config.json
+      workers/default/bundle/worker.js
+      workers/default/bundle/eden-eve-host-worker.mjs
+      containers/<container application>/container.config.json
     deployment.json              the deployment record (mode 0600)
     deployment-attempt.json      retained evidence of an indeterminate attempt
   targets/<environment>-<name>/
@@ -559,8 +568,8 @@ image identity and never runs a broad Docker cleanup.
 
 | Requirement | Value |
 | --- | --- |
-| Node | `>=24.17.0` |
-| Wrangler | `4.147.0`, installed as a direct dependency of the CLI |
+| Node | `>=24.22.0`; an older Node stops `preflight`, `deploy`, and `destroy` with `EVE_NODE_UNSUPPORTED` |
+| `cf` (Cloudflare's CLI) | `1.0.0-rc.2`, a release candidate, pinned exactly and installed as a direct dependency of the CLI |
 | Project package manager | npm defaults to `11.13.0` when `packageManager` is absent, or uses an exact `npm@<major>.<minor>.<patch>` pin with major 7 or newer. pnpm requires an exact `pnpm@<major>.<minor>.<patch>` pin; ranges and tags are rejected |
 | Project lockfile | Exactly one regular root lockfile for the selected manager; mixed locks are rejected. npm accepts `package-lock.json` v2/v3 and uses `npm ci --ignore-scripts --no-audit --no-fund` (production adds `--omit=dev`); dependency lifecycle scripts do not run. pnpm 9 and newer require `lockfileVersion: '9'`, pnpm 7 and 8 require `lockfileVersion: '6'`, older pnpm requires `lockfileVersion: '5'` |
 | Registry configuration | `.npmrc` is excluded from build layers; private registries and installs requiring project `.npmrc` configuration are unsupported |

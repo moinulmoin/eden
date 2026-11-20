@@ -61,7 +61,7 @@ World each one needs.
 
 npm projects deploy as-is using frozen `npm ci` installs; no pnpm conversion is
 needed. Exact-pinned pnpm projects are also supported. Eden runs on Node
-`>=24.17.0` on macOS and Linux; Bun project lockfiles and native Windows are not
+`>=24.22.0` on macOS and Linux; Bun project lockfiles and native Windows are not
 supported. Bun can install the Eden CLI, but Eden itself runs on Node.
 
 `.npmrc` is excluded from build layers. Private registries and installs requiring
@@ -140,7 +140,7 @@ blocking versions and live session counts. There is no override flag.
 ### Can I deploy from CI or another machine?
 
 `--json` gives scripts a machine-readable result, and any machine with Docker,
-Node, and Wrangler access can deploy. Updating or destroying an existing
+Node, and a `cf` sign-in or `CLOUDFLARE_API_TOKEN` can deploy. Updating or destroying an existing
 target needs the `.eden/` folder Eden wrote. Run from the project root that
 holds it, or select that root with `--project`. Keep the folder out of git.
 If it is lost, see

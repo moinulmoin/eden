@@ -1,4 +1,4 @@
-import { access, readFile } from "node:fs/promises";
+import { access, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { dirname } from "node:path";
 import process from "node:process";
@@ -15,33 +15,40 @@ import {
 } from "./owned-process.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const wranglerEntrypoint = join(
-  repositoryRoot,
-  "node_modules",
-  "wrangler",
-  "bin",
-  "wrangler.js",
-);
-// The four pinned Wrangler help probes take about 1.9s without the pnpm
-// launcher and about 3.0s in Vitest. Keep the margin local to this expensive
+const cfEntrypoint = join(repositoryRoot, "node_modules", "cf", "bin", "cf");
+// The cf command users type, at the version Eden runs.
+const CF_COMMAND = "npx cf@1.0.0-rc.2";
+// One cf help probe takes about 0.4s. Keep the margin local to this
 // assertion rather than increasing the global Vitest timeout. Each owned
 // child also has its own shorter cancellation deadline.
-const WRANGLER_HELP_TEST_TIMEOUT_MS = 15_000;
-const WRANGLER_HELP_PROCESS_TIMEOUT_MS = 10_000;
+const CF_HELP_TEST_TIMEOUT_MS = 30_000;
+const CF_HELP_PROCESS_TIMEOUT_MS = 10_000;
 
 async function readRepositoryFile(relativePath) {
   return readFile(join(repositoryRoot, relativePath), "utf8");
 }
 
-function extractDocumentedWranglerCommands(readme) {
-  return [...readme.matchAll(/```sh\n([\s\S]*?)```/gu)]
+// Every cf command line inside a sh block, which is what a user copies.
+function extractDocumentedCfCommands(document) {
+  return [...document.matchAll(/```sh\n([\s\S]*?)```/gu)]
     .flatMap((match) =>
       match[1]
         .replaceAll(/\\\n\s*/gu, " ")
         .split("\n")
         .map((line) => line.trim())
-        .filter((line) => /\bwrangler\s+(?:deploy|secret\s+(?:put|delete)|delete)\b/u.test(line)),
+        .filter((line) => /(?:^|\s)cf(?:@\S+)?\s/u.test(line)),
     );
+}
+
+// The subcommand words of a documented cf line: everything before its first
+// flag, placeholder, or value.
+function cfCommandPath(tokens) {
+  const path = [];
+  for (const token of tokens) {
+    if (!/^[a-z][a-z-]*$/u.test(token)) break;
+    path.push(token);
+  }
+  return path;
 }
 
 function tokensForCommand(command) {
@@ -83,9 +90,10 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
     expect(document).toMatch(/^npm install --global @moinulmoin\/eden$/mu);
     expect(document).toMatch(/^pnpm add --global @moinulmoin\/eden$/mu);
     expect(document).toMatch(/^bun add --global @moinulmoin\/eden$/mu);
-    expect(document).toMatch(/Node `>=24\.17\.0`/u);
+    expect(document).toMatch(/Node `>=24\.22\.0`/u);
     expect(document).toContain("Docker or OrbStack");
-    expect(document).toContain("npx wrangler@4.147.0 login");
+    expect(document).toContain(`${CF_COMMAND} auth login`);
+    expect(document).not.toMatch(/wrangler@|wrangler (?:login|whoami)/u);
     expect(document).toContain("eden deploy");
     expect(document).toContain("eden destroy");
     expect(document).toMatch(/pnpm (?:add --global|install)/);
@@ -96,7 +104,7 @@ test("documents the supported CLI and clean-room operator boundaries", async () 
   expect(readme).toContain("## Install");
   expect(readme).toContain("Users install only `@moinulmoin/eden`;");
   expect(readme).toMatch(/Bun is supported as an installer only/i);
-  expect(readme).toMatch(/Node `>=24\.17\.0` remains\s+the Eden runtime/i);
+  expect(readme).toMatch(/Node `>=24\.22\.0` remains\s+the Eden runtime/i);
   expect(workflow).toContain("permissions:\n  contents: read");
   expect(workflow).toContain("actions/checkout@11d5960a326750d5838078e36cf38b85af677262");
   expect(workflow).toContain("actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020");
@@ -173,63 +181,62 @@ test("retains the exact release NOTICE", async () => {
 });
 
 test(
-  "targets every documented mutating Wrangler command explicitly",
+  "documents only cf commands that the pinned cf has, mutating ones included",
   async () => {
-    const [readme, deployDoc, validationDoc] = await Promise.all([
-      readRepositoryFile("README.md"),
-      readRepositoryFile("docs/deploy.md"),
-      readRepositoryFile("docs/validation.md"),
-    ]);
-    const commands = extractDocumentedWranglerCommands(
-      `${readme}\n${deployDoc}\n${validationDoc}`,
+    const docs = (await readdir(join(repositoryRoot, "docs")))
+      .filter((name) => name.endsWith(".md") && name !== "eve-compatibility-history.md")
+      .map((name) => `docs/${name}`);
+    const documents = await Promise.all(
+      ["README.md", "packages/cli/README.md", "skills/eden/SKILL.md", ...docs].map(readRepositoryFile),
     );
+    const commands = [...new Set(documents.flatMap(extractDocumentedCfCommands))];
 
-    const helpByCommand = new Map();
-    for (const command of ["deploy", "secret put", "secret delete", "delete"]) {
-      const commandParts = command.split(" ");
-      const result = await runOwnedProcess({
-        file: process.execPath,
-        args: [wranglerEntrypoint, ...commandParts, "--help"],
-        cwd: repositoryRoot,
-        timeoutMs: WRANGLER_HELP_PROCESS_TIMEOUT_MS,
-        label: `wrangler-help-${command.replaceAll(" ", "-")}`,
-      });
-      expect(
-        result.ok,
-        `${command} Wrangler help failed: ${result.stderr || result.stdout}`,
-      ).toBe(true);
-      expectNoProcessReservations(`Wrangler help ${command}`);
-      helpByCommand.set(command, `${result.stdout}\n${result.stderr}`);
-    }
-
+    const helpByPath = new Map();
+    const documentedPaths = new Set();
     for (const documented of commands) {
       const tokens = tokensForCommand(documented);
-      const wranglerIndex = tokens.indexOf("wrangler");
-      const commandName = tokens[wranglerIndex + 1];
-      const commandKey =
-        commandName === "secret"
-          ? `secret ${tokens[wranglerIndex + 2]}`
-          : commandName;
-      const help = helpByCommand.get(commandKey);
-
-      expect(help, documented).toBeDefined();
-      if (commandKey === "delete") {
-        expect(help, documented).toContain("wrangler delete [name]");
-        expect(tokens, documented).toContain("--env");
-        expect(tokens[wranglerIndex + 2], documented).not.toMatch(/^--/u);
-      } else {
-        expect(help, documented).toContain(`wrangler ${commandKey}`);
-        expect(tokens, documented).toContain("--name");
-        expect(tokens[tokens.indexOf("--name") + 1], documented).not.toMatch(/^--/u);
-        expect(tokens, documented).not.toContain("--env");
+      // Every cf line a user copies names the version Eden runs.
+      expect(documented, documented).toContain(`${CF_COMMAND} `);
+      const path = cfCommandPath(tokens.slice(tokens.indexOf("cf@1.0.0-rc.2") + 1));
+      expect(path.length, documented).toBeGreaterThan(0);
+      const key = path.join(" ");
+      documentedPaths.add(key);
+      if (!helpByPath.has(key)) {
+        const result = await runOwnedProcess({
+          file: process.execPath,
+          args: [cfEntrypoint, ...path, "--help"],
+          cwd: repositoryRoot,
+          timeoutMs: CF_HELP_PROCESS_TIMEOUT_MS,
+          label: `cf-help-${path.join("-")}`,
+        });
+        expect(result.ok, `${key} cf help failed: ${result.stderr || result.stdout}`).toBe(true);
+        expectNoProcessReservations(`cf help ${key}`);
+        helpByPath.set(key, `${result.stdout}\n${result.stderr}`);
+      }
+      const help = helpByPath.get(key);
+      // cf answers an unknown command with an error box and exit code 0.
+      expect(help, documented).toMatch(new RegExp(`^cf ${key}(?: |$)`, "mu"));
+      expect(help, documented).not.toContain("Unknown command");
+      for (const flag of tokens.filter((token) => token.startsWith("--"))) {
+        expect(help, documented).toMatch(new RegExp(`(?:^|\\s)${flag}[ ,]`, "mu"));
       }
     }
+
+    // The commands that change the account, which the docs tell a user to type.
+    for (const mutating of [
+      "auth login",
+      "workers delete",
+      "containers applications delete",
+      "containers images delete",
+    ]) {
+      expect([...documentedPaths], mutating).toContain(mutating);
+    }
   },
-  WRANGLER_HELP_TEST_TIMEOUT_MS,
+  CF_HELP_TEST_TIMEOUT_MS,
 );
 
 test(
-  "aborts a hung Wrangler help child and its descendants before the next probe",
+  "aborts a hung cf help child and its descendants before the next probe",
   async () => {
     const result = await runOwnedProcess({
       file: process.execPath,
@@ -244,7 +251,7 @@ test(
       ],
       cwd: repositoryRoot,
       timeoutMs: 150,
-      label: "wrangler-hung-help-fixture",
+      label: "cf-hung-help-fixture",
     });
 
     expect(result.ok).toBe(false);
@@ -258,20 +265,20 @@ test(
       file: process.execPath,
       args: [
         "-e",
-        'setTimeout(() => process.stdout.write("after-hung-wrangler"), 100)',
+        'setTimeout(() => process.stdout.write("after-hung-cf"), 100)',
       ],
       cwd: repositoryRoot,
       timeoutMs: 2_000,
-      label: "wrangler-follow-up",
+      label: "cf-follow-up",
     });
     expect(followUp.ok).toBe(true);
-    expect(followUp.stdout).toBe("after-hung-wrangler");
-    expectNoProcessReservations("hung Wrangler follow-up");
+    expect(followUp.stdout).toBe("after-hung-cf");
+    expectNoProcessReservations("hung cf follow-up");
   },
   5_000,
 );
 
-test("classifies a signal-terminated Wrangler child as a failure", async () => {
+test("classifies a signal-terminated cf child as a failure", async () => {
   const result = await runOwnedProcess({
     file: process.execPath,
     args: [
@@ -280,7 +287,7 @@ test("classifies a signal-terminated Wrangler child as a failure", async () => {
     ],
     cwd: repositoryRoot,
     timeoutMs: 2_000,
-    label: "wrangler-signal-fixture",
+    label: "cf-signal-fixture",
   });
 
   expect(result.code).toBeNull();
@@ -288,7 +295,7 @@ test("classifies a signal-terminated Wrangler child as a failure", async () => {
   expect(result.ok).toBe(false);
   expect(result.cleanupVerified).toBe(true);
   await expect(result.remainingPids()).resolves.toEqual([]);
-  expectNoProcessReservations("signal-terminated Wrangler child");
+  expectNoProcessReservations("signal-terminated cf child");
 });
 
 test("waits for close before returning trailing descendant output", async () => {
@@ -305,7 +312,7 @@ test("waits for close before returning trailing descendant output", async () => 
     ],
     cwd: repositoryRoot,
     timeoutMs: 2_000,
-    label: "wrangler-close-trailing-output-fixture",
+    label: "cf-close-trailing-output-fixture",
   });
 
   expect(result.ok, processDiagnostic(result)).toBe(true);
@@ -376,7 +383,7 @@ test("retries a transient root identity observation before cleanup", async () =>
     const entries = snapshotOwnedProcesses();
     if (entries === undefined) return entries;
     const root = entries.find((entry) =>
-      entry.command.includes("eden-owned-wrangler-transient-identity-"),
+      entry.command.includes("eden-owned-cf-transient-identity-"),
     );
     if (root !== undefined) {
       observations += 1;
@@ -396,7 +403,7 @@ test("retries a transient root identity observation before cleanup", async () =>
     args: ["-e", 'setTimeout(() => {}, 500)'],
     cwd: repositoryRoot,
     timeoutMs: 2_000,
-    label: "wrangler-transient-identity-fixture",
+    label: "cf-transient-identity-fixture",
     snapshot,
   });
 
@@ -611,7 +618,7 @@ test("retries a root hidden once after SIGKILL before declaring cleanup", async 
     if (entries === undefined) return entries;
     if (rootHidden) snapshotsAfterHide += 1;
     const root = entries.find((entry) =>
-      entry.command.includes("eden-owned-wrangler-hidden-root-"),
+      entry.command.includes("eden-owned-cf-hidden-root-"),
     );
     if (root !== undefined) rootPid = root.pid;
     if (hideRootOnNextSnapshot) {
@@ -631,7 +638,7 @@ test("retries a root hidden once after SIGKILL before declaring cleanup", async 
     ],
     cwd: repositoryRoot,
     timeoutMs: 150,
-    label: "wrangler-hidden-root-fixture",
+    label: "cf-hidden-root-fixture",
     snapshot,
     sendSignal: (target, signal) => {
       if (signal === "SIGKILL") hideRootOnNextSnapshot = true;
@@ -661,7 +668,7 @@ test("diagnoses output-limit termination without retaining a reservation", async
     ],
     cwd: repositoryRoot,
     timeoutMs: 2_000,
-    label: "wrangler-output-limit-fixture",
+    label: "cf-output-limit-fixture",
   });
 
   expect(result.ok, processDiagnostic(result)).toBe(false);
@@ -673,7 +680,7 @@ test("diagnoses output-limit termination without retaining a reservation", async
   expectNoProcessReservations("output-limit termination");
 });
 
-test("aborts a hung Wrangler child tree within the owned cleanup bound", async () => {
+test("aborts a hung cf child tree within the owned cleanup bound", async () => {
   const controller = new globalThis.AbortController();
   const abortTimer = globalThis.setTimeout(() => controller.abort(), 100);
   const result = await runOwnedProcess({
@@ -685,7 +692,7 @@ test("aborts a hung Wrangler child tree within the owned cleanup bound", async (
     cwd: repositoryRoot,
     timeoutMs: 5_000,
     signal: controller.signal,
-    label: "wrangler-abort-fixture",
+    label: "cf-abort-fixture",
   });
   globalThis.clearTimeout(abortTimer);
 
@@ -693,7 +700,7 @@ test("aborts a hung Wrangler child tree within the owned cleanup bound", async (
   expect(result.aborted).toBe(true);
   expect(result.cleanupVerified).toBe(true);
   await expect(result.remainingPids()).resolves.toEqual([]);
-  expectNoProcessReservations("aborted Wrangler child");
+  expectNoProcessReservations("aborted cf child");
 });
 
 test(
@@ -708,7 +715,7 @@ test(
     ],
     cwd: repositoryRoot,
     timeoutMs: 1_000,
-    label: "wrangler-empty-snapshot-fixture",
+    label: "cf-empty-snapshot-fixture",
     snapshot: () => (observe ? snapshotOwnedProcesses() : []),
   });
 
@@ -741,7 +748,7 @@ test(
     ],
     cwd: repositoryRoot,
     timeoutMs: 1_000,
-    label: "wrangler-failed-observation-fixture",
+    label: "cf-failed-observation-fixture",
     snapshot: () => (observe ? snapshotOwnedProcesses() : undefined),
   });
 
@@ -770,7 +777,7 @@ test(
     const entries = snapshotOwnedProcesses();
     if (entries === undefined) return entries;
     const root = entries.find((entry) =>
-      entry.command.includes("eden-owned-wrangler-zero-code-cleanup-"),
+      entry.command.includes("eden-owned-cf-zero-code-cleanup-"),
     );
     if (root !== undefined) identityObserved = true;
     if (identityObserved && !restoreObservation && root === undefined) {
@@ -783,7 +790,7 @@ test(
     args: ["-e", "setTimeout(() => process.exit(0), 100)"],
     cwd: repositoryRoot,
     timeoutMs: 2_000,
-    label: "wrangler-zero-code-cleanup-fixture",
+    label: "cf-zero-code-cleanup-fixture",
     snapshot,
   });
 
@@ -839,7 +846,7 @@ test(
     // can stretch past 150ms under load, letting the first SIGTERM terminate
     // an unarmed root and verify cleanup as a natural exit.
     timeoutMs: 600,
-    label: "wrangler-identity-replacement-fixture",
+    label: "cf-identity-replacement-fixture",
     snapshot,
     sendSignal: (target, signal) => {
       signals.push(signal);
