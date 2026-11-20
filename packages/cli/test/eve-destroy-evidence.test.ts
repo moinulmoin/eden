@@ -911,6 +911,38 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(lstat(other.current)).resolves.toBeDefined();
   });
 
+  test("a deploy to production stops with EVE_DEPLOY_BUSY while a preview destroy of the same name runs", async () => {
+    const { root } = await deployedProject();
+    cloud.workers.add(worker);
+    cloud.containers.add(container);
+    let reached = (): void => undefined;
+    let resume = (): void => undefined;
+    const destroyReading = new Promise<void>((resolve) => { reached = resolve; });
+    const paused = new Promise<void>((resolve) => { resume = resolve; });
+    cloud.onWorkerRead = async (nth) => {
+      if (nth !== 0) return;
+      reached();
+      await paused;
+    };
+    const destroying = destroy(root);
+    await destroyReading;
+    const output: string[] = [];
+    const exitCode = await runEdenCli(
+      ["deploy", "--project", root, "--env", "production", "--name", "eve-destroy-fixture", "--json"],
+      { cwd: root, stdout: (line) => output.push(line), stderr: (line) => output.push(line) },
+    );
+    expect(output).toHaveLength(1);
+    const result = JSON.parse(output[0] ?? "") as { readonly ok?: boolean; readonly error?: { readonly code?: string; readonly remediation?: string } };
+    expect({ exitCode, ok: result.ok, code: result.error?.code }).toEqual({ exitCode: 1, ok: false, code: "EVE_DEPLOY_BUSY" });
+    expect(result.error?.remediation).toContain("rerun the same eden command");
+    expect(result.error?.remediation).toContain(".eden/eve-deploy/locks/<name>.lock");
+    expect(cloud.deleted).toEqual([]);
+    await expect(readdir(join(root, ".eden", "eve-deploy", "locks"))).resolves.toEqual(["eve-destroy-fixture.lock"]);
+    resume();
+    expect((await destroying).exitCode).toBe(0);
+    await expect(readdir(join(root, ".eden", "eve-deploy", "locks"))).resolves.toEqual([]);
+  });
+
   test("a CURRENT that names another project's generation is refused before any Cloudflare call", async () => {
     const other = await deployedProject();
     const { root, current } = await deployedProject();

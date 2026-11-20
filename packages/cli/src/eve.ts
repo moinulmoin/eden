@@ -105,9 +105,9 @@ function eveErrorRemediation(code: string): string {
     case "EVE_DEPLOY_CHECKS_FAILED":
       return "Fix each failed check using its remediation, then rerun eden deploy.";
     case "EVE_DEPLOY_BUSY":
-      return "Wait for the other eden run on this target to finish, then retry. If that run was killed, confirm no eden process is still running before you remove .eden/eve-deploy/locks/<env>-<name>.lock by hand.";
+      return "Wait for the other eden run on this name to finish, in either environment, then rerun the same eden command. If that run was killed, confirm no eden process is still running before you remove .eden/eve-deploy/locks/<name>.lock by hand.";
     case "EVE_DEPLOY_LOCK_RELEASE_UNPROVEN":
-      return "Confirm no eden process is still running against the target, then remove the stale lock file at .eden/eve-deploy/locks/<env>-<name>.lock.";
+      return "Confirm no eden process is still running against the name, then remove the stale lock file at .eden/eve-deploy/locks/<name>.lock.";
     case "EVE_DEPLOY_PROMOTION_FAILED":
       return "Inspect the local record under .eden/eve-deploy/targets/<env>-<name>/CURRENT and the live target before retrying.";
     case "EVE_DEPLOYMENT_FAILED":

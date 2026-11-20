@@ -393,9 +393,9 @@ login cannot act on the checked account, the command fails.
   `registry.cloudflare.com/<account>/<repository>@sha256:<digest>`, and
   refuses any other reference before it changes anything on the target. A recorded image that is
   not in that form cannot be placed in a repository, so it stops every
-  sweep of that deploy. `eden deploy` and `eden destroy` take one lock in
-  the project's `.eden` folder, which stops two runs from the same folder
-  only. It does not stop a copy of the project on another machine, or any
+  sweep of that deploy. `eden deploy` and `eden destroy` take one lock per
+  name in the project's `.eden` folder, the same lock for both
+  environments, which stops two runs from the same folder only. It does not stop a copy of the project on another machine, or any
   other push to the registry: an image pushed to an owned repository while
   cleanup runs can be deleted.
 - **Some registry objects outlive destroy.** Destroy tries to delete everything

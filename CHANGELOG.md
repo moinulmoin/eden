@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- One name is now locked in both environments. `--env preview` and
+  `--env production` with the same `--name` are the same Worker, and until
+  now two runs from one project folder, one in each environment, could
+  publish or delete it at the same time. The second run now stops with
+  `EVE_DEPLOY_BUSY` before it reads or changes anything. The lock file moved
+  from `.eden/eve-deploy/locks/<environment>-<name>.lock` to
+  `.eden/eve-deploy/locks/<name>.lock`; Eden no longer reads a lock file
+  with the old name.
+
 ## 0.15.0 — 2026-11-20
 
 Eden now runs Cloudflare's `cf` CLI, pinned to `1.0.0-rc.2`, instead of
