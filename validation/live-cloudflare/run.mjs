@@ -231,6 +231,8 @@ async function step(title, body) {
   } catch (error) {
     entry.status = "failed";
     entry.detail = redact(error instanceof Error ? error.message : String(error));
+    // Everything a failed eden command printed as JSON: every check, warning and error field.
+    if (error?.edenOutput !== undefined) entry.edenOutput = error.edenOutput;
     throw error;
   } finally {
     entry.seconds = seconds(Date.now() - started);
@@ -259,7 +261,10 @@ async function eden(command, { withEnvFile = true, interruptible = true, interru
   registryAccount = /^registry\.cloudflare\.com\/([A-Za-z0-9_-]+)\/eden-eve-/u.exec(output.deployment?.imageReference ?? "")?.[1] ?? registryAccount;
   if (result.code !== 0 || output.ok !== true) {
     const failed = (output.checks ?? []).filter((check) => check.status === "failed").map((check) => check.id + ": " + check.message);
-    throw new Error(["eden " + command + " failed (exit " + result.code + "): " + (output.error?.code ?? "no error code") + " " + (output.error?.message ?? ""), ...failed, tail(result.stderr, 15)].filter(Boolean).join("\n"));
+    const failure = new Error(["eden " + command + " failed (exit " + result.code + "): " + (output.error?.code ?? "no error code") + " " + (output.error?.message ?? ""), ...failed, tail(result.stderr, 15)].filter(Boolean).join("\n"));
+    // The step keeps the whole object in the summary, so a failure that does not come back can still be read.
+    failure.edenOutput = output;
+    throw failure;
   }
   if (interrupted) {
     const line = result.stderr.split("\n").find((entry) => entry.startsWith("interrupted-deploy: "));
