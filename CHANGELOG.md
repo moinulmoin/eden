@@ -14,8 +14,10 @@ the same code as `0.13.0`.
 
 The full live check passed on Cloudflare at the commit this release was cut
 from: a fresh deploy, a same-version update, an upgrade from Eve `0.91.0` to
-`1.0.2`, a sleep and wake, and a destroy. The record is in
-`docs/eve-compatibility-history.md`.
+`1.0.2`, a sleep and wake, and a destroy. That run sent no requests while a
+deploy switched versions, so it does not test the version-switch fixes.
+Those were measured in a separate run on 2026-11-20, on the branch of the
+fix. Both records are in `docs/eve-compatibility-history.md`.
 
 ### Upgrading from 0.13.0
 
