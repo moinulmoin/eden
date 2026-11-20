@@ -5,7 +5,9 @@
 - Eve `1.1.0` is now the latest tested Eve, with `@workflow/world-postgres`
   `5.3.0` and the Cloudflare World. Eden, the project, and both Worlds need
   no change for it. Eve `0.91.0` stays the oldest supported version. Eve
-  `1.0.2` still deploys, but the compatibility gate no longer tests it.
+  `1.0.2` still deploys, but the compatibility gate no longer tests it. The
+  full live check passed on Cloudflare with an upgrade from Eve `0.91.0` to
+  `1.1.0`; the record is in `docs/eve-compatibility-history.md`.
 
 ## 0.14.0 — 2026-11-20
 
