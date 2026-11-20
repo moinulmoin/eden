@@ -1223,6 +1223,20 @@ describe("EveHostDurableContainer lifecycle", () => {
     expect(runtime.running).toBe(true);
   });
 
+  test("requests that arrive together during an image update all get Eve's answer from one new container", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: OLD_IMAGE, carryArchive: "session-files" });
+    const object = hostContainer(new Map(), runtime);
+    const responses = await Promise.all([1, 2, 3, 4].map(() => object.fetch(new Request(
+      "https://eden-eve-preview.account.workers.dev/eve/v1/info",
+      { headers: { "x-eden-eve-deployment-id": IDENTITY.deploymentId } },
+    ))));
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200]);
+    expect(runtime.state.timeline.filter((event) => event !== "health" && event !== "forward")).toEqual([
+      "carry-out", "destroy", "start", "carry-in",
+    ]);
+    expect(runtime.lastStart?.image).toBe(CURRENT_IMAGE);
+  });
+
   test("a request through a Worker of the replaced release gets Eve's answer, and the new object is not reset", async () => {
     const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
     const abort = vi.fn((reason?: string) => { throw new Error(reason); });

@@ -527,6 +527,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   private activeDeliveries = 0;
   private activeForwarding = 0;
   private schedulerRoleReconcile: Promise<void> | undefined;
+  private imageReconcile: Promise<void> | undefined;
   private retainedFences: Promise<void> | undefined;
   private readonly deliveryClaims = new Map<EveQueueDeliveryClaim, { generation: number; fail(error: Error): void }>();
 
@@ -865,6 +866,10 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     const worldToken = globalThis.crypto.randomUUID();
     await this.ctx.storage.put("eden.eve.host.world-token", worldToken);
     this.envVars.EDEN_WORLD_TOKEN = worldToken;
+    // Both start sources run `expectedImage` (a snapshot is only restored
+    // from that image). Recorded before the start, so a request that inspects
+    // the new container before it reports its image does not replace it.
+    await this.ctx.storage.put(EVE_HOST_CONTAINER_STARTED_IMAGE_KEY, expectedImage);
     runtime.start({
       ...(snapshotId === undefined
         ? { image: expectedImage }
@@ -887,9 +892,6 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     // A fresh process receives the retained scheduler fence even when its
     // filesystem came from a snapshot of the formerly-current deployment.
     await this.ctx.storage.delete("eden.eve.host.scheduler-fence-pending");
-    // Both start sources run `expectedImage` (a snapshot is only restored
-    // from that image).
-    await this.ctx.storage.put(EVE_HOST_CONTAINER_STARTED_IMAGE_KEY, expectedImage);
     // Intercepts do not survive a container start and late registration lags;
     // register inside the same block before readiness polling.
     await this.registerLoopbackIntercept(runtime);
@@ -905,6 +907,13 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
    * at start stands in for it.
    */
   private async reconcileRunningImage(): Promise<void> {
+    // One replacement at a time: a second caller that judged the old
+    // container would otherwise destroy the new one the first just started.
+    this.imageReconcile ??= this.replaceStaleImage().finally(() => { this.imageReconcile = undefined; });
+    await this.imageReconcile;
+  }
+
+  private async replaceStaleImage(): Promise<void> {
     if (this.imageVerified) return;
     const runtime = this.containerRuntime();
     if (runtime === undefined || !runtime.running) return;
