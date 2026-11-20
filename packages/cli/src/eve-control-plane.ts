@@ -528,6 +528,8 @@ export type EveImagePublicationResult =
   | {
     readonly status: "indeterminate";
     readonly reason: string;
+    /** What to do next, in place of the one remediation every DEPLOY_INDETERMINATE gets. */
+    readonly remediation?: string;
     readonly evidenceRetained: true;
   };
 
@@ -2602,36 +2604,37 @@ async function publishImageWithCf(
         maxBuffer: 512 * 1024,
       },
     );
+    // cf signs Docker in and starts docker push as a process of its own.
+    // Eden stops only cf, so a push Eden stopped waiting for can go on.
+    const pushing = `docker push registry.cloudflare.com/${request.accountId}/${request.localImageTag}`;
+    const mayStillRun =
+      `The Docker push that cf started may still be running and may still finish. To see it, run: ps -ax | grep "${pushing}". Let it finish, or stop it with kill and its process ID. Then run eden deploy again with the same --project, --env, and --name, and keep the .eden folder.`;
     const pushed = await cf({
       args: ["containers", "push", "--tag", request.localImageTag],
       accountId: request.accountId,
       timeoutMs: CLOUDFLARE_PUBLICATION_TIMEOUT_MS,
+      interruptNote: `eden deploy was interrupted during the image push and stopped cf only. ${mayStillRun}`,
     });
     if (pushed.exitCode !== 0) {
-      // The push carries no runtime values, so the end of what cf and
-      // Docker printed is kept beside the generation, as for the publish.
-      const log = join(request.generationRoot, "cf-push.log");
-      const kept = await writeFile(
-        log,
-        `cf containers push: exit ${pushed.exitCode ?? (pushed.running === true ? "none (cf did not stop when killed)" : "none (cf was stopped)")}\n${safeText(pushed.stderr.slice(-2_000))}`,
-        { mode: 0o600 },
-      ).then(() => true, () => false);
-      // cf signs Docker in, then runs docker tag and docker push. How it
-      // failed is read from cf's own two messages, seen on 2026-11-20.
-      const how = /-25299|already exists in the keychain/u.test(pushed.stderr)
-        ? "Docker's credential store already holds an entry for registry.cloudflare.com. On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry."
-        : pushed.running === true
-        ? "cf containers push ran past Eden's ten minutes and did not stop when Eden killed it. It and its docker push may still be running."
-        : pushed.exitCode === undefined
-        ? "cf containers push ended without an exit code. Eden stops it, and the docker push under it, after ten minutes."
+      // Nothing cf or Docker printed is kept or shown: cf hands Docker the
+      // registry password, and Docker's own output can repeat it. Only how
+      // the push ended, read from cf's fixed messages seen on 2026-11-20.
+      const unfinished = pushed.exitCode === undefined;
+      const how = pushed.running === true
+        ? "cf containers push ran past Eden's ten minutes and did not stop when Eden killed it (no exit code). cf may still be running."
+        : unfinished
+        ? "cf containers push did not finish in Eden's ten minutes (no exit code). Eden stopped cf only."
+        : /-25299|already exists in the keychain/u.test(pushed.stderr)
+        ? `Docker's credential store already holds an entry for registry.cloudflare.com (cf exited ${pushed.exitCode}). On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry.`
         : /Login failed with code: \d+/u.test(pushed.stderr)
-        ? "docker login to registry.cloudflare.com failed. cf signs Docker in to the registry, and Docker saves that in its credential store."
+        ? `docker login to registry.cloudflare.com failed (cf exited ${pushed.exitCode}). cf signs Docker in to the registry, and Docker saves that in its credential store.`
         : /Docker command exited with code: \d+/u.test(pushed.stderr)
-        ? "Docker signed in to registry.cloudflare.com, and its tag or push command then failed."
+        ? `Docker signed in to registry.cloudflare.com, and its tag or push command then failed (cf exited ${pushed.exitCode}).`
         : `cf containers push exited ${pushed.exitCode}.`;
       return {
         status: "indeterminate",
-        reason: `The exact Cloudflare Container image push did not complete: ${how}${kept ? ` What cf and Docker printed is in ${log}.` : ""}`,
+        reason: `The exact Cloudflare Container image push did not complete: ${how}${unfinished ? " The Docker push that cf started may still be running and may still finish." : ""}`,
+        ...(unfinished ? { remediation: mayStillRun } : {}),
         evidenceRetained: true,
       };
     }
@@ -3595,10 +3598,12 @@ async function runEveDeployment(
           imageDigest,
         },
       );
-      throw deploymentFailure(
-        "DEPLOY_INDETERMINATE",
-        imagePublication.reason,
-      );
+      throw new EveCliError({
+        code: "DEPLOY_INDETERMINATE",
+        message: safeText(imagePublication.reason),
+        source: "eden deploy",
+        ...(imagePublication.remediation === undefined ? {} : { remediation: imagePublication.remediation }),
+      });
     }
     const publishedRepo = imagePublication.imageReference.split("@")[0];
     const expectedRepo = targetImageReference.split("@")[0];

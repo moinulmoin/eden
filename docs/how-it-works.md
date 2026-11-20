@@ -75,9 +75,11 @@ until the checks in steps 1–4 have passed.
    itself runs before the build and again after it, and the deploy stops if
    the two name different accounts. `cf containers push` gets ten minutes.
    When they pass, or when Eden is stopped with Ctrl-C or a kill, Eden
-   kills `cf` and every process under it. `cf` runs `docker push` in a
-   process group of its own, so killing `cf` alone would leave the upload
-   running.
+   stops `cf` and nothing else. `cf` runs `docker push` as a process in
+   a group of its own, so that push may go on and may still finish after
+   the deploy has ended `DEPLOY_INDETERMINATE`. Eden says so and names the
+   command that shows the push; see
+   [Troubleshooting](./troubleshooting.md#deploy_indeterminate--the-image-push-could-not-be-proven).
 6. **Stage runtime variables** (only with `--env-file`). The values are
    held for the publish, which uploads them as Worker secrets with the
    Worker version, so code and values change together. Values never go into

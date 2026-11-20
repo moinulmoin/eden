@@ -646,7 +646,7 @@ async function writeBuild(snapshotRoot: string): Promise<void> {
   await symlink("../eve/bin/eve.js", join(snapshotRoot, "node_modules/.bin/eve"));
 }
 
-type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string; readonly message?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly message?: string; readonly remediation?: string }[] };
+type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string; readonly message?: string; readonly remediation?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly message?: string; readonly remediation?: string }[] };
 
 /** A deploy that publishes through Eden's own cf calls and its own read afterwards. */
 async function deploy(
@@ -1499,48 +1499,61 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
   });
 });
 
-describe("a failed image push says how it failed and keeps what cf and Docker printed (MOI-312)", () => {
-  // The boxes are what cf 1.0.0-rc.2 printed on 2026-11-20 around a stand-in docker that failed at each step; the lines before them stand for Docker's own.
+describe("a failed image push says how it ended and keeps nothing cf or Docker printed (MOI-312, MOI-235)", () => {
+  // The boxes are what cf 1.0.0-rc.2 printed on 2026-11-20 around a stand-in docker that failed at each step. The line before each stands for Docker's own, which can repeat the registry password.
+  const said = "error storing credentials for v1 with registry-password\n\n";
+  const stillRuns = "The Docker push that cf started may still be running and may still finish.";
   test.each([
     [
-      "that Eden stopped",
-      { exitCode: null, stderr: "" },
-      /push did not complete: cf containers push ended without an exit code\. Eden stops it, and the docker push under it, after ten minutes\./u,
+      "that ran past Eden's ten minutes",
+      { exitCode: null, stderr: said },
+      "cf containers push did not finish in Eden's ten minutes (no exit code). Eden stopped cf only. " + stillRuns,
+      true,
     ],
     [
       "whose docker login failed",
-      { exitCode: 1, stderr: "Error saving credentials: error storing credentials - err: exit status 1, out: `not implemented`\n\n┌ Error\n│ Login failed with code: 1\n└\n" },
-      /push did not complete: docker login to registry\.cloudflare\.com failed\. cf signs Docker in to the registry, and Docker saves that in its credential store\./u,
+      { exitCode: 1, stderr: said + "┌ Error\n│ Login failed with code: 1\n└\n" },
+      "docker login to registry.cloudflare.com failed (cf exited 1). cf signs Docker in to the registry, and Docker saves that in its credential store.",
+      false,
     ],
     [
       "whose docker login found a stale keychain entry",
-      { exitCode: 1, stderr: "Error saving credentials: error storing credentials - err: exit status 1, out: `The specified item already exists in the keychain. (-25299)`\n\n┌ Error\n│ Login failed with code: 1\n└\n" },
-      /push did not complete: Docker's credential store already holds an entry for registry\.cloudflare\.com\. On macOS, run security delete-internet-password -s registry\.cloudflare\.com, then retry\./u,
+      { exitCode: 1, stderr: said + "out: `The specified item already exists in the keychain. (-25299)`\n\n┌ Error\n│ Login failed with code: 1\n└\n" },
+      "Docker's credential store already holds an entry for registry.cloudflare.com (cf exited 1). On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry.",
+      false,
     ],
     [
       "whose docker push failed",
-      { exitCode: 1, stdout: "Login Succeeded\n", stderr: "denied: stand-in refusal\n\n┌ Error\n│ Docker command exited with code: 1\n└\n" },
-      /push did not complete: Docker signed in to registry\.cloudflare\.com, and its tag or push command then failed\./u,
+      { exitCode: 1, stdout: "Login Succeeded\n", stderr: said + "┌ Error\n│ Docker command exited with code: 1\n└\n" },
+      "Docker signed in to registry.cloudflare.com, and its tag or push command then failed (cf exited 1).",
+      false,
     ],
     [
       "that failed another way",
-      { exitCode: 1, stderr: "\n┌ Error\n│ fetch failed\n└\n" },
-      /push did not complete: cf containers push exited 1\./u,
+      { exitCode: 3, stderr: said + "┌ Error\n│ fetch failed\n└\n" },
+      "cf containers push exited 3.",
+      false,
     ],
-  ] as const)("a cf containers push %s", async (_name, pushResult, message) => {
+  ] as const)("a cf containers push %s", async (_name, pushResult, how, mayStillRun) => {
     const root = await deployableProject();
     const account = "1".repeat(32);
     cloud.whoami = () => account;
     cloud.pushResult = pushResult;
-    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    const output: string[] = [];
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true, output });
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
-    expect(result.error?.message).toMatch(message);
-    const log = join(root, ".eden", "eve-deploy", "generations", "generation-one", "cf-push.log");
-    expect(result.error?.message).toContain("What cf and Docker printed is in " + log + ".");
-    expect(await readFile(log, "utf8")).toBe(
-      "cf containers push: exit " + (pushResult.exitCode ?? "none (cf was stopped)") + "\n" + pushResult.stderr,
-    );
-    expect((await lstat(log)).mode & 0o777).toBe(0o600);
+    expect(result.error?.message).toBe("The exact Cloudflare Container image push did not complete: " + how);
+    // Only a push Eden stopped waiting for names the docker push to look for, by the image cf pushed.
+    const look = 'To see it, run: ps -ax | grep "docker push registry.cloudflare.com/' + String(cloud.pushed[0]) + '".';
+    expect(result.error?.remediation?.includes(look)).toBe(mayStillRun);
+    if (mayStillRun) expect(result.error?.remediation).toMatch(/^The Docker push that cf started may still be running and may still finish\..* Then run eden deploy again with the same --project, --env, and --name, and keep the \.eden folder\.$/u);
+    // Nothing of what cf and Docker printed is shown or kept.
+    expect(output.join("\n")).not.toContain("registry-password");
+    const kept = await readdir(join(root, ".eden"), { recursive: true, withFileTypes: true });
+    expect(kept.map((file) => file.name)).not.toContain("cf-push.log");
+    for (const entry of kept.filter((file) => file.isFile())) {
+      expect(await readFile(join(entry.parentPath, entry.name), "utf8")).not.toContain("registry-password");
+    }
     expect([...cloud.workers]).toEqual([]);
   });
 });

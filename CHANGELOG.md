@@ -36,21 +36,20 @@
 - A failed image push now says how it failed. The `DEPLOY_INDETERMINATE`
   message tells apart a push Eden stopped after ten minutes, a
   `docker login` that failed, a `docker tag` or `docker push` that failed
-  after the login, and any other `cf containers push` failure. The end of
-  what `cf` and Docker printed is kept in `cf-push.log` in the generation
-  folder, and the message names the file. Until now every one of these read
-  `The exact Cloudflare Container image push did not complete.`
-- When Eden stops `cf` because its time ran out, or because Eden itself
-  got Ctrl-C or a kill, it now also stops every process `cf` started. `cf`
-  `1.0.0-rc.2` runs `docker push` in a process group of its own, so until
-  now the upload went on after `eden deploy` had ended with
-  `DEPLOY_INDETERMINATE`, and could leave an image in the registry that no
-  deployment record named. Run with the pinned `cf` and a stand-in
-  `docker`: before the change the push finished three seconds after Eden
-  had returned; after it the push was gone when Eden returned. The upload
-  to Cloudflare's registry itself was not interrupted in a test.
-  `docs/troubleshooting.md` says how to remove an image that a push left
-  before it was stopped.
+  after the login, and any other `cf containers push` failure, with `cf`'s
+  exit code. Until now every one of these read `The exact Cloudflare
+  Container image push did not complete.` Nothing `cf` or Docker printed
+  is shown or kept.
+- A push that runs past Eden's ten minutes, or that Ctrl-C interrupts, can
+  go on after `eden deploy` has ended: Eden stops `cf`, and `cf`
+  `1.0.0-rc.2` runs `docker push` as a process of its own. With the pinned
+  `cf` and a stand-in `docker` the push finished three seconds after Eden
+  had returned. Eden's behavior is unchanged, and it now says so: the
+  message says the Docker push may still be running and may still finish,
+  and the remediation gives the `ps` command that shows it and says to run
+  `eden deploy` again afterwards. After Ctrl-C the same text is printed on
+  standard error. `docs/troubleshooting.md` says what happens to an image
+  such a push leaves.
 
 ## 0.15.0 — 2026-11-20
 
