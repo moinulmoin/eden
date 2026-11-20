@@ -2512,6 +2512,8 @@ async function runWranglerWithInput(
       readonly exitCode: number;
       readonly stdout: string;
       readonly stderr: string;
+      /** True when Wrangler itself exited with this code. */
+      readonly exited?: boolean;
     }): void => {
       if (settled) return;
       settled = true;
@@ -2519,7 +2521,8 @@ async function runWranglerWithInput(
         exitCode: result.exitCode,
         stdout: safeText(result.stdout),
         stderr: safeText(result.stderr),
-        containerSettingsUnapplied: result.stderr.replace(/\s+/gu, " ").includes(WRANGLER_CONTAINER_SETTINGS_UNAPPLIED),
+        containerSettingsUnapplied: result.exited === true && result.exitCode !== 0 &&
+          WRANGLER_CONTAINER_SETTINGS_UNAPPLIED.test(result.stderr.replace(TERMINAL_COLOR, "")),
       });
     };
     const timeout = setTimeout(() => {
@@ -2542,7 +2545,7 @@ async function runWranglerWithInput(
     });
     child.once("close", (code) => {
       clearTimeout(timeout);
-      finish({ exitCode: code ?? 1, stdout, stderr });
+      finish({ exitCode: code ?? 1, stdout, stderr, exited: code !== null });
     });
     if (input === undefined) child.stdin.end();
     else child.stdin.end(input);
@@ -2661,15 +2664,20 @@ async function defaultImagePublicationRunner(
 }
 
 /**
- * Wrangler 4.147.0 prints this when it uploaded the Worker version and then
- * failed while setting up the Container application, whatever the cause.
+ * The whole error Wrangler 4.147.0 prints, on a line of its own, when it
+ * uploaded the Worker version and then failed while setting up the
+ * Container application, whatever the cause.
  */
 const WRANGLER_CONTAINER_SETTINGS_UNAPPLIED =
-  "The Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings.";
-const CONTAINER_SETTINGS_UNAPPLIED_REMEDIATION =
-  "Eden did not run the publish again. Check the deployment URL's /eve/v1/health and inspect the Worker, the Container application, and the retained .eden evidence. On a first deploy this has left a Worker without its Container application, which eden deploy then refuses with VAL-CLI-007-TARGET-CONFLICT: run eden destroy with the same --project, --env, and --name, again after a minute if it answers EVE_DESTROY_OWNERSHIP_UNPROVEN, then run eden deploy. Keep the .eden folder.";
-/** Deployments whose publish stopped at the Container application settings. */
-const containerSettingsUnapplied = new WeakSet<object>();
+  /(?:^|\n)✘ \[ERROR\] The Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings\. Re-run the same `wrangler deploy` command to retry and finish deployment\.[ \t]*(?:\r?\n|$)/u;
+const TERMINAL_COLOR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "gu");
+const CONTAINER_SETTINGS_UNAPPLIED_INSPECTION =
+  "Eden did not run the publish again. Check the deployment URL's /eve/v1/health and inspect the Worker, the Container application, and the retained .eden evidence. Keep the .eden folder.";
+/** For a target's first deploy only; run on Cloudflare on 2026-11-20. */
+const CONTAINER_SETTINGS_UNAPPLIED_FIRST_DEPLOY =
+  " This was the target's first deploy. It can leave a Worker without its Container application, which eden deploy refuses with VAL-CLI-007-TARGET-CONFLICT. Run eden destroy with the same --project, --env, and --name, again after a minute if it answers EVE_DESTROY_OWNERSHIP_UNPROVEN. Run eden deploy only after destroy ends destroyed or absent.";
+/** The remediation of each deployment whose publish stopped at the Container application settings. */
+const containerSettingsUnapplied = new WeakMap<object, string>();
 
 function defaultPublicationRunner(): EveDeploymentPublicationRunner {
   return async (request) => {
@@ -3535,7 +3543,10 @@ async function runEveDeployment(
   if (publication.status === "indeterminate") {
     await writeFailureRecord("indeterminate", safeText(publication.reason));
     const deployment = deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(publication.reason), evidenceLocation: candidate.generationRoot });
-    if (publication.containerSettingsUnapplied === true) containerSettingsUnapplied.add(deployment);
+    if (publication.containerSettingsUnapplied === true) {
+      containerSettingsUnapplied.set(deployment, CONTAINER_SETTINGS_UNAPPLIED_INSPECTION +
+        (operation === "create" ? CONTAINER_SETTINGS_UNAPPLIED_FIRST_DEPLOY : ""));
+    }
     return {
       ...collected.result,
       ok: false,
@@ -4723,7 +4734,7 @@ export async function runEveControlPlane(
           ...(retirementPending
             ? { remediation: failedCleanup.flatMap((value) => value.remediation ?? []).join(" ") }
             : deploymentResult.deployment !== undefined && containerSettingsUnapplied.has(deploymentResult.deployment)
-              ? { remediation: CONTAINER_SETTINGS_UNAPPLIED_REMEDIATION }
+              ? { remediation: containerSettingsUnapplied.get(deploymentResult.deployment) as string }
               : {}),
           code: status === "indeterminate"
             ? "DEPLOY_INDETERMINATE"
