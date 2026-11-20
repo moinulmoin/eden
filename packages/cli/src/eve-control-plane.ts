@@ -76,6 +76,7 @@ import {
 } from "./eve-runtime-config.js";
 import {
   CF_COMMAND,
+  cfAuthCommand,
   cloudflareApiAnswered,
   cloudflareCliError,
   cloudflareCliJson,
@@ -2341,14 +2342,14 @@ function cloudflareAccessBlocked(result: EveCloudflareAccess): EvePreflightCheck
     "blocked",
     "Authenticated Cloudflare account and Container access could not be verified without a mutating operation.",
     result.accountAccess === "available"
-      ? `cf is signed in, but the account's Containers could not be read. Confirm that the account ${CF_COMMAND} auth whoami shows is on the Workers Paid plan, or switch accounts with ${CF_COMMAND} auth login, then retry.`
+      ? `cf is signed in, but the account's Containers could not be read. Confirm that the account ${cfAuthCommand("whoami")} shows is on the Workers Paid plan, or switch accounts with ${cfAuthCommand("login")}, then retry.`
       : result.loginProblem === "token-unusable"
-      ? `CLOUDFLARE_API_TOKEN is set, and Cloudflare did not accept it or it can see no account. Signing in again changes nothing while the variable is set. Correct the token or unset CLOUDFLARE_API_TOKEN, confirm with ${CF_COMMAND} auth whoami that it shows exactly one account, then retry.`
+      ? `CLOUDFLARE_API_TOKEN is set, and Cloudflare did not accept it or it can see no account. Signing in again changes nothing while the variable is set. Correct the token or unset CLOUDFLARE_API_TOKEN, confirm with ${cfAuthCommand("whoami")} that it shows exactly one account, then retry.`
       : result.loginProblem === "account-mismatch"
-      ? `CLOUDFLARE_ACCOUNT_ID names an account this login does not have. Signing in again changes nothing. Unset CLOUDFLARE_ACCOUNT_ID or set it to the account ${CF_COMMAND} auth whoami shows, then retry.`
+      ? `CLOUDFLARE_ACCOUNT_ID names an account this login does not have. Signing in again changes nothing. Unset CLOUDFLARE_ACCOUNT_ID or set it to the account ${cfAuthCommand("whoami")} shows, then retry.`
       : result.loginProblem === "wrangler-login-only"
-      ? `Eden now uses Cloudflare's cf CLI, which does not read the Wrangler login this machine has. Run ${CF_COMMAND} auth login once, or set CLOUDFLARE_API_TOKEN, confirm the account with ${CF_COMMAND} auth whoami, then retry.`
-      : `Run ${CF_COMMAND} auth login, or set CLOUDFLARE_API_TOKEN, and confirm with ${CF_COMMAND} auth whoami that it shows exactly one account. Then retry.`,
+      ? `Eden now uses Cloudflare's cf CLI, which does not read the Wrangler login this machine has. Run ${cfAuthCommand("login")} once, or set CLOUDFLARE_API_TOKEN, confirm the account with ${cfAuthCommand("whoami")}, then retry.`
+      : `Run ${cfAuthCommand("login")}, or set CLOUDFLARE_API_TOKEN, and confirm with ${cfAuthCommand("whoami")} that it shows exactly one account. Then retry.`,
   );
 }
 
@@ -2788,6 +2789,24 @@ async function finishPublication(
   return "unfinished";
 }
 
+/**
+ * What a failed "cf deploy" printed, as far as it is safe to keep on disk.
+ * When the command carried secrets, only cf's error box is kept, and every
+ * secret value is cut out of it exactly, as written and as JSON writes it.
+ */
+function publishDiagnostic(stderr: string, secrets: ReadonlyMap<string, string>): string {
+  if (secrets.size === 0) return safeText(stderr);
+  const box = stderr.indexOf("┌");
+  let text = box === -1 ? "" : stderr.slice(box);
+  for (const value of [...secrets.values()].sort((left, right) => right.length - left.length)) {
+    if (value.length === 0) continue;
+    for (const form of new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value)])) {
+      text = text.replaceAll(form, "[redacted]");
+    }
+  }
+  return safeText(text);
+}
+
 function defaultPublicationRunner(
   cf: CloudflareCliRunner,
   /** Uploaded as the Worker's secrets with this version. */
@@ -2807,7 +2826,7 @@ function defaultPublicationRunner(
     if (deployed.exitCode !== 0) {
       // What cf printed for the publish and for each finishing command, kept
       // beside the Build Output for whoever inspects the failure.
-      const log = [safeText(deployed.stderr)];
+      const log = [publishDiagnostic(deployed.stderr, secrets)];
       const finish = await finishPublication(async (step) => {
         const result = await cf(step);
         log.push(`cf ${step.args.slice(0, 3).join(" ")}: exit ${result.exitCode}\n${safeText(result.stderr)}`);
@@ -4544,7 +4563,7 @@ async function collectEvePreflight(
           "VAL-CLI-007-CLOUDFLARE-ACCESS",
           "failed",
           "The exact read-only Cloudflare adapter failed without a safe result.",
-          `Confirm the account with ${CF_COMMAND} auth whoami, then retry; nothing was changed on Cloudflare.`,
+          `Confirm the account with ${cfAuthCommand("whoami")}, then retry; nothing was changed on Cloudflare.`,
         ),
         blockedAfterFailure(
           "VAL-CLI-007-TARGET-CONFLICT",
@@ -4829,7 +4848,7 @@ async function collectEvePreflight(
           "VAL-CLI-007-CLOUDFLARE-ACCESS",
           "failed",
           "The exact read-only Cloudflare adapter failed without a safe result.",
-          `Confirm the account with ${CF_COMMAND} auth whoami, then retry; nothing was changed on Cloudflare.`,
+          `Confirm the account with ${cfAuthCommand("whoami")}, then retry; nothing was changed on Cloudflare.`,
         ),
         blockedAfterFailure(
           "VAL-CLI-007-TARGET-CONFLICT",

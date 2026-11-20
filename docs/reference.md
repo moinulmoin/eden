@@ -387,7 +387,8 @@ in the account.
 | --- | --- | --- |
 | `EDEN_EVE_CONTAINER_SLEEP_AFTER` | `eden deploy` | Sets the container idle sleep window. Format: a number with an optional `ms`, `s`, `m`, `h`, or `d` suffix, where a bare number means seconds (`90s`, `3h`). Default `1h`; the maximum is `345m` (5 h 45 min), because Cloudflare stops a container within six hours of its Durable Object going idle and Eden must snapshot before that. A larger value fails the publish step with `EVE_HOST_CONFIG_INVALID`; the Worker-side check is `HOST_READINESS_UNPROVEN` |
 | `CLOUDFLARE_API_TOKEN` | `cf` and Eden | `cf` uses it as its login instead of `cf auth login`. Eden itself never sends it |
-| `CLOUDFLARE_AUTH_PROFILE` | `cf` | Passed from your shell to `cf` unchanged |
+| `CLOUDFLARE_AUTH_PROFILE` | `cf` and Eden | The `cf` login profile. Eden sets it for every `cf` command, to `default` when you set none, so a folder's `cf auth activate` binding is not used |
+| `CLOUDFLARE_AUTH_USE_KEYRING` | `cf` | Passed from your shell to `cf` unchanged |
 | `WRANGLER_HOME` | Eden | No longer used for credentials. Eden only checks whether a Wrangler login file (`config/default.toml`) exists there, to say so in `VAL-CLI-007-CLOUDFLARE-ACCESS` when `cf` is signed out. Otherwise it looks in `~/.wrangler` when present, then `$XDG_CONFIG_HOME/.wrangler`, or `~/Library/Preferences/.wrangler` on macOS and `~/.config/.wrangler` elsewhere. Eden never reads the file's contents |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY` | Eden and `cf` | Passed from your shell to the Docker CLI and the `cf` image push, so both use the same daemon and credentials |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and lowercase variants) | Eden and `cf` | Passed from your shell to Docker and `cf`. [Eden's own registry requests](./security.md#what-eden-can-change-in-your-cloudflare-account) never use a proxy |

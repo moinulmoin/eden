@@ -49,7 +49,11 @@ How Eden handles it:
   Worker version (`cf deploy --prebuilt --secrets-file`), so code and values
   change together. Eden writes them to one file, readable only by your user,
   in the private temporary folder that command runs in, and deletes the
-  folder when the command ends. `cf` runs with `CLOUDFLARE_ACCOUNT_ID` set to
+  folder when the command ends, when it times out, and when Eden gets
+  Ctrl-C (`SIGINT`) or `SIGTERM`. A killed Eden (`SIGKILL`), a crash, or a
+  power loss can leave the folder: it is `eden-cf-<random>` under your
+  temporary folder, mode `0700`, with `secrets.json` mode `0600`. Delete it
+  by hand if a deploy ended that way. `cf` runs with `CLOUDFLARE_ACCOUNT_ID` set to
   the account Eden checked, so the values go to that account or the upload
   fails. Secrets the file does not name stay as they are. On an update Eden
   may also set its own deployment-control token at once with
@@ -203,6 +207,17 @@ else. `cf` gets a fixed list of your shell's variables (see the
 `CLOUDFLARE_API_BASE_URL` is always `https://api.cloudflare.com/client/v4`.
 So a project's `cloudflare.config.ts` or `.env` file cannot choose the
 account or the token.
+
+Eden names the `cf` login in every command: the profile in
+`CLOUDFLARE_AUTH_PROFILE`, else `default`. A folder's `cf auth activate`
+binding never chooses another. To check the login Eden reads, add the
+profile: `npx cf@1.0.0-rc.2 auth whoami --profile default`. Eden's
+remediations print the command with the profile. `CLOUDFLARE_AUTH_USE_KEYRING`
+is passed to `cf`, so `cf` looks for the login where you told it to keep it.
+
+When a publish that carried runtime values fails, `worker/cf-deploy.log`
+keeps only `cf`'s error box, with every value cut out of it exactly, as
+written, as JSON writes it, and URL-encoded.
 
 ### Which account each command uses
 

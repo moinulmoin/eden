@@ -18,6 +18,10 @@
 - **Eden needs Node `^24.22.0 || ^26.12.0`**, the lines `cf` declares from
   24 up. On any other Node, `preflight`, `deploy`, and `destroy` stop with
   the new code `EVE_NODE_UNSUPPORTED`. The builder image is unchanged.
+- **Eden names the `cf` login profile in every command**
+  (`CLOUDFLARE_AUTH_PROFILE`, else `default`), and its remediations print
+  `--profile`. `CLOUDFLARE_AUTH_USE_KEYRING` reaches `cf`. Ctrl-C and
+  `SIGTERM` remove the temporary folder that holds the secrets file.
 - **A missing or different `cf` stops with `EVE_CF_UNAVAILABLE`** and says
   to install Eden again. `eden --help` works without `cf`.
 - **`VAL-CLI-007-CLOUDFLARE-ACCESS` tells three cases apart**: a signed-out

@@ -84,6 +84,8 @@ const cloud = vi.hoisted(() => {
     probes: [] as string[],
     /** When set, how "cf deploy" exits 1: before it uploads anything, or with the Worker version live and no Container application. */
     deployFailure: undefined as "before-upload" | "after-upload" | undefined,
+    /** Text cf prints before its error box and again inside it when the deploy fails after the upload. */
+    deployOutput: "",
     /** Whether "cf containers applications create" fails. */
     createFails: false,
     /** Each Worker whose triggers cf deployed, as account/worker. */
@@ -270,7 +272,7 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
       // What cf 1.0.0-rc.2 printed on 2026-11-20 when Cloudflare did not show the uploaded version in time.
       return {
         exitCode: 1,
-        stderr: "\n┌ Error\n│ The Worker version was deployed, but its Durable Object-managed Container\n│ application settings were not fully applied. Re-run the same `cf deploy`\n│ command to retry and finish deployment.\n└\n",
+        stderr: cloud.deployOutput + "\n┌ Error\n│ The Worker version was deployed, but its Durable Object-managed Container\n│ application settings were not fully applied. Re-run the same `cf deploy`\n│ command to retry and finish deployment." + cloud.deployOutput + "\n└\n",
       };
     }
     cloud.containers.add(published + "/" + worker.name + "-container#" + cloud.namespace);
@@ -459,6 +461,7 @@ beforeEach(() => {
     probeStays: false,
     probes: [],
     deployFailure: undefined,
+    deployOutput: "",
     createFails: false,
     triggers: [],
     runs: [],
@@ -957,6 +960,23 @@ describe("eden deploy sends every cf write to the account it checked (MOI-254)",
     return deploy(root, "generation-one", { account, envFile: join(envRoot, "runtime.env"), push });
   };
 
+  test("the log of a failed publish that carried secrets holds cf's error and none of the values", async () => {
+    const root = await deployableProject();
+    const envRoot = await mkdtemp(join(tmpdir(), "eden-moi254-"));
+    roots.push(envRoot);
+    // A short value, and one that JSON writes differently.
+    await writeFile(join(envRoot, "runtime.env"), "MODEL_KEY=k9\nQUOTED=say \"hi\"\n", "utf8");
+    cloud.deployFailure = "after-upload";
+    cloud.createFails = true;
+    cloud.deployOutput = "\n│ MODEL_KEY k9 QUOTED say \\\"hi\\\" and say \"hi\"";
+    const { exitCode } = await deploy(root, "generation-one", { envFile: join(envRoot, "runtime.env") });
+    expect(exitCode).toBe(1);
+    const log = await readFile(join(root, ".eden", "eve-deploy", "generations", "generation-one", "worker", "cf-deploy.log"), "utf8");
+    expect(log).toContain("application settings were not fully applied");
+    expect(log).toContain("cf containers applications create: exit 1");
+    expect(log).not.toMatch(/k9|say/u);
+  });
+
   test("a login that changes after the check cannot move a secret upload or the publish", async () => {
     const { exitCode, result } = await deployWhileTheLoginChanges(false);
     expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
@@ -983,7 +1003,8 @@ describe("eden deploy sends every cf write to the account it checked (MOI-254)",
     // What cf 1.0.0-rc.2 printed for a token Cloudflare does not accept, on 2026-11-20.
     ["a token Cloudflare does not accept", { authenticated: true, tokenValid: null, accounts: [] }, { CLOUDFLARE_API_TOKEN: "not-a-token" }, /CLOUDFLARE_API_TOKEN is set.*Signing in again changes nothing/u],
     ["an account variable the login does not have", undefined, { CLOUDFLARE_ACCOUNT_ID: "2".repeat(32) }, /CLOUDFLARE_ACCOUNT_ID names an account this login does not have/u],
-    ["a signed-out cf", { authenticated: false }, {}, /auth login, or set CLOUDFLARE_API_TOKEN/u],
+    ["a signed-out cf", { authenticated: false }, {}, /auth login --profile default, or set CLOUDFLARE_API_TOKEN/u],
+    ["a signed-out cf with a named profile", { authenticated: false }, { CLOUDFLARE_AUTH_PROFILE: "work" }, /auth login --profile work, or set CLOUDFLARE_API_TOKEN.*auth whoami --profile work/u],
   ])("%s gets its own next step", async (_name, whoamiAnswer, env, remediation) => {
     const root = await deployableProject();
     cloud.whoami = () => account;
@@ -1112,6 +1133,8 @@ describe("cf runs where nothing of the user's can choose the account or the cred
     vi.stubEnv("CLOUDFLARE_API_BASE_URL", "https://example.invalid/client/v4");
     vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "");
     vi.stubEnv("EDEN_TEST_UNRELATED_SECRET", "unrelated-secret");
+    vi.stubEnv("CLOUDFLARE_AUTH_PROFILE", "work");
+    vi.stubEnv("CLOUDFLARE_AUTH_USE_KEYRING", "true");
     const account = "1".repeat(32);
     cloud.whoami = () => account;
     expect((await deploy(root, "generation-one", { account, push: true, ownChecks: true })).exitCode).toBe(0);
@@ -1121,6 +1144,9 @@ describe("cf runs where nothing of the user's can choose the account or the cred
       expect(run.config).toBe("export default {};\n");
       expect(run.env.CLOUDFLARE_API_BASE_URL).toBe("https://api.cloudflare.com/client/v4");
       expect(run.env.EDEN_TEST_UNRELATED_SECRET).toBeUndefined();
+      // The login is named in every command, so no folder's binding chooses another.
+      expect({ profile: run.env.CLOUDFLARE_AUTH_PROFILE, keyring: run.env.CLOUDFLARE_AUTH_USE_KEYRING, delegation: run.env.CF_DELEGATION })
+        .toEqual({ profile: "work", keyring: "true", delegation: "1" });
       // Only the login check runs without an account.
       expect(run.env.CLOUDFLARE_ACCOUNT_ID).toBe(run.args.join(" ") === "auth whoami" ? "" : account);
     }

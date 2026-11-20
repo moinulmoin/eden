@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -10,6 +10,21 @@ export const CF_VERSION = "1.0.0-rc.2";
 
 /** The cf command users run by hand, at the version Eden runs. */
 export const CF_COMMAND = `npx cf@${CF_VERSION}`;
+
+/**
+ * The cf login profile every command of Eden uses: the one
+ * CLOUDFLARE_AUTH_PROFILE names, else cf's "default". Naming it in each
+ * command keeps a folder's "cf auth activate" binding from choosing another.
+ */
+export function cloudflareAuthProfile(): string {
+  const named = process.env.CLOUDFLARE_AUTH_PROFILE;
+  return named !== undefined && named.length > 0 ? named : "default";
+}
+
+/** The cf auth command to run by hand so that it reads the login Eden reads. */
+export function cfAuthCommand(command: "login" | "whoami"): string {
+  return `${CF_COMMAND} auth ${command} --profile ${cloudflareAuthProfile()}`;
+}
 
 /** The cf package installed beside Eden, looked up when a command needs it, so help works without it. */
 function installedCloudflareCli(): { readonly entrypoint: string; readonly version: unknown } {
@@ -87,7 +102,9 @@ export function cloudflareCliEnvironment(accountId: string | undefined): NodeJS.
     NODE_EXTRA_CA_CERTS: env.NODE_EXTRA_CA_CERTS,
     XDG_CONFIG_HOME: env.XDG_CONFIG_HOME,
     CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN,
-    CLOUDFLARE_AUTH_PROFILE: env.CLOUDFLARE_AUTH_PROFILE,
+    CLOUDFLARE_AUTH_PROFILE: cloudflareAuthProfile(),
+    // Where cf keeps and looks for its login; without it a keyring-only login can look signed out.
+    CLOUDFLARE_AUTH_USE_KEYRING: env.CLOUDFLARE_AUTH_USE_KEYRING,
     CLOUDFLARE_ACCOUNT_ID: accountId ?? env.CLOUDFLARE_ACCOUNT_ID,
     CLOUDFLARE_API_BASE_URL: "https://api.cloudflare.com/client/v4",
     CF_SEND_TELEMETRY: env.CF_SEND_TELEMETRY,
@@ -119,6 +136,18 @@ async function runCf(
   environment: (accountId: string | undefined) => NodeJS.ProcessEnv,
 ): Promise<CloudflareCliResult> {
   const cwd = await mkdtemp(join(tmpdir(), "eden-cf-"));
+  let child: ReturnType<typeof spawn> | undefined;
+  // The folder can hold the secrets file. Ctrl-C and a plain kill must not
+  // leave it: remove it, stop cf, then let the signal end Eden as it would have.
+  const interrupted = (signal: NodeJS.Signals): void => {
+    child?.kill("SIGKILL");
+    rmSync(cwd, { recursive: true, force: true });
+    process.removeListener("SIGINT", interrupted);
+    process.removeListener("SIGTERM", interrupted);
+    process.kill(process.pid, signal);
+  };
+  process.on("SIGINT", interrupted);
+  process.on("SIGTERM", interrupted);
   try {
     await writeFile(join(cwd, "cloudflare.config.ts"), "export default {};\n", { mode: 0o600 });
     for (const [path, content] of Object.entries(request.files ?? {})) {
@@ -126,11 +155,12 @@ async function runCf(
       await writeFile(join(cwd, path), content, { mode: 0o600 });
     }
     return await new Promise<CloudflareCliResult>((resolveResult) => {
-      const child = spawn(process.execPath, [installedCloudflareCli().entrypoint, ...request.args], {
+      const started = spawn(process.execPath, [installedCloudflareCli().entrypoint, ...request.args], {
         cwd,
         env: environment(request.accountId),
         stdio: ["ignore", "pipe", "pipe"],
       });
+      child = started;
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let settled = false;
@@ -145,15 +175,17 @@ async function runCf(
         });
       };
       const timer = setTimeout(() => {
-        child.kill("SIGKILL");
+        started.kill("SIGKILL");
         finish(undefined);
       }, request.timeoutMs ?? 120_000);
-      child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-      child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-      child.on("error", () => finish(undefined));
-      child.on("close", (code) => finish(code ?? undefined));
+      started.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+      started.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      started.on("error", () => finish(undefined));
+      started.on("close", (code) => finish(code ?? undefined));
     });
   } finally {
+    process.removeListener("SIGINT", interrupted);
+    process.removeListener("SIGTERM", interrupted);
     await rm(cwd, { recursive: true, force: true });
   }
 }

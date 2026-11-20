@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { CF_COMMAND } from "./eve-cloudflare-cli.js";
+import { CF_COMMAND, cfAuthCommand } from "./eve-cloudflare-cli.js";
 
 export const EVE_CLI_COMMANDS = [
   "preflight",
@@ -121,7 +121,7 @@ function eveErrorRemediation(code: string): string {
     case "EVE_UPDATE_RECORD_UNAVAILABLE":
       return "Re-run the last successful deploy generation, or destroy the exact target with eden destroy.";
     case "EVE_ORIGIN_UNAVAILABLE":
-      return `Eden reads the account's workers.dev subdomain from the URL of a Worker of the account. Confirm the account with ${CF_COMMAND} auth whoami and that it has a workers.dev subdomain (Cloudflare dashboard, Workers & Pages), then retry.`;
+      return `Eden reads the account's workers.dev subdomain from the URL of a Worker of the account. Confirm the account with ${cfAuthCommand("whoami")} and that it has a workers.dev subdomain (Cloudflare dashboard, Workers & Pages), then retry.`;
     case "EVE_HOST_CONFIG_INVALID":
       return "Correct the value the message names, then rerun eden deploy.";
     case "EVE_PROJECT_ROOT_INVALID":
@@ -144,7 +144,7 @@ function eveErrorRemediation(code: string): string {
     case "EVE_DESTROY_RECORD_MISMATCH":
       return "Rerun eden destroy with the exact --env and --name the deploy printed.";
     case "EVE_DESTROY_OWNERSHIP_UNPROVEN":
-      return `Run ${CF_COMMAND} auth whoami and sign in to the account that owns this deployment if it names another. If the account is right, wait a minute and rerun eden destroy. If it still refuses, stop and read EVE_DESTROY_OWNERSHIP_UNPROVEN in docs/troubleshooting.md. Eden will not delete a different Worker that now uses this name.`;
+      return `Run ${cfAuthCommand("whoami")} and sign in to the account that owns this deployment if it names another. If the account is right, wait a minute and rerun eden destroy. If it still refuses, stop and read EVE_DESTROY_OWNERSHIP_UNPROVEN in docs/troubleshooting.md. Eden will not delete a different Worker that now uses this name.`;
     case "EVE_DESTROY_INDETERMINATE":
     case "EVE_DESTROY_ABSENCE_UNPROVEN":
       return "Wait a minute for Cloudflare to settle, then rerun eden destroy with the same --project, --env, and --name. Keep the .eden folder; never delete resources by name prefix.";

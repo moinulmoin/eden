@@ -397,14 +397,18 @@ inventory through a read-only adapter and never mutates during preflight.
 fails in a few seconds.
 
 When `cf` is not signed in, or its sign-in does not show exactly one
-account, the remediation is `Run npx cf@1.0.0-rc.2 auth login, or set
-CLOUDFLARE_API_TOKEN, and confirm with npx cf@1.0.0-rc.2 auth whoami that it
-shows exactly one account. Then retry.`:
+account, the remediation is `Run npx cf@1.0.0-rc.2 auth login --profile default, or
+set CLOUDFLARE_API_TOKEN, and confirm with npx cf@1.0.0-rc.2 auth whoami
+--profile default that it shows exactly one account. Then retry.`:
 
 ```sh
-npx cf@1.0.0-rc.2 auth login
-npx cf@1.0.0-rc.2 auth whoami
+npx cf@1.0.0-rc.2 auth login --profile default
+npx cf@1.0.0-rc.2 auth whoami --profile default
 ```
+
+Eden reads the profile `CLOUDFLARE_AUTH_PROFILE` names, else `default`, and
+not the one a folder is bound to with `cf auth activate`. The remediation
+prints the commands with `--profile`, so they read the same login.
 
 `cf auth whoami` exits 0 signed in or not, so Eden reads its JSON. The
 sign-in counts only when `authenticated` and `tokenValid` are true and it
@@ -427,9 +431,9 @@ Eden 0.14 and earlier used Wrangler and its saved login. Eden now runs
 Cloudflare's `cf` CLI, which does not read that login. When `cf` is signed
 out and this machine has a Wrangler login file, the remediation says so:
 `Eden now uses Cloudflare's cf CLI, which does not read the Wrangler login
-this machine has. Run npx cf@1.0.0-rc.2 auth login once, or set
-CLOUDFLARE_API_TOKEN, confirm the account with npx cf@1.0.0-rc.2 auth
-whoami, then retry.` Sign in once; the `.eden/` folder and your deployed
+this machine has. Run npx cf@1.0.0-rc.2 auth login --profile default once,
+or set CLOUDFLARE_API_TOKEN, confirm the account with npx cf@1.0.0-rc.2 auth
+whoami --profile default, then retry.` Sign in once; the `.eden/` folder and your deployed
 targets need no change. Eden only checks that the Wrangler file exists and
 never opens it.
 
@@ -749,7 +753,8 @@ this publish's release ID. Cloudflare can take a while to show a version it
 just accepted, so Eden repeats that read for up to two minutes. Eden writes
 what `cf` printed for the publish, and for each command it ran to finish it,
 to `worker/cf-deploy.log` in the generation folder under
-`.eden/eve-deploy/generations/`.
+`.eden/eve-deploy/generations/`. When the publish carried runtime values,
+the file keeps only `cf`'s error box, with the values cut out.
 
 If it does not, the message is `The exact Cloudflare publication did not
 return a terminal success result.` Eden makes no further change. The failed
