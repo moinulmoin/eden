@@ -2799,8 +2799,8 @@ async function finishPublication(
   // for this release alone, so the release in service is read again right
   // before it. That shortens the time in which a write can reach a release
   // that has been replaced; Cloudflare offers no write that is refused then.
-  const stillServed = async (): Promise<boolean> =>
-    (await readServedRelease(api, request))?.namespaceId === namespaceId;
+  const stillServed = async (read: CloudflareApiRead = api): Promise<boolean> =>
+    (await readServedRelease(read, request))?.namespaceId === namespaceId;
   const application = await readPublishApplication(api, request, namespaceId);
   if (application === undefined) return "unfinished";
   if (application === "absent") {
@@ -2823,11 +2823,12 @@ async function finishPublication(
   }
   // Applying the triggers again changes nothing, so a failure is retried for
   // two minutes: on 2026-11-20 cf answered here that the Worker did not exist
-  // seconds after Cloudflare had shown its version.
+  // seconds after Cloudflare had shown its version. The read of the release
+  // before each try gets what is left of the same two minutes.
   const applying = withinTime(120_000, cf, api);
   for (let attempt = 0; attempt < 24 && (attempt === 0 || applying.left() > 5_000); attempt += 1) {
     if (attempt > 0) await pause(5_000);
-    if (!await stillServed()) return "unfinished";
+    if (!await stillServed(applying.api)) return "unfinished";
     const triggers = await applying.cf({
       args: ["workers", "triggers", "deploy", "--prebuilt"],
       accountId,

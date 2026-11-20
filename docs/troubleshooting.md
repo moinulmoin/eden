@@ -779,7 +779,8 @@ return a terminal success result.` Eden makes no further change. The failed
 If it does, Eden finishes the publish itself: it creates the Container
 application when the account has none of the target's name, reads it back,
 then deploys the triggers, trying again for up to two minutes while that
-fails. The deploy then continues as any other. Eden writes nothing when the
+fails. Before each try it reads the release in service again, and that read
+counts against the same two minutes. The deploy then continues as any other. Eden writes nothing when the
 Worker version has no single binding for the Container class, or when a
 Container application of that name has another ID, policy or namespace.
 When one of those steps fails or one of those answers disagrees, the

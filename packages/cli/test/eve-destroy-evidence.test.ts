@@ -1441,6 +1441,24 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     expect(cloud.apiReads.at(-1)?.url).toMatch(/\/versions\/[0-9a-f-]{36}$/u);
   });
 
+  test("the two minutes for the triggers also end the read of the release before a try", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.triggerFailures = 1;
+    const real = performance.now.bind(performance);
+    let skipped = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => real() + skipped);
+    let refused = false;
+    cloud.onMutation = () => { refused = cloud.runs.at(-1)?.args[1] === "triggers"; };
+    // The first read of the release before the second try answers after the two minutes.
+    cloud.onWorkerRead = () => { if (refused) skipped = 3 * 60_000; };
+    const { exitCode, result } = await deploy(root).finally(() => clock.mockRestore());
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect(cloud.triggers).toEqual([]);
+    // Eden asks Cloudflare nothing more about the release once the two minutes have passed.
+    expect(cloud.apiReads.at(-1)?.url).toMatch(/\/deployments$/u);
+  });
+
   test("a publish cf called done after the deadline is not promoted, and Eden starts no other command", async () => {
     const root = await deployableProject();
     const real = performance.now.bind(performance);

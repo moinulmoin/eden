@@ -20,6 +20,11 @@
   63-character name that ends in `-container` or a cut of it from `-c` to
   `-containe`, is refused. A derived default name is never one of these,
   and `eden destroy` still accepts them.
+- When Eden finishes a publish that `cf deploy` left half done, the two
+  minutes it gives the triggers now also end the read of the release in
+  service that comes before each try. Until now only that read's own time
+  limit and the publish's 15-minute deadline ended it. No trigger was
+  deployed after the two minutes before this change either.
 
 ## 0.15.0 — 2026-11-20
 
