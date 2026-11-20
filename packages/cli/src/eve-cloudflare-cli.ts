@@ -79,6 +79,8 @@ export interface CloudflareCliResult {
   readonly exitCode: number | undefined;
   readonly stdout: string;
   readonly stderr: string;
+  /** Set when cf was started, was told to stop, and did not report that it had stopped. */
+  readonly running?: true;
 }
 
 export type CloudflareCliRunner = (
@@ -188,24 +190,34 @@ async function runCf(
       const stderr: Buffer[] = [];
       let settled = false;
       let timedOut = false;
-      const finish = (exitCode: number | undefined): void => {
+      let unstopped: NodeJS.Timeout | undefined;
+      const finish = (exitCode: number | undefined, running = false): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearTimeout(unstopped);
         resolveResult({
           exitCode,
           stdout: Buffer.concat(stdout).toString("utf8"),
           stderr: Buffer.concat(stderr).toString("utf8"),
+          ...(running ? { running: true as const } : {}),
         });
       };
       // Out of time: cf is killed, and the result waits until it is gone.
+      // Only cf's own exit shows that. A kill that could not be delivered
+      // does not, so after two seconds without an exit the result says cf
+      // may still run.
       const timer = setTimeout(() => {
         timedOut = true;
         started.kill("SIGKILL");
+        unstopped = setTimeout(() => finish(undefined, true), 2_000);
       }, left);
       started.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
       started.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-      started.on("error", () => finish(undefined));
+      // An error from a cf that never started ends the command. One from a
+      // cf that did start, such as a signal that was not delivered, says
+      // nothing about whether cf has stopped.
+      started.on("error", () => { if (started.pid === undefined) finish(undefined); });
       started.on("exit", () => { if (timedOut) finish(undefined); });
       started.on("close", (code) => finish(timedOut ? undefined : code ?? undefined));
     });

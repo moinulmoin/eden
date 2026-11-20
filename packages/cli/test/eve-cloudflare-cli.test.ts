@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { ChildProcess, spawn } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -44,15 +44,47 @@ test.each(["SIGINT", "SIGTERM"] as const)("%s while cf runs removes the folder t
   expect(folders()).toEqual([]);
 }, 30_000);
 
+/** Whether another program could take the port now. */
+const free = (port: number) => new Promise<boolean>((resolve) => {
+  const other = createServer();
+  other.once("error", () => resolve(false));
+  other.listen(port, "127.0.0.1", () => other.close(() => resolve(true)));
+});
+
+test("a cf that cannot be stopped is not reported as gone, and the listener keeps its port", async () => {
+  vi.stubEnv("CLOUDFLARE_API_TOKEN", "");
+  // An API that never answers, so the real cf runs until it is stopped.
+  const api = createServer(() => undefined);
+  await new Promise<void>((resolve) => api.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise((resolve) => { api.closeAllConnections(); api.close(resolve); }));
+  const stuck = "http://127.0.0.1:" + String((api.address() as AddressInfo).port) + "/client/v4";
+  const real = createCloudflareCliRunner((account) => ({ ...cloudflareCliEnvironment(account), CLOUDFLARE_API_TOKEN: "no-ones-token-" + "0".repeat(30), CLOUDFLARE_API_BASE_URL: stuck }));
+  // What Node does when the system refuses the signal: an "error" on the child, which keeps running.
+  const children: ChildProcess[] = [];
+  const kill = vi.spyOn(ChildProcess.prototype, "kill").mockImplementation(function (this: ChildProcess) {
+    children.push(this);
+    this.emit("error", Object.assign(new Error("kill EPERM"), { code: "EPERM" }));
+    return false;
+  });
+  cleanups.push(async () => { kill.mockRestore(); children[0]?.kill("SIGKILL"); });
+  let port = 0;
+  let running: boolean | undefined;
+  const cf: CloudflareCliRunner = async (request) => {
+    port = Number(new URL(request.apiBaseUrl ?? "").port);
+    // cf is sent to the API that never answers, and gets one second.
+    const result = await real({ args: request.args, timeoutMs: 1_000 });
+    running = result.running;
+    return result;
+  };
+  expect(await cloudflareApiTokenArrives(cf)).toBe(false);
+  expect({ running, alive: children[0]?.exitCode === null && children[0].signalCode === null }).toEqual({ running: true, alive: true });
+  expect(await free(port)).toBe(false);
+}, 30_000);
+
 test("the listener that takes cf's token keeps its port from before cf starts until cf has exited", async () => {
   vi.stubEnv("CLOUDFLARE_API_TOKEN", "");
   // The real cf, with a token that is no one's: it asks the address it is given who it is, three times.
   const real = createCloudflareCliRunner((account) => ({ ...cloudflareCliEnvironment(account), CLOUDFLARE_API_TOKEN: "no-ones-token-" + "0".repeat(30) }));
-  const free = (port: number) => new Promise<boolean>((resolve) => {
-    const other = createServer();
-    other.once("error", () => resolve(false));
-    other.listen(port, "127.0.0.1", () => other.close(() => resolve(true)));
-  });
   let port = 0;
   let freed = 0;
   const cf: CloudflareCliRunner = async (request) => {

@@ -30,13 +30,16 @@ export type CloudflareApiRead = (
  * The listener keeps the port until cf has exited, so no other program can
  * take the port and receive one of them. It takes the bearer of the first
  * request that is the pinned cf asking who it is, answers every request 401
- * itself, and sends nothing on. The token is returned to the caller and
- * written nowhere. The whole of it takes at most `timeoutMs`.
+ * itself, and sends nothing on. When cf was told to stop and did not
+ * report that it had, the listener stays bound for as long as Eden runs and
+ * no token is returned. The token is returned to the caller and written
+ * nowhere. The whole of it takes at most `timeoutMs`.
  */
 async function captureLoginToken(cf: CloudflareCliRunner, timeoutMs: number): Promise<string | undefined> {
   const deadline = performance.now() + Math.min(timeoutMs, 30_000);
   const secret = randomBytes(16).toString("hex");
   let token: string | undefined;
+  let stopped = true;
   const server = createServer();
   server.on("request", (request, response) => {
     const bearer = /^Bearer ([\x21-\x7e]{20,})$/u.exec(request.headers.authorization ?? "")?.[1];
@@ -56,18 +59,24 @@ async function captureLoginToken(cf: CloudflareCliRunner, timeoutMs: number): Pr
     const address = server.address();
     const left = Math.ceil(deadline - performance.now());
     if (typeof address !== "object" || address === null || left <= 0) return undefined;
-    await cf({
+    const result = await cf({
       args: ["auth", "whoami"],
       apiBaseUrl: `http://127.0.0.1:${address.port}/${secret}/client/v4`,
       timeoutMs: left,
     });
+    stopped = result.running !== true;
   } catch {
     return undefined;
   } finally {
-    server.close();
-    server.closeAllConnections();
+    if (stopped) {
+      server.close();
+      server.closeAllConnections();
+    } else {
+      // cf may still send the token here: the port stays Eden's until Eden ends.
+      server.unref();
+    }
   }
-  return token;
+  return stopped ? token : undefined;
 }
 
 /**

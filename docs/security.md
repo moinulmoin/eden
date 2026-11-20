@@ -230,6 +230,9 @@ Without the variable, Eden uses the token of your `cf` login.
 5. The listener keeps its port until `cf` has exited, also when Eden stops
    `cf` because its time ran out. Only then does it close. So no other
    program can take the port while `cf` may still send the token to it.
+   Only `cf`'s own exit counts. When Eden tells `cf` to stop and `cf` does
+   not exit within two seconds, Eden takes no token, keeps the port until
+   Eden itself ends, and the command fails as it does when no token arrives.
 
 The token stays in Eden's memory for that one command. Eden does not print
 it, write it to disk, or put it in a command line or an environment
