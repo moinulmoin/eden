@@ -125,7 +125,7 @@ vi.mock("node:timers/promises", async (importOriginal) => {
     ...actual,
     // While the fake registry runs, a wait only moves its clock.
     setTimeout: ((...waitArgs: Parameters<typeof actual.setTimeout>) => {
-      if (!fakeRegistry.active && !fakeWrangler.intercept) return actual.setTimeout(...waitArgs);
+      if (!fakeRegistry.active) return actual.setTimeout(...waitArgs);
       fakeRegistry.clock += waitArgs[0] ?? 0;
       return Promise.resolve();
     }) as typeof actual.setTimeout,
@@ -1661,12 +1661,11 @@ describe("top-level Eden Deploy commands", () => {
   // What Wrangler 4.147.0 printed on 2026-11-19 when Cloudflare did not show the uploaded version in time.
   const containerSettingsUnapplied = "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mThe Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings. Re-run the same `wrangler deploy` command to retry and finish deployment.\u001b[0m\n\n";
 
-  // Exit 1 is that failure, 2 is any other failure, 0 is a publish.
   test.each([
-    ["every time", [1, 1, 1], 3, "Wrangler uploaded the Worker version but could not apply its Container application settings in 3 attempts."],
-    ["once, before another failure", [1, 2], 2, "The exact Cloudflare publication did not return a terminal success result."],
-    ["twice, before a publish that cannot be read back", [1, 1, 0], 3, "The exact Worker deployment and named Container could not be re-read after publication."],
-  ] as const)("reruns wrangler deploy when it could not apply the Container settings %s, and promotes nothing unproven", async (_name, exits, runs, reason) => {
+    ["its Container settings error", containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true],
+    ["its Container settings error after long warnings", "warning ".repeat(300) + "\n" + containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true],
+    ["another error", "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API failed.\u001b[0m\n\n", "The exact Cloudflare publication did not return a terminal success result.", false],
+  ] as const)("runs wrangler deploy once when it fails with %s, and names the next command", async (_name, stderr, reason, namesDestroy) => {
     const root = await createRoot();
     await writeFile(
       join(root, "package.json"),
@@ -1681,11 +1680,7 @@ describe("top-level Eden Deploy commands", () => {
     const errors: string[] = [];
 
     const output: string[] = [];
-    // After a publish, the stand-in's Worker read answers that the Worker does not exist.
-    startFakeRegistry({ entries: {} });
-    fakeWrangler.answers = exits.map((exitCode) => exitCode === 1
-      ? { exitCode, stderr: containerSettingsUnapplied }
-      : { exitCode: exitCode === 0 ? 0 : 1 });
+    fakeWrangler.answers = [{ exitCode: 1, stderr }];
     const calls = await withFakeWrangler(async () => {
       await expect(
         runEdenCli(
@@ -1749,14 +1744,12 @@ describe("top-level Eden Deploy commands", () => {
         ),
       ).resolves.toBe(1);
     });
-    fakeRegistry.active = false;
-
-    expect(calls.map((call) => call.args[0])).toEqual(Array.from({ length: runs }, () => "deploy"));
+    expect(calls.map((call) => call.args[0])).toEqual(["deploy"]);
     const result = JSON.parse(output[0] as string) as { readonly ok: boolean; readonly error: { readonly code: string; readonly remediation: string }; readonly deployment: { readonly status: string; readonly reason: string } };
     expect({ ok: result.ok, code: result.error.code, status: result.deployment.status, reason: result.deployment.reason })
       .toEqual({ ok: false, code: "DEPLOY_INDETERMINATE", status: "indeterminate", reason });
-    // Only the failure that survived every rerun names destroy as the next command.
-    expect(result.error.remediation.includes("Run eden destroy with the same --project, --env, and --name")).toBe(runs === 3 && exits[2] === 1);
+    expect(result.error.remediation.includes("run eden destroy with the same --project, --env, and --name")).toBe(namesDestroy);
+    expect(result.error.remediation.includes("Eden did not run the publish again")).toBe(namesDestroy);
     await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-publish-deadline", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -3510,8 +3503,6 @@ export default eveChannel({
                 identity: request.identity,
                 createdByAttempt: true,
                 ownershipProven: true as const,
-                // The publish needed a second wrangler deploy.
-                attempts: 2,
               };
             },
             health: async (request) => ({
@@ -3536,7 +3527,6 @@ export default eveChannel({
     expect(result.warnings.map((value) => value.id)).toContain(
       "EVE_SCHEDULE_UNSUPPORTED",
     );
-    expect(result.warnings.map((value) => value.id)).toContain("EVE_PUBLISH_RETRIED");
     expect(publishedTriggers).toEqual({ crons: ["* * * * *"] });
   });
 

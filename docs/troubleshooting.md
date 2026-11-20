@@ -646,26 +646,20 @@ and digest identity, the deploy ends as indeterminate. The push may take ten
 minutes; Eden stops waiting after that. See
 [Indeterminate outcomes](#indeterminate-outcomes) below.
 
-`Wrangler uploaded the Worker version but could not apply its Container
-application settings in 3 attempts.` Wrangler uploads the Worker, then reads
-the new version back to set up the Container application. On 2026-11-19
-Cloudflare answered `404` to that read for several seconds, and Wrangler
-gave up. Eden runs `wrangler deploy` up to three times for this one error.
-When all three fail on a target's first deploy, the Worker exists without
-its Container application, and `eden deploy` refuses it with
-`VAL-CLI-007-TARGET-CONFLICT`. Run `eden destroy` with the same `--project`,
-`--env`, and `--name`; if it answers `EVE_DESTROY_OWNERSHIP_UNPROVEN`, wait
-a minute and run it again. Then run `eden deploy` again. This was run on
-Cloudflare on 2026-11-20. For a target that was deployed before, the same
-failure was not followed by a rerun; check the URL's health, then rerun
-`eden deploy`.
+`Wrangler uploaded the Worker version but did not finish applying its
+Container application settings.` Wrangler prints one error for every failure
+at that step, so the message does not say why. Eden does not run the publish
+again. Check the deployment URL's `/eve/v1/health`, and inspect the Worker,
+the Container application, and the retained `.eden` evidence.
 
-### `EVE_PUBLISH_RETRIED`
-
-A warning on a deploy that succeeded. Wrangler uploaded the Worker version
-but could not apply its Container application settings, and Eden ran
-`wrangler deploy` again. Eden read the Worker and the Container application
-back after the rerun. Nothing needs doing.
+On 2026-11-19 and 2026-11-20 the cause was Cloudflare: Wrangler read the
+version it had just uploaded and got `404` five times. After that failure on
+one target's first deploy, the Worker existed without its Container
+application, and `eden deploy` refused it twice with
+`VAL-CLI-007-TARGET-CONFLICT`. `eden destroy` with the same `--project`,
+`--env`, and `--name` answered `EVE_DESTROY_OWNERSHIP_UNPROVEN` once, then
+ended `destroyed` 80 seconds later. `eden deploy` can run again after that.
+Recovery was not run for a target that had been deployed before.
 
 ### `EVE_IMAGE_IDENTITY_MISMATCH`
 
@@ -1213,15 +1207,25 @@ replacement.
 
 A deploy that ended `DEPLOY_INDETERMINATE` can leave a Worker that does not
 carry the deployment's settings yet. Wait a minute and rerun `eden destroy`.
-On 2026-11-19 that worked for two such targets. A third kept refusing; its
-Worker was deleted by hand, after checking in the Cloudflare dashboard that
-the failed deploy had created it:
+On 2026-11-19 and 2026-11-20 that worked for two such targets.
+
+A third kept refusing, and its Worker was deleted by hand. Eden cannot prove
+ownership in that state, so the person who owns the account must, and must
+approve the delete. Stop unless every one of these holds:
+
+1. `npx wrangler@4.147.0 whoami` names the account whose id is `accountId`
+   in `<project>/.eden/eve-deploy/generations/<generation>/deployment-intent.json`.
+2. The Worker's name is `workerName` in that same file.
+3. `npx wrangler@4.147.0 deployments list --name <workerName>` shows only
+   deployments created while the failed `eden deploy` ran, by your login.
+4. No other project or person deploys a Worker with that name.
+
+Then delete that one Worker in that one account, and rerun `eden destroy`
+to clear the rest:
 
 ```sh
-npx wrangler@4.147.0 delete --name <worker>
+CLOUDFLARE_ACCOUNT_ID=<accountId> npx wrangler@4.147.0 delete --name <workerName>
 ```
-
-Then rerun `eden destroy` to clear the rest.
 
 ### `EVE_DESTROY_INDETERMINATE`
 
