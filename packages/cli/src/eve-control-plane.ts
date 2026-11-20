@@ -2673,7 +2673,7 @@ const WRANGLER_CONTAINER_SETTINGS_UNAPPLIED =
 const TERMINAL_COLOR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "gu");
 const CONTAINER_SETTINGS_UNAPPLIED_INSPECTION =
   "Eden did not run the publish again. Check the deployment URL's /eve/v1/health and inspect the Worker, the Container application, and the retained .eden evidence. Keep the .eden folder.";
-/** For a target's first deploy only; run on Cloudflare on 2026-11-20. */
+/** Only for a target this project never promoted; run on Cloudflare on 2026-11-20. */
 const CONTAINER_SETTINGS_UNAPPLIED_FIRST_DEPLOY =
   " This was the target's first deploy. It can leave a Worker without its Container application, which eden deploy refuses with VAL-CLI-007-TARGET-CONFLICT. Run eden destroy with the same --project, --env, and --name, again after a minute if it answers EVE_DESTROY_OWNERSHIP_UNPROVEN. Run eden deploy only after destroy ends destroyed or absent.";
 /** The remediation of each deployment whose publish stopped at the Container application settings. */
@@ -3544,8 +3544,13 @@ async function runEveDeployment(
     await writeFailureRecord("indeterminate", safeText(publication.reason));
     const deployment = deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(publication.reason), evidenceLocation: candidate.generationRoot });
     if (publication.containerSettingsUnapplied === true) {
+      // A first deploy: Cloudflare had no such target, and this project never
+      // promoted one. A CURRENT that exists or cannot be checked is not that.
+      const neverPromoted = operation === "create" && await lstat(
+        join(request.projectRoot, ".eden", "eve-deploy", "targets", `${request.environment}-${request.name}`, "CURRENT"),
+      ).then(() => false, (error: NodeJS.ErrnoException) => error.code === "ENOENT");
       containerSettingsUnapplied.set(deployment, CONTAINER_SETTINGS_UNAPPLIED_INSPECTION +
-        (operation === "create" ? CONTAINER_SETTINGS_UNAPPLIED_FIRST_DEPLOY : ""));
+        (neverPromoted ? CONTAINER_SETTINGS_UNAPPLIED_FIRST_DEPLOY : ""));
     }
     return {
       ...collected.result,

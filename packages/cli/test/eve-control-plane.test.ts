@@ -1656,12 +1656,13 @@ describe("top-level Eden Deploy commands", () => {
   const containerSettingsUnapplied = "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mThe Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings. Re-run the same `wrangler deploy` command to retry and finish deployment.\u001b[0m\n\n";
 
   test.each([
-    ["its Container settings error", containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1],
-    ["its Container settings error after long warnings", "warning ".repeat(300) + "\n" + containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1],
-    ["another error", "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API failed.\u001b[0m\n\n", "The exact Cloudflare publication did not return a terminal success result.", false, 1],
-    ["a warning that quotes its Container settings error, then another error", "\u001b[33m▲ \u001b[43;33m[\u001b[43;30mWARNING\u001b[43;33m]\u001b[0m \u001b[1mAn earlier run said: The Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings.\u001b[0m\n\n\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API failed.\u001b[0m\n\n", "The exact Cloudflare publication did not return a terminal success result.", false, 1],
-    ["its Container settings error before a signal ended it", containerSettingsUnapplied, "The exact Cloudflare publication did not return a terminal success result.", false, null],
-  ] as const)("runs wrangler deploy once when it fails with %s, and names the next command", async (_name, stderr, reason, namesDestroy, exitCode) => {
+    ["its Container settings error", containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1, false],
+    ["its Container settings error on a target this project promoted before", containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", false, 1, true],
+    ["its Container settings error after long warnings", "warning ".repeat(300) + "\n" + containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1, false],
+    ["another error", "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API failed.\u001b[0m\n\n", "The exact Cloudflare publication did not return a terminal success result.", false, 1, false],
+    ["a warning that quotes its Container settings error, then another error", "\u001b[33m▲ \u001b[43;33m[\u001b[43;30mWARNING\u001b[43;33m]\u001b[0m \u001b[1mAn earlier run said: The Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings.\u001b[0m\n\n\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API failed.\u001b[0m\n\n", "The exact Cloudflare publication did not return a terminal success result.", false, 1, false],
+    ["its Container settings error before a signal ended it", containerSettingsUnapplied, "The exact Cloudflare publication did not return a terminal success result.", false, null, false],
+  ] as const)("runs wrangler deploy once when it fails with %s, and names the next command", async (_name, stderr, reason, namesDestroy, exitCode, promotedBefore) => {
     const root = await createRoot();
     await writeFile(
       join(root, "package.json"),
@@ -1677,6 +1678,13 @@ describe("top-level Eden Deploy commands", () => {
 
     const output: string[] = [];
     fakeWrangler.answers = [{ exitCode, stderr }];
+    const current = join(root, ".eden", "eve-deploy", "targets", "preview-eve-publish-deadline", "CURRENT");
+    if (promotedBefore) {
+      // An earlier promotion, with the target since removed on Cloudflare.
+      await mkdir(join(root, ".eden", "eve-deploy", "generations", "generation-zero"), { recursive: true });
+      await mkdir(join(current, ".."), { recursive: true });
+      await symlink("../../generations/generation-zero", current);
+    }
     const calls = await withFakeWrangler(async () => {
       await expect(
         runEdenCli(
@@ -1745,8 +1753,9 @@ describe("top-level Eden Deploy commands", () => {
     expect({ ok: result.ok, code: result.error.code, status: result.deployment.status, reason: result.deployment.reason })
       .toEqual({ ok: false, code: "DEPLOY_INDETERMINATE", status: "indeterminate", reason });
     expect(result.error.remediation.includes("Run eden destroy with the same --project, --env, and --name")).toBe(namesDestroy);
-    expect(result.error.remediation.includes("Eden did not run the publish again")).toBe(namesDestroy);
-    await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-publish-deadline", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(result.error.remediation.includes("Eden did not run the publish again")).toBe(reason.startsWith("Wrangler uploaded"));
+    if (promotedBefore) expect((await lstat(current)).isSymbolicLink()).toBe(true);
+    else await expect(lstat(current)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test("parses --json on every command", () => {

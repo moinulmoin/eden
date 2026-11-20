@@ -662,7 +662,8 @@ twice with `VAL-CLI-007-TARGET-CONFLICT`. `eden destroy` with the same
 once, then ended `destroyed` 80 seconds later. `eden deploy` is the next
 command once destroy ends `destroyed` or `absent`; it was not run on that
 target. Recovery was not run for a target that had been deployed before:
-stop at inspection there.
+stop at inspection there. Eden names `eden destroy` only when Cloudflare
+had no such target and this project has no `CURRENT` for it.
 
 ### `EVE_IMAGE_IDENTITY_MISMATCH`
 
