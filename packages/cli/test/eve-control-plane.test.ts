@@ -1657,6 +1657,29 @@ describe("top-level Eden Deploy commands", () => {
     expect(errors.join("\n")).toContain("DEPLOY_INDETERMINATE");
   });
 
+  test.each(["preflight", "deploy", "destroy"])("eden %s on a Node older than 24.22 stops with the version it needs and the fix", async (command) => {
+    const output: string[] = [];
+    await expect(runEdenCli(
+      [command, "--name", "eve-node-floor", "--json"],
+      { stdout: (line) => output.push(line), nodeVersion: "24.21.0" },
+    )).resolves.toBe(1);
+    expect(output).toHaveLength(1);
+    expect(JSON.parse(output[0] as string)).toMatchObject({
+      ok: false,
+      error: {
+        code: "EVE_NODE_UNSUPPORTED",
+        message: "Eden needs Node 24.22.0 or newer and is running on Node 24.21.0.",
+        remediation: expect.stringContaining("Install Node 24.22.0 or newer") as unknown,
+      },
+    });
+  });
+
+  test("eden --help still prints on a Node older than 24.22", async () => {
+    const output: string[] = [];
+    await expect(runEdenCli(["--help"], { stdout: (line) => output.push(line), nodeVersion: "24.17.0" })).resolves.toBe(0);
+    expect(output.join("\n")).toContain("preflight");
+  });
+
   test("parses --json on every command", () => {
     for (const command of ["preflight", "deploy", "destroy"] as const) {
       const parsed = parseEveArguments([

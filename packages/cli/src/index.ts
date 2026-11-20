@@ -180,6 +180,8 @@ export interface EdenCliRunOptions {
    * Runtime values and remote-provider mutations never cross this boundary.
    */
   readonly eveControlPlane?: EvePreflightOptions;
+  /** The Node version to check instead of the running one. */
+  readonly nodeVersion?: string;
 }
 
 
@@ -468,6 +470,16 @@ export async function runEdenCli(
       stdout(eveHelpText(parsed.scope));
       if (json) flushJson();
       return 0;
+    }
+    // The cf CLI Eden runs needs this Node.
+    const node = options.nodeVersion ?? process.versions.node;
+    const [major = 0, minor = 0] = node.split(".").map(Number);
+    if (major < 24 || (major === 24 && minor < 22)) {
+      throw new EveCliError({
+        code: "EVE_NODE_UNSUPPORTED",
+        message: `Eden needs Node 24.22.0 or newer and is running on Node ${node}.`,
+        remediation: "Install Node 24.22.0 or newer (for example: nvm install 24), check it with node --version, then run the command again.",
+      });
     }
     await runEveInvocation(parsed, {
       ...options,
