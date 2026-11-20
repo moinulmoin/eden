@@ -4038,6 +4038,7 @@ describe("eden deploy in-place update", () => {
     const operations: string[] = [];
     let publishedMigrations: unknown;
     let publishedImage: unknown;
+    let publishedPreviousRelease: unknown;
 
     await expect(
       runEdenCli(
@@ -4049,6 +4050,7 @@ describe("eden deploy in-place update", () => {
           stderr: (line) => errors.push(line),
           eveControlPlane: updateControlPlane(root, operations, {
             onPublish: (request) => {
+              publishedPreviousRelease = request.hostConfig.worker.vars.EDEN_EVE_PREVIOUS_RELEASE_ID;
               publishedMigrations = request.hostConfig.worker.migrations;
               publishedImage = request.identity.containerImage;
             },
@@ -4074,6 +4076,8 @@ describe("eden deploy in-place update", () => {
       { tag: "v1", new_sqlite_classes: ["EveHostDurableContainer"] },
     ]);
     expect(publishedImage).toBe(`registry.cloudflare.com/account-test/eve@sha256:${"d".repeat(64)}`);
+    // The published Worker names the release it replaces, so its object serves that release's Workers.
+    expect(publishedPreviousRelease).toBe("eve-deploy-prior");
     expect(operations).toEqual([
       "publish",
       "health",

@@ -361,6 +361,8 @@ export interface EveHostConfigRequest extends EveHostIdentity {
   readonly accountId?: string;
   readonly stableWorkersDevOrigin: string;
   readonly containerImage: string;
+  /** The release this publish replaces, as its Workers stamped their requests. */
+  readonly previousReleaseId?: string;
   readonly retainedDeployments?: Readonly<Record<string, EveRetainedDeployment>>;
   readonly containerImageBuildContext?: string;
   readonly runtimeVariableNames?: readonly string[];
@@ -416,6 +418,7 @@ export interface EveHostWranglerConfig {
     readonly EDEN_EVE_GENERATION_ID: string;
     readonly EDEN_EVE_DEPLOYMENTS?: string;
     readonly EDEN_EVE_RELEASE_ID: string;
+    readonly EDEN_EVE_PREVIOUS_RELEASE_ID?: string;
     readonly EVE_RUNTIME_VARIABLE_NAMES: readonly string[];
     readonly EDEN_EVE_RUNTIME_REVISION?: string;
     readonly EDEN_EVE_CONTAINER_SLEEP_AFTER?: string;
@@ -708,6 +711,7 @@ export function createEveHostConfig(
         EVE_CONTAINER_INSTANCE_NAME: request.stableContainerInstanceName,
         EDEN_EVE_DEPLOYMENT_ID: request.deploymentId,
         EDEN_EVE_RELEASE_ID: request.releaseId ?? request.deploymentId,
+        ...(request.previousReleaseId === undefined ? {} : { EDEN_EVE_PREVIOUS_RELEASE_ID: request.previousReleaseId }),
         EDEN_EVE_GENERATION_ID: request.generationId,
         ...(request.retainedDeployments === undefined ? {} : { EDEN_EVE_DEPLOYMENTS: JSON.stringify(deployments) }),
         EVE_RUNTIME_VARIABLE_NAMES: request.runtimeVariableNames ?? [],
@@ -894,6 +898,7 @@ export interface EveHostContainerEnvironment {
   readonly EDEN_EVE_DEPLOYMENT_ID?: string;
   readonly EDEN_EVE_GENERATION_ID?: string;
   readonly EDEN_EVE_RELEASE_ID?: string;
+  readonly EDEN_EVE_PREVIOUS_RELEASE_ID?: string;
   readonly EDEN_EVE_CONTROL_TOKEN?: string;
   readonly EDEN_EVE_DEPLOYMENTS?: string;
   readonly EDEN_EVE_RUNTIME_REVISION?: string;
@@ -962,6 +967,7 @@ const RESERVED_EVE_HOST_VARIABLES = new Set([
   "EDEN_EVE_GENERATION_ID",
   "EDEN_EVE_DEPLOYMENTS",
   "EDEN_EVE_RELEASE_ID",
+  "EDEN_EVE_PREVIOUS_RELEASE_ID",
   "EDEN_AFFINITY_CONTRACT",
   "EDEN_EVE_CONTROL_TOKEN",
   "EVE_SCHEDULES_DISABLED",

@@ -256,6 +256,7 @@ function hostContainer(
   options: {
     readonly deploymentId?: string;
     readonly abort?: (reason?: string) => void;
+    readonly env?: Record<string, string>;
   } = {},
 ) {
   const container = new EveHostDurableContainer(
@@ -287,6 +288,7 @@ function hostContainer(
       EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
       EDEN_EVE_DEPLOYMENT_ID: options.deploymentId ?? IDENTITY.deploymentId,
       EDEN_EVE_GENERATION_ID: IDENTITY.generationId,
+      ...options.env,
     },
   );
   return container;
@@ -1219,6 +1221,64 @@ describe("EveHostDurableContainer lifecycle", () => {
     expect(stored.size).toBe(0);
     expect(alarms).toEqual([]);
     expect(runtime.running).toBe(true);
+  });
+
+  test("a request through a Worker of the replaced release gets Eve's answer, and the new object is not reset", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
+    const abort = vi.fn((reason?: string) => { throw new Error(reason); });
+    const object = hostContainer(new Map(), runtime, undefined, {
+      abort,
+      env: { EDEN_EVE_RELEASE_ID: "release-new", EDEN_EVE_PREVIOUS_RELEASE_ID: "release-old" },
+    });
+    const env = { EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => object.fetch(new Request(request)) }) } };
+    const worker = (releaseId: string) => createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+      releaseId,
+    });
+
+    for (const init of [{}, { method: "POST", body: "{}" }]) {
+      const older = await worker("release-old").fetch(new Request("https://client.invalid/eve/v1/session", init), env);
+      expect(older.status).toBe(200);
+      expect(await older.json()).toEqual({ status: "ready" });
+      expect(older.headers.get("x-eden-eve-release-id")).toBe("release-old");
+      // Only a Worker of this release proves the deploy's health.
+      expect(older.headers.get("x-eden-eve-started-deployment")).toBeNull();
+    }
+    const current = await worker("release-new").fetch(new Request("https://client.invalid/eve/v1/health"), env);
+    expect(current.headers.get("x-eden-eve-started-deployment")).toBe("release-new");
+    expect(abort).not.toHaveBeenCalled();
+
+    // A release this object does not know may be newer, so it still resets.
+    await expect(object.fetch(new Request("https://client.invalid/eve/v1/health", {
+      headers: { "x-eden-eve-deployment-id": IDENTITY.deploymentId, "x-eden-eve-release-id": "release-unknown" },
+    }))).rejects.toThrow("stale Worker version");
+    expect(abort).toHaveBeenCalledTimes(1);
+  });
+
+  test("a Worker of the replaced release that names a version no longer routed gets a retryable 503", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
+    const abort = vi.fn((reason?: string) => { throw new Error(reason); });
+    const object = hostContainer(new Map(), runtime, undefined, {
+      abort,
+      env: {
+        EDEN_EVE_RELEASE_ID: "release-new",
+        EDEN_EVE_PREVIOUS_RELEASE_ID: "release-old",
+        EDEN_EVE_DEPLOYMENTS: JSON.stringify({ "dep-new": { image: "eve", generationId: "gen-new" } }),
+      },
+    });
+    const response = await createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+      releaseId: "release-old",
+    }).fetch(new Request("https://client.invalid/eve/v1/session", { method: "POST", body: "{}" }), {
+      EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+      EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => object.fetch(new Request(request)) }) },
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("1");
+    expect(abort).not.toHaveBeenCalled();
+    expect(runtime.state.timeline).toEqual([]);
   });
 
   test("a current Worker resets the old DO, carries files, and only then echoes its started deployment", async () => {

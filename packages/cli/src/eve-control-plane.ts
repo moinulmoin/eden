@@ -3260,6 +3260,8 @@ async function runEveDeployment(
     request.name,
   );
   const releaseId = `eve-deploy-${randomUUID()}`;
+  // What the replaced release's Workers stamp on their requests.
+  const previousReleaseId = priorIdentity?.releaseId ?? priorIdentity?.deploymentId;
   let previousEveVersion = priorIdentity?.eveVersion;
   if (previousEveVersion === undefined && prior !== undefined) {
     previousEveVersion = (await readInstalledManifest(join(prior.generationRoot, "container/snapshot"), "eve"))?.version;
@@ -3523,6 +3525,7 @@ async function runEveDeployment(
   try {
     hostConfig = createEveHostConfig({
       ...baseConfigRequest,
+      ...(previousReleaseId === undefined || previousReleaseId === releaseId ? {} : { previousReleaseId }),
     });
   } catch (error: unknown) {
     throw deploymentFailure(

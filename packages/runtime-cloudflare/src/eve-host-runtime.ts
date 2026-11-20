@@ -1219,8 +1219,17 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     const requestDeploymentId =
       request.headers.get("x-eden-eve-deployment-id") ?? undefined;
     const requestedRelease = request.headers.get("x-eden-eve-release-id") ?? requestDeploymentId;
-    if (requestedRelease !== undefined && requestedRelease !== (this.env.EDEN_EVE_RELEASE_ID ?? this.env.EDEN_EVE_DEPLOYMENT_ID)) {
+    const olderCaller = requestedRelease !== undefined && requestedRelease === this.env.EDEN_EVE_PREVIOUS_RELEASE_ID;
+    if (requestedRelease !== undefined && !olderCaller && requestedRelease !== (this.env.EDEN_EVE_RELEASE_ID ?? this.env.EDEN_EVE_DEPLOYMENT_ID)) {
       this.ctx.abort(EVE_HOST_STALE_WORKER_REASON);
+    }
+    // A Worker of the release this one replaced is still serving while
+    // Cloudflare switches versions. This object already runs the newer code,
+    // so a reset would gain nothing; a deployment this release no longer
+    // routes cannot be served and the client retries on the new Worker.
+    if (olderCaller && this.env.EDEN_EVE_DEPLOYMENTS !== undefined &&
+      requestDeploymentId !== undefined && deploymentImages(this.env)[requestDeploymentId] === undefined) {
+      return new Response("Eden is switching versions. Retry the request.\n", { status: 503, headers: { "retry-after": "1" } });
     }
     await this.identifyDeployment(requestDeploymentId);
     if (new URL(request.url).pathname === "/__eden/internal/fence-schedules") {
@@ -1239,6 +1248,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     if (
       requestDeploymentId !== undefined &&
       requestDeploymentId === this.deploymentId &&
+      !olderCaller &&
       this.readinessEvidence !== undefined &&
       this.imageVerified
     ) {
