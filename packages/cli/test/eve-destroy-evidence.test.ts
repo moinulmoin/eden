@@ -943,6 +943,27 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(readdir(join(root, ".eden", "eve-deploy", "locks"))).resolves.toEqual([]);
   });
 
+  test.each([
+    ["preflight", "a".repeat(53) + "-container", "a".repeat(53)],
+    ["deploy", "a".repeat(53) + "-container", "a".repeat(53)],
+    ["deploy", "a".repeat(52) + "-container", "a".repeat(52)],
+    ["deploy", "a".repeat(59) + "b-co", "a".repeat(59) + "b"],
+  ] as const)("eden %s refuses the name %s, whose Container application another name gets, before any Cloudflare call", async (command, name, sibling) => {
+    const root = await deployableProject();
+    const output: string[] = [];
+    const exitCode = await runEdenCli(
+      [command, "--project", root, "--env", "preview", "--name", name, "--json"],
+      { cwd: root, stdout: (line) => output.push(line), stderr: (line) => output.push(line) },
+    );
+    expect(output).toHaveLength(1);
+    const result = JSON.parse(output[0] ?? "") as { readonly ok?: boolean; readonly error?: { readonly code?: string; readonly message?: string; readonly remediation?: string } };
+    expect({ exitCode, ok: result.ok, code: result.error?.code }).toEqual({ exitCode: 1, ok: false, code: "EVE_NAME_CONTAINER_SHARED" });
+    expect(result.error?.message).toContain("of the name " + sibling + ";");
+    expect(result.error?.remediation).toContain("Rerun with another --name <name>");
+    expect({ whoami: cloud.whoamiCalls, reads: cloud.apiReads }).toEqual({ whoami: 0, reads: [] });
+    await expect(lstat(join(root, ".eden"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("a CURRENT that names another project's generation is refused before any Cloudflare call", async () => {
     const other = await deployedProject();
     const { root, current } = await deployedProject();

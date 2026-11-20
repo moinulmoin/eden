@@ -5003,6 +5003,21 @@ export async function runEveControlPlane(
   let failed = false;
   let lockReleased = true;
   try {
+    // A name of 62 or 63 characters has no room for a suffix, so its Container
+    // application carries the Worker's own name. When that is also what a
+    // shorter name's `<name>-container` is cut to, the two targets would
+    // share one application.
+    const application = boundedResourceName(request.name, "container");
+    const sibling = [2, 3, 4, 5, 6, 7, 8, 9, 10]
+      .map((cut) => request.name.slice(0, -cut))
+      .find((shorter) => EVE_NAME_PATTERN.test(shorter) && boundedResourceName(shorter, "container") === application);
+    if (sibling !== undefined) {
+      throw new EveCliError({
+        code: "EVE_NAME_CONTAINER_SHARED",
+        message:
+          `The name ${request.name} would get the Container application ${application}, which is also the Container application of the name ${sibling}; nothing was read or changed on Cloudflare.`,
+      });
+    }
     lock = request.command === "deploy"
       ? await acquireEveTargetLock(request.projectRoot, request.environment, request.name)
       : undefined;

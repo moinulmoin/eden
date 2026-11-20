@@ -95,6 +95,8 @@ function eveErrorRemediation(code: string): string {
       return "Rerun eden destroy without --env-file; cleanup needs no application secrets.";
     case "EVE_NAME_REQUIRED":
       return "Rerun with --name <name>. For destroy, use the exact name the deploy printed.";
+    case "EVE_NAME_CONTAINER_SHARED":
+      return "Rerun with another --name <name>. A name of 61 characters or fewer always gets a Container application of its own.";
     case "EVE_NAME_DERIVATION_FAILED":
       return "Rerun with an explicit --name <name>.";
     case "VERSION_UNAVAILABLE":

@@ -228,6 +228,12 @@ with a letter or a digit. The same pattern is enforced for the Worker name
 and the Container application name. A name that does not match fails with
 `EVE_NAME_INVALID`.
 
+`preflight` and `deploy` also refuse, with `EVE_NAME_CONTAINER_SHARED`, a
+name whose Container application would be the one a shorter name gets: a
+62-character name that ends in `-container`, or a 63-character name that
+ends in `-container` or a cut of it from `-c` to `-containe`. A derived
+default name is never one of these. `destroy` accepts them.
+
 ### Derived default name
 
 `preflight` and `deploy` derive a deterministic name when `--name` is omitted:

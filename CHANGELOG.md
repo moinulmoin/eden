@@ -10,6 +10,16 @@
   from `.eden/eve-deploy/locks/<environment>-<name>.lock` to
   `.eden/eve-deploy/locks/<name>.lock`; Eden no longer reads a lock file
   with the old name.
+- `preflight` and `deploy` now refuse a `--name` whose Container application
+  would be the one another name gets, with `EVE_NAME_CONTAINER_SHARED`,
+  before anything is read or changed on Cloudflare. Eden cuts
+  `<name>-container` to 63 characters, so a 53-character name and the
+  63-character name made of it plus `-container` both got the same
+  Container application, and `eden destroy` of one could delete the
+  other's. Only a 62-character name that ends in `-container`, or a
+  63-character name that ends in `-container` or a cut of it from `-c` to
+  `-containe`, is refused. A derived default name is never one of these,
+  and `eden destroy` still accepts them.
 
 ## 0.15.0 — 2026-11-20
 
