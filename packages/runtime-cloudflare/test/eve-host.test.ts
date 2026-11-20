@@ -825,7 +825,7 @@ describe("generic Eve Cloudflare host", () => {
     }
   });
 
-  test("propagates the second stale-Worker failure without a retry loop", async () => {
+  test("waits about 30 seconds for an object still on the old release, then answers a retryable 503 without sending the body", async () => {
     const error = new Error("remote exception: stale Worker version");
     const upstreamFetch = vi.fn(async (request: Request) => {
       expect(request.method).toBe("GET");
@@ -837,12 +837,49 @@ describe("generic Eve Cloudflare host", () => {
       publicOrigin: "https://eden-eve-preview.account.workers.dev",
       ...IDENTITY,
     });
-    await expect(worker.fetch(new Request("https://client.invalid/write", {
-      method: "POST",
-      body: "non-idempotent-body",
-    }), { EVE_CONTAINER: { getByName } })).rejects.toBe(error);
-    expect(upstreamFetch).toHaveBeenCalledTimes(2);
-    expect(getByName).toHaveBeenCalledTimes(2);
+    vi.useFakeTimers();
+    try {
+      const started = Date.now();
+      const pending = worker.fetch(new Request("https://client.invalid/write", {
+        method: "POST",
+        body: "non-idempotent-body",
+      }), { EVE_CONTAINER: { getByName } });
+      await vi.runAllTimersAsync();
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("5");
+      expect(Date.now() - started).toBe(31_750);
+      expect(upstreamFetch).toHaveBeenCalledTimes(10);
+      expect(getByName).toHaveBeenCalledTimes(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a request that meets an object on the old release is served once the object restarts on the new one", async () => {
+    let attempts = 0;
+    const getByName = vi.fn(() => ({
+      fetch: async () => {
+        attempts += 1;
+        if (attempts <= 4) throw new Error("remote exception: stale Worker version");
+        return new Response("eve");
+      },
+    }));
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    vi.useFakeTimers();
+    try {
+      const pending = worker.fetch(new Request("https://client.invalid/eve/v1/session/s/stream"), { EVE_CONTAINER: { getByName } });
+      await vi.runAllTimersAsync();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("eve");
+      expect(attempts).toBe(5);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("routes container egress to the public origin back through the container", async () => {
@@ -1026,7 +1063,7 @@ describe("Eve schedule wake triggers", () => {
   });
 
   test.each([false, true])(
-    "retries a scheduled stale-Worker wake only once (second attempt fails: %s)",
+    "a scheduled wake waits for an object on the old release (object stays old: %s)",
     async (secondAttemptFails) => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const error = new Error("remote exception: stale Worker version");
@@ -1052,25 +1089,22 @@ describe("Eve schedule wake triggers", () => {
         schedules: [{ name: "digest", cron: "0 9 * * 1-5" }],
       });
       const waited: Promise<unknown>[] = [];
+      vi.useFakeTimers();
       try {
         worker.scheduled?.(
           { cron: "* * * * *", scheduledTime: Date.parse("2026-10-02T08:57:00Z") },
           { EVE_CONTAINER: { getByName } },
           { waitUntil: (task) => { waited.push(task); } },
         );
-        await Promise.all(waited);
+        await vi.runAllTimersAsync();
+        const [wake] = await Promise.all(waited) as [Response];
         expect(waited).toHaveLength(1);
-        expect(wakeFetch).toHaveBeenCalledTimes(2);
-        expect(getByName).toHaveBeenCalledTimes(2);
-        if (secondAttemptFails) {
-          expect(errorSpy).toHaveBeenCalledWith(
-            "The scheduled wake request failed:",
-            error.message,
-          );
-        } else {
-          expect(errorSpy).not.toHaveBeenCalled();
-        }
+        expect(wakeFetch).toHaveBeenCalledTimes(secondAttemptFails ? 10 : 2);
+        expect(getByName).toHaveBeenCalledTimes(secondAttemptFails ? 10 : 2);
+        expect(wake.status).toBe(secondAttemptFails ? 503 : 200);
+        expect(errorSpy).not.toHaveBeenCalled();
       } finally {
+        vi.useRealTimers();
         errorSpy.mockRestore();
       }
     },

@@ -26,6 +26,30 @@ import {
 const EVE_CLOUDFLARE_CONTAINERS_CA_PATH =
   "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
 const EVE_HOST_STALE_WORKER_REASON = "stale Worker version";
+/**
+ * Pauses before each further try while an object is still on an earlier
+ * release. A reset object can come back on the old code until Cloudflare has
+ * the new version where the object runs: 20 s was seen on 2026-11-20.
+ */
+const EVE_HOST_STALE_RETRY_DELAYS_MS = [0, 250, 500, 1_000, 2_000, 4_000, 8_000, 8_000, 8_000];
+
+function isStaleRelease(error: unknown): boolean {
+  return error instanceof Error && error.message.includes(EVE_HOST_STALE_WORKER_REASON);
+}
+
+/** Only the pre-forwarding stale abort is safe to send again. A failed stub
+ * can remain broken, so `send` resolves the object anew on every try. */
+async function retryWhileStale<T>(send: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await send();
+    } catch (error: unknown) {
+      const delay = EVE_HOST_STALE_RETRY_DELAYS_MS[attempt];
+      if (!isStaleRelease(error) || delay === undefined || signal?.aborted === true) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
 
 function deploymentImages(env: EveHostContainerEnvironment): Record<string, EveDeploymentRoute> {
   const raw = env.EDEN_EVE_DEPLOYMENTS;
@@ -579,12 +603,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
             "x-eden-eve-release-id": this.env.EDEN_EVE_RELEASE_ID ?? this.env.EDEN_EVE_DEPLOYMENT_ID!,
           },
         });
-        let response: Response;
-        try { response = await namespace.getByName(deploymentInstance(this.env, id)).fetch(request); }
-        catch (error) {
-          if (!(error instanceof Error) || !error.message.includes(EVE_HOST_STALE_WORKER_REASON)) throw error;
-          response = await namespace.getByName(deploymentInstance(this.env, id)).fetch(request);
-        }
+        const response = await retryWhileStale(() => namespace.getByName(deploymentInstance(this.env, id)).fetch(request));
         if (!response.ok) throw new Error(`Cannot fence schedules on retained deployment ${id}.`);
         await response.body?.cancel();
       }
@@ -1723,21 +1742,17 @@ export function createEveHostWorker(
           new URL(EVE_HOST_DEFAULTS.healthPath, options.publicOrigin),
           { signal: forwarded.signal },
         ), metadata);
-    let container = resolveContainer(env);
+    let container!: ReturnType<typeof resolveContainer>;
     let response: Response;
     try {
-      response = await container.fetch(bodyless);
+      response = await retryWhileStale(() => {
+        container = resolveContainer(env);
+        return container.fetch(bodyless);
+      }, request.signal);
     } catch (error: unknown) {
-      if (
-        !(error instanceof Error) ||
-        !error.message.includes(EVE_HOST_STALE_WORKER_REASON)
-      ) {
-        throw error;
-      }
-      // Only the pre-forwarding stale abort is safe to retry. A failed stub
-      // can remain broken, so resolve it again and retry the bodyless request once.
-      container = resolveContainer(env);
-      response = await container.fetch(bodyless);
+      if (!isStaleRelease(error)) throw error;
+      // Nothing was forwarded, so the client can send the request again.
+      return new Response("Eden is switching versions. Retry the request.\n", { status: 503, headers: { "retry-after": "5" } });
     }
     if (bodyless === forwarded) return response;
     await response.body?.cancel();
