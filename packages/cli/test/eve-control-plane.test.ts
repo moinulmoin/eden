@@ -17,7 +17,6 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { promisify } from "node:util";
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -41,24 +40,26 @@ import { exactTargetContainerEntries } from "../src/eve-control-plane.js";
 const roots: string[] = [];
 
 /**
- * Wrangler is spawned as `node <wrangler entrypoint> ...args`. While
- * `intercept` is set, spawns are replaced by a child that exits 1 on the next
- * turn, and the deadline armed immediately after each spawn is recorded.
+ * cf is spawned as `node <cf's bin/cf> ...args`. While `intercept` is set,
+ * each spawn is replaced by a child that gives the next answer, or exits 1
+ * with no output, and the deadline armed immediately after each spawn is
+ * recorded.
  */
-const fakeWrangler = vi.hoisted(() => ({
+const fakeCf = vi.hoisted(() => ({
   intercept: false,
   pending: undefined as readonly string[] | undefined,
   calls: [] as { readonly args: readonly string[]; readonly timeoutMs: unknown }[],
-  /** What each spawn in turn prints on stderr, a Buffer per chunk, and exits with; then exit 1 with no output. */
-  answers: [] as { readonly exitCode: number | null; readonly stderr?: string | readonly Buffer[] }[],
+  /** What each spawn in turn prints and exits with. */
+  answers: [] as { readonly exitCode: number | null; readonly stdout?: string; readonly stderr?: string }[],
 }));
 
 /**
  * A stand-in for Cloudflare's registry. While `active`, a request to the
- * registry lists `entries` or gets `answer(ref)` for a delete, and Wrangler's
- * `containers images delete` and `containers registries credentials` run
- * against the same state. `whoami` names `whoamiAccountId()`, and the exact
- * Worker is reported absent. Any other Wrangler read is refused.
+ * registry lists `entries` or gets `answer(ref)` for a delete, and cf's
+ * `containers images delete` and `containers registries credentials generate`
+ * run against the same state. `auth whoami` names `whoamiAccountId()`, and
+ * the exact Worker and Container application are reported absent, in the
+ * forms cf 1.0.0-rc.2 printed on 2026-11-20. Any other cf command fails.
  */
 const fakeRegistry = vi.hoisted(() => {
   type Answer =
@@ -72,7 +73,7 @@ const fakeRegistry = vi.hoisted(() => {
     /** The digest the registry answers a HEAD for a listed `repository:tag` with; any other tag gets 404. */
     digests: new Map<string, string>(),
     pageSize: 1_000,
-    /** Whether Wrangler's delete of a tag succeeds; the tag then leaves the listing. */
+    /** Whether cf's delete of a tag succeeds; the tag then leaves the listing. */
     deletable: (() => true) as (ref: string) => boolean,
     /** The registry's answer to Eden's own delete; `leavesAfterMs` takes the entry out of the listing that much later. */
     answer: (() => ({ status: 404, body: "" })) as (ref: string) => Answer,
@@ -86,14 +87,14 @@ const fakeRegistry = vi.hoisted(() => {
     /** Called when destroy reads the target, with the read's number from 0. */
     onRead: (() => undefined) as (nth: number) => void,
     reads: 0,
-    wranglerFailure: ((ref) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 403 Forbidden`) as (
+    cfFailure: ((ref) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 403 Forbidden`) as (
       ref: string,
     ) => string,
     credentialAccountId: "account-test",
     /** What `performance.now()` returns while a command runs against the fake registry. */
     clock: 0,
     leaving: [] as { readonly repository: string; readonly entry: string; readonly at: number }[],
-    wranglerDeletes: [] as string[],
+    cfDeletes: [] as string[],
     credentialCalls: 0,
     listings: 0,
     registryRequests: [] as {
@@ -204,81 +205,79 @@ vi.mock("node:https", async (importOriginal) => {
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof ChildProcess>();
-  const execFile = ((...execArgs: Parameters<typeof actual.execFile>) =>
-    actual.execFile(...execArgs)) as typeof actual.execFile;
-  Object.defineProperty(execFile, promisify.custom, {
-    value: (file: string, argv: readonly string[], options: object) => {
-      const args = argv.slice(1);
-      if (!fakeRegistry.active || !/wrangler/u.test(argv[0] ?? "")) {
-        return promisify(actual.execFile)(file, argv, options);
+  /** What cf prints and exits with while the fake registry runs. */
+  const registryCf = (
+    args: readonly string[],
+    env: NodeJS.ProcessEnv,
+  ): { readonly exitCode: number; readonly stdout?: string; readonly stderr?: string } => {
+    const line = args.join(" ");
+    if (line === "auth whoami") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ authenticated: true, tokenValid: true, accounts: [{ id: fakeRegistry.whoamiAccountId() }] }),
+      };
+    }
+    if (line.startsWith("containers registries credentials generate ")) {
+      fakeRegistry.credentialCalls += 1;
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          account_id: fakeRegistry.credentialAccountId,
+          registry_host: "registry.cloudflare.com",
+          username: "v1",
+          password: "registry-password",
+        }),
+      };
+    }
+    if (line.startsWith("containers images delete ")) {
+      const ref = args[3] ?? "";
+      const [repository = "", tag = ""] = ref.split(":");
+      fakeRegistry.cfDeletes.push(ref);
+      if (!fakeRegistry.deletable(ref)) {
+        // cf prints its own errors on stderr in this form, a long message wrapped at spaces (read on 2026-11-20).
+        const wrapped = fakeRegistry.cfFailure(ref).replaceAll(" (digest: ", "\n│ (digest:\n│ ").replace(/ Forbidden$/u, "\n│ Forbidden");
+        return { exitCode: 1, stderr: "\n┌ Error\n│ " + wrapped + "\n└\n" };
       }
-      if (args[0] === "whoami") {
-        return Promise.resolve({
-          stdout: JSON.stringify({ loggedIn: true, accounts: [{ id: fakeRegistry.whoamiAccountId() }] }),
-          stderr: "",
-        });
-      }
-      if (args[1] === "registries" && args[2] === "credentials") {
-        fakeRegistry.credentialCalls += 1;
-        return Promise.resolve({
-          stdout: JSON.stringify({
-            account_id: fakeRegistry.credentialAccountId,
-            registry_host: "registry.cloudflare.com",
-            username: "v1",
-            password: "registry-password",
-          }),
-          stderr: "",
-        });
-      }
-      return Promise.reject(new Error(`Unexpected Wrangler call: ${args.join(" ")}`));
-    },
-  });
+      fakeRegistry.entries.set(
+        repository,
+        (fakeRegistry.entries.get(repository) ?? []).filter((present) => present !== tag),
+      );
+      return { exitCode: 0 };
+    }
+    if (line.startsWith("containers applications list ")) return { exitCode: 0, stdout: "[]" };
+    if (line.startsWith("workers deployments list --worker ")) {
+      fakeRegistry.onRead(fakeRegistry.reads++);
+      return {
+        exitCode: 1,
+        stderr: `\n┌ APIError\n│ [10007] This Worker does not exist on your account.\n│ 404 Not Found · HTTP /accounts/${env.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${args[4]}/deployments\n└\n`,
+      };
+    }
+    return { exitCode: 1, stderr: `Unexpected cf call: ${line}` };
+  };
   return {
     ...actual,
-    execFile,
     spawn: ((...spawnArgs: Parameters<typeof actual.spawn>) => {
-      if (fakeRegistry.active && (spawnArgs[1] as readonly string[])[3] === "delete") {
-        const ref = (spawnArgs[1] as readonly string[])[4] ?? "";
-        const [repository = "", tag = ""] = ref.split(":");
-        fakeRegistry.wranglerDeletes.push(ref);
-        const deleted = fakeRegistry.deletable(ref);
-        if (deleted) {
-          fakeRegistry.entries.set(
-            repository,
-            (fakeRegistry.entries.get(repository) ?? []).filter((present) => present !== tag),
-          );
-        }
-        const child = Object.assign(new EventEmitter(), {
-          stdout: new EventEmitter(),
-          stderr: new EventEmitter(),
-          stdin: { end: () => undefined },
-          kill: () => true,
-        });
-        setImmediate(() => {
-          if (!deleted) {
-            // Wrangler 4.147.0 prints its error on stderr in this form.
-            child.stderr.emit("data", Buffer.from(
-              `\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1m${fakeRegistry.wranglerFailure(ref)}\u001b[0m\n\n`,
-            ));
-          }
-          child.emit("close", deleted ? 0 : 1);
-        });
-        return child;
-      }
-      if (!fakeWrangler.intercept) return actual.spawn(...spawnArgs);
       const argv = spawnArgs[1] as readonly string[];
-      fakeWrangler.pending = argv.slice(1);
+      if (
+        !/[\\/]cf[\\/]bin[\\/]cf$/u.test(argv[0] ?? "") ||
+        (!fakeRegistry.active && !fakeCf.intercept)
+      ) return actual.spawn(...spawnArgs);
+      const args = argv.slice(1);
+      let answer: (typeof fakeCf.answers)[number];
+      if (fakeCf.intercept) {
+        fakeCf.pending = args;
+        answer = fakeCf.answers.shift() ?? { exitCode: 1 };
+      } else {
+        answer = registryCf(args, (spawnArgs[2] as { readonly env: NodeJS.ProcessEnv }).env);
+      }
       const child = Object.assign(new EventEmitter(), {
         stdout: new EventEmitter(),
         stderr: new EventEmitter(),
-        stdin: { end: () => undefined },
         kill: () => true,
       });
-      const answer = fakeWrangler.answers.shift() ?? { exitCode: 1 };
       setImmediate(() => {
-        for (const chunk of typeof answer.stderr === "string" ? [Buffer.from(answer.stderr)] : answer.stderr ?? []) {
-          child.stderr.emit("data", chunk);
-        }
+        if (answer.stdout !== undefined) child.stdout.emit("data", Buffer.from(answer.stdout));
+        if (answer.stderr !== undefined) child.stderr.emit("data", Buffer.from(answer.stderr));
         child.emit("close", answer.exitCode);
       });
       return child;
@@ -311,7 +310,7 @@ type FakeRegistrySetup = {
   readonly listing?: typeof fakeRegistry.listing;
   readonly whoamiAccountId?: typeof fakeRegistry.whoamiAccountId;
   readonly onRead?: typeof fakeRegistry.onRead;
-  readonly wranglerFailure?: typeof fakeRegistry.wranglerFailure;
+  readonly cfFailure?: typeof fakeRegistry.cfFailure;
   readonly credentialAccountId?: string;
 };
 
@@ -327,45 +326,45 @@ function startFakeRegistry(setup: FakeRegistrySetup): void {
     whoamiAccountId: setup.whoamiAccountId ?? (() => "account-test"),
     onRead: setup.onRead ?? (() => undefined),
     reads: 0,
-    wranglerFailure: setup.wranglerFailure ??
+    cfFailure: setup.cfFailure ??
       ((ref: string) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 403 Forbidden`),
     credentialAccountId: setup.credentialAccountId ?? "account-test",
     clock: 0,
     leaving: [],
-    wranglerDeletes: [],
+    cfDeletes: [],
     credentialCalls: 0,
     listings: 0,
     registryRequests: [],
   });
 }
 
-async function withFakeWrangler(
+async function withFakeCf(
   run: () => Promise<void>,
 ): Promise<readonly { readonly args: readonly string[]; readonly timeoutMs: unknown }[]> {
   const realSetTimeout = globalThis.setTimeout;
   const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(
     ((handler: () => void, timeoutMs?: number) => {
-      if (fakeWrangler.pending !== undefined) {
-        fakeWrangler.calls.push({ args: fakeWrangler.pending, timeoutMs });
-        fakeWrangler.pending = undefined;
+      if (fakeCf.pending !== undefined) {
+        fakeCf.calls.push({ args: fakeCf.pending, timeoutMs });
+        fakeCf.pending = undefined;
       }
       return realSetTimeout(handler, timeoutMs);
     }) as unknown as typeof setTimeout,
   );
-  fakeWrangler.intercept = true;
-  fakeWrangler.calls = [];
+  fakeCf.intercept = true;
+  fakeCf.calls = [];
   try {
     await run();
-    return fakeWrangler.calls;
+    return fakeCf.calls;
   } finally {
-    fakeWrangler.intercept = false;
-    fakeWrangler.pending = undefined;
-    fakeWrangler.answers = [];
+    fakeCf.intercept = false;
+    fakeCf.pending = undefined;
+    fakeCf.answers = [];
     timers.mockRestore();
   }
 }
 
-/** Keeps a preflight that fails locally from running the real Wrangler access check. */
+/** Keeps a preflight that fails locally from running the real cf access check. */
 const unreachedCloudflareRead = (): never => {
   throw new Error("The Cloudflare read must not run.");
 };
@@ -1573,7 +1572,7 @@ describe("top-level Eden Deploy commands", () => {
     expect(errors.join("\n")).not.toContain("ambiguous cleanup");
   });
 
-  test("gives the default Wrangler deploy publication a 600 second deadline", async () => {
+  test("gives the default cf deploy publication a 600 second deadline", async () => {
     const root = await createRoot();
     await writeFile(
       join(root, "package.json"),
@@ -1587,7 +1586,7 @@ describe("top-level Eden Deploy commands", () => {
     await writeFile(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
     const errors: string[] = [];
 
-    const calls = await withFakeWrangler(async () => {
+    const calls = await withFakeCf(async () => {
       await expect(
         runEdenCli(
           ["deploy",
@@ -1650,125 +1649,12 @@ describe("top-level Eden Deploy commands", () => {
       ).resolves.toBe(1);
     });
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.args.slice(0, 2)).toEqual(["deploy", "--config"]);
-    expect(calls[0]?.args.slice(3)).toEqual([
-      "--name",
-      "eve-publish-deadline",
-      "--env",
-      "preview",
-      "--strict",
+    // The publish, then the read that finds no version of this publish to finish.
+    expect(calls).toEqual([
+      { args: ["deploy", "--prebuilt"], timeoutMs: 600_000 },
+      { args: ["workers", "deployments", "list", "--worker", "eve-publish-deadline"], timeoutMs: 30_000 },
     ]);
-    expect(calls[0]?.timeoutMs).toBe(600_000);
     expect(errors.join("\n")).toContain("DEPLOY_INDETERMINATE");
-  });
-
-  // What Wrangler 4.147.0 printed on 2026-11-19 when Cloudflare did not show the uploaded version in time.
-  const containerSettingsUnapplied = "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mThe Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings. Re-run the same `wrangler deploy` command to retry and finish deployment.\u001b[0m\n\n";
-
-  test.each([
-    ["its Container settings error", containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1, false],
-    ["its Container settings error on a target this project promoted before", containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", false, 1, true],
-    // The three bytes of ✘ start at byte 5.
-    ["its Container settings error with ✘ split across two chunks", [Buffer.from(containerSettingsUnapplied).subarray(0, 6), Buffer.from(containerSettingsUnapplied).subarray(6)], "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1, false],
-    ["its Container settings error after long warnings", "warning ".repeat(300) + "\n" + containerSettingsUnapplied, "Wrangler uploaded the Worker version but did not finish applying its Container application settings.", true, 1, false],
-    ["another error", "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API failed.\u001b[0m\n\n", "The exact Cloudflare publication did not return a terminal success result.", false, 1, false],
-    ["a warning that quotes its Container settings error, then another error", "\u001b[33m▲ \u001b[43;33m[\u001b[43;30mWARNING\u001b[43;33m]\u001b[0m \u001b[1mAn earlier run said: The Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings.\u001b[0m\n\n\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API failed.\u001b[0m\n\n", "The exact Cloudflare publication did not return a terminal success result.", false, 1, false],
-    ["its Container settings error before a signal ended it", containerSettingsUnapplied, "The exact Cloudflare publication did not return a terminal success result.", false, null, false],
-  ] as const)("runs wrangler deploy once when it fails with %s, and names the next command", async (_name, stderr, reason, namesDestroy, exitCode, promotedBefore) => {
-    const root = await createRoot();
-    await writeFile(
-      join(root, "package.json"),
-      JSON.stringify({
-        name: "eve-publish-deadline",
-        private: true,
-        packageManager: "pnpm@11.21.0",
-      }),
-      "utf8",
-    );
-    await writeFile(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
-    const errors: string[] = [];
-
-    const output: string[] = [];
-    fakeWrangler.answers = [{ exitCode, stderr }];
-    const current = join(root, ".eden", "eve-deploy", "targets", "preview-eve-publish-deadline", "CURRENT");
-    if (promotedBefore) {
-      // An earlier promotion, with the target since removed on Cloudflare.
-      await mkdir(join(root, ".eden", "eve-deploy", "generations", "generation-zero"), { recursive: true });
-      await mkdir(join(current, ".."), { recursive: true });
-      await symlink("../../generations/generation-zero", current);
-    }
-    const calls = await withFakeWrangler(async () => {
-      await expect(
-        runEdenCli(
-          ["deploy",
-          "--project",
-          root,
-          "--env",
-          "preview",
-          "--name",
-          "eve-publish-deadline", "--json"],
-          {
-            cwd: root,
-            stderr: (line) => errors.push(line),
-            stdout: (line) => output.push(line),
-            eveControlPlane: {
-              artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
-              builder: fakeBuilder(),
-              containerImageReference:
-                `registry.cloudflare.com/account-test/eve@sha256:${"e".repeat(64)}`,
-              hostRequirements: {
-                architecture: "linux/amd64",
-                world: "supported",
-                sandbox: "supported",
-                privileged: false,
-                devices: "none",
-                kernel: "supported",
-                network: "supported",
-                durableLocalFilesystem: false,
-              },
-              runtimeRunner: async () => ({
-                ok: true,
-                checks: [
-                  {
-                    id: "VAL-BUILD-005",
-                    status: "passed",
-                    message: "Image passed.",
-                  },
-                  {
-                    id: "VAL-BUILD-006",
-                    status: "passed",
-                    message: "Eve start passed.",
-                  },
-                  {
-                    id: "VAL-BUILD-007",
-                    status: "passed",
-                    message: "Health passed.",
-                  },
-                ],
-                imageDigest: `sha256:${"e".repeat(64)}`,
-                cleanup: runtimeCleanup,
-              }),
-              cloudflareRead: async () => ({
-                accountAccess: "available",
-                containerAccess: "available",
-                accountId: "account-test",
-                workersDevSubdomain: "account",
-                target: { state: "absent" },
-              }),
-            },
-          },
-        ),
-      ).resolves.toBe(1);
-    });
-    expect(calls.map((call) => call.args[0])).toEqual(["deploy"]);
-    const result = JSON.parse(output[0] as string) as { readonly ok: boolean; readonly error: { readonly code: string; readonly remediation: string }; readonly deployment: { readonly status: string; readonly reason: string } };
-    expect({ ok: result.ok, code: result.error.code, status: result.deployment.status, reason: result.deployment.reason })
-      .toEqual({ ok: false, code: "DEPLOY_INDETERMINATE", status: "indeterminate", reason });
-    expect(result.error.remediation.includes("Run eden destroy with the same --project, --env, and --name")).toBe(namesDestroy);
-    expect(result.error.remediation.includes("Eden did not run the publish again")).toBe(reason.startsWith("Wrangler uploaded"));
-    if (promotedBefore) expect((await lstat(current)).isSymbolicLink()).toBe(true);
-    else await expect(lstat(current)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test("parses --json on every command", () => {
@@ -2334,23 +2220,7 @@ describe("eden destroy", () => {
     });
     const output: string[] = [];
     const clock = vi.spyOn(performance, "now").mockImplementation(() => fakeRegistry.clock);
-    // Eden reads the target from Cloudflare's API with a token: no Container application, and no Worker.
-    vi.stubEnv("CLOUDFLARE_API_TOKEN", "test-token");
-    vi.stubGlobal("fetch", (input: string | URL) => {
-      const worker = String(input).endsWith("/deployments");
-      if (worker) fakeRegistry.onRead(fakeRegistry.reads++);
-      return Promise.resolve(new Response(
-        JSON.stringify(worker
-          ? {
-            result: null,
-            success: false,
-            errors: [{ code: 10007, message: "This Worker does not exist on your account." }],
-            messages: [],
-          }
-          : { success: true, result: [], errors: [], messages: [], result_info: {} }),
-        { status: worker ? 404 : 200 },
-      ));
-    });
+    vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "");
     try {
       const exitCode = await runEdenCli(
         ["destroy", "--project", root, "--env", "preview", "--name", "eve-destroy-fixture",
@@ -2390,7 +2260,7 @@ describe("eden destroy", () => {
     });
     expect(exitCode).toBe(0);
     expect(output).toHaveLength(1);
-    expect(new Set(fakeRegistry.wranglerDeletes)).toEqual(new Set([
+    expect(new Set(fakeRegistry.cfDeletes)).toEqual(new Set([
       destroyRegistryImage,
       snapshot,
       `${secondRepository}:candidate`,
@@ -2484,7 +2354,7 @@ describe("eden destroy", () => {
       },
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.wranglerDeletes).toEqual([destroyRegistryImage, late]);
+    expect(fakeRegistry.cfDeletes).toEqual([destroyRegistryImage, late]);
     expect(registryDeletes()).toEqual([late, lateManifest]);
     expect(JSON.parse(output[0] as string)).toMatchObject({
       ok: true,
@@ -2507,7 +2377,7 @@ describe("eden destroy", () => {
       },
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.wranglerDeletes).toEqual([
+    expect(fakeRegistry.cfDeletes).toEqual([
       destroyRegistryImage,
       `${destroyRegistryRepository}:late-1`,
       `${destroyRegistryRepository}:late-2`,
@@ -2547,7 +2417,7 @@ describe("eden destroy", () => {
       listing: () => listing,
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.wranglerDeletes).toEqual([]);
+    expect(fakeRegistry.cfDeletes).toEqual([]);
     expect(registryDeletes()).toEqual([]);
     const result = JSON.parse(output[0] as string) as { readonly error: { readonly remediation: string } };
     expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
@@ -2571,7 +2441,7 @@ describe("eden destroy", () => {
       listing: (_repository, _nth, last) => answer(last),
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.wranglerDeletes).toEqual([]);
+    expect(fakeRegistry.cfDeletes).toEqual([]);
     // Destroy's first read, the cleanup and the final read each give up on their own listing.
     expect(fakeRegistry.registryRequests.map((request) => request.method)).toEqual(Array(requests).fill("GET"));
     expect(JSON.parse(output[0] as string)).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
@@ -2594,7 +2464,7 @@ describe("eden destroy", () => {
       listing: (_repository, _nth, last) => fakeRegistry.reads === 2 ? answer(last) : undefined,
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.wranglerDeletes).toEqual([destroyRegistryImage]);
+    expect(fakeRegistry.cfDeletes).toEqual([destroyRegistryImage]);
     expect(registryDeletes()).toEqual([]);
     expect(JSON.parse(output[0] as string)).toMatchObject({
       ok: false,
@@ -2608,11 +2478,11 @@ describe("eden destroy", () => {
     const { root } = await createDeployedFixture();
     const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
       entries: { [destroyRegistryRepository]: ["candidate"] },
-      // Wrangler is signed in to another account by the time destroy verifies.
+      // cf is signed in to another account by the time destroy verifies.
       whoamiAccountId: () => fakeRegistry.reads === 0 ? "account-test" : "another-account",
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.wranglerDeletes).toEqual([destroyRegistryImage]);
+    expect(fakeRegistry.cfDeletes).toEqual([destroyRegistryImage]);
     // Nothing is read from the other account, so no second credential is asked for.
     expect(fakeRegistry.credentialCalls).toBe(1);
     expect(JSON.parse(output[0] as string)).toMatchObject({
@@ -2707,7 +2577,7 @@ describe("eden destroy", () => {
       pageSize: 1,
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.wranglerDeletes).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
+    expect(fakeRegistry.cfDeletes).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
   });
 
   test("reads a listing that takes several pages", async () => {
@@ -2718,7 +2588,7 @@ describe("eden destroy", () => {
       pageSize: 2,
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.wranglerDeletes).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
+    expect(fakeRegistry.cfDeletes).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
     // Three pages and the empty one that ends a listing, for destroy's first
     // read and again for the cleanup; then one empty listing after the
     // deletes and one for the final read.
@@ -2741,7 +2611,7 @@ describe("eden destroy", () => {
         : { status: 403, body: JSON.stringify({ errors: [{ code: "DENIED", message: "access denied" }] }) },
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.wranglerDeletes).toContain(other);
+    expect(fakeRegistry.cfDeletes).toContain(other);
     expect(new Set(registryDeletes())).toEqual(new Set([snapshot, other]));
     expect(fakeRegistry.credentialCalls).toBe(1);
     const result = JSON.parse(output[0] as string) as Record<string, unknown>;
@@ -2796,7 +2666,7 @@ describe("eden destroy", () => {
     });
     expect(exitCode).toBe(1);
     // Without a credential for this account nothing is listed, so nothing is deleted.
-    expect(fakeRegistry.wranglerDeletes).toEqual(credentialAccountId === undefined ? [destroyRegistryImage, snapshot] : []);
+    expect(fakeRegistry.cfDeletes).toEqual(credentialAccountId === undefined ? [destroyRegistryImage, snapshot] : []);
     expect(fakeRegistry.registryRequests.map((request) => request.method)).toEqual(
       // A listing is a page and the empty page that ends it: destroy's first
       // read and the cleanup's, then after the delete the cleanup's and the final read's.
@@ -2809,13 +2679,13 @@ describe("eden destroy", () => {
     expect(result).not.toHaveProperty("registryObjectsKept");
   });
 
-  test("sends no delete of its own when Wrangler deletes every tag", async () => {
+  test("sends no delete of its own when cf deletes every tag", async () => {
     const { root } = await createDeployedFixture();
     const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
       entries: { [destroyRegistryRepository]: ["candidate", "rootfs-set-custom"] },
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.wranglerDeletes).toHaveLength(2);
+    expect(fakeRegistry.cfDeletes).toHaveLength(2);
     expect(fakeRegistry.credentialCalls).toBe(1);
     expect(registryDeletes()).toEqual([]);
     const result = JSON.parse(output[0] as string) as Record<string, unknown>;
@@ -2824,20 +2694,20 @@ describe("eden destroy", () => {
   });
 
   test.each([
-    ["Wrangler could not read the tag", (ref: string) => `Failed to retrieve info for ${ref}: 403 Forbidden`],
-    ["the registry answered Wrangler's delete with 500", (ref: string) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 500 Internal Server Error`],
-    ["Wrangler named another tag", () => `Failed to delete ${destroyRegistryRepository}:other (digest: sha256:${"0".repeat(64)}): 403 Forbidden`],
-  ] as const)("sends no delete of its own when %s", async (_name, wranglerFailure) => {
+    ["cf could not read the tag", (ref: string) => `Failed to retrieve info for ${ref}: 403 Forbidden`],
+    ["the registry answered cf's delete with 500", (ref: string) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 500 Internal Server Error`],
+    ["cf named another tag", () => `Failed to delete ${destroyRegistryRepository}:other (digest: sha256:${"0".repeat(64)}): 403 Forbidden`],
+  ] as const)("sends no delete of its own when %s", async (_name, cfFailure) => {
     const { root } = await createDeployedFixture();
     const snapshot = `${destroyRegistryRepository}:rootfs-snapshot-aaa`;
     const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
       entries: { [destroyRegistryRepository]: ["candidate", "rootfs-snapshot-aaa"] },
       deletable: (ref) => ref !== snapshot,
-      wranglerFailure,
+      cfFailure,
       answer: () => ({ status: 403, body: snapshotRefusal }),
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.wranglerDeletes).toContain(snapshot);
+    expect(fakeRegistry.cfDeletes).toContain(snapshot);
     expect(registryDeletes()).toEqual([]);
     expect(JSON.parse(output[0] as string)).toMatchObject({
       status: "failed",
@@ -2845,7 +2715,7 @@ describe("eden destroy", () => {
     });
   });
 
-  test("stops asking the registry after 60 seconds without an answer, and still asks Wrangler to delete every tag", async () => {
+  test("stops asking the registry after 60 seconds without an answer, and still asks cf to delete every tag", async () => {
     const { root } = await createDeployedFixture();
     const snapshotTags = ["rootfs-snapshot-a", "rootfs-snapshot-b", "rootfs-snapshot-c", "rootfs-snapshot-d"];
     const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
@@ -2855,8 +2725,8 @@ describe("eden destroy", () => {
     });
     expect(exitCode).toBe(1);
     // The second wait starts with 29,999.75 ms left; the tags after it are still deleted.
-    expect(fakeRegistry.wranglerDeletes).toHaveLength(6);
-    expect(fakeRegistry.wranglerDeletes.at(-1)).toBe(`${destroyRegistryRepository}:z-last`);
+    expect(fakeRegistry.cfDeletes).toHaveLength(6);
+    expect(fakeRegistry.cfDeletes.at(-1)).toBe(`${destroyRegistryRepository}:z-last`);
     expect(registryDeletes()).toHaveLength(2);
     expect(fakeRegistry.entries.get(destroyRegistryRepository)).toEqual(snapshotTags);
     const result = JSON.parse(output[0] as string) as { readonly error: { readonly remediation: string } };
@@ -2873,7 +2743,7 @@ describe("eden destroy", () => {
       answer: (ref) => ref.endsWith("-ok") ? { status: 403, body: snapshotRefusal } : "stall",
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.wranglerDeletes).toHaveLength(4);
+    expect(fakeRegistry.cfDeletes).toHaveLength(4);
     expect(registryDeletes()).toHaveLength(3);
     const result = JSON.parse(output[0] as string) as Record<string, unknown>;
     expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
@@ -2928,7 +2798,7 @@ describe("eden destroy", () => {
       json: false,
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.wranglerDeletes).toHaveLength(201);
+    expect(fakeRegistry.cfDeletes).toHaveLength(201);
     expect(registryDeletes()).toHaveLength(200);
     expect(fakeRegistry.credentialCalls).toBe(1);
     const lines = output.join("\n").split("\n");
@@ -3037,11 +2907,11 @@ describe("eden destroy", () => {
     expect(errors).toEqual([]);
   });
 
-  test("keeps the default Wrangler Worker deletion on the 120 second deadline", async () => {
+  test("keeps the default cf Worker deletion on the 120 second deadline", async () => {
     const { root } = await createDeployedFixture();
     const errors: string[] = [];
     const output: string[] = [];
-    const calls = await withFakeWrangler(async () => {
+    const calls = await withFakeCf(async () => {
       await expect(
         runEdenCli(
           ["destroy",
@@ -3071,10 +2941,7 @@ describe("eden destroy", () => {
 
     expect(calls).toEqual([
       {
-        args: [
-          "delete", "--name", "eve-destroy-fixture", "--force",
-          "--config", expect.stringMatching(/eden-wrangler-[^/]+\/wrangler\.json$/u),
-        ],
+        args: ["workers", "delete", "eve-destroy-fixture", "--force"],
         timeoutMs: 120_000,
       },
     ]);
@@ -4130,7 +3997,7 @@ describe("eden deploy in-place update", () => {
     } finally {
       fakeRegistry.active = false;
     }
-    expect(new Set(fakeRegistry.wranglerDeletes)).toEqual(new Set([priorImage, snapshot, other]));
+    expect(new Set(fakeRegistry.cfDeletes)).toEqual(new Set([priorImage, snapshot, other]));
     const result = JSON.parse(output[0] as string) as {
       readonly checks: readonly { readonly id: string; readonly status: string }[];
       readonly warnings: readonly { readonly id: string }[];
@@ -4188,7 +4055,7 @@ describe("eden deploy in-place update", () => {
     }
     expect(JSON.parse(output[0] as string)).toMatchObject({ ok: false, error: { code: "EVE_IMAGE_IDENTITY_MISMATCH" } });
     expect(operations).toEqual([]);
-    expect(fakeRegistry.wranglerDeletes).toEqual([]);
+    expect(fakeRegistry.cfDeletes).toEqual([]);
     expect(fakeRegistry.registryRequests).toEqual([]);
     const current = await realpath(join(root, ".eden", "eve-deploy", "targets", `preview-${updateName}`, "CURRENT"));
     expect(current).toContain("gen-prior");
@@ -4220,7 +4087,7 @@ describe("eden deploy in-place update", () => {
     } finally {
       fakeRegistry.active = false;
     }
-    expect(fakeRegistry.wranglerDeletes).toEqual([]);
+    expect(fakeRegistry.cfDeletes).toEqual([]);
     expect(fakeRegistry.registryRequests).toEqual([]);
     const result = JSON.parse(output[0] as string) as {
       readonly deployment: { readonly imageReference: string };
@@ -4542,15 +4409,15 @@ describe("eden deploy in-place update", () => {
       expect(promotedTag).not.toBe(priorTag);
       if (prior !== "own") {
         // The older image keeps its tag, so destroy can still remove it. Nothing is deleted.
-        expect(fakeRegistry.wranglerDeletes).toEqual([]);
+        expect(fakeRegistry.cfDeletes).toEqual([]);
         expect(registryDeletes()).toEqual([]);
         if (prior === "unrecorded") expect(fakeRegistry.registryRequests.slice(requestsBefore)).toEqual([]);
         expect(fakeRegistry.listed(repository)).toEqual(["candidate", promotedTag, manifest("c"), manifest("d"), manifest("e")]);
         expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).toBe("skipped");
       } else {
-        // Every request of the cleanup: a listing, what the tag names, Wrangler's delete of
+        // Every request of the cleanup: a listing, what the tag names, cf's delete of
         // that tag, and listings until the image has left. Eden sends no delete of its own.
-        expect(fakeRegistry.wranglerDeletes).toEqual([`${repository}:${priorTag}`]);
+        expect(fakeRegistry.cfDeletes).toEqual([`${repository}:${priorTag}`]);
         // A listing is two requests: its page, and the empty page that ends it.
         const listing = [`GET ${repository}`, `GET ${repository}`];
         expect(fakeRegistry.registryRequests.slice(requestsBefore).map((sent) => `${String(sent.method)} ${sent.ref}`)).toEqual([
@@ -4579,7 +4446,7 @@ describe("eden deploy in-place update", () => {
       const { repository } = await deploy("generation-two", manifest("c"));
       state.healthy = false;
       expect((await deploy("generation-three", manifest("d"))).code).not.toBe(0);
-      expect(fakeRegistry.wranglerDeletes).toEqual([]);
+      expect(fakeRegistry.cfDeletes).toEqual([]);
       expect(registryDeletes()).toEqual([]);
       expect(fakeRegistry.listed(repository)).toEqual(
         [...state.pushed.map((pushed) => pushed.slice(repository.length + 1)), manifest("c"), manifest("d")].sort(),
@@ -4661,7 +4528,7 @@ describe("eden deploy in-place update", () => {
       state.worldRetires = false;
       const second = await deploy("generation-three", manifest("d"));
       expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).toBe("failed");
-      expect(fakeRegistry.wranglerDeletes).toEqual([]);
+      expect(fakeRegistry.cfDeletes).toEqual([]);
       expect(registryDeletes()).toEqual([]);
       expect(fakeRegistry.listed(repository)).toEqual(expect.arrayContaining(["generation-pending", manifest("e"), manifest("c")]));
     } finally {

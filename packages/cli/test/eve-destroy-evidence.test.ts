@@ -2,7 +2,7 @@ import type * as ChildProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import type * as Https from "node:https";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -13,59 +13,68 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { runEdenCli } from "../src/index.js";
 
 /**
- * A stand-in for Cloudflare behind Eden's default destroy reader: Wrangler
- * (whoami, the registry credential, the deletes), the Cloudflare API
- * (Container applications, the Worker's deployments and settings), and the
- * registry. Resources live per account, so a read under another account
- * does not see them.
+ * A stand-in for Cloudflare behind Eden's default readers and writers: the
+ * cf CLI (the login, the Worker and Container application reads, the
+ * registry credential, the publish, the deletes) and the registry.
+ * Resources live per account, so a command under another account does not
+ * see them. cf's outputs are in the forms cf 1.0.0-rc.2 printed on
+ * 2026-11-20.
  */
 const cloud = vi.hoisted(() => {
-  type WorkerFailure = {
-    /** What "wrangler deployments list" prints on stderr before it exits 1. */
-    readonly stderr: string;
-    /** What the API answers for the Worker: no answer, or a status and body. */
-    readonly api: "network" | { readonly status: number; readonly body: string; readonly redirected?: boolean };
-  };
+  type CfResult = { readonly exitCode: number | null; readonly stdout?: string; readonly stderr?: string };
   const state = {
     active: false,
-    /** The account "wrangler whoami" names on its nth call, from 0. */
+    /** The account "cf auth whoami" names on its nth call, from 0. */
     whoami: (() => "account-test") as (nth: number) => string,
     whoamiCalls: 0,
-    /** The account Wrangler's own commands act on: the one whoami named last. */
-    wranglerAccount: "account-test",
+    /** The account cf's login names: the one whoami named last. */
+    loginAccount: "account-test",
     workers: new Set<string>(),
     containers: new Set<string>(),
     tags: [] as string[],
-    workerFailure: undefined as WorkerFailure | undefined,
-    /** Called before each read of the Worker, with the read's number from 0. */
+    /** When set, what "cf workers deployments list" prints and exits with. */
+    workerFailure: undefined as CfResult | undefined,
+    /** Called before each read of the Worker's deployments, with the read's number from 0. */
     onWorkerRead: (() => undefined) as (nth: number) => unknown,
     workerReads: 0,
-    /** How many deployments the API lists for a Worker that exists. */
+    /** How many deployments cf lists for a Worker that exists. */
     deployments: 1,
-    /** When set, the deployments the API lists, whatever they are. */
+    /** When set, the deployments cf lists, whatever they are. */
     deploymentEntries: undefined as readonly unknown[] | undefined,
-    /** When set, the API's whole answer to the Container applications read, given its true entries. */
-    containerAnswer: undefined as ((entries: string) => string) | undefined,
-    /** The status of the API's answer to the Container applications read. */
-    containerStatus: 200,
-    /** When set, the body of the API's 200 answer about a Worker that exists. */
-    workerAnswer: undefined as ((deployments: string) => string) | undefined,
+    /** When set, what "cf containers applications list" prints and exits with, given its true entries. */
+    containerAnswer: undefined as ((entries: string) => CfResult) | undefined,
     /** The plain-text bindings of the Worker: what the last publish stamped. */
     stamps: [] as { readonly type: string; readonly name: string; readonly text: string }[],
-    /** Called before each Wrangler command that changes the account. */
+    /** Called before each cf command that changes the account. */
     onMutation: (() => undefined) as () => void,
-    /** Called before each Wrangler read other than whoami. */
+    /** Called before each cf read other than whoami. */
     onRead: (() => undefined) as () => void,
-    apiAccounts: [] as string[],
-    /** CLOUDFLARE_ACCOUNT_ID as each changing Wrangler command received it. */
+    /** The account each cf read ran against. */
+    readAccounts: [] as string[],
+    /** CLOUDFLARE_ACCOUNT_ID as each changing cf command received it. */
     pinned: [] as (string | undefined)[],
     /** The registry repositories whose listing was asked for. */
     listed: new Set<string>(),
     deleted: [] as string[],
-    /** Each secret Wrangler uploaded, as account/worker/name. */
+    /** Each secret cf uploaded, as account/worker/name. */
     secrets: [] as string[],
-    /** Each image Wrangler pushed, as account/repository:tag. */
+    /** Each image cf pushed, as account/repository:tag. */
     pushed: [] as string[],
+    /** When set, how "cf deploy" exits 1: before it uploads anything, or with the Worker version live and no Container application. */
+    deployFailure: undefined as "before-upload" | "after-upload" | undefined,
+    /** Whether "cf containers applications create" fails. */
+    createFails: false,
+    /** Each Worker whose triggers cf deployed, as account/worker. */
+    triggers: [] as string[],
+    /** Each cf command: its arguments, the cloudflare.config.ts in its folder, and its environment. */
+    runs: [] as { readonly args: readonly string[]; readonly cwd: string; readonly config: string | undefined; readonly env: NodeJS.ProcessEnv }[],
+    /** The Durable Object namespace of the Container class, which is also its Container application's ID. */
+    namespace: "abcdef0123456789abcdef0123456789",
+    /** cf's error box for one Cloudflare API error. */
+    apiError: (code: number, message: string, status: string, path: string): CfResult => ({
+      exitCode: 1,
+      stderr: "\n┌ APIError\n│ [" + code + "] " + message + "\n│ " + status + " · HTTP " + path + "\n└\n",
+    }),
   };
   return state;
 });
@@ -98,6 +107,159 @@ vi.mock("node:https", async (importOriginal) => {
   };
 });
 
+/** What the fake cf does with one command, run in the folder and environment Eden gave it. */
+async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv): Promise<{ readonly exitCode: number | null; readonly stdout?: string; readonly stderr?: string }> {
+  const ok = (value: unknown) => ({ exitCode: 0, stdout: JSON.stringify(value, null, 2) + "\n" });
+  const line = args.join(" ");
+  const command = [
+    "auth whoami", "workers deployments list", "workers versions get", "workers versions list", "workers list",
+    "workers delete", "workers secrets bulk-edit", "workers triggers deploy", "containers applications list",
+    "containers applications get", "containers applications create", "containers applications delete",
+    "containers registries credentials", "containers images delete", "containers push", "deploy",
+  ].find((known) => line === known || line.startsWith(known + " "));
+  let config: string | undefined;
+  try {
+    config = readFileSync(join(cwd, "cloudflare.config.ts"), "utf8");
+  } catch {
+    config = undefined;
+  }
+  cloud.runs.push({ args, cwd, config, env });
+  if (command === "auth whoami") {
+    cloud.loginAccount = cloud.whoami(cloud.whoamiCalls++);
+    return ok({ authenticated: true, tokenValid: true, accounts: [{ id: cloud.loginAccount }] });
+  }
+  // cf acts on CLOUDFLARE_ACCOUNT_ID when it is set, else on its login's account.
+  const pinned = env.CLOUDFLARE_ACCOUNT_ID || undefined;
+  const flag = (name: string): string => args[args.indexOf(name) + 1] ?? "";
+  if (command === "workers deployments list") {
+    const account = pinned ?? cloud.loginAccount;
+    cloud.readAccounts.push(account);
+    await cloud.onWorkerRead(cloud.workerReads++);
+    if (cloud.workerFailure !== undefined) return cloud.workerFailure;
+    if (!cloud.workers.has(account + "/" + flag("--worker"))) {
+      return cloud.apiError(10007, "This Worker does not exist on your account.", "404 Not Found", "/accounts/" + account + "/workers/scripts/" + flag("--worker") + "/deployments");
+    }
+    return ok({
+      deployments: cloud.deploymentEntries ?? Array.from({ length: cloud.deployments }, (_, nth) => ({
+        id: "deployment-" + nth,
+        source: "cf_cli",
+        versions: [{ version_id: "00000000-0000-4000-8000-00000000000" + nth, percentage: 100 }],
+        created_on: "2026-11-20T11:38:3" + nth + ".845435Z",
+      })),
+    });
+  }
+  const reads = ["workers versions get", "workers versions list", "containers applications list", "containers applications get", "workers list", "containers registries credentials"];
+  if (reads.includes(command)) {
+    cloud.onRead();
+    const account = pinned ?? cloud.loginAccount;
+    cloud.readAccounts.push(account);
+    if (command === "workers versions get") {
+      return ok({
+        id: args[3],
+        bindings: [...cloud.stamps, { type: "durable_object_namespace", name: "EVE_CONTAINER", class_name: "EveHostDurableContainer", namespace_id: cloud.namespace }],
+      });
+    }
+    if (command === "workers versions list") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify([{ id: "00000000-0000-4000-8000-000000000001", number: 1 }]),
+        stderr: 'result_info: {"page":1,"per_page":10,"count":1,"total_count":1}\n',
+      };
+    }
+    if (command === "containers applications list") {
+      const entries = [...cloud.containers].flatMap((entry) => {
+        const [owner, rest = ""] = entry.split("/");
+        const [application, id] = rest.split("#");
+        return owner === account && application === flag("--name") ? [{ id, name: application }] : [];
+      });
+      return cloud.containerAnswer?.(JSON.stringify(entries)) ?? ok(entries);
+    }
+    if (command === "containers applications get") {
+      return [...cloud.containers].some((entry) => entry.startsWith(account + "/") && entry.endsWith("#" + args[3]))
+        ? ok({ id: args[3], scheduling_policy: "durable_object", durable_objects: { namespace_id: cloud.namespace } })
+        : cloud.apiError(1609, "Container application not found: " + args[3], "404 Not Found", "/accounts/" + account + "/containers/applications/" + args[3]);
+    }
+    if (command === "workers list") return ok([{ name: "another", subdomain: { enabled: true, url: "https://another.account.workers.dev" } }]);
+    return ok({ account_id: account, registry_host: "registry.cloudflare.com", username: "v1", password: "registry-password" });
+  }
+  cloud.onMutation();
+  cloud.pinned.push(pinned);
+  const account = pinned ?? cloud.loginAccount;
+  if (command === "deploy" || command === "workers triggers deploy") {
+    const output = join(cwd, ".cloudflare/output/v1");
+    const config = JSON.parse(readFileSync(join(output, "config.json"), "utf8")) as { readonly settings?: { readonly accountId?: string } };
+    const worker = JSON.parse(readFileSync(join(output, "workers/default/worker.config.json"), "utf8")) as {
+      readonly name: string;
+      readonly env: Readonly<Record<string, { readonly type: string; readonly value?: unknown }>>;
+    };
+    // cf takes the Build Output's account before CLOUDFLARE_ACCOUNT_ID.
+    const published = config.settings?.accountId ?? account;
+    if (command === "workers triggers deploy") {
+      cloud.triggers.push(published + "/" + worker.name);
+      return { exitCode: 0 };
+    }
+    if (cloud.deployFailure === "before-upload") return { exitCode: 1, stderr: "\n┌ Error\n│ fetch failed\n└\n" };
+    cloud.stamps = Object.entries(worker.env).flatMap(([name, binding]) =>
+      binding.type === "text" ? [{ type: "plain_text", name, text: String(binding.value) }] : []
+    );
+    if (args.includes("--secrets-file")) {
+      for (const name of Object.keys(JSON.parse(readFileSync(join(cwd, flag("--secrets-file")), "utf8")) as object)) {
+        cloud.secrets.push(published + "/" + worker.name + "/" + name);
+      }
+    }
+    cloud.workers.add(published + "/" + worker.name);
+    if (cloud.deployFailure === "after-upload") {
+      // What cf 1.0.0-rc.2 printed on 2026-11-20 when Cloudflare did not show the uploaded version in time.
+      return {
+        exitCode: 1,
+        stderr: "\n┌ Error\n│ The Worker version was deployed, but its Durable Object-managed Container\n│ application settings were not fully applied. Re-run the same `cf deploy`\n│ command to retry and finish deployment.\n└\n",
+      };
+    }
+    cloud.containers.add(published + "/" + worker.name + "-container#" + cloud.namespace);
+    cloud.triggers.push(published + "/" + worker.name);
+    return { exitCode: 0 };
+  }
+  if (command === "containers applications create") {
+    if (cloud.createFails) return cloud.apiError(1000, "Internal error", "500 Internal Server Error", "/accounts/" + account + "/containers/applications");
+    const body = JSON.parse(flag("--body")) as { readonly name: string; readonly durable_objects: { readonly namespace_id: string } };
+    cloud.containers.add(account + "/" + body.name + "#" + body.durable_objects.namespace_id);
+    return ok({ id: body.durable_objects.namespace_id, name: body.name });
+  }
+  if (command === "workers secrets bulk-edit") {
+    for (const name of Object.keys(JSON.parse(readFileSync(join(cwd, flag("--secrets").slice(1)), "utf8")) as object)) {
+      cloud.secrets.push(account + "/" + flag("--worker") + "/" + name);
+    }
+    return { exitCode: 0 };
+  }
+  if (command === "containers push") {
+    cloud.pushed.push(account + "/" + flag("--tag"));
+    return { exitCode: 0 };
+  }
+  if (command === "workers delete") {
+    if (!cloud.workers.delete(account + "/" + args[2])) {
+      return cloud.apiError(10007, "This Worker does not exist on your account.", "404 Not Found", "/accounts/" + account + "/workers/workers/" + args[2]);
+    }
+    cloud.deleted.push("worker:" + account + "/" + args[2]);
+    return { exitCode: 0 };
+  }
+  if (command === "containers applications delete") {
+    const entry = [...cloud.containers].find((present) => present.startsWith(account + "/") && present.endsWith("#" + args[3]));
+    if (entry === undefined) {
+      return cloud.apiError(1609, '{"error":"APPLICATION_NOT_FOUND"}', "404 Not Found", "/accounts/" + account + "/containers/applications/" + args[3]);
+    }
+    cloud.containers.delete(entry);
+    cloud.deleted.push("container:" + entry);
+    return ok({ message: "Application " + args[3] + " has been deleted." });
+  }
+  if (command === "containers images delete") {
+    const tag = (args[3] ?? "").split(":")[1] ?? "";
+    cloud.tags = cloud.tags.filter((present) => present !== tag);
+    cloud.deleted.push("image:" + args[3]);
+    return { exitCode: 0 };
+  }
+  return { exitCode: 1, stderr: "Unexpected cf call: " + args.join(" ") };
+}
+
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof ChildProcess>();
   const execFile = ((...execArgs: Parameters<typeof actual.execFile>) =>
@@ -113,164 +275,31 @@ vi.mock("node:child_process", async (importOriginal) => {
           stderr: "",
         };
       }
-      if (!cloud.active || !/wrangler/u.test(argv[0] ?? "")) {
-        return promisify(actual.execFile)(file, argv, options);
-      }
-      const args = argv.slice(1);
-      if (args[0] === "whoami") {
-        cloud.wranglerAccount = cloud.whoami(cloud.whoamiCalls++);
-        return { stdout: JSON.stringify({ loggedIn: true, accounts: [{ id: cloud.wranglerAccount }] }), stderr: "" };
-      }
-      if (args[0] === "deployments" && args[1] === "list") {
-        await cloud.onWorkerRead(cloud.workerReads++);
-        if (cloud.workerFailure !== undefined) {
-          throw Object.assign(new Error("Wrangler failed."), { stderr: cloud.workerFailure.stderr });
-        }
-        if (cloud.workers.has(cloud.wranglerAccount + "/" + args[3])) {
-          return { stdout: JSON.stringify([{ id: "deployment-1" }]), stderr: "" };
-        }
-        // Wrangler 4.147.0's answer for a Worker that does not exist, read on 2026-11-19.
-        throw Object.assign(new Error("Wrangler failed."), {
-          stderr: "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mA request to the Cloudflare API (/accounts/" +
-            cloud.wranglerAccount + "/workers/scripts/" + args[3] + "/deployments) failed.\u001b[0m\n\n  This Worker does not exist on your account. [code: 10007]\n",
-        });
-      }
-      cloud.onRead();
-      // Wrangler acts on CLOUDFLARE_ACCOUNT_ID when it is set, else on its login's account.
-      const account = (options as { readonly env?: NodeJS.ProcessEnv }).env?.CLOUDFLARE_ACCOUNT_ID || cloud.wranglerAccount;
-      if (args[1] === "registries" && args[2] === "credentials") {
-        return {
-          stdout: JSON.stringify({
-            account_id: account,
-            registry_host: "registry.cloudflare.com",
-            username: "v1",
-            password: "registry-password",
-          }),
-          stderr: "",
-        };
-      }
-      if (args[0] === "containers" && args[1] === "info" && [...cloud.containers].some((entry) => entry.startsWith(account + "/") && entry.endsWith("#" + args[2]))) {
-        return {
-          stdout: JSON.stringify({ scheduling_policy: "durable_object", durable_objects: { namespace_id: "namespace-test" } }),
-          stderr: "",
-        };
-      }
-      throw new Error("Unexpected Wrangler call: " + args.join(" "));
+      return promisify(actual.execFile)(file, argv, options);
     },
   });
   return {
     ...actual,
     execFile,
     spawn: ((...spawnArgs: Parameters<typeof actual.spawn>) => {
-      if (!cloud.active) return actual.spawn(...spawnArgs);
-      const args = (spawnArgs[1] as readonly string[]).slice(1);
-      cloud.onMutation();
-      // Wrangler acts on CLOUDFLARE_ACCOUNT_ID when it is set, else on its login's account.
-      const pinned = (spawnArgs[2] as { readonly env?: NodeJS.ProcessEnv }).env?.CLOUDFLARE_ACCOUNT_ID;
-      cloud.pinned.push(pinned);
-      const account = pinned || cloud.wranglerAccount;
-      let exitCode = 1;
-      if (args[0] === "deploy") {
-        // What Wrangler would publish: the plain-text vars of the config Eden wrote.
-        const config = JSON.parse(readFileSync(args[2] ?? "", "utf8")) as { readonly account_id?: string; readonly vars?: Readonly<Record<string, unknown>> };
-        cloud.stamps = Object.entries(config.vars ?? {}).flatMap(([name, text]) =>
-          typeof text === "string" ? [{ type: "plain_text", name, text }] : []
-        );
-        // Wrangler 4.147.0 takes a config's account_id before CLOUDFLARE_ACCOUNT_ID.
-        const published = config.account_id ?? account;
-        cloud.workers.add(published + "/" + args[4]);
-        cloud.containers.add(published + "/" + args[4] + "-container#container-new");
-        exitCode = 0;
-      } else if (args[0] === "secret" && args[1] === "put") {
-        cloud.secrets.push(account + "/" + args[4] + "/" + args[2]);
-        exitCode = 0;
-      } else if (args[0] === "containers" && args[1] === "push") {
-        cloud.pushed.push(account + "/" + args[2]);
-        exitCode = 0;
-      } else if (args[0] === "delete" && args[1] === "--name") {
-        exitCode = cloud.workers.delete(account + "/" + args[2]) ? 0 : 1;
-        if (exitCode === 0) cloud.deleted.push("worker:" + account + "/" + args[2]);
-      } else if (args[0] === "containers" && args[1] === "delete") {
-        for (const entry of [...cloud.containers]) {
-          if (entry.endsWith("#" + args[2])) {
-            cloud.containers.delete(entry);
-            cloud.deleted.push("container:" + entry);
-            exitCode = 0;
-          }
-        }
-      } else if (args[0] === "containers" && args[1] === "images" && args[2] === "delete") {
-        const tag = (args[3] ?? "").split(":")[1] ?? "";
-        cloud.tags = cloud.tags.filter((present) => present !== tag);
-        cloud.deleted.push("image:" + args[3]);
-        exitCode = 0;
-      }
+      const argv = spawnArgs[1] as readonly string[];
+      // Eden runs cf as `node <cf's bin/cf> ...args`.
+      if (!cloud.active || !/[\\/]cf[\\/]bin[\\/]cf$/u.test(argv[0] ?? "")) return actual.spawn(...spawnArgs);
+      const options = spawnArgs[2] as { readonly cwd: string; readonly env: NodeJS.ProcessEnv };
       const child = Object.assign(new EventEmitter(), {
         stdout: new EventEmitter(),
         stderr: new EventEmitter(),
-        stdin: { end: () => undefined },
         kill: () => true,
       });
-      setImmediate(() => child.emit("close", exitCode));
+      void cf(argv.slice(1), options.cwd, options.env).then((result) => {
+        if (result.stdout !== undefined) child.stdout.emit("data", Buffer.from(result.stdout));
+        if (result.stderr !== undefined) child.stderr.emit("data", Buffer.from(result.stderr));
+        child.emit("close", result.exitCode);
+      });
       return child;
     }) as unknown as typeof actual.spawn,
   };
 });
-
-const json = (status: number, body: unknown): Response =>
-  new Response(typeof body === "string" ? body : JSON.stringify(body), { status });
-
-async function cloudflareApi(input: string | URL | Request, init?: RequestInit): Promise<Response> {
-  const url = new URL(input instanceof Request ? input.url : String(input));
-  const [, , , , account = "", ...rest] = url.pathname.split("/");
-  cloud.apiAccounts.push(account);
-  if (rest.join("/") === "containers/applications") {
-    const name = url.searchParams.get("name");
-    const entries = [...cloud.containers].flatMap((entry) => {
-      const [owner, rest2 = ""] = entry.split("/");
-      const [application, id] = rest2.split("#");
-      return owner === account && application === name ? [{ id, name: application }] : [];
-    });
-    return json(cloud.containerStatus, cloud.containerAnswer?.(JSON.stringify(entries)) ??
-      { success: true, errors: [], messages: [], result: entries, result_info: {} });
-  }
-  if (rest.join("/") === "workers/subdomain") return json(200, { success: true, errors: [], messages: [], result: { subdomain: "account" } });
-  if (rest[0] === "workers" && rest[1] === "scripts" && rest[3] === "deployments") {
-    await cloud.onWorkerRead(cloud.workerReads++);
-    if (cloud.workerFailure?.api === "network") throw new TypeError("fetch failed");
-    if (cloud.workerFailure !== undefined) {
-      const answer = json(cloud.workerFailure.api.status, cloud.workerFailure.api.body);
-      if (!cloud.workerFailure.api.redirected) return answer;
-      // What fetch does with a redirect: refuse it when asked to, else return the page it led to.
-      if (init?.redirect === "error") throw new TypeError("fetch failed");
-      Object.defineProperty(answer, "redirected", { value: true });
-      return answer;
-    }
-    if (cloud.workers.has(account + "/" + rest[2])) {
-      const deployments = cloud.deploymentEntries ??
-        Array.from({ length: cloud.deployments }, (_, nth) => ({ id: "deployment-" + nth }));
-      return json(200, cloud.workerAnswer?.(JSON.stringify(deployments)) ??
-        { success: true, errors: [], messages: [], result: { deployments } });
-    }
-  }
-  if (rest[0] === "workers" && rest[1] === "scripts" && rest[3] === "settings" && cloud.workers.has(account + "/" + rest[2])) {
-    return json(200, {
-      success: true,
-      result: {
-        bindings: [
-          ...cloud.stamps,
-          { type: "durable_object_namespace", name: "EVE_CONTAINER", namespace_id: "namespace-test" },
-        ],
-      },
-    });
-  }
-  // The API's answer for a Worker that does not exist, read on 2026-11-19.
-  return json(404, {
-    result: null,
-    success: false,
-    errors: [{ code: 10007, message: "This Worker does not exist on your account." }],
-    messages: [],
-  });
-}
 
 const roots: string[] = [];
 const targetKey = "preview-eve-destroy-fixture-" + createHash("sha256")
@@ -344,7 +373,7 @@ beforeEach(() => {
     active: true,
     whoami: () => "account-test",
     whoamiCalls: 0,
-    wranglerAccount: "account-test",
+    loginAccount: "account-test",
     workers: new Set<string>(),
     containers: new Set<string>(),
     tags: [],
@@ -354,83 +383,67 @@ beforeEach(() => {
     deployments: 1,
     deploymentEntries: undefined,
     containerAnswer: undefined,
-    containerStatus: 200,
-    workerAnswer: undefined,
     stamps: [{ type: "plain_text", name: "EDEN_EVE_DEPLOYMENT_ID", text: "eve-deploy-test" }],
     onMutation: () => undefined,
     onRead: () => undefined,
-    apiAccounts: [],
+    readAccounts: [],
     pinned: [],
+    deployFailure: undefined,
+    createFails: false,
+    triggers: [],
+    runs: [],
     listed: new Set<string>(),
     deleted: [],
     secrets: [],
     pushed: [],
   });
-  // Keeps the reader away from this machine's Wrangler login.
-  vi.stubEnv("CLOUDFLARE_API_TOKEN", "test-token");
+  vi.stubEnv("CLOUDFLARE_API_TOKEN", "");
   vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "");
-  vi.stubGlobal("fetch", cloudflareApi);
 });
 
 afterEach(async () => {
   cloud.active = false;
   vi.unstubAllEnvs();
-  vi.unstubAllGlobals();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-/** Failed Worker lookups. The stderr texts marked "captured" are Wrangler 4.147.0's own, read on 2026-11-19. */
+const deploymentsPath = "/accounts/account-test/workers/scripts/eve-destroy-fixture/deployments";
+const missingWorker = cloud.apiError(10007, "This Worker does not exist on your account.", "404 Not Found", deploymentsPath);
+/**
+ * What cf can print for the Worker's deployments that is not Cloudflare's
+ * own answer that this Worker does not exist. The authentication error is
+ * the form cf 1.0.0-rc.2 printed on 2026-11-20.
+ */
 const failures = {
-  "a missing Wrangler configuration file": {
-    stderr: "✘ [ERROR] Wrangler configuration file not found",
-    api: { status: 200, body: "not json" },
+  "an authentication error (captured form)": {
+    exitCode: 1,
+    stderr: cloud.apiError(10000, "Authentication error", "403 Forbidden", deploymentsPath).stderr + "→ Check your API token permissions\n",
   },
-  "an authentication error on an account whose id contains 10007 (captured form)": {
-    stderr: "✘ [ERROR] A request to the Cloudflare API (/accounts/ab10007cdef0123456789abcdef01234/workers/scripts/eve-destroy-fixture/deployments) failed.\n\n  Authentication error [code: 10000]\n",
-    api: { status: 403, body: JSON.stringify({ success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null }) },
-  },
-  "a gateway's 404 Not Found page": {
-    stderr: "✘ [ERROR] Received a malformed response from the API\n\n  <html><head><title>404 Not Found</title></head></html>\n",
-    api: { status: 404, body: "<html><head><title>404 Not Found</title></head></html>" },
-  },
-  "a server error that mentions a missing resource": {
-    stderr: "✘ [ERROR] A request to the Cloudflare API failed.\n\n  upstream does not exist [code: 10013]\n",
-    api: { status: 502, body: JSON.stringify({ success: false, errors: [{ code: 10013, message: "upstream does not exist" }], messages: [], result: null }) },
-  },
-  "a network failure (captured)": {
-    stderr: "▲ [WARNING] A fetch request failed, likely due to a connectivity issue.\n\n✘ [ERROR] fetch failed\n",
-    api: "network",
-  },
-  "an authentication error (captured)": {
-    stderr: "✘ [ERROR] A request to the Cloudflare API (/accounts/0123456789abcdef0123456789abcdef/workers/scripts/eve-destroy-fixture/deployments) failed.\n\n  Authentication error [code: 10000]\n",
-    api: { status: 403, body: JSON.stringify({ success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null }) },
-  },
-  "a 404 with another error code": {
-    stderr: "✘ [ERROR] A request to the Cloudflare API failed.\n\n  No route for that URI [code: 10404]\n",
-    api: { status: 404, body: JSON.stringify({ success: false, errors: [{ code: 10404, message: "No route for that URI" }], messages: [], result: null }) },
-  },
-  "code 10007 on a status other than 404": {
-    stderr: "✘ [ERROR] A request to the Cloudflare API failed.\n\n  Bad gateway [code: 10007]\n",
-    api: { status: 502, body: JSON.stringify({ success: false, errors: [{ code: 10007, message: "Bad gateway" }], messages: [], result: null }) },
-  },
-} as const;
-
-const missingWorker = { code: 10007, message: "This Worker does not exist on your account." };
-/** Answers that carry code 10007 and are still not the API's answer for a missing Worker. */
-const contradictions = {
+  "an authentication error on an account whose id contains 10007": cloud.apiError(
+    10000, "Authentication error", "403 Forbidden", "/accounts/ab10007cdef0123456789abcdef01234/workers/scripts/eve-destroy-fixture/deployments",
+  ),
+  "a 404 with another error code": cloud.apiError(10404, "No route for that URI", "404 Not Found", deploymentsPath),
+  "code 10007 on a status other than 404": cloud.apiError(10007, "Bad gateway", "502 Bad Gateway", deploymentsPath),
+  "the missing-Worker answer for another Worker's path": cloud.apiError(
+    10007, "This Worker does not exist on your account.", "404 Not Found", "/accounts/account-test/workers/scripts/another/deployments",
+  ),
+  "the missing-Worker answer for another account's path": cloud.apiError(
+    10007, "This Worker does not exist on your account.", "404 Not Found", "/accounts/account-other/workers/scripts/eve-destroy-fixture/deployments",
+  ),
   "an error that names code 10000 and code 10007": {
-    status: 404,
-    body: '{"result":null,"success":false,"errors":[{"code":10000,"code":10007,"message":"Authentication error"}],"messages":[]}',
+    exitCode: 1,
+    stderr: "\n┌ APIError\n│ [10000] Authentication error\n│ [10007] This Worker does not exist on your account.\n│ 404 Not Found · HTTP " + deploymentsPath + "\n└\n",
   },
-  "a 10007 error beside a list of deployments": {
-    status: 404,
-    body: JSON.stringify({ result: { deployments: [{ id: "deployment-1" }] }, success: false, errors: [missingWorker], messages: [] }),
-  },
-  "a 10007 answer reached through a redirect": {
-    status: 404,
-    body: JSON.stringify({ result: null, success: false, errors: [missingWorker], messages: [] }),
-    redirected: true,
-  },
+  "the missing-Worker answer twice": { exitCode: 1, stderr: (missingWorker.stderr ?? "").repeat(2) },
+  "the missing-Worker answer after a line cf never printed there": { exitCode: 1, stderr: "warning: using a cached answer\n" + (missingWorker.stderr ?? "") },
+  "the missing-Worker answer beside a list of deployments": { exitCode: 1, stdout: '{"deployments":[{"id":"deployment-1"}]}', stderr: missingWorker.stderr },
+  "the missing-Worker answer and exit code 2": { exitCode: 2, stderr: missingWorker.stderr },
+  "the missing-Worker answer from a cf that was killed": { exitCode: null, stderr: missingWorker.stderr },
+  "the missing-Worker answer and exit code 0": { exitCode: 0, stderr: missingWorker.stderr },
+  "a network failure": { exitCode: 1, stderr: "\n┌ Error\n│ fetch failed\n└\n" },
+  "a gateway's 404 Not Found page": { exitCode: 1, stderr: "\n┌ Error\n│ <html><head><title>404 Not Found</title></head></html>\n└\n" },
+  "output that is not JSON": { exitCode: 0, stdout: "not json" },
+  "no output at all": { exitCode: 1 },
 } as const;
 
 /** A project that builds and boots, for a deploy whose publish step is Eden's own. */
@@ -476,7 +489,7 @@ async function writeBuild(snapshotRoot: string): Promise<void> {
 
 type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly remediation?: string }[] };
 
-/** A deploy that publishes through Eden's own Wrangler call and its own read afterwards. */
+/** A deploy that publishes through Eden's own cf calls and its own read afterwards. */
 async function deploy(
   root: string,
   generationId = "generation-one",
@@ -542,20 +555,6 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     },
   );
 
-  test.each(Object.keys(contradictions) as (keyof typeof contradictions)[])(
-    "%s is not an absent Worker: destroy stops and changes nothing",
-    async (name) => {
-      const { root, current } = await deployedProject();
-      cloud.workers.add(worker);
-      cloud.containers.add(container);
-      cloud.workerFailure = { stderr: "", api: contradictions[name] };
-      const { exitCode, result } = await destroy(root);
-      expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
-      expect(cloud.deleted).toEqual([]);
-      await expect(lstat(current)).resolves.toBeDefined();
-    },
-  );
-
   test("a Worker with no deployment still exists: destroy deletes it", async () => {
     const { root, current } = await deployedProject();
     cloud.workers.add(worker);
@@ -567,12 +566,12 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(lstat(current)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test("every Wrangler delete is pinned to the recorded account, so a login that changes after the reads cannot move it", async () => {
+  test("every cf delete is pinned to the recorded account, so a login that changes after the reads cannot move it", async () => {
     const { root } = await deployedProject();
     cloud.workers.add(worker).add("account-other/eve-destroy-fixture");
     cloud.containers.add(container);
     cloud.tags = ["candidate"];
-    cloud.onMutation = () => { cloud.wranglerAccount = "account-other"; };
+    cloud.onMutation = () => { cloud.loginAccount = "account-other"; };
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
     expect(cloud.pinned).toEqual(["account-test", "account-test", "account-test"]);
@@ -580,19 +579,19 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     expect([...cloud.workers]).toEqual(["account-other/eve-destroy-fixture"]);
   });
 
-  test("a login that changes after whoami cannot move a Wrangler read to another account", async () => {
+  test("a login that changes after whoami cannot move a cf read to another account", async () => {
     const { root, current } = await deployedProject();
     cloud.workers.add(worker);
     cloud.containers.add(container);
     cloud.tags = ["candidate"];
-    cloud.onRead = () => { cloud.wranglerAccount = "account-other"; };
+    cloud.onRead = () => { cloud.loginAccount = "account-other"; };
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
     expect(cloud.deleted).toEqual(["worker:" + worker, "container:" + container, "image:" + repository + ":candidate"]);
     await expect(lstat(current)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test("the API's own 10007 answer is an absent Worker: the rest is deleted and CURRENT is cleared", async () => {
+  test("Cloudflare's own 10007 answer for this Worker is an absent Worker: the rest is deleted and CURRENT is cleared", async () => {
     const { root, current } = await deployedProject();
     cloud.containers.add(container);
     cloud.tags = ["candidate"];
@@ -609,14 +608,15 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(lstat(current)).resolves.toBeDefined();
   });
 
-  test("each read asks whoami once and sends every Cloudflare API read to that account", async () => {
+  test("each read asks whoami once and sends every cf read to that account", async () => {
     const { root } = await deployedProject();
     cloud.containers.add(container);
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
     // Two reads: before the deletes and after them.
     expect(cloud.whoamiCalls).toBe(2);
-    expect(cloud.apiAccounts).toEqual(Array(4).fill("account-test"));
+    expect(cloud.readAccounts.length).toBeGreaterThanOrEqual(4);
+    expect(new Set(cloud.readAccounts)).toEqual(new Set(["account-test"]));
   });
 
   test("a login that changes between whoami calls cannot move the Container read to another account", async () => {
@@ -629,7 +629,7 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     // it. The second whoami names another account: nothing is read there,
     // and absence is unproven.
     expect(cloud.deleted).toContain("container:" + container);
-    expect(cloud.apiAccounts.every((account) => account === "account-test")).toBe(true);
+    expect(cloud.readAccounts.every((account) => account === "account-test")).toBe(true);
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
     await expect(lstat(current)).resolves.toBeDefined();
   });
@@ -640,7 +640,7 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     cloud.whoami = () => "account-other";
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_OWNERSHIP_UNPROVEN" });
-    expect({ api: cloud.apiAccounts, deleted: cloud.deleted }).toEqual({ api: [], deleted: [] });
+    expect({ reads: cloud.readAccounts, deleted: cloud.deleted }).toEqual({ reads: [], deleted: [] });
     await expect(lstat(current)).resolves.toBeDefined();
   });
 
@@ -691,7 +691,7 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_RECORD_UNPROVEN" });
     expect(result.error?.remediation).toContain("eden destroy");
-    expect({ whoami: cloud.whoamiCalls, api: cloud.apiAccounts, deleted: cloud.deleted }).toEqual({ whoami: 0, api: [], deleted: [] });
+    expect({ whoami: cloud.whoamiCalls, reads: cloud.readAccounts, deleted: cloud.deleted }).toEqual({ whoami: 0, reads: [], deleted: [] });
     await expect(lstat(other.current)).resolves.toBeDefined();
   });
 
@@ -762,24 +762,30 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
   });
 
   test.each([
-    ["an empty list", "[]"],
-    ["another application", '[{"id":"container-999","name":"another-container"}]'],
-  ] as const)("a Container answer that names result twice, the live application then %s, is no proof of absence", async (_name, second) => {
+    ["an authentication error", () => cloud.apiError(10000, "Authentication error", "403 Forbidden", "/accounts/account-test/containers/applications?name=eve-destroy-fixture-container")],
+    ["an empty list and exit code 1", () => ({ exitCode: 1, stdout: "[]" })],
+    ["an empty list from a cf that was killed", () => ({ exitCode: null, stdout: "[]" })],
+    ["an object instead of a list", () => ({ exitCode: 0, stdout: '{"result":[]}' })],
+    ["an empty list and paging facts cf printed twice", () => ({ exitCode: 0, stdout: "[]", stderr: 'result_info: {"count":0}\nresult_info: {"count":1}\n' })],
+    ["an empty list and paging facts that are not JSON", () => ({ exitCode: 0, stdout: "[]", stderr: "result_info: <html>\n" })],
+    ["100 other applications and no paging facts", () => ({ exitCode: 0, stdout: JSON.stringify(Array.from({ length: 100 }, (_, nth) => ({ id: "other-" + nth, name: "another-container" }))) })],
+    ["the live application and exit code 1", (entries: string) => ({ exitCode: 1, stdout: entries })],
+  ] as const)("a Container answer of %s is no proof of absence and names nothing to delete", async (_name, answer) => {
     const { root, current } = await deployedProject();
     cloud.containers.add(container);
     cloud.tags = ["candidate"];
-    cloud.containerAnswer = (entries) => '{"success":true,"errors":[],"messages":[],"result":' + entries + ',"result":' + second + ',"result_info":{}}';
+    cloud.containerAnswer = answer;
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
     expect(cloud.deleted).toEqual([]);
     await expect(lstat(current)).resolves.toBeDefined();
   });
 
-  test("a Container answer that turns ambiguous after the deletes leaves CURRENT in place", async () => {
+  test("a Container answer that cannot be read after the deletes leaves CURRENT in place", async () => {
     const { root, current } = await deployedProject();
     cloud.containers.add(container);
     cloud.onMutation = () => {
-      cloud.containerAnswer = (entries) => '{"success":true,"errors":[],"messages":[],"result":[{"id":"container-123","name":"eve-destroy-fixture-container"}],"result":' + entries + ',"result_info":{}}';
+      cloud.containerAnswer = () => ({ exitCode: 1, stdout: "[]" });
     };
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
@@ -811,22 +817,6 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(run()).resolves.toEqual({ exitCode: 0, status: "absent" });
   });
 
-  test.each([
-    ["status 206", 206, '{"success":true,"result":[],"errors":[],"messages":[],"result_info":{}}'],
-    ["an authentication error beside success", 200, '{"success":true,"result":[],"errors":[{"code":10000,"message":"Authentication error"}],"messages":[],"result_info":{}}'],
-    ["no errors field", 200, '{"success":true,"result":[],"result_info":{}}'],
-  ] as const)("an empty Container list with %s is no proof of absence", async (_name, status, body) => {
-    const { root, current } = await deployedProject();
-    cloud.containers.add(container);
-    cloud.tags = ["candidate"];
-    cloud.containerStatus = status;
-    cloud.containerAnswer = () => body;
-    const { exitCode, result } = await destroy(root);
-    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
-    expect(cloud.deleted).toEqual([]);
-    await expect(lstat(current)).resolves.toBeDefined();
-  });
-
   test.each(["", ".", "..", "/", "a/b", "Release-1"])("a generation id of %j is refused before anything is published", async (generationId) => {
     const root = await deployableProject();
     const { exitCode, result } = await deploy(root, generationId);
@@ -836,25 +826,15 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(lstat(join(root, ".eden", "eve-deploy", "targets"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test.each([
-    ["an authentication error", (entries: string) => '{"success":true,"errors":[{"code":10000,"message":"Authentication error"}],"messages":[],"result":' + entries + ',"result_info":{}}'],
-    ["result named twice", (entries: string) => '{"success":true,"errors":[],"messages":[],"result":' + entries + ',"result":' + entries + ',"result_info":{}}'],
-  ] as const)("a Container answer that lists the application beside %s names nothing to delete", async (_name, answer) => {
-    const { root, current } = await deployedProject();
-    cloud.workers.clear();
-    cloud.containers.add(container);
-    cloud.containerAnswer = answer;
-    const { exitCode, result } = await destroy(root);
-    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DESTROY_INDETERMINATE" });
-    expect(cloud.deleted).toEqual([]);
-    await expect(lstat(current)).resolves.toBeDefined();
-  });
-
   test("a clean Container answer with escaped text and other fields still lets destroy finish", async () => {
     const { root, current } = await deployedProject();
     cloud.containers.add(container);
-    cloud.containerAnswer = (entries) => '{ "success": true, "errors": [], "messages": [], "result": ' +
-      entries.replace('"name"', '"note":"a\\/b \\u0026 c","size":1.0,"name"') + ', "result_info": {} }';
+    // The paging line is in the form cf printed on 2026-11-20.
+    cloud.containerAnswer = (entries) => ({
+      exitCode: 0,
+      stdout: entries.replace('"name"', '"note":"a\\/b \\u0026 c","size":1.0,"name"'),
+      stderr: 'result_info: {"page":1,"per_page":20,"count":1,"total_count":1}\n',
+    });
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
     expect(cloud.deleted).toContain("container:" + container);
@@ -875,7 +855,6 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     ["an entry with no id", () => { cloud.deploymentEntries = [{}]; }],
     ["an entry that is a list", () => { cloud.deploymentEntries = [[]]; }],
     ["an entry with an empty id", () => { cloud.deploymentEntries = [{ id: "" }]; }],
-    ["deployments named twice", () => { cloud.workerAnswer = (deployments) => '{"success":true,"errors":[],"messages":[],"result":{"deployments":[],"deployments":' + deployments + '}}'; }],
   ] as const)("after publish, a deployments answer with %s is not a publication", async (_name, arrange) => {
     const root = await deployableProject();
     arrange();
@@ -884,16 +863,16 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
   });
 });
 
-describe("eden deploy sends every Wrangler write to the account it checked (MOI-254)", () => {
+describe("eden deploy sends every cf write to the account it checked (MOI-254)", () => {
   const account = "1".repeat(32);
-  /** A deploy with one runtime value, during which Wrangler's login moves to another account before the first write. */
+  /** A deploy with one runtime value, during which cf's login moves to another account before the first write. */
   const deployWhileTheLoginChanges = async (push: boolean) => {
     const root = await deployableProject();
     const envRoot = await mkdtemp(join(tmpdir(), "eden-moi254-"));
     roots.push(envRoot);
     await writeFile(join(envRoot, "runtime.env"), "MODEL_KEY=model-key-value\n", "utf8");
-    cloud.wranglerAccount = account;
-    cloud.onMutation = () => { cloud.wranglerAccount = "2".repeat(32); };
+    cloud.loginAccount = account;
+    cloud.onMutation = () => { cloud.loginAccount = "2".repeat(32); };
     return deploy(root, "generation-one", { account, envFile: join(envRoot, "runtime.env"), push });
   };
 
@@ -915,7 +894,7 @@ describe("eden deploy sends every Wrangler write to the account it checked (MOI-
     });
     expect({ pinned: cloud.pinned, pushed: cloud.pushed, secrets: cloud.secrets, workers: [...cloud.workers] })
       .toEqual({ pinned: [], pushed: [], secrets: [], workers: [] });
-    expect(cloud.apiAccounts.every((read) => read === account)).toBe(true);
+    expect(cloud.readAccounts.every((read) => read === account)).toBe(true);
     await expect(lstat(join(root, ".eden", "eve-deploy", "targets"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -933,5 +912,95 @@ describe("eden deploy sends every Wrangler write to the account it checked (MOI-
     expect(cloud.pushed).toHaveLength(1);
     expect(cloud.pushed[0]).toMatch(new RegExp("^" + account + "/eden-eve-"));
     expect(cloud.secrets).toEqual([account + "/eve-deploy-fixture/MODEL_KEY"]);
+  });
+});
+
+describe("eden finishes a publish cf left half done, and destroy removes one it could not finish (MOI-258, MOI-268)", () => {
+  const worker = "account-test/eve-deploy-fixture";
+  const destroyDeployed = async (root: string) => {
+    const output: string[] = [];
+    const exitCode = await runEdenCli(
+      ["destroy", "--project", root, "--env", "preview", "--name", "eve-deploy-fixture", "--json"],
+      { cwd: root, stdout: (line) => output.push(line), stderr: (line) => output.push(line) },
+    );
+    return { exitCode, result: JSON.parse(output.at(-1) ?? "") as { readonly status?: string; readonly error?: { readonly code?: string } } };
+  };
+
+  test("when cf deploy fails after the Worker version is live, Eden creates the Container application and deploys the triggers itself", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, ok: result.ok }).toEqual({ exitCode: 0, ok: true });
+    expect(cloud.runs.filter((run) => run.args[0] === "deploy")).toHaveLength(1);
+    expect([...cloud.containers]).toEqual(["account-test/eve-deploy-fixture-container#" + cloud.namespace]);
+    expect(cloud.triggers).toEqual([worker]);
+    await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT"))).resolves.toBeDefined();
+  });
+
+  test("when cf deploy fails before it uploads, Eden creates nothing and ends DEPLOY_INDETERMINATE", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "before-upload";
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect({ workers: [...cloud.workers], containers: [...cloud.containers], triggers: cloud.triggers }).toEqual({ workers: [], containers: [], triggers: [] });
+  });
+
+  test("a Worker another release left in service is not finished: Eden creates nothing for it", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "before-upload";
+    cloud.workers.add(worker);
+    cloud.stamps = [{ type: "plain_text", name: "EDEN_EVE_RELEASE_ID", text: "eve-deploy-another" }];
+    const { exitCode, result } = await deploy(root);
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect({ containers: [...cloud.containers], triggers: cloud.triggers }).toEqual({ containers: [], triggers: [] });
+  });
+
+  test("a publish Eden cannot finish names the next commands, and destroy then removes the Worker it left", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.createFails = true;
+    const failed = await deploy(root);
+    expect({ exitCode: failed.exitCode, code: failed.result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect((failed.result.error as { readonly remediation?: string }).remediation).toMatch(/eden deploy again.*eden destroy/u);
+    expect({ workers: [...cloud.workers], containers: [...cloud.containers] }).toEqual({ workers: [worker], containers: [] });
+    const destroyed = await destroyDeployed(root);
+    expect({ exitCode: destroyed.exitCode, status: destroyed.result.status }).toEqual({ exitCode: 0, status: "destroyed" });
+    expect(cloud.deleted).toEqual(["worker:" + worker]);
+    expect([...cloud.workers]).toEqual([]);
+  });
+});
+
+describe("cf runs where nothing of the user's can choose the account or the credentials (MOI-254)", () => {
+  test("every cf command of a deploy and a destroy gets a private folder, an empty config, and a fixed environment", async () => {
+    const root = await deployableProject();
+    await writeFile(join(root, "cloudflare.config.ts"), "throw new Error('the project config ran');\n", "utf8");
+    await writeFile(join(root, ".env"), "CLOUDFLARE_ACCOUNT_ID=" + "9".repeat(32) + "\n", "utf8");
+    vi.stubEnv("CLOUDFLARE_API_BASE_URL", "https://example.invalid/client/v4");
+    vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "");
+    vi.stubEnv("EDEN_TEST_UNRELATED_SECRET", "unrelated-secret");
+    const account = "1".repeat(32);
+    cloud.whoami = () => account;
+    expect((await deploy(root, "generation-one", { account, push: true, ownChecks: true })).exitCode).toBe(0);
+    expect(cloud.runs.length).toBeGreaterThan(5);
+    for (const run of cloud.runs) {
+      expect(run.cwd.startsWith(root)).toBe(false);
+      expect(run.config).toBe("export default {};\n");
+      expect(run.env.CLOUDFLARE_API_BASE_URL).toBe("https://api.cloudflare.com/client/v4");
+      expect(run.env.EDEN_TEST_UNRELATED_SECRET).toBeUndefined();
+      // Only the login check runs without an account.
+      expect(run.env.CLOUDFLARE_ACCOUNT_ID).toBe(run.args.join(" ") === "auth whoami" ? "" : account);
+    }
+  });
+
+  test("the Build Output Eden publishes names the checked account", async () => {
+    const root = await deployableProject();
+    const account = "1".repeat(32);
+    cloud.whoami = () => account;
+    expect((await deploy(root, "generation-one", { account, push: true, ownChecks: true })).exitCode).toBe(0);
+    const config = JSON.parse(await readFile(
+      join(root, ".eden", "eve-deploy", "generations", "generation-one", "worker", ".cloudflare", "output", "v1", "config.json"),
+      "utf8",
+    )) as unknown;
+    expect(config).toMatchObject({ settings: { accountId: account } });
   });
 });

@@ -33,7 +33,7 @@
   ],
   "dependencies": {
     "@moinulmoin/eden-runtime-cloudflare": "0.13.0",
-    "wrangler": "4.147.0"
+    "cf": "1.0.0-rc.2"
   },
   "scripts": {
     "build": "tsc -b",
