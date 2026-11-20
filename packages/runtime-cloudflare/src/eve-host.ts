@@ -751,10 +751,13 @@ export function createEveHostConfig(
   };
 }
 
+/** The vendored host bundle's module name beside the generated entry. */
+export const EVE_HOST_BUNDLE_MODULE = "eden-eve-host-worker.mjs";
+
 export function generateEveHostWorkerSource(
   request: EveGeneratedWorkerSourceRequest,
 ): string {
-  const moduleSpecifier = "./eden-eve-host-worker.mjs";
+  const moduleSpecifier = `./${EVE_HOST_BUNDLE_MODULE}`;
   const workerOptions = {
     publicOrigin: request.config.container.publicOrigin,
     workerName: request.config.worker.name,
@@ -791,6 +794,67 @@ export function generateEveHostWorkerSource(
     `export default createEveHostWorker(${JSON.stringify(workerOptions)});`,
     "",
   ].join("\n");
+}
+
+/**
+ * The Build Output files `cf deploy --prebuilt` publishes for this config,
+ * by path under `.cloudflare/output/v1/`. The caller adds the vendored host
+ * bundle beside the entry module as `${EVE_HOST_BUNDLE_MODULE}`. The Durable Object
+ * classes are the ones the recorded migrations declared: cf has no migration
+ * history, it publishes the classes that are live.
+ */
+export function createEveHostBuildOutput(
+  request: EveGeneratedWorkerSourceRequest & { readonly workerSource: string },
+): Readonly<Record<string, string>> {
+  const worker = request.config.worker;
+  const container = worker.containers[0];
+  const env: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(worker.vars)) {
+    env[name] = typeof value === "string" ? { type: "text", value } : { type: "json", value };
+  }
+  for (const binding of worker.durable_objects.bindings) {
+    env[binding.name] = { type: "durable-object", worker: worker.name, exportName: binding.class_name };
+  }
+  const exports: Record<string, unknown> = {};
+  for (const migration of worker.migrations) {
+    for (const className of migration.new_sqlite_classes ?? []) {
+      exports[className] = {
+        type: "durable-object",
+        storage: "sqlite",
+        ...(className === container.class_name ? { container: container.name } : {}),
+      };
+    }
+  }
+  return {
+    "config.json": JSON.stringify({
+      ...(worker.account_id === undefined ? {} : { settings: { accountId: worker.account_id } }),
+      buildContext: { isPreview: false },
+    }),
+    "workers/default/worker.config.json": JSON.stringify({
+      name: worker.name,
+      compatibilityDate: worker.compatibility_date,
+      compatibilityFlags: worker.compatibility_flags,
+      workersDev: worker.workers_dev,
+      env,
+      exports,
+      ...(worker.triggers === undefined
+        ? {}
+        : { triggers: worker.triggers.crons.map((schedule) => ({ type: "scheduled", schedule })) }),
+      manifest: {
+        type: "complete",
+        mainModule: "worker.js",
+        modules: { "worker.js": { type: "esm" }, [EVE_HOST_BUNDLE_MODULE]: { type: "esm" } },
+      },
+    }),
+    "workers/default/bundle/worker.js": request.workerSource,
+    [`containers/${container.name}/container.config.json`]: JSON.stringify({
+      name: container.name,
+      schedulingPolicy: "durable-object",
+      images: Object.fromEntries(
+        Object.entries(container.images).map(([name, image]) => [name, { reference: image.image }]),
+      ),
+    }),
+  };
 }
 
 export interface EveHostForwardingMetadata {
