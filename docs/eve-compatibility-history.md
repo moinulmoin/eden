@@ -82,6 +82,66 @@ Earlier the same day, before Eden read the API itself:
 
 Not run: an API token against Eden's own API reads, an account that has no
 `workers.dev` subdomain, and an account that has no Worker.
+## Live check with Eve 1.1.0 (2026-11-20)
+
+Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
+account, with Wrangler `4.147.0` and an OAuth login, on the branch that
+moves the latest fixture to Eve `1.1.0`, at `ddfb87f`. That branch changes
+no Eden code: it is main at `9d82312` (release `0.14.0`) plus the fixture
+pin and docs.
+
+Full run of `pnpm run check:live`, target `eden-live-20261120-0decf250`,
+`16:31:14Z` to `16:48:33Z`, Eve `0.91.0` to `1.1.0`, the World packed from
+this workspace (version `0.14.0`), a 90-second idle window. All 18 steps
+passed.
+
+- `eden preflight` passed 14 checks with no warnings in 87 seconds. The
+  fresh deploy took 200 seconds, the same-version update 124 seconds, and
+  the deploy on Eve `1.1.0` 301 seconds, all on the same URL. Both updates
+  carried the warning `EVE_UPDATE_IN_FLIGHT`.
+- The same-version update reported `VAL-LIFE-007` passed: `The superseded
+  image was deleted from the registry by its tag after promotion.`
+- Session `wrun_01M7WX1MPW0ASJK5HK4K4HSA4X` answered after each deploy and
+  after the sleep, with its earlier turns in its stream and its file
+  intact. A new session started after the update, and one ran bash on Eve
+  `1.1.0` after the upgrade. After 165 seconds with no requests the first
+  health request took 7.3 seconds, and the server process was 8 seconds old.
+- A session on Eve `1.1.0` asked its server process: no `queueAuthMode`
+  line. An unauthenticated session request got `401`, and the two workflow
+  queue routes answered `404`.
+- `eden destroy` ended in 59 seconds and reported 18 objects in
+  `EVE_REGISTRY_OBJECTS_KEPT`: 15 `refused-snapshot` and 3
+  `refused-singleton-artifact`, none of them `accepted-still-listed`.
+- The check's catalog read found those 18 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+
+Three earlier runs the same day, from the same commit, stopped at the fresh
+deploy on Eve `0.91.0`, before any Eve `1.1.0` step:
+
+- `eden-live-20261120-45afe43f`, `12:38:10Z` to `12:42:39Z`:
+  `DEPLOY_INDETERMINATE`, `Wrangler uploaded the Worker version but did not
+  finish applying its Container application settings.` `eden destroy`
+  answered `EVE_DESTROY_OWNERSHIP_UNPROVEN` once and ended `destroyed` 30
+  seconds later.
+- `eden-live-20261120-18d81a3d`, `12:43:53Z` to `12:47:29Z`, and
+  `eden-live-20261120-793d9c96`, `13:23:34Z` to `13:27:01Z`:
+  `DEPLOY_INDETERMINATE`, `The exact Cloudflare publication did not return a
+  terminal success result.` Wrangler's own log shows the cause. Writing the
+  first secret created the Worker. About 2 seconds later `wrangler deploy`
+  read `/workers/services/<name>`, got `200`, and stopped with `TypeError:
+  Cannot read properties of null (reading 'tag')` before it uploaded
+  anything. Wrangler reads `default_environment.script.tag` there. The log
+  does not hold the response body.
+- Each of those two Workers had three deployments, all made by the failed
+  deploy within 4 seconds, and no Container application. `eden destroy`
+  answered `EVE_DESTROY_OWNERSHIP_UNPROVEN` 8 times over 9 minutes for the
+  first and was tried twice for the second. Each Worker was then deleted
+  with `wrangler delete` from an empty folder with `CLOUDFLARE_ACCOUNT_ID`
+  set, and `eden destroy` ended `destroyed` about a minute later with
+  nothing kept.
+
+Eve `1.1.0` with Eve's local World was not run on Cloudflare.
 
 ## Live check for release 0.14.0 (2026-11-20)
 
