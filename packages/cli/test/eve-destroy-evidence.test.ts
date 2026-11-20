@@ -1558,6 +1558,71 @@ describe("a failed image push says how it ended and keeps nothing cf or Docker p
   });
 });
 
+describe("destroy deletes a Container application left without its Worker only when it is the recorded one (MOI-322)", () => {
+  const current = (root: string) => join(root, ".eden", "eve-deploy", "targets", "preview-eve-deploy-fixture", "CURRENT");
+  const destroyDeployed = async (root: string) => {
+    const output: string[] = [];
+    const exitCode = await runEdenCli(
+      ["destroy", "--project", root, "--env", "preview", "--name", "eve-deploy-fixture", "--json"],
+      { cwd: root, stdout: (line) => output.push(line), stderr: (line) => output.push(line) },
+    );
+    expect(output).toHaveLength(1);
+    return { exitCode, result: JSON.parse(output[0] ?? "") as { readonly status?: string; readonly error?: { readonly code?: string; readonly message?: string; readonly remediation?: string } } };
+  };
+  /** A deploy by Eden's own publish, then the Worker removed by hand. */
+  const deployedWithoutWorker = async (): Promise<string> => {
+    const root = await deployableProject();
+    expect((await deploy(root)).exitCode).toBe(0);
+    cloud.workers.clear();
+    return root;
+  };
+
+  test("a deploy writes the Container application's ID into the deployment record", async () => {
+    const root = await deployableProject();
+    expect((await deploy(root)).exitCode).toBe(0);
+    const record = JSON.parse(await readFile(join(await realpath(current(root)), "deployment.json"), "utf8")) as { readonly identity: Record<string, unknown> };
+    expect(record.identity.containerApplicationId).toBe(cloud.namespace);
+  });
+
+  test("the application with the recorded ID is deleted, and the target ends destroyed", async () => {
+    const root = await deployedWithoutWorker();
+    const { exitCode, result } = await destroyDeployed(root);
+    expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
+    expect(cloud.deleted).toEqual(["container:account-test/eve-deploy-fixture-container#" + cloud.namespace]);
+    await expect(lstat(current(root))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("another application of the same name is not deleted: destroy stops and says where to look", async () => {
+    const root = await deployedWithoutWorker();
+    const other = "f".repeat(32);
+    cloud.containers = new Set(["account-test/eve-deploy-fixture-container#" + other]);
+    cloud.tags = ["candidate"];
+    const { exitCode, result } = await destroyDeployed(root);
+    expect({ exitCode, status: result.status, code: result.error?.code }).toEqual({ exitCode: 1, status: "failed", code: "EVE_DESTROY_OWNERSHIP_UNPROVEN" });
+    expect(result.error?.message).toBe(
+      "The Worker is gone, and the Container application named eve-deploy-fixture-container has the ID " + other + ", not the ID " + cloud.namespace +
+        " this deployment's record holds. It is not the one Eden deployed; nothing was deleted.",
+    );
+    expect(result.error?.remediation).toMatch(/^Look at the Container application eve-deploy-fixture-container in the Cloudflare dashboard of account account-test\. .* run eden destroy again with the same --project, --env, and --name/u);
+    // Nothing is deleted, the registry included, and the record stays.
+    expect({ deleted: cloud.deleted, containers: [...cloud.containers], tags: cloud.tags }).toEqual({
+      deleted: [],
+      containers: ["account-test/eve-deploy-fixture-container#" + other],
+      tags: ["candidate"],
+    });
+    await expect(lstat(current(root))).resolves.toBeDefined();
+  });
+
+  test("a record with no ID, from Eden 0.15.0 or older, still deletes the application by its name", async () => {
+    const { root, current: pointer } = await deployedProject();
+    cloud.containers.add(container);
+    const { exitCode, result } = await destroy(root);
+    expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
+    expect(cloud.deleted).toEqual(["container:" + container]);
+    await expect(lstat(pointer)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
 describe("cf runs where nothing of the user's can choose the account or the credentials (MOI-254)", () => {
   test("every cf command of a deploy and a destroy gets a private folder, an empty config, and a fixed environment", async () => {
     const root = await deployableProject();

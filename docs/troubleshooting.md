@@ -1459,6 +1459,20 @@ deployment ID or release ID is not one the local records name, or when the
 Container application's namespace does not match the Worker's binding. Eden
 refuses to delete a same-name replacement.
 
+`The Worker is gone, and the Container application named <name>-container
+has the ID <id>, not the ID <id> this deployment's record holds. It is not
+the one Eden deployed; nothing was deleted.` The Worker does not exist, and
+a Container application of the target's name does, with another ID than the
+one the deploy wrote into `deployment.json`: it is not the application
+that deploy read back. Destroy deletes nothing, the registry included, and keeps the record. Look
+at that application in the Cloudflare dashboard of the account the message
+names. If it is yours to remove, delete it there, then run `eden destroy`
+again with the same `--project`, `--env`, and `--name`; it removes the
+rest and clears the record. If it belongs to something else, leave it and
+keep the `.eden` folder. A record written by Eden `0.15.0` or older holds
+no ID, so for such a target destroy still deletes the application by its
+name; the next `eden deploy` writes the ID.
+
 A Worker that a first deploy left without its Container application does
 not fail here: destroy proves it from the version in service and the failed
 attempt's record, and removes it.

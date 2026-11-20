@@ -375,9 +375,11 @@ stopped before its Container application existed: destroy removes that
 Worker alone, using the record of the failed attempt.
 
 When the Worker does not exist and a Container application of the recorded
-name does, destroy deletes that application on the record and the name
-alone: the record does not hold the application's ID. See
-[Security](./security.md).
+name does, destroy deletes that application only when Cloudflare lists it
+under the ID the deploy wrote into the record. With another ID destroy
+stops with `EVE_DESTROY_OWNERSHIP_UNPROVEN` and deletes nothing. A record
+from Eden `0.15.0` or older holds no ID; for it the name alone decides, as
+before, until the next deploy writes one. See [Security](./security.md).
 
 Destroy Destroy reads everything again after its deletes and clears
 the `CURRENT` pointer only if it is the symlink that named the record and
