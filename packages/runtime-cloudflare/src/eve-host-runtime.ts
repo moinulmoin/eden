@@ -96,29 +96,42 @@ async function sendWhileSwitching(
       if (left <= 0 || gone()) return switchingVersions(5);
       const delay = EVE_HOST_RELEASE_RETRY_DELAYS_MS[attempt] ?? 4_000;
       await new Promise<void>((resolve) => setTimeout(resolve, Math.min(delay, left)));
-      if (gone()) return switchingVersions(5);
+      // A timer can fire late; the deadline is checked again before the try.
+      if (Date.now() > deadline || gone()) return switchingVersions(5);
     }
   }
 }
+
+/** A retained version's object could not place this release; see `placeCaller`. */
+const EVE_HOST_RETAINED_SWITCHING = new Error("A retained deployment is switching versions.");
 
 type EveWorldNamespace = { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
 const worldsOnThisRelease = new WeakSet<EveWorldNamespace>();
 
 /**
- * One read-only request that asks the World object to place this release. A
- * World object on the release before this one resets itself and the call
- * throws; one that cannot place this release answers 503. A World object
- * from before this check answers like one on this release.
+ * One read-only request before a World call, bounded by `deadline`. A World
+ * object on the release before this one resets itself for it and the call
+ * throws. It proves nothing about routes: it only keeps a World call from
+ * being the request that meets the reset. The World object answers a GET
+ * with 405; only that answer is remembered.
  */
-async function checkWorldRelease(env: EveHostContainerEnvironment, world: EveWorldNamespace): Promise<Response> {
-  if (worldsOnThisRelease.has(world)) return new Response(null, { status: 204 });
-  const response = await world.get(world.idFromName("world")).fetch(
-    new Request(new URL("/__eden/world/rpc", env.EVE_PUBLIC_ORIGIN), { headers: releaseHeaders(env) }),
-  );
-  if (response.status === 503) return response;
-  await response.body?.cancel();
-  worldsOnThisRelease.add(world);
-  return response;
+async function nudgeWorld(env: EveHostContainerEnvironment, world: EveWorldNamespace, deadline: number): Promise<Response> {
+  if (worldsOnThisRelease.has(world)) return new Response(null, { status: 405 });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const response = await Promise.race([
+      world.get(world.idFromName("world")).fetch(
+        new Request(new URL("/__eden/world/rpc", env.EVE_PUBLIC_ORIGIN), { headers: releaseHeaders(env) }),
+      ),
+      new Promise<Response>((resolve) => {
+        timer = setTimeout(() => resolve(switchingVersions(5)), Math.max(0, deadline - Date.now()));
+      }),
+    ]);
+    if (response.status === 405) worldsOnThisRelease.add(world);
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function deploymentImages(env: EveHostContainerEnvironment): Record<string, EveDeploymentRoute> {
@@ -467,10 +480,12 @@ export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnviro
 
   override async fetch(request: Request): Promise<Response> {
     // Cloudflare can keep this object on an earlier release after a deploy,
-    // with that release's route table.
-    const caller = placeCaller(this.env, request.headers, request.headers.get("x-eden-eve-release-id") ?? undefined);
-    if (caller === "newer") this.ctx.abort(EVE_HOST_STALE_WORKER_REASON);
-    if (caller === "unknown") return switchingVersions(5);
+    // with that release's route table. It resets only for a container of
+    // the release that replaced its own; every other caller is served as
+    // before.
+    if (placeCaller(this.env, request.headers, request.headers.get("x-eden-eve-release-id") ?? undefined) === "newer") {
+      this.ctx.abort(EVE_HOST_STALE_WORKER_REASON);
+    }
     if (request.method !== "POST") return new Response(null, { status: 405 });
     const result = await this.core.handleRpc(new Uint8Array(await request.arrayBuffer()));
     return new Response(result as Uint8Array<ArrayBuffer>, {
@@ -552,8 +567,10 @@ export async function routeEveOutboundRequest(
       get(id: unknown): { fetch(request: Request): Promise<Response> };
     } | undefined;
     if (world === undefined) return new Response(null, { status: 404 });
-    const check = await sendWhileSwitching(() => checkWorldRelease(env, world), Date.now() + EVE_HOST_RELEASE_WAIT_MS);
-    if (check.status === 503) return check;
+    const deadline = Date.now() + EVE_HOST_RELEASE_WAIT_MS;
+    const nudge = await sendWhileSwitching(() => nudgeWorld(env, world, deadline), deadline);
+    if (nudge.status === 503) return nudge;
+    await nudge.body?.cancel();
     const headers = new Headers(request.headers);
     headers.delete("x-eden-eve-release-id");
     headers.delete("x-eden-eve-previous-release-id");
@@ -692,6 +709,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
         // One try: a retained object still on the old release resets itself
         // and this throws, and the Worker that owns the request waits.
         const response = await namespace.getByName(deploymentInstance(this.env, id)).fetch(request);
+        if (response.status === 503) throw EVE_HOST_RETAINED_SWITCHING;
         if (!response.ok) throw new Error(`Cannot fence schedules on retained deployment ${id}.`);
         await response.body?.cancel();
       }
@@ -1340,10 +1358,14 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     if (caller === "unknown") return switchingVersions(5);
     const olderCaller = caller === "older";
     // A Worker of the release this one replaced is still serving while
-    // Cloudflare switches versions. A deployment this release no longer
-    // routes cannot be served and the client retries on the new Worker.
-    if (olderCaller && this.env.EDEN_EVE_DEPLOYMENTS !== undefined &&
-      requestDeploymentId !== undefined && deploymentImages(this.env)[requestDeploymentId] === undefined) {
+    // Cloudflare switches versions. It is served only as the deployment it
+    // names: with affinity, one this release still routes (the same one after
+    // a same-version update, the kept one after an Eve upgrade); without
+    // affinity every release is its own deployment, so it never is. Otherwise
+    // the client retries and reaches the new Worker.
+    if (olderCaller && requestDeploymentId !== undefined && (this.env.EDEN_EVE_DEPLOYMENTS === undefined
+      ? requestDeploymentId !== this.env.EDEN_EVE_DEPLOYMENT_ID
+      : deploymentImages(this.env)[requestDeploymentId] === undefined)) {
       return switchingVersions(1);
     }
     await this.identifyDeployment(requestDeploymentId);
@@ -1354,14 +1376,13 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
       }
       return new Response(null, { status: 204 });
     }
-    // The first request of a release also places it with the World object, so
-    // a World object still on the release before resets before Eve needs it.
-    const world = this.env.EDEN_WORLD as EveWorldNamespace | undefined;
-    if (this.env.EDEN_EVE_WORLD_CLOUDFLARE && world !== undefined) {
-      const check = await checkWorldRelease(this.env, world);
-      if (check.status === 503) return check;
+    let response: Response;
+    try {
+      response = await this.forwardToEve(request);
+    } catch (error: unknown) {
+      if (error !== EVE_HOST_RETAINED_SWITCHING) throw error;
+      return switchingVersions(5);
     }
-    const response = await this.forwardToEve(request);
     // Reporting the verified start back lets deploy health-gate promotion on
     // the served container actually running this generation's image: the
     // header echoes only when the running container's image equals this

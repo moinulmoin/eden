@@ -463,17 +463,32 @@ describe("World object after a deploy", () => {
     }
   });
 
-  test("a container of a release the World object cannot place gets a retryable 503, and the World object is not reset", async () => {
+  test("a container of any other release is answered as before, and the World object is not reset", async () => {
     const world = worldFixture(["release-3", "release-2"], ["release-3", "release-2"]);
     try {
       for (const [release, previous] of [["release-1", undefined], ["release-9", "release-8"]] as const) {
-        const response = await world.container(release, previous)();
-        expect(response.status).toBe(503);
-        expect(response.headers.get("retry-after")).toBe("5");
+        expect((await world.container(release, previous)()).status).toBe(200);
       }
       expect(world.resets).toEqual([]);
+      expect(world.messages()).toBe(2);
+    } finally {
+      world.close();
+    }
+  });
+
+  test("a World object that does not answer holds a call 30 seconds, then the container gets a retryable 503", async () => {
+    const world = worldFixture(["release-2", "release-1"], ["release-2", "release-1"]);
+    vi.useFakeTimers();
+    try {
+      const started = Date.now();
+      const pending = world.container("release-2", "release-1", () => new Promise<Response>(() => {}))();
+      await vi.runAllTimersAsync();
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(Date.now() - started).toBe(30_000);
       expect(world.messages()).toBe(0);
     } finally {
+      vi.useRealTimers();
       world.close();
     }
   });
@@ -1045,6 +1060,68 @@ describe("generic Eve Cloudflare host", () => {
     },
   );
 
+  test("no try starts after 30 seconds when the pauses run late", async () => {
+    const startedAt: number[] = [];
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    vi.useFakeTimers();
+    const fakeSetTimeout = globalThis.setTimeout;
+    const late = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number) =>
+      fakeSetTimeout(() => {
+        vi.setSystemTime(Date.now() + 15_000);
+        callback();
+      }, ms)) as never);
+    try {
+      const started = Date.now();
+      const pending = worker.fetch(new Request("https://client.invalid/eve/v1/info"), {
+        EVE_CONTAINER: {
+          getByName: () => ({
+            fetch: async () => {
+              startedAt.push(Date.now() - started);
+              throw new Error("remote exception: stale Worker version");
+            },
+          }),
+        },
+      });
+      await vi.runAllTimersAsync();
+      expect((await pending).status).toBe(503);
+      expect(Math.max(...startedAt)).toBeLessThanOrEqual(30_000);
+    } finally {
+      late.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a retained version's object that cannot place this release gives the client a retryable 503", async () => {
+    const current = hostContainer(new Map(), fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE }), undefined, {
+      env: {
+        EDEN_EVE_DEPLOYMENTS: JSON.stringify({
+          [IDENTITY.deploymentId]: { image: "eve", generationId: IDENTITY.generationId },
+          "dep-retained": { image: "eve-retained", generationId: "gen-retained" },
+        }),
+        EVE_CONTAINER: {
+          idFromName: (name: string) => name,
+          getByName: () => ({
+            fetch: async () => new Response("Eden is switching versions. Retry the request.\n", { status: 503, headers: { "retry-after": "5" } }),
+          }),
+        } as never,
+      },
+    });
+    (current as unknown as { ctx: { id: unknown } }).ctx.id = {
+      equals: (other: string) => other !== IDENTITY.stableContainerInstanceName && other.includes(IDENTITY.deploymentId),
+    };
+    const response = await createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    }).fetch(new Request("https://client.invalid/eve/v1/health"), {
+      EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => current.fetch(new Request(request)) }) },
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("5");
+  });
+
   test("one retained version still on the old release holds a request 30 seconds, not longer, before the retryable 503", async () => {
     const retainedFetch = vi.fn(async () => {
       throw new Error("remote exception: stale Worker version");
@@ -1551,6 +1628,30 @@ describe("EveHostDurableContainer lifecycle", () => {
       },
     }))).rejects.toThrow("stale Worker version");
     expect(abort).toHaveBeenCalledTimes(1);
+  });
+
+  test("without deployment affinity a Worker of the replaced release gets a retryable 503, and nothing reaches the new image", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
+    const abort = vi.fn((reason?: string) => { throw new Error(reason); });
+    // Every release is its own deployment without affinity.
+    const object = hostContainer(new Map(), runtime, undefined, {
+      abort,
+      deploymentId: "release-new",
+      env: { EDEN_EVE_RELEASE_ID: "release-new", EDEN_EVE_PREVIOUS_RELEASE_ID: "release-old" },
+    });
+    const env = { EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => object.fetch(new Request(request)) }) } };
+    for (const init of [{}, { method: "POST", body: "{}" }]) {
+      const response = await createEveHostWorker({
+        publicOrigin: "https://eden-eve-preview.account.workers.dev",
+        ...IDENTITY,
+        deploymentId: "release-old",
+        releaseId: "release-old",
+      }).fetch(new Request("https://client.invalid/eve/v1/session", init), env);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("1");
+    }
+    expect(abort).not.toHaveBeenCalled();
+    expect(runtime.state.timeline).toEqual([]);
   });
 
   test("a Worker of the replaced release that names a version no longer routed gets a retryable 503", async () => {
