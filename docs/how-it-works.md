@@ -91,10 +91,15 @@ until the checks in steps 1–4 have passed.
    not count. If it does, the version must have exactly one binding for the
    Container class in this Worker. Eden then finishes the publish with `cf`
    steps: it reads from Cloudflare's API the Container applications of the
-   target's name and then the one it finds. That application must have the
-   listed ID, the name, the `durable_object` policy and the binding's
-   namespace. When the account has none of that name, Eden creates it
+   target's name and then the one it finds. That application's ID must be the
+   binding's namespace, in the listing and in its own read, and it must
+   have the name, the `durable_object` policy and that namespace. When the
+   account has none of that name, Eden creates it
    (`cf containers applications create`) and reads it back the same way.
+   Right before each of its writes Eden reads the release in service again
+   and writes nothing when another release has replaced this one. Cloudflare
+   has no write that it refuses in that case, so this shortens the gap and
+   does not close it.
    Then it runs `cf workers triggers deploy --prebuilt`. If one of these
    steps fails or one of these answers disagrees, Eden writes nothing more,
    the deploy ends `DEPLOY_INDETERMINATE`, and the last promoted deploy
@@ -102,8 +107,8 @@ until the checks in steps 1–4 have passed.
    reads the release in service and its Container application once more,
    together, and promotes only when they still agree. The whole publish has
    one deadline of 15 minutes, from the start of `cf deploy` to the end of
-   that last read. Every `cf` command and every wait gets what is left of
-   it. Once it has passed Eden starts no other command, and the deploy ends
+   that last read. Every `cf` command, every read, every wait, and taking
+   the token of the `cf` login get what is left of it. Once it has passed Eden starts no other command, and the deploy ends
    `DEPLOY_INDETERMINATE`.
 8. **Verify and promote** (`verifying health at <origin>`). Eden calls the
    public `/eve/v1/health` and only treats the deployment as live once it

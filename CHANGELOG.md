@@ -38,10 +38,12 @@
   `eden deploy` again sets up what is missing. Cloudflare can take a while
   to show a version it just accepted, so Eden repeats its read for up to
   two minutes. What `cf` printed is kept in `worker/cf-deploy.log` in the
-  generation folder. Eden finishes only the version Cloudflare serves, with
+  generation folder; when the publish carried runtime values, only
+  `cf deploy`'s exit code and a sentence of Eden's own are kept for it. Eden finishes only the version Cloudflare serves, with
   one binding for the Container class, and only a Container application
-  whose ID, name, policy and namespace all match; otherwise it writes
-  nothing more.
+  whose ID is the binding's namespace and whose name, policy and namespace
+  all match; otherwise it writes nothing more. It reads the release in
+  service again right before each write.
 - **A publish counts only when the release and its Container application
   agree.** After every publish Eden reads the release in service and the
   target's one Container application together, for up to two minutes. If
@@ -51,8 +53,8 @@
   stays current.
 - **A publish has one deadline of 15 minutes.** It runs from the start of
   `cf deploy` to the end of the last read that confirms the publish. Every
-  `cf` command and every wait gets what is left of it, and Eden starts no
-  command after it. Before, each step had its own limit, and a slow read
+  `cf` command, every read, every wait, and taking the token of the `cf`
+  login get what is left of it, and Eden starts no command after it. Before, each step had its own limit, and a slow read
   could be followed by another write.
 - **`eden destroy` stops when Cloudflare's reads of the Worker disagree.**
   A Worker that one read shows deployed and the next shows with no
@@ -64,7 +66,9 @@
   `api.cloudflare.com`. With `CLOUDFLARE_API_TOKEN` set Eden sends that
   token. Otherwise it takes the login's token from `cf`: it runs
   `cf auth whoami` against a listener of its own on `127.0.0.1`, keeps
-  the token in memory for that command, and writes it nowhere. This relies
+  the token in memory for that command, and writes it nowhere. The
+  listener answers every request itself and keeps its port until `cf` has
+  exited. This relies
   on `cf` behavior Cloudflare does not document as a contract;
   `docs/security.md` describes it and compares it with 0.14. When `cf`
   hands over no token, `preflight` and `deploy` stop at

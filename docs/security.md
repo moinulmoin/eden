@@ -218,13 +218,18 @@ Without the variable, Eden uses the token of your `cf` login.
    it starts `cf`.
 2. Eden runs `cf auth whoami` with `CLOUDFLARE_API_BASE_URL` set to that
    listener, under a random path that only this `cf` process is given.
+   For this one command Eden passes `cf` no proxy variables and turns its
+   telemetry off.
 3. `cf` asks the listener who it is and sends its login's token, as it would
-   to Cloudflare. Eden takes the token from the first request, and only when
-   that request has the random path, is a `GET` of `/accounts`,
-   `/memberships` or `/user`, and names `cf-cli/1.0.0-rc.2` as its user
-   agent.
-4. The listener answers `401`, sends the request nowhere, and closes. It
-   takes one request.
+   to Cloudflare. On 2026-11-20 one `cf auth whoami` sent three such
+   requests, for `/accounts`, `/memberships` and `/user`. Eden takes the
+   token from the first request that has the random path, is a `GET` of one
+   of those three, and names `cf-cli/1.0.0-rc.2` as its user agent.
+4. The listener answers every request `401` itself and sends none of them
+   anywhere.
+5. The listener keeps its port until `cf` has exited, also when Eden stops
+   `cf` because its time ran out. Only then does it close. So no other
+   program can take the port while `cf` may still send the token to it.
 
 The token stays in Eden's memory for that one command. Eden does not print
 it, write it to disk, or put it in a command line or an environment
@@ -255,10 +260,15 @@ What to know about this way of getting the token:
   `cf auth whoami` the token crosses the loopback interface as an HTTP
   header, not encrypted.
 - A program running as you can still get the token, now by running the same
-  `cf` command itself. A program running as another user cannot bind Eden's
-  listener or learn its path from Eden. It could capture loopback traffic
-  only with administrator rights. If another local program reaches the
-  listener first, Eden gets no token from it and stops.
+  `cf` command itself. The listener's port and random path are in that one
+  `cf` process's environment, not in its command line. Who can read a
+  process's environment depends on your system: a program running as you
+  usually can, and an administrator can. An administrator can also capture
+  loopback traffic. Eden does not protect the token from either.
+- The checks on the request (path, method, user agent) decide which request
+  Eden takes a token from. They do not prove which program sent it. A
+  program that sends the listener a request gets `401` and gives Eden
+  nothing it would use as a token unless it knows the random path.
 
 Every `cf` command runs in a fresh, private temporary folder that Eden
 creates outside the project and deletes afterwards. The folder holds an
@@ -266,6 +276,8 @@ empty `cloudflare.config.ts` and the files that one command needs, nothing
 else. `cf` gets a fixed list of your shell's variables (see the
 [reference](./reference.md#variables-eden-reads)), and
 `CLOUDFLARE_API_BASE_URL` is always `https://api.cloudflare.com/client/v4`.
+The one exception is the `cf auth whoami` described above, which gets
+Eden's own listener as that address and changes nothing on Cloudflare.
 So a project's `cloudflare.config.ts` or `.env` file cannot choose the
 account or the token.
 
@@ -277,8 +289,11 @@ remediations print the command with the profile. `CLOUDFLARE_AUTH_USE_KEYRING`
 is passed to `cf`, so `cf` looks for the login where you told it to keep it.
 
 When a publish that carried runtime values fails, `worker/cf-deploy.log`
-keeps only `cf`'s error box, with every value cut out of it exactly, as
-written, as JSON writes it, and URL-encoded.
+keeps nothing that `cf deploy` printed, because `cf` can print a value
+whole, wrapped over two lines, or escaped. It keeps `cf`'s exit code and a
+sentence of Eden's own that says which known `cf` message was seen, if any.
+What `cf` printed for the commands Eden ran afterwards to finish the
+publish is kept; those commands are not given the values.
 
 ### Which account each command uses
 

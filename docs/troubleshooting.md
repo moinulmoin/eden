@@ -740,7 +740,8 @@ just accepted, so Eden repeats that read for up to two minutes. Eden writes
 what `cf` printed for the publish, and for each command it ran to finish it,
 to `worker/cf-deploy.log` in the generation folder under
 `.eden/eve-deploy/generations/`. When the publish carried runtime values,
-the file keeps only `cf`'s error box, with the values cut out.
+the file keeps nothing `cf deploy` printed: only its exit code and, in
+Eden's own words, which known `cf` message was seen.
 
 If it does not, the message is `The exact Cloudflare publication did not
 return a terminal success result.` Eden makes no further change. The failed
@@ -773,7 +774,8 @@ selectors.
 
 The whole publish has one deadline of 15 minutes, from the start of
 `cf deploy` to the end of that last read. `cf deploy` itself gets at most
-ten of them. Once the deadline has passed Eden starts no other command, and
+ten of them. Taking the token of the `cf` login counts against the same
+deadline. Once the deadline has passed Eden starts no other command, and
 the message is `The publish was not finished and checked within its 15
 minutes.` Run `eden deploy` again with the same selectors.
 
