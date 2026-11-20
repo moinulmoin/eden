@@ -646,6 +646,27 @@ and digest identity, the deploy ends as indeterminate. The push may take ten
 minutes; Eden stops waiting after that. See
 [Indeterminate outcomes](#indeterminate-outcomes) below.
 
+`Wrangler uploaded the Worker version but could not apply its Container
+application settings in 3 attempts.` Wrangler uploads the Worker, then reads
+the new version back to set up the Container application. On 2026-11-19
+Cloudflare answered `404` to that read for several seconds, and Wrangler
+gave up. Eden runs `wrangler deploy` up to three times for this one error.
+When all three fail on a target's first deploy, the Worker exists without
+its Container application, and `eden deploy` refuses it with
+`VAL-CLI-007-TARGET-CONFLICT`. Run `eden destroy` with the same `--project`,
+`--env`, and `--name`; if it answers `EVE_DESTROY_OWNERSHIP_UNPROVEN`, wait
+a minute and run it again. Then run `eden deploy` again. This was run on
+Cloudflare on 2026-11-20. For a target that was deployed before, the same
+failure was not followed by a rerun; check the URL's health, then rerun
+`eden deploy`.
+
+### `EVE_PUBLISH_RETRIED`
+
+A warning on a deploy that succeeded. Wrangler uploaded the Worker version
+but could not apply its Container application settings, and Eden ran
+`wrangler deploy` again. Eden read the Worker and the Container application
+back after the rerun. Nothing needs doing.
+
 ### `EVE_IMAGE_IDENTITY_MISMATCH`
 
 `The exact Container image reference did not match the verified local image
@@ -1187,8 +1208,20 @@ npx wrangler@4.147.0 login
 
 This also fails when the live Worker's authenticated provider settings do
 not match the recorded deployment identities, or its Container namespace
-does not match the Worker binding. Inspect the exact target before retrying;
-Eden refuses to delete a same-name replacement.
+does not match the Worker binding. Eden refuses to delete a same-name
+replacement.
+
+A deploy that ended `DEPLOY_INDETERMINATE` can leave a Worker that does not
+carry the deployment's settings yet. Wait a minute and rerun `eden destroy`.
+On 2026-11-19 that worked for two such targets. A third kept refusing; its
+Worker was deleted by hand, after checking in the Cloudflare dashboard that
+the failed deploy had created it:
+
+```sh
+npx wrangler@4.147.0 delete --name <worker>
+```
+
+Then rerun `eden destroy` to clear the rest.
 
 ### `EVE_DESTROY_INDETERMINATE`
 

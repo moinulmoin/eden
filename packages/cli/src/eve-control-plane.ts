@@ -436,6 +436,8 @@ export type EveDeploymentPublicationResult =
     readonly identity: EveDeploymentIdentityProof;
     readonly createdByAttempt: boolean;
     readonly ownershipProven: true;
+    /** How many times `wrangler deploy` ran, when more than once. */
+    readonly attempts?: number;
   }
   | {
     readonly status: "failed";
@@ -2575,27 +2577,55 @@ async function defaultImagePublicationRunner(
   }
 }
 
-function defaultPublicationRunner(): EveDeploymentPublicationRunner {
+/**
+ * Wrangler 4.147.0 prints this when it uploaded the Worker version and then
+ * could not read that version back to set up the Container application. Its
+ * own advice is to run the same `wrangler deploy` again.
+ */
+const WRANGLER_CONTAINER_SETTINGS_UNAPPLIED =
+  "The Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings.";
+const WRANGLER_PUBLICATION_ATTEMPTS = 3;
+const CONTAINER_SETTINGS_UNAPPLIED_REASON =
+  `Wrangler uploaded the Worker version but could not apply its Container application settings in ${WRANGLER_PUBLICATION_ATTEMPTS} attempts.`;
+/** Run on Cloudflare on 2026-11-20, on a target's first deploy. */
+const CONTAINER_SETTINGS_UNAPPLIED_REMEDIATION =
+  "If this was the target's first deploy, the Worker now exists without its Container application and eden deploy refuses it. Run eden destroy with the same --project, --env, and --name; if it answers EVE_DESTROY_OWNERSHIP_UNPROVEN, wait a minute and run it again. Then run eden deploy again. If the target was deployed before, check the deployment URL's /eve/v1/health, then rerun eden deploy. Keep the .eden folder.";
+
+function defaultPublicationRunner(
+  onRetry: (attempt: number) => void,
+): EveDeploymentPublicationRunner {
   return async (request) => {
-    const result = await runWranglerWithInput(
-      [
-        "deploy",
-        "--config",
-        request.wranglerConfigPath,
-        "--name",
-        request.identity.workerName,
-        "--env",
-        request.identity.environment,
-        "--strict",
-      ],
-      undefined,
-      WRANGLER_PUBLICATION_TIMEOUT_MS,
-    );
+    let attempts = 0;
+    let unapplied = false;
+    let result: Awaited<ReturnType<typeof runWranglerWithInput>>;
+    for (;;) {
+      attempts += 1;
+      result = await runWranglerWithInput(
+        [
+          "deploy",
+          "--config",
+          request.wranglerConfigPath,
+          "--name",
+          request.identity.workerName,
+          "--env",
+          request.identity.environment,
+          "--strict",
+        ],
+        undefined,
+        WRANGLER_PUBLICATION_TIMEOUT_MS,
+      );
+      unapplied = result.exitCode !== 0 &&
+        `${result.stdout} ${result.stderr}`.replace(/\s+/gu, " ").includes(WRANGLER_CONTAINER_SETTINGS_UNAPPLIED);
+      if (!unapplied || attempts === WRANGLER_PUBLICATION_ATTEMPTS) break;
+      onRetry(attempts);
+      await waitForActivation(5_000);
+    }
     if (result.exitCode !== 0) {
       return {
         status: "indeterminate",
-        reason:
-          "The exact Cloudflare publication did not return a terminal success result.",
+        reason: unapplied
+          ? CONTAINER_SETTINGS_UNAPPLIED_REASON
+          : "The exact Cloudflare publication did not return a terminal success result.",
         ownershipEvidenceRetained: true,
       };
     }
@@ -2624,6 +2654,7 @@ function defaultPublicationRunner(): EveDeploymentPublicationRunner {
       identity: request.identity,
       createdByAttempt: true,
       ownershipProven: true,
+      ...(attempts === 1 ? {} : { attempts }),
     };
   };
 }
@@ -3409,7 +3440,9 @@ async function runEveDeployment(
   const publishOne = async (
     request: EveDeploymentPublicationRequest,
   ): Promise<EveDeploymentPublicationResult> =>
-    (options.publish ?? defaultPublicationRunner())(request);
+    (options.publish ?? defaultPublicationRunner((attempt) =>
+      eveProgress(options, `wrangler deploy could not apply the Container application settings; running it again (attempt ${attempt + 1} of ${WRANGLER_PUBLICATION_ATTEMPTS})`)
+    ))(request);
   let publication: EveDeploymentPublicationResult;
   const writeFailureRecord = async (
     status: EveDeploymentStatus,
@@ -3445,6 +3478,13 @@ async function runEveDeployment(
       ok: false,
       deployment: deploymentMetadata(identity, targetKey, "indeterminate", operation, superseded, { reason: safeText(publication.reason), evidenceLocation: candidate.generationRoot }),
     };
+  }
+  if (publication.status === "published" && publication.attempts !== undefined) {
+    resultWarnings.push({
+      id: "EVE_PUBLISH_RETRIED",
+      message: `Wrangler uploaded the Worker version but could not apply its Container application settings, so Eden ran wrangler deploy again. Attempt ${publication.attempts} of ${WRANGLER_PUBLICATION_ATTEMPTS} finished, and Eden read the Worker and the Container application back afterwards.`,
+      remediation: "Nothing to do for this deployment. If this warning keeps appearing, Cloudflare is slow to show new Worker versions; a later deploy can still end with DEPLOY_INDETERMINATE.",
+    });
   }
   if (
     publication.status === "failed" ||
@@ -4622,7 +4662,9 @@ export async function runEveControlPlane(
           // One instruction: the failed checks' own, so none contradicts another.
           ...(retirementPending
             ? { remediation: failedCleanup.flatMap((value) => value.remediation ?? []).join(" ") }
-            : {}),
+            : deploymentResult.deployment?.reason === CONTAINER_SETTINGS_UNAPPLIED_REASON
+              ? { remediation: CONTAINER_SETTINGS_UNAPPLIED_REMEDIATION }
+              : {}),
           code: status === "indeterminate"
             ? "DEPLOY_INDETERMINATE"
             : status === "deployed"

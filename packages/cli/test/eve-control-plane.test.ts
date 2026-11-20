@@ -49,6 +49,8 @@ const fakeWrangler = vi.hoisted(() => ({
   intercept: false,
   pending: undefined as readonly string[] | undefined,
   calls: [] as { readonly args: readonly string[]; readonly timeoutMs: unknown }[],
+  /** What each spawn in turn prints on stderr and exits with; then exit 1 with no output. */
+  answers: [] as { readonly exitCode: number; readonly stderr?: string }[],
 }));
 
 /**
@@ -123,7 +125,7 @@ vi.mock("node:timers/promises", async (importOriginal) => {
     ...actual,
     // While the fake registry runs, a wait only moves its clock.
     setTimeout: ((...waitArgs: Parameters<typeof actual.setTimeout>) => {
-      if (!fakeRegistry.active) return actual.setTimeout(...waitArgs);
+      if (!fakeRegistry.active && !fakeWrangler.intercept) return actual.setTimeout(...waitArgs);
       fakeRegistry.clock += waitArgs[0] ?? 0;
       return Promise.resolve();
     }) as typeof actual.setTimeout,
@@ -270,7 +272,11 @@ vi.mock("node:child_process", async (importOriginal) => {
         stdin: { end: () => undefined },
         kill: () => true,
       });
-      setImmediate(() => child.emit("close", 1));
+      const answer = fakeWrangler.answers.shift() ?? { exitCode: 1 };
+      setImmediate(() => {
+        if (answer.stderr !== undefined) child.stderr.emit("data", Buffer.from(answer.stderr));
+        child.emit("close", answer.exitCode);
+      });
       return child;
     }) as unknown as typeof actual.spawn,
   };
@@ -349,6 +355,7 @@ async function withFakeWrangler(
   } finally {
     fakeWrangler.intercept = false;
     fakeWrangler.pending = undefined;
+    fakeWrangler.answers = [];
     timers.mockRestore();
   }
 }
@@ -1649,6 +1656,108 @@ describe("top-level Eden Deploy commands", () => {
     ]);
     expect(calls[0]?.timeoutMs).toBe(600_000);
     expect(errors.join("\n")).toContain("DEPLOY_INDETERMINATE");
+  });
+
+  // What Wrangler 4.147.0 printed on 2026-11-19 when Cloudflare did not show the uploaded version in time.
+  const containerSettingsUnapplied = "\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1mThe Worker version was deployed, but Wrangler could not finish applying its Durable Object-managed Container application settings. Re-run the same `wrangler deploy` command to retry and finish deployment.\u001b[0m\n\n";
+
+  // Exit 1 is that failure, 2 is any other failure, 0 is a publish.
+  test.each([
+    ["every time", [1, 1, 1], 3, "Wrangler uploaded the Worker version but could not apply its Container application settings in 3 attempts."],
+    ["once, before another failure", [1, 2], 2, "The exact Cloudflare publication did not return a terminal success result."],
+    ["twice, before a publish that cannot be read back", [1, 1, 0], 3, "The exact Worker deployment and named Container could not be re-read after publication."],
+  ] as const)("reruns wrangler deploy when it could not apply the Container settings %s, and promotes nothing unproven", async (_name, exits, runs, reason) => {
+    const root = await createRoot();
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({
+        name: "eve-publish-deadline",
+        private: true,
+        packageManager: "pnpm@11.21.0",
+      }),
+      "utf8",
+    );
+    await writeFile(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+    const errors: string[] = [];
+
+    const output: string[] = [];
+    // After a publish, the stand-in's Worker read answers that the Worker does not exist.
+    startFakeRegistry({ entries: {} });
+    fakeWrangler.answers = exits.map((exitCode) => exitCode === 1
+      ? { exitCode, stderr: containerSettingsUnapplied }
+      : { exitCode: exitCode === 0 ? 0 : 1 });
+    const calls = await withFakeWrangler(async () => {
+      await expect(
+        runEdenCli(
+          ["deploy",
+          "--project",
+          root,
+          "--env",
+          "preview",
+          "--name",
+          "eve-publish-deadline", "--json"],
+          {
+            cwd: root,
+            stderr: (line) => errors.push(line),
+            stdout: (line) => output.push(line),
+            eveControlPlane: {
+              artifactRoot: join(root, ".eden", "eve-artifacts", "generation-one"),
+              builder: fakeBuilder(),
+              containerImageReference:
+                `registry.cloudflare.com/account-test/eve@sha256:${"e".repeat(64)}`,
+              hostRequirements: {
+                architecture: "linux/amd64",
+                world: "supported",
+                sandbox: "supported",
+                privileged: false,
+                devices: "none",
+                kernel: "supported",
+                network: "supported",
+                durableLocalFilesystem: false,
+              },
+              runtimeRunner: async () => ({
+                ok: true,
+                checks: [
+                  {
+                    id: "VAL-BUILD-005",
+                    status: "passed",
+                    message: "Image passed.",
+                  },
+                  {
+                    id: "VAL-BUILD-006",
+                    status: "passed",
+                    message: "Eve start passed.",
+                  },
+                  {
+                    id: "VAL-BUILD-007",
+                    status: "passed",
+                    message: "Health passed.",
+                  },
+                ],
+                imageDigest: `sha256:${"e".repeat(64)}`,
+                cleanup: runtimeCleanup,
+              }),
+              cloudflareRead: async () => ({
+                accountAccess: "available",
+                containerAccess: "available",
+                accountId: "account-test",
+                workersDevSubdomain: "account",
+                target: { state: "absent" },
+              }),
+            },
+          },
+        ),
+      ).resolves.toBe(1);
+    });
+    fakeRegistry.active = false;
+
+    expect(calls.map((call) => call.args[0])).toEqual(Array.from({ length: runs }, () => "deploy"));
+    const result = JSON.parse(output[0] as string) as { readonly ok: boolean; readonly error: { readonly code: string; readonly remediation: string }; readonly deployment: { readonly status: string; readonly reason: string } };
+    expect({ ok: result.ok, code: result.error.code, status: result.deployment.status, reason: result.deployment.reason })
+      .toEqual({ ok: false, code: "DEPLOY_INDETERMINATE", status: "indeterminate", reason });
+    // Only the failure that survived every rerun names destroy as the next command.
+    expect(result.error.remediation.includes("Run eden destroy with the same --project, --env, and --name")).toBe(runs === 3 && exits[2] === 1);
+    await expect(lstat(join(root, ".eden", "eve-deploy", "targets", "preview-eve-publish-deadline", "CURRENT"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test("parses --json on every command", () => {
@@ -3401,6 +3510,8 @@ export default eveChannel({
                 identity: request.identity,
                 createdByAttempt: true,
                 ownershipProven: true as const,
+                // The publish needed a second wrangler deploy.
+                attempts: 2,
               };
             },
             health: async (request) => ({
@@ -3425,6 +3536,7 @@ export default eveChannel({
     expect(result.warnings.map((value) => value.id)).toContain(
       "EVE_SCHEDULE_UNSUPPORTED",
     );
+    expect(result.warnings.map((value) => value.id)).toContain("EVE_PUBLISH_RETRIED");
     expect(publishedTriggers).toEqual({ crons: ["* * * * *"] });
   });
 

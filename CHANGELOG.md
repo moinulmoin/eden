@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- `eden deploy` now runs `wrangler deploy` again, up to three times, when
+  Wrangler uploads the Worker version but cannot apply its Container
+  application settings. On 2026-11-19 Cloudflare was slow to show new
+  versions and this ended about half of all deploys with
+  `DEPLOY_INDETERMINATE`. A deploy that needed a rerun carries the
+  `EVE_PUBLISH_RETRIED` warning. When every attempt fails, the error names
+  the commands that recover a first deploy: `eden destroy`, then
+  `eden deploy`.
+- `EVE_DESTROY_OWNERSHIP_UNPROVEN` now says what to do when the account is
+  right but a failed deploy left a half-published Worker.
 - `eden preflight` and `eden deploy` no longer fail at `VAL-BUILD-005` when
   Docker's selected builder uses the `docker-container` driver. That builder
   keeps a built image in its own cache, so Docker never received it. Eden now
