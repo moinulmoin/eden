@@ -4,6 +4,43 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for release 0.14.0 (2026-11-20)
+
+Run on macOS with Docker `29.8.2`, against the maintainer's Cloudflare
+account, with Wrangler `4.147.0` and an OAuth login, on main at `4bb7f98`.
+The `0.14.0` release commit differs from `4bb7f98` only by version numbers,
+the lockfile, the changelog, and docs.
+
+Full run of `pnpm run check:live`, target `eden-live-20261120-8e4742bc`,
+`11:27:24Z` to `11:44:27Z`, Eve `0.91.0` to `1.0.2`, the World packed from
+this workspace (version `0.13.0`), a 90-second idle window. All 18 steps
+passed on the first run.
+
+- `eden preflight` passed 14 checks with no warnings in 130 seconds. The
+  fresh deploy took 181 seconds, the same-version update 176 seconds, and
+  the deploy on Eve `1.0.2` 202 seconds, all on the same URL. Both updates
+  carried the warning `EVE_UPDATE_IN_FLIGHT`.
+- The same-version update reported `VAL-LIFE-007` passed: `The superseded
+  image was deleted from the registry by its tag after promotion.`
+- Session `wrun_01M7WBPD49J8MXZFEJTKG9DJM2` answered after each deploy and
+  after the sleep, with its earlier turns in its stream and its file
+  intact. A new session started after the update, and one on Eve `1.0.2`
+  after the upgrade. After 165 seconds with no requests the first health
+  request took 6.4 seconds, and the server process was 8 seconds old.
+- A session on Eve `1.0.2` asked its server process: no `queueAuthMode`
+  line. An unauthenticated session request got `401`, and the two workflow
+  queue routes answered `404`.
+- `eden destroy` ended in 53 seconds and reported 15 objects in
+  `EVE_REGISTRY_OBJECTS_KEPT`: 12 `refused-snapshot` and 3
+  `refused-singleton-artifact`, none of them `accepted-still-listed`.
+- The check's catalog read found those 15 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+
+The run sent no requests while a deploy was switching versions, so it does
+not test the version switch. The `0.14.0` packages from npm were not
+deployed.
+
 ## Postgres World 5.3.0 checks (2026-11-20)
 
 Run on macOS with Docker, without Cloudflare credentials. No live Cloudflare
