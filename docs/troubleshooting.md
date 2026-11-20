@@ -882,12 +882,19 @@ same exact target after resolving that check.
 A warning on a successful same-version update: `The update is healthy and
 promoted, but Eden could not show that the superseded image
 <repository>@sha256:<digest> left Cloudflare's registry.` The deploy
-succeeded and nothing is needed now. The replaced image still has its tag,
-so it can still be removed:
+succeeded and nothing is needed now. Do not redeploy for this: a later
+deploy does not try this image again. The image may or may not still be in
+the registry, with or without its tag.
 
-- The next `eden deploy` of the same Eve version from this project folder
-  deletes it by its tag. Do not deploy for this alone.
-- `eden destroy` deletes it with the target.
+- `eden destroy` tries to delete everything the registry lists for the
+  target, and reports what Cloudflare keeps.
+- After an Eve upgrade, the retirement of this Eve version does the same
+  for this repository.
+
+Eden deletes a tag here only when the registry resolves it to the digest
+the deployment record names for the replaced image. The same happens when
+an update is interrupted after promotion and before the delete: the
+replaced image stays until destroy or that retirement.
 
 Eden reads the registry with direct requests to `registry.cloudflare.com`
 and never uses a proxy for them. On a machine that cannot reach the registry
@@ -1425,8 +1432,8 @@ delete would be answered differently. What is known about the kept objects:
 - An image manifest names the layers that hold the project's built code.
   Cloudflare does not document what a chain artifact holds.
 - Eden now gives every pushed image a tag of its own and deletes a
-  replaced image by that tag, so an update no longer leaves an untagged
-  image. Images that Eden `0.13.x` or older left untagged stay, and destroy
+  replaced image by that tag, so a completed update no longer leaves an
+  untagged image. Images that Eden `0.13.x` or older left untagged stay, and destroy
   lists them here.
 - Not known: when Cloudflare removes chain artifacts and untagged
   manifests, and whether kept objects count toward the 50 GB of image

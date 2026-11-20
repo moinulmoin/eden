@@ -458,7 +458,7 @@ so health checks can distinguish same-version updates.
 | Durable Object class | `EveHostDurableContainer`, plus `EdenWorldDurableObject` when the project selects the Cloudflare Durable Object World |
 | Worker secrets | One secret per `--env-file` variable of this run |
 | Cron Trigger | `* * * * *`, only when the project's compiled schedules contain at least one cron expression the trigger can evaluate |
-| Registry repository | `eden-eve-<environment>-<name>-<target-key-digest>-<generation-id>` in `registry.cloudflare.com`; with deployment affinity the last part is the affinity ID. Each pushed image is tagged with its generation ID (`candidate` up to Eden `0.13.x`) |
+| Registry repository | `eden-eve-<environment>-<name>-<target-key-digest>-<generation-id>` in `registry.cloudflare.com`; with deployment affinity the last part is the affinity ID. Each pushed image is tagged with the release ID of its deploy, `eve-deploy-<uuid>` (`candidate` up to Eden `0.13.x`) |
 
 The target key digest is the first 24 hexadecimal characters of the SHA-256
 hash of the project identity, account identity, environment, and name, so two

@@ -238,10 +238,12 @@ login cannot act on the checked account, the command fails.
   on a repository that holds the image it just promoted or the image of a
   version it still keeps. In that repository a same-version update deletes
   only the image it replaced, after the new deployment is healthy and
-  promoted: the tag `candidate` that Eden `0.13.x` and older pushed, the
-  tags named after this project's other generations under `.eden`, and the
-  replaced image's own `sha256:` entry. It skips this when another kept
-  version's image is in the same repository. Eden works with one spelling of an image,
+  promoted. The deployment record names that image's repository and digest.
+  Eden deletes its `sha256:` entry, and of the two tags it can have (the
+  release ID of the deploy that pushed it, or `candidate` from Eden
+  `0.13.x` and older) only one the registry lists and resolves to that
+  digest. It deletes nothing when the repository also holds the image of a
+  kept version, or of a version whose retirement the record still names. Eden works with one spelling of an image,
   `registry.cloudflare.com/<account>/<repository>@sha256:<digest>`, and
   refuses any other reference before it changes anything on the target. A recorded image that is
   not in that form cannot be placed in a repository, so it stops every

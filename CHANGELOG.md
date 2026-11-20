@@ -10,11 +10,15 @@
   pushed every image under the tag `candidate`, so the earlier image lost
   its only tag, and Cloudflare's registry does not remove an image that no
   tag names: `eden destroy` reported one `accepted-still-listed` object per
-  such update. Eden now tags each pushed image with its generation ID and,
-  once the new deployment is healthy and promoted, deletes the replaced
-  image by its tag. If that delete cannot be shown, the deploy still
-  succeeds with the new warning `EVE_SUPERSEDED_IMAGE_NOT_DELETED`, and the
-  next same-version deploy from the same project folder tries again.
+  such update. Eden now tags each pushed image with the release ID it
+  generates for that deploy (`eve-deploy-<uuid>`) and, once the new
+  deployment is healthy and promoted, deletes the replaced image by its
+  tag. It deletes a tag only when the registry resolves it to the digest
+  the deployment record names for the replaced image. If the delete cannot
+  be shown, the deploy still succeeds with the new warning
+  `EVE_SUPERSEDED_IMAGE_NOT_DELETED`. A later deploy does not try that
+  image again; `eden destroy`, or the retirement of that Eve version after
+  an upgrade, tries to delete everything in the repository.
   A target deployed with Eden `0.13.x` or older still updates and destroys:
   the first same-version update deletes `candidate` and the image it names.
   Images those versions had already left untagged stay in the registry, and

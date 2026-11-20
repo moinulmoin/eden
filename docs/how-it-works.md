@@ -195,20 +195,27 @@ behavior and the warning that an Eve upgrade can strand sessions.
 - **Cleanup:** a session's first run stays on its original version until the
   session ends, so that version is kept even after the session moves. A later
   deploy removes versions no longer needed by sessions, work, or transfers.
-- **Registry images:** every image Eden pushes gets a tag of its own, its
-  generation ID. A same-version update pushes into the repository of the
-  image it replaces. Once the new deployment is healthy and promoted, Eden
-  deletes the replaced image by its tag, and Cloudflare's registry then
-  removes the image. Eden never deletes it earlier. If that delete cannot be
-  shown, the update still succeeds with the warning
-  [`EVE_SUPERSEDED_IMAGE_NOT_DELETED`](./troubleshooting.md#eve_superseded_image_not_deleted),
-  and the next same-version deploy from the same project folder tries again.
+- **Registry images:** every image Eden pushes gets a tag of its own, the
+  release ID Eden generates for that deploy (`eve-deploy-<uuid>`). A
+  same-version update pushes into the repository of the image it replaces.
+  Once the new deployment is healthy and promoted, Eden deletes the
+  replaced image by its tag, and Cloudflare's registry then removes the
+  image. Eden never deletes it earlier. It takes the replaced image's
+  repository and digest from the deployment record, and deletes a tag only
+  when the registry resolves it to that digest. It deletes nothing when the
+  repository also holds the image of a kept version or of a version whose
+  retirement the record still names. If the delete cannot be shown, the
+  update still succeeds with the warning
+  [`EVE_SUPERSEDED_IMAGE_NOT_DELETED`](./troubleshooting.md#eve_superseded_image_not_deleted).
+  A later deploy does not try that image again. `eden destroy`, and the
+  retirement of that Eve version after an upgrade, try to delete everything
+  the repository lists.
 - **Targets deployed with Eden `0.13.x` or older:** those versions pushed
   every image under the tag `candidate`, so each same-version update took
   the tag from the image before it. Cloudflare's registry does not remove an
   image that no tag names. This version still updates and destroys such a
-  target: the first same-version update deletes `candidate` and the image
-  it names. The images that had already lost the tag stay, and
+  target: the first same-version update deletes `candidate` when the
+  registry resolves it to the image being replaced, and with it that image. The images that had already lost the tag stay, and
   `eden destroy` reports them as `accepted-still-listed` in
   [`EVE_REGISTRY_OBJECTS_KEPT`](./troubleshooting.md#eve_registry_objects_kept).
 
