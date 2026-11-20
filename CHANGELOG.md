@@ -16,9 +16,9 @@ to `1.1.0`, a sleep and wake, and a destroy. The record is in
 
 ### Upgrading from 0.14.0
 
-- Eden needs Node `24.22` or newer (`^24.22.0 || ^26.12.0`). On any other
-  Node, `preflight`, `deploy`, and `destroy` stop with
-  `EVE_NODE_UNSUPPORTED`.
+- Eden needs Node `^24.22.0 || ^26.12.0`: `24.22` or newer in the 24
+  line, or `26.12` or newer in the 26 line. On any other Node, `preflight`,
+  `deploy`, and `destroy` stop with `EVE_NODE_UNSUPPORTED`.
 - `cf` does not read the Wrangler login. Run
   `npx cf@1.0.0-rc.2 auth login` once, unless `CLOUDFLARE_API_TOKEN` is
   set. Until then `preflight` and `deploy` stop with
