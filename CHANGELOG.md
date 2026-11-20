@@ -20,6 +20,36 @@
   63-character name that ends in `-container` or a cut of it from `-c` to
   `-containe`, is refused. A derived default name is never one of these,
   and `eden destroy` still accepts them.
+- When Eden finishes a publish that `cf deploy` left half done, the two
+  minutes it gives the triggers now also end the read of the release in
+  service that comes before each try. Until now only that read's own time
+  limit and the publish's 15-minute deadline ended it. No trigger was
+  deployed after the two minutes before this change either.
+- `VAL-HOST-006` now says what to do. When Cloudflare's API answers that
+  the account has no `workers.dev` subdomain, the check names the account
+  and the dashboard page where one is registered. When the subdomain could
+  not be read, it says so and names the `cf auth whoami` command to run.
+  Until now both cases got one message whose remediation told the user to
+  "return" an account ID and a subdomain. The no-subdomain answer is the one
+  `cf` `1.0.0-rc.2` reads; no account without a subdomain was available to
+  test it on Cloudflare.
+- A failed image push now says how it failed. The `DEPLOY_INDETERMINATE`
+  message tells apart a push Eden stopped after ten minutes, a
+  `docker login` that failed, a `docker tag` or `docker push` that failed
+  after the login, and any other `cf containers push` failure, with `cf`'s
+  exit code. Until now every one of these read `The exact Cloudflare
+  Container image push did not complete.` Nothing `cf` or Docker printed
+  is shown or kept.
+- A push that runs past Eden's ten minutes, or that Ctrl-C interrupts, can
+  go on after `eden deploy` has ended: Eden stops `cf`, and `cf`
+  `1.0.0-rc.2` runs `docker push` as a process of its own. With the pinned
+  `cf` and a stand-in `docker` the push finished three seconds after Eden
+  had returned. Eden's behavior is unchanged, and it now says so: the
+  message says the Docker push may still be running and may still finish,
+  and the remediation gives the `ps` command that shows it and says to run
+  `eden deploy` again afterwards. After Ctrl-C the same text is printed on
+  standard error. `docs/troubleshooting.md` says what happens to an image
+  such a push leaves.
 
 ## 0.15.0 — 2026-11-20
 

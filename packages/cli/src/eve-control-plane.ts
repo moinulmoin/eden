@@ -265,6 +265,8 @@ export interface EveCloudflareReadResult {
   readonly containerAccess: "available" | "unavailable";
   readonly accountId?: string;
   readonly workersDevSubdomain?: string;
+  /** Cloudflare's API answered that the account has registered no workers.dev subdomain. */
+  readonly workersDevSubdomainUnregistered?: true;
   readonly stableWorkersDevOrigin?: string;
   readonly target: {
     readonly state: EveCloudflareTargetState;
@@ -526,6 +528,8 @@ export type EveImagePublicationResult =
   | {
     readonly status: "indeterminate";
     readonly reason: string;
+    /** What to do next, in place of the one remediation every DEPLOY_INDETERMINATE gets. */
+    readonly remediation?: string;
     readonly evidenceRetained: true;
   };
 
@@ -1632,19 +1636,24 @@ function cloudflareApiMissing(answer: CloudflareApiAnswer | undefined, code: num
     typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
-/** The account's workers.dev subdomain, as Cloudflare's API gives it. */
+/**
+ * The account's workers.dev subdomain, as Cloudflare's API gives it, or
+ * that the API says the account has none: 404 with the one error 10007,
+ * which is the code cf 1.0.0-rc.2 reads as "no subdomain registered".
+ * Neither field when the read proved nothing.
+ */
 async function readWorkersDevSubdomain(
   api: CloudflareApiRead,
   accountId: string | undefined,
-): Promise<string | undefined> {
-  if (accountId === undefined) return undefined;
-  const result = cloudflareApiResult(
-    await api(`/accounts/${encodeURIComponent(accountId)}/workers/subdomain`),
-  )?.result;
+): Promise<Pick<EveCloudflareReadResult, "workersDevSubdomain" | "workersDevSubdomainUnregistered">> {
+  if (accountId === undefined) return {};
+  const answer = await api(`/accounts/${encodeURIComponent(accountId)}/workers/subdomain`);
+  if (cloudflareApiMissing(answer, 10007)) return { workersDevSubdomainUnregistered: true };
+  const result = cloudflareApiResult(answer)?.result;
   const subdomain = typeof result === "object" && result !== null && "subdomain" in result
     ? result.subdomain
     : undefined;
-  return typeof subdomain === "string" && EVE_NAME_PATTERN.test(subdomain) ? subdomain : undefined;
+  return typeof subdomain === "string" && EVE_NAME_PATTERN.test(subdomain) ? { workersDevSubdomain: subdomain } : {};
 }
 
 /**
@@ -1806,7 +1815,7 @@ async function defaultCloudflareRead(
   const containerAccess = containerEntries === undefined
     ? "unavailable"
     : "available";
-  const workersDevSubdomain = await readWorkersDevSubdomain(api, accountId);
+  const workersDev = await readWorkersDevSubdomain(api, accountId);
   if (
     accountAccess === "unavailable" ||
     containerAccess === "unavailable" ||
@@ -1818,9 +1827,7 @@ async function defaultCloudflareRead(
       ...(accountId === undefined
         ? {}
         : { accountId }),
-      ...(workersDevSubdomain === undefined
-        ? {}
-        : { workersDevSubdomain }),
+      ...workersDev,
       target: {
         state: "ambiguous",
         message:
@@ -1840,9 +1847,7 @@ async function defaultCloudflareRead(
       ...(accountId === undefined
         ? {}
         : { accountId }),
-      ...(workersDevSubdomain === undefined
-        ? {}
-        : { workersDevSubdomain }),
+      ...workersDev,
       target: { state: "absent" },
     };
   }
@@ -1863,9 +1868,7 @@ async function defaultCloudflareRead(
     ...(accountId === undefined
       ? {}
       : { accountId }),
-    ...(workersDevSubdomain === undefined
-      ? {}
-      : { workersDevSubdomain }),
+    ...workersDev,
     target: {
       // The read-only inventory proves the exact target exists but cannot
       // prove who created it; Eden's immutable deployment record resolves
@@ -2601,19 +2604,37 @@ async function publishImageWithCf(
         maxBuffer: 512 * 1024,
       },
     );
+    // cf signs Docker in and starts docker push as a process of its own.
+    // Eden stops only cf, so a push Eden stopped waiting for can go on.
+    const pushing = `docker push registry.cloudflare.com/${request.accountId}/${request.localImageTag}`;
+    const mayStillRun =
+      `The Docker push that cf started may still be running and may still finish. To see it, run: ps -ax | grep "${pushing}". Let it finish, or stop it with kill and its process ID. Then run eden deploy again with the same --project, --env, and --name, and keep the .eden folder.`;
     const pushed = await cf({
       args: ["containers", "push", "--tag", request.localImageTag],
       accountId: request.accountId,
       timeoutMs: CLOUDFLARE_PUBLICATION_TIMEOUT_MS,
+      interruptNote: `eden deploy was interrupted during the image push and stopped cf only. ${mayStillRun}`,
     });
     if (pushed.exitCode !== 0) {
+      // Nothing cf or Docker printed is kept or shown: cf hands Docker the
+      // registry password, and Docker's own output can repeat it. Only how
+      // the push ended, read from cf's fixed messages seen on 2026-11-20.
+      const unfinished = pushed.exitCode === undefined;
+      const how = pushed.running === true
+        ? "cf containers push ran past Eden's ten minutes and did not stop when Eden killed it (no exit code). cf may still be running."
+        : unfinished
+        ? "cf containers push did not finish in Eden's ten minutes (no exit code). Eden stopped cf only."
+        : /-25299|already exists in the keychain/u.test(pushed.stderr)
+        ? `Docker's credential store already holds an entry for registry.cloudflare.com (cf exited ${pushed.exitCode}). On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry.`
+        : /Login failed with code: \d+/u.test(pushed.stderr)
+        ? `docker login to registry.cloudflare.com failed (cf exited ${pushed.exitCode}). cf signs Docker in to the registry, and Docker saves that in its credential store.`
+        : /Docker command exited with code: \d+/u.test(pushed.stderr)
+        ? `Docker signed in to registry.cloudflare.com, and its tag or push command then failed (cf exited ${pushed.exitCode}).`
+        : `cf containers push exited ${pushed.exitCode}.`;
       return {
         status: "indeterminate",
-        // cf pushes with the caller's Docker credential store. This is the
-        // one failure of it Eden names: macOS refusing a second keychain entry.
-        reason: /-25299|already exists in the keychain/u.test(pushed.stderr)
-          ? "The exact Cloudflare Container image push did not complete: Docker's credential store already holds an entry for registry.cloudflare.com. On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry."
-          : "The exact Cloudflare Container image push did not complete.",
+        reason: `The exact Cloudflare Container image push did not complete: ${how}${unfinished ? " The Docker push that cf started may still be running and may still finish." : ""}`,
+        ...(unfinished ? { remediation: mayStillRun } : {}),
         evidenceRetained: true,
       };
     }
@@ -2799,8 +2820,8 @@ async function finishPublication(
   // for this release alone, so the release in service is read again right
   // before it. That shortens the time in which a write can reach a release
   // that has been replaced; Cloudflare offers no write that is refused then.
-  const stillServed = async (): Promise<boolean> =>
-    (await readServedRelease(api, request))?.namespaceId === namespaceId;
+  const stillServed = async (read: CloudflareApiRead = api): Promise<boolean> =>
+    (await readServedRelease(read, request))?.namespaceId === namespaceId;
   const application = await readPublishApplication(api, request, namespaceId);
   if (application === undefined) return "unfinished";
   if (application === "absent") {
@@ -2823,11 +2844,12 @@ async function finishPublication(
   }
   // Applying the triggers again changes nothing, so a failure is retried for
   // two minutes: on 2026-11-20 cf answered here that the Worker did not exist
-  // seconds after Cloudflare had shown its version.
+  // seconds after Cloudflare had shown its version. The read of the release
+  // before each try gets what is left of the same two minutes.
   const applying = withinTime(120_000, cf, api);
   for (let attempt = 0; attempt < 24 && (attempt === 0 || applying.left() > 5_000); attempt += 1) {
     if (attempt > 0) await pause(5_000);
-    if (!await stillServed()) return "unfinished";
+    if (!await stillServed(applying.api)) return "unfinished";
     const triggers = await applying.cf({
       args: ["workers", "triggers", "deploy", "--prebuilt"],
       accountId,
@@ -3576,10 +3598,12 @@ async function runEveDeployment(
           imageDigest,
         },
       );
-      throw deploymentFailure(
-        "DEPLOY_INDETERMINATE",
-        imagePublication.reason,
-      );
+      throw new EveCliError({
+        code: "DEPLOY_INDETERMINATE",
+        message: safeText(imagePublication.reason),
+        source: "eden deploy",
+        ...(imagePublication.remediation === undefined ? {} : { remediation: imagePublication.remediation }),
+      });
     }
     const publishedRepo = imagePublication.imageReference.split("@")[0];
     const expectedRepo = targetImageReference.split("@")[0];
@@ -4690,13 +4714,26 @@ async function collectEvePreflight(
     }
     publicOrigin = await resolvedCloudflareOrigin(cloudflare, request.name);
     if (publicOrigin === undefined) {
+      // Three cases a user acts on differently: the account has no
+      // subdomain, the subdomain could not be read, and anything else.
+      const account = cloudflare.accountId;
+      const retry = `Confirm the login with ${cfAuthCommand("whoami")}, then run eden deploy again. Nothing was changed on Cloudflare.`;
       checks.push(
-        check(
-          "VAL-HOST-006",
-          "failed",
-          "The authenticated Cloudflare read did not prove the exact workers.dev origin before Eve initialization.",
-          "Return one authenticated account ID, one workers.dev subdomain, and the exact Worker-origin binding.",
-        ),
+        account !== undefined && cloudflare.workersDevSubdomainUnregistered === true
+          ? check(
+            "VAL-HOST-006",
+            "failed",
+            `Cloudflare account ${account} has no workers.dev subdomain, which is part of the deployment's URL.`,
+            `Register one at https://dash.cloudflare.com/${account}/workers/onboarding, then run eden deploy again. Nothing was changed on Cloudflare.`,
+          )
+          : check(
+            "VAL-HOST-006",
+            "failed",
+            account !== undefined && cloudflare.workersDevSubdomain === undefined
+              ? `Eden could not read the workers.dev subdomain of Cloudflare account ${account}, which is part of the deployment's URL. Cloudflare's API did not say that the account has none.`
+              : "The authenticated Cloudflare read did not prove the exact workers.dev origin before Eve initialization.",
+            retry,
+          ),
       );
     }
     if (!allChecksClear(checks)) {

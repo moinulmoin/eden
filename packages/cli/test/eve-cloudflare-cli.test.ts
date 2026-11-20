@@ -44,6 +44,35 @@ test.each(["SIGINT", "SIGTERM"] as const)("%s while cf runs removes the folder t
   expect(folders()).toEqual([]);
 }, 30_000);
 
+test("Ctrl-C during the image push says that the Docker push cf started may still be running", async () => {
+  const temporary = await realpath(await mkdtemp(join(tmpdir(), "eden-cf-signal-")));
+  cleanups.push(() => rm(temporary, { recursive: true, force: true }));
+  // An API that never answers, so the real cf waits once it has asked for the registry credential.
+  let asked = false;
+  const api = createServer(() => { asked = true; });
+  await new Promise<void>((resolve) => api.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise((resolve) => { api.closeAllConnections(); api.close(resolve); }));
+  const script = join(temporary, "run.mjs");
+  await writeFile(script, [
+    "const { createCloudflareCliRunner, cloudflareCliEnvironment } = await import(process.argv[2]);",
+    "const run = createCloudflareCliRunner((account) => ({ ...cloudflareCliEnvironment(account), CLOUDFLARE_API_TOKEN: 'not-a-token', CLOUDFLARE_API_BASE_URL: process.argv[3] }));",
+    "await run({ args: ['containers', 'push', '--tag', 'stand-in:tag'], accountId: '1'.repeat(32), interruptNote: 'the docker push may still be running' });",
+  ].join("\n"), "utf8");
+  const child = spawn(process.execPath, [
+    script,
+    fileURLToPath(new URL("../src/eve-cloudflare-cli.ts", import.meta.url)),
+    "http://127.0.0.1:" + String((api.address() as AddressInfo).port) + "/client/v4",
+  ], { env: { ...process.env, TMPDIR: temporary }, stdio: ["ignore", "ignore", "pipe"] });
+  cleanups.push(async () => { child.kill("SIGKILL"); });
+  let printed = "";
+  child.stderr.on("data", (chunk: Buffer) => { printed += chunk.toString("utf8"); });
+  const exited = new Promise<NodeJS.Signals | null>((resolve) => child.on("close", (_code, by) => resolve(by)));
+  await expect.poll(() => asked, { timeout: 20_000 }).toBe(true);
+  child.kill("SIGINT");
+  expect(await exited).toBe("SIGINT");
+  expect(printed).toContain("the docker push may still be running\n");
+}, 30_000);
+
 /** Whether another program could take the port now. */
 const free = (port: number) => new Promise<boolean>((resolve) => {
   const other = createServer();

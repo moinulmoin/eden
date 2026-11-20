@@ -298,7 +298,12 @@ keeps nothing that `cf deploy` printed, because `cf` can print a value
 whole, wrapped over two lines, or escaped. It keeps `cf`'s exit code and a
 sentence of Eden's own that says which known `cf` message was seen, if any.
 What `cf` printed for the commands Eden ran afterwards to finish the
-publish is kept; those commands are not given the values.
+publish is kept; those commands are not given the values. The image
+push is not given the values, but `cf` hands Docker a registry password for
+it, and Docker's output can repeat what it was given. So Eden shows and
+keeps nothing `cf` or Docker printed during the push, as for the publish:
+the failure message holds `cf`'s exit code and which of a fixed set of
+known `cf` messages was seen.
 
 ### Which account each command uses
 
@@ -360,6 +365,14 @@ login cannot act on the checked account, the command fails.
   checks its registry repositories for anything other than
   [objects Cloudflare keeps](./troubleshooting.md#eve_registry_objects_kept).
   It never deletes by name prefix.
+- **A Container application left without its Worker is deleted on the
+  record and its name.** While the Worker exists, destroy proves the
+  Container application by the namespace the Worker binds. Once Cloudflare's
+  API says the Worker does not exist, there is nothing left to compare the
+  application with, and the deployment record holds its name, not its ID.
+  So destroy deletes the one application of the recorded name in the
+  recorded account. If someone deleted the Worker and created another
+  Container application of that exact name, destroy deletes that one.
 - **Destroy clears only its own pointer.** Destroy refuses a target whose
   record is reached through a symlink that leaves the project's `.eden`
   folder, and reads no record file that is a symlink. It removes `CURRENT` only if the pointer is still the file it read

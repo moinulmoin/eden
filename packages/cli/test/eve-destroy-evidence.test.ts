@@ -82,6 +82,10 @@ const cloud = vi.hoisted(() => {
     secrets: [] as string[],
     /** Each image cf pushed, as account/repository:tag. */
     pushed: [] as string[],
+    /** When set, how "cf containers push" ends, in place of exit 0. A null exit code is a cf that Eden stopped. */
+    pushResult: undefined as CfResult | undefined,
+    /** When set, the API's answer to the read of the account's workers.dev subdomain. */
+    subdomainAnswer: undefined as { readonly status: number; readonly body: string } | undefined,
     /** How many times "cf workers triggers deploy" answers that the Worker does not exist. */
     triggerFailures: 0,
     /** When set, how "cf deploy" exits 1: before it uploads anything, or with the Worker version live and no Container application. */
@@ -247,7 +251,7 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
   }
   if (command === "containers push") {
     cloud.pushed.push(account + "/" + flag("--tag"));
-    return { exitCode: 0 };
+    return cloud.pushResult ?? { exitCode: 0 };
   }
   if (command === "workers delete") {
     if (!cloud.workers.delete(account + "/" + args[2])) {
@@ -323,7 +327,9 @@ async function cloudflareApi(input: string | URL | Request, init?: RequestInit):
     });
   }
   cloud.onRead();
-  if (path === "workers/subdomain") return found({ subdomain: "account" });
+  if (path === "workers/subdomain") {
+    return cloud.subdomainAnswer === undefined ? found({ subdomain: "account" }) : json(cloud.subdomainAnswer.status, cloud.subdomainAnswer.body);
+  }
   if (path === "containers/applications") {
     const entries = [...cloud.containers].flatMap((entry) => {
       const [owner, named = ""] = entry.split("/");
@@ -526,6 +532,8 @@ beforeEach(() => {
     deleted: [],
     secrets: [],
     pushed: [],
+    pushResult: undefined,
+    subdomainAnswer: undefined,
   });
   vi.stubEnv("CLOUDFLARE_API_TOKEN", "");
   vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "");
@@ -638,7 +646,7 @@ async function writeBuild(snapshotRoot: string): Promise<void> {
   await symlink("../eve/bin/eve.js", join(snapshotRoot, "node_modules/.bin/eve"));
 }
 
-type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly message?: string; readonly remediation?: string }[] };
+type DeployResult = { readonly ok?: boolean; readonly error?: { readonly code?: string; readonly message?: string; readonly remediation?: string }; readonly checks?: readonly { readonly id: string; readonly status: string; readonly message?: string; readonly remediation?: string }[] };
 
 /** A deploy that publishes through Eden's own cf calls and its own read afterwards. */
 async function deploy(
@@ -1441,6 +1449,24 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     expect(cloud.apiReads.at(-1)?.url).toMatch(/\/versions\/[0-9a-f-]{36}$/u);
   });
 
+  test("the two minutes for the triggers also end the read of the release before a try", async () => {
+    const root = await deployableProject();
+    cloud.deployFailure = "after-upload";
+    cloud.triggerFailures = 1;
+    const real = performance.now.bind(performance);
+    let skipped = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => real() + skipped);
+    let refused = false;
+    cloud.onMutation = () => { refused = cloud.runs.at(-1)?.args[1] === "triggers"; };
+    // The first read of the release before the second try answers after the two minutes.
+    cloud.onWorkerRead = () => { if (refused) skipped = 3 * 60_000; };
+    const { exitCode, result } = await deploy(root).finally(() => clock.mockRestore());
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect(cloud.triggers).toEqual([]);
+    // Eden asks Cloudflare nothing more about the release once the two minutes have passed.
+    expect(cloud.apiReads.at(-1)?.url).toMatch(/\/deployments$/u);
+  });
+
   test("a publish cf called done after the deadline is not promoted, and Eden starts no other command", async () => {
     const root = await deployableProject();
     const real = performance.now.bind(performance);
@@ -1469,6 +1495,65 @@ describe("eden finishes a publish cf left half done, and destroy removes one it 
     const destroyed = await destroyDeployed(root);
     expect({ exitCode: destroyed.exitCode, status: destroyed.result.status }).toEqual({ exitCode: 0, status: "destroyed" });
     expect(cloud.deleted).toEqual(["worker:" + worker]);
+    expect([...cloud.workers]).toEqual([]);
+  });
+});
+
+describe("a failed image push says how it ended and keeps nothing cf or Docker printed (MOI-312, MOI-235)", () => {
+  // The boxes are what cf 1.0.0-rc.2 printed on 2026-11-20 around a stand-in docker that failed at each step. The line before each stands for Docker's own, which can repeat the registry password.
+  const said = "error storing credentials for v1 with registry-password\n\n";
+  const stillRuns = "The Docker push that cf started may still be running and may still finish.";
+  test.each([
+    [
+      "that ran past Eden's ten minutes",
+      { exitCode: null, stderr: said },
+      "cf containers push did not finish in Eden's ten minutes (no exit code). Eden stopped cf only. " + stillRuns,
+      true,
+    ],
+    [
+      "whose docker login failed",
+      { exitCode: 1, stderr: said + "┌ Error\n│ Login failed with code: 1\n└\n" },
+      "docker login to registry.cloudflare.com failed (cf exited 1). cf signs Docker in to the registry, and Docker saves that in its credential store.",
+      false,
+    ],
+    [
+      "whose docker login found a stale keychain entry",
+      { exitCode: 1, stderr: said + "out: `The specified item already exists in the keychain. (-25299)`\n\n┌ Error\n│ Login failed with code: 1\n└\n" },
+      "Docker's credential store already holds an entry for registry.cloudflare.com (cf exited 1). On macOS, run security delete-internet-password -s registry.cloudflare.com, then retry.",
+      false,
+    ],
+    [
+      "whose docker push failed",
+      { exitCode: 1, stdout: "Login Succeeded\n", stderr: said + "┌ Error\n│ Docker command exited with code: 1\n└\n" },
+      "Docker signed in to registry.cloudflare.com, and its tag or push command then failed (cf exited 1).",
+      false,
+    ],
+    [
+      "that failed another way",
+      { exitCode: 3, stderr: said + "┌ Error\n│ fetch failed\n└\n" },
+      "cf containers push exited 3.",
+      false,
+    ],
+  ] as const)("a cf containers push %s", async (_name, pushResult, how, mayStillRun) => {
+    const root = await deployableProject();
+    const account = "1".repeat(32);
+    cloud.whoami = () => account;
+    cloud.pushResult = pushResult;
+    const output: string[] = [];
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true, output });
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "DEPLOY_INDETERMINATE" });
+    expect(result.error?.message).toBe("The exact Cloudflare Container image push did not complete: " + how);
+    // Only a push Eden stopped waiting for names the docker push to look for, by the image cf pushed.
+    const look = 'To see it, run: ps -ax | grep "docker push registry.cloudflare.com/' + String(cloud.pushed[0]) + '".';
+    expect(result.error?.remediation?.includes(look)).toBe(mayStillRun);
+    if (mayStillRun) expect(result.error?.remediation).toMatch(/^The Docker push that cf started may still be running and may still finish\..* Then run eden deploy again with the same --project, --env, and --name, and keep the \.eden folder\.$/u);
+    // Nothing of what cf and Docker printed is shown or kept.
+    expect(output.join("\n")).not.toContain("registry-password");
+    const kept = await readdir(join(root, ".eden"), { recursive: true, withFileTypes: true });
+    expect(kept.map((file) => file.name)).not.toContain("cf-push.log");
+    for (const entry of kept.filter((file) => file.isFile())) {
+      expect(await readFile(join(entry.parentPath, entry.name), "utf8")).not.toContain("registry-password");
+    }
     expect([...cloud.workers]).toEqual([]);
   });
 });
@@ -1536,6 +1621,34 @@ describe("Eden reads Cloudflare's API with the token of cf's login, or with CLOU
     for (const entry of kept.filter((file) => file.isFile())) {
       expect(await readFile(join(entry.parentPath, entry.name), "utf8")).not.toContain(cloud.loginToken);
     }
+  });
+
+  test.each([
+    [
+      "has no workers.dev subdomain is told where to register one",
+      refused(404, 10007, "There is not a workers.dev subdomain registered for this account."),
+      /^Cloudflare account 1{32} has no workers\.dev subdomain/u,
+      /^Register one at https:\/\/dash\.cloudflare\.com\/1{32}\/workers\/onboarding, then run eden deploy again/u,
+    ],
+    [
+      "does not show its workers.dev subdomain is told to check the login, not to register",
+      refused(403, 10000, "Authentication error"),
+      /^Eden could not read the workers\.dev subdomain of Cloudflare account 1{32}/u,
+      /^Confirm the login with npx cf@1\.0\.0-rc\.2 auth whoami --profile default, then run eden deploy again/u,
+    ],
+  ] as const)("an account that %s, before any write", async (_name, answer, message, remediation) => {
+    const root = await deployableProject();
+    cloud.whoami = () => account;
+    cloud.subdomainAnswer = answer;
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DEPLOY_CHECKS_FAILED" });
+    expect(result.checks?.filter((check) => check.status === "failed")).toEqual([{
+      id: "VAL-HOST-006",
+      status: "failed",
+      message: expect.stringMatching(message) as unknown,
+      remediation: expect.stringMatching(remediation) as unknown,
+    }]);
+    expect({ pinned: cloud.pinned, pushed: cloud.pushed, workers: [...cloud.workers] }).toEqual({ pinned: [], pushed: [], workers: [] });
   });
 
   test("with CLOUDFLARE_API_TOKEN set, Eden reads with it and asks cf for nothing", async () => {

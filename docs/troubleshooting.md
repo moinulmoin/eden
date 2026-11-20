@@ -259,8 +259,8 @@ before you remove the lock file by hand.
 
 `cf containers push` uses your Docker credential store. When the push fails
 this way, the deploy's `DEPLOY_INDETERMINATE` message names the keychain
-entry and the command below. Eden prints nothing else of what the push
-wrote.
+entry and the command below. Eden shows and keeps nothing else of what the
+push printed.
 
 On macOS, a stale `registry.cloudflare.com` keychain entry makes the managed
 registry login fail with `The specified item already exists in the keychain
@@ -527,14 +527,29 @@ declarations.
 ### `VAL-HOST-006` — the public origin could not be proven
 
 Deploy could not learn the account's `workers.dev` subdomain, which is part
-of the deployment's URL. The message is `The authenticated Cloudflare read did
-not prove the exact workers.dev origin before Eve initialization.` Eden
-reads the subdomain from Cloudflare's API
-(`GET /accounts/<account id>/workers/subdomain`). Confirm the login with
-`npx cf@1.0.0-rc.2 auth whoami` and retry. An account that never registered a
-`workers.dev` subdomain has none to read: register one at
-`https://dash.cloudflare.com/<account id>/workers/onboarding`. No such
-account was available to test.
+of the deployment's URL. Eden reads the subdomain from Cloudflare's API
+(`GET /accounts/<account id>/workers/subdomain`), before it changes anything
+on Cloudflare. The message says which of three things happened:
+
+- `Cloudflare account <account id> has no workers.dev subdomain, which is
+  part of the deployment's URL.` The API answered `404` with the one error
+  code `10007`, which is the code `cf` `1.0.0-rc.2` reads as "no subdomain
+  registered". Register one at
+  `https://dash.cloudflare.com/<account id>/workers/onboarding`, then run
+  `eden deploy` again. No such account was available to test: the answer is
+  known from `cf`'s code, not from a run on Cloudflare.
+- `Eden could not read the workers.dev subdomain of Cloudflare account
+  <account id> ... Cloudflare's API did not say that the account has none.`
+  The read got no answer, an error such as an authentication error, or an
+  answer Eden could not use. Confirm the login with
+  `npx cf@1.0.0-rc.2 auth whoami --profile default`, or with the profile in
+  `CLOUDFLARE_AUTH_PROFILE`, and run `eden deploy` again. The remediation
+  prints the command with the profile.
+- `The authenticated Cloudflare read did not prove the exact workers.dev
+  origin before Eve initialization.` Any other case, such as an account
+  that could not be read; the `VAL-CLI-007-CLOUDFLARE-ACCESS` check beside
+  it then says why. Confirm the login the same way and run `eden deploy`
+  again.
 
 ### `EVE_ORIGIN_UNAVAILABLE`
 
@@ -755,9 +770,56 @@ local check has passed.
 Eden pushes the runtime image to the managed Cloudflare registry
 (`registry.cloudflare.com`). When the push does not return a terminal
 success, or the published image does not match the exact target repository
-and digest identity, the deploy ends as indeterminate. The push may take ten
-minutes; Eden stops waiting after that. See
+and digest identity, the deploy ends as indeterminate. See
 [Indeterminate outcomes](#indeterminate-outcomes) below.
+
+The push gets ten minutes. Then Eden stops `cf`, and only `cf`. `cf`
+`1.0.0-rc.2` starts `docker push` as a process of its own, in its own
+process group, and that process is not stopped: with the pinned `cf` and a
+stand-in `docker`, the push went on and finished three seconds after Eden
+had returned. The same holds when you stop Eden with Ctrl-C or a kill
+during the push. So after such a deploy the Docker push may still be
+running and may still finish. The remediation, and a line on standard error
+after Ctrl-C, give the command that shows it:
+
+```sh
+ps -ax | grep "docker push registry.cloudflare.com/<account id>/<repository>:<tag>"
+```
+
+Let it finish, or stop it with `kill <process id>`. Docker's reference says
+that killing `docker push` ends the push. Then run `eden deploy` again with
+the same `--project`, `--env`, and `--name`.
+
+A push that finished its upload leaves an image in the registry.
+`deployment-attempt.json` in the generation folder names
+its repository as `imageRepository`. Once a deploy
+of the target has succeeded, `eden destroy` also empties the repositories
+of its failed attempts. A target that never deployed has no deployment
+record, so `eden destroy` answers `EVE_DESTROY_RECORD_UNPROVEN` and deletes
+nothing. If you give the target up at that point, list that one repository
+as [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept) shows and
+delete what it lists with
+`npx cf@1.0.0-rc.2 containers images delete <repository>:<tag>`.
+
+`cf containers push` signs Docker in to the registry, then runs
+`docker tag` and `docker push`. When it fails, the message starts with
+`The exact Cloudflare Container image push did not complete:` and says how:
+
+| The message goes on | What happened |
+| --- | --- |
+| `cf containers push did not finish in Eden's ten minutes (no exit code). Eden stopped cf only. The Docker push that cf started may still be running and may still finish.` | The push took longer than ten minutes, or `cf` was killed. See above. |
+| `cf containers push ran past Eden's ten minutes and did not stop when Eden killed it (no exit code). cf may still be running. The Docker push that cf started may still be running and may still finish.` | The system did not deliver Eden's kill of `cf`. Look for `cf` as well as for the Docker push. This case was not run. |
+| `Docker's credential store already holds an entry for registry.cloudflare.com (cf exited <code>).` | See [Managed registry login fails with `-25299`](#managed-registry-login-fails-with--25299). |
+| `docker login to registry.cloudflare.com failed (cf exited <code>). cf signs Docker in to the registry, and Docker saves that in its credential store.` | `docker login` exited with an error. |
+| `Docker signed in to registry.cloudflare.com, and its tag or push command then failed (cf exited <code>).` | `docker tag` or `docker push` exited with an error. |
+| `cf containers push exited <code>.` | `cf` failed another way, for example before it reached Docker. |
+
+Eden shows and keeps nothing that `cf` or Docker printed during the push:
+`cf` hands Docker the registry password, and Docker's output can repeat it.
+The message holds only which of these fixed cases was seen and `cf`'s exit
+code. The `cf` messages behind the rows were read from `cf` `1.0.0-rc.2`
+run with a stand-in `docker` that failed at each step, not from a failed
+push to Cloudflare's registry.
 
 The publish is one `cf deploy --prebuilt`, which Eden never runs twice.
 `cf deploy` uploads the Worker version first, then sets up the Container
@@ -779,7 +841,8 @@ return a terminal success result.` Eden makes no further change. The failed
 If it does, Eden finishes the publish itself: it creates the Container
 application when the account has none of the target's name, reads it back,
 then deploys the triggers, trying again for up to two minutes while that
-fails. The deploy then continues as any other. Eden writes nothing when the
+fails. Before each try it reads the release in service again, and that read
+counts against the same two minutes. The deploy then continues as any other. Eden writes nothing when the
 Worker version has no single binding for the Container class, or when a
 Container application of that name has another ID, policy or namespace.
 When one of those steps fails or one of those answers disagrees, the

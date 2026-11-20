@@ -72,6 +72,8 @@ export interface CloudflareCliRequest {
    * Eden's own, so the command also gets no proxy and sends no telemetry.
    */
   readonly apiBaseUrl?: string;
+  /** Written to standard error when Ctrl-C or a kill ends Eden while this command runs. */
+  readonly interruptNote?: string;
 }
 
 export interface CloudflareCliResult {
@@ -151,6 +153,7 @@ async function runCf(
   // leave it: remove it, stop cf, then let the signal end Eden as it would have.
   const interrupted = (signal: NodeJS.Signals): void => {
     child?.kill("SIGKILL");
+    if (child !== undefined && request.interruptNote !== undefined) process.stderr.write(request.interruptNote + "\n");
     rmSync(cwd, { recursive: true, force: true });
     process.removeListener("SIGINT", interrupted);
     process.removeListener("SIGTERM", interrupted);

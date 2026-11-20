@@ -73,7 +73,13 @@ until the checks in steps 1–4 have passed.
    `cf` runs every command with the account from step 3, so a login
    that changes mid-deploy cannot move a write to another account. Step 3
    itself runs before the build and again after it, and the deploy stops if
-   the two name different accounts.
+   the two name different accounts. `cf containers push` gets ten minutes.
+   When they pass, or when Eden is stopped with Ctrl-C or a kill, Eden
+   stops `cf` and nothing else. `cf` runs `docker push` as a process in
+   a group of its own, so that push may go on and may still finish after
+   the deploy has ended `DEPLOY_INDETERMINATE`. Eden says so and names the
+   command that shows the push; see
+   [Troubleshooting](./troubleshooting.md#deploy_indeterminate--the-image-push-could-not-be-proven).
 6. **Stage runtime variables** (only with `--env-file`). The values are
    held for the publish, which uploads them as Worker secrets with the
    Worker version, so code and values change together. Values never go into
@@ -367,6 +373,11 @@ version in service: the deployment ID and release ID Eden stamped must be
 ones the local records name. This also covers a target whose first publish
 stopped before its Container application existed: destroy removes that
 Worker alone, using the record of the failed attempt.
+
+When the Worker does not exist and a Container application of the recorded
+name does, destroy deletes that application on the record and the name
+alone: the record does not hold the application's ID. See
+[Security](./security.md).
 
 Destroy Destroy reads everything again after its deletes and clears
 the `CURRENT` pointer only if it is the symlink that named the record and

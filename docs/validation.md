@@ -132,7 +132,11 @@ step fails there is no tail output; the step's own error is what you get.
 
 Each step prints `✓`, `✗`, or `-` (skipped) with its time. The last output
 is one JSON object with `ok`, the target, and every step. The exit code is
-`0` when no step fails.
+`0` when no step fails. A step that failed because an `eden` command
+failed also has `edenOutput`: the whole JSON object that command printed,
+with every check, passed or failed, so the read that failed can be told
+from the ones that passed. The model key and the session token are
+redacted in it as everywhere else.
 
 Defaults and options:
 
