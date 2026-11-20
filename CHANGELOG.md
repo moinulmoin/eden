@@ -78,8 +78,10 @@
   Cloudflare's deployments read and its Worker read can disagree for a
   while after a Worker is created or deleted. Both must answer that the
   Worker does not exist. A Container application list with a count or total
-  that does not match its entries, or one that runs past twenty pages, is
-  no proof of absence.
+  that does not match its entries, a full page that gives no total, or a
+  list that runs past twenty pages, is no proof of absence. `eden deploy`
+  stops before it publishes when the account has two Container applications
+  of the target's name.
 - Eden 0.14.0 cannot deploy a target this version deployed: it exits 1
   with `DEPLOY_INDETERMINATE` and the live deployment keeps answering.
 - **`eden destroy` removes a first deploy that was only half published.**

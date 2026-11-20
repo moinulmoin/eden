@@ -452,7 +452,10 @@ writes nothing in the second account. Confirm the account you intend with
 When `cf` is signed in but the account's Containers cannot be read, the
 remediation says so. The account must be on the Workers Paid plan, which
 Cloudflare Containers requires. Review the account that `auth whoami` returns
-before you retry, or switch accounts with `npx cf@1.0.0-rc.2 auth login`; Eden never selects a different Cloudflare account silently.
+before you retry, or switch accounts with
+`npx cf@1.0.0-rc.2 auth login --profile default`. Name the profile in
+`CLOUDFLARE_AUTH_PROFILE` in place of `default` when you set one. Eden never
+selects a different Cloudflare account silently.
 
 When the read-only adapter itself fails, the check reports
 `The exact read-only Cloudflare adapter failed without a safe result.` and no

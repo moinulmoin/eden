@@ -201,8 +201,10 @@ checked account:
 - the Container applications of the target's name, and one application;
 - the account's `workers.dev` subdomain.
 
-Eden changes nothing with them. Every change in your account goes through
-`cf`.
+Eden changes nothing with them. Every change to a Worker or a Container
+application goes through `cf`. The one change Eden sends itself is registry
+cleanup: the delete requests to `registry.cloudflare.com` described under
+[What Eden can change in your Cloudflare account](#what-eden-can-change-in-your-cloudflare-account).
 
 The reads need a token. When `CLOUDFLARE_API_TOKEN` is set, Eden sends that
 token and takes nothing from `cf`. A token made from Cloudflare's "Edit

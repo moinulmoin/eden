@@ -263,8 +263,10 @@ the agent sleeps takes about 10–15 seconds.
 - `VAL-CLI-007-CLOUDFLARE-ACCESS`: `cf` is not signed in, its sign-in does
   not show exactly one account, or the account lacks Workers
   Paid/Containers. It is checked before the build. The user has to fix this
-  (`npx cf@1.0.0-rc.2 auth login`, then `npx cf@1.0.0-rc.2 auth whoami`),
-  or set `CLOUDFLARE_API_TOKEN`.
+  (`npx cf@1.0.0-rc.2 auth login --profile default`, then
+  `npx cf@1.0.0-rc.2 auth whoami --profile default`; name the profile in
+  `CLOUDFLARE_AUTH_PROFILE` in place of `default` when one is set), or set
+  `CLOUDFLARE_API_TOKEN`.
 - `EVE_NODE_UNSUPPORTED`: Node is not 24.22.0 or newer on the 24 line, or
   26.12.0 or newer on the 26 line. Install Node 24 (for example
   `nvm install 24`), then run the command again.
