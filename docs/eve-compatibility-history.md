@@ -4,6 +4,36 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Postgres World 5.4.0 checks (2026-11-21)
+
+Run on macOS with Docker and Postgres 16, Node `24.22.3`, on main at
+`4367232` with the fixture change, without Cloudflare credentials. No live
+Cloudflare run was made: the Eden leg removes `@workflow/world-postgres`
+from the project, so the Cloudflare path does not load it. No project with
+the Postgres World was deployed to Cloudflare.
+
+- The compatibility gate passed both legs for both fixtures: Eve `0.91.0`
+  with `@workflow/world-postgres` `5.0.5`, and Eve `1.1.0` with `5.4.0`.
+  `EVE_WORLD_PAIRING` passed in both.
+- The published `5.4.0` and `5.3.0` packages were unpacked and compared.
+  Unlike `5.3.0`, `5.4.0` changes code: the queue, storage, streamer,
+  retention, and run lease modules, and startup recovery, which now skips
+  runs parked on a hook or a wait. It adds migration
+  `0032_add_run_wake_pending`, a `./kubernetes` export, a Helm chart, and a
+  `workflow-postgres-prune` binary. Eden uses none of the three additions.
+- `5.4.0` pins `@workflow/world` `5.3.0`, `@workflow/world-local` `5.5.0`,
+  and `@workflow/errors` `5.1.4`. Eve `1.1.0` bundles `@workflow/world`
+  `5.2.2`. `@workflow/world` `5.3.0` adds an optional `runs.deleteDataMany`
+  method to the World interface.
+- The `bootstrap` binary Eden runs before a publish keeps its name. On one
+  empty database, `bootstrap` from `5.3.0` and then from `5.4.0` both
+  exited 0, and the `wake_pending` column on `workflow.workflow_runs`
+  existed only after the second. A second `5.4.0` run and a later `5.3.0`
+  run also exited 0. No run data was in that database.
+- Both versions declare `queueAuthMode: "skip"`, and declare deployment
+  affinity only when `deploymentId` or `WORKFLOW_POSTGRES_DEPLOYMENT_ID` is
+  set. Eden sets neither.
+
 ## Live check for release 0.15.0 (2026-11-20)
 
 Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
