@@ -1377,7 +1377,7 @@ It checks the two known durable Worlds. Match the World's `@workflow/core`
 or `@workflow/world` dependency to Eve's `@workflow/core` major and, if both
 declare one, prerelease family. The tested pairs are: for Eve `1.1.0`, which
 bundles `@workflow/world` `5.2.2`, the tested pair is
-`@workflow/world-postgres@5.3.0`; for Eve `0.91.0`, which bundles
+`@workflow/world-postgres@5.4.0`; for Eve `0.91.0`, which bundles
 `@workflow/world` `5.0.5`, it is `@workflow/world-postgres@5.0.5`.
 
 The Cloudflare World must also declare `eden.capabilities.worldRpcAuth`.
@@ -1472,7 +1472,8 @@ Eden had read it, or the record is damaged. ...` The record's
 `identity.containerApplicationId` is `null` or is not one ID. Eden writes
 `null` before a publish and writes the ID only after it has read the
 release in service and its Container application together. So a first
-deploy that ended `DEPLOY_INDETERMINATE` has a record with `null`. While
+deploy whose publication verification never finished has a record with
+`null`. While
 its Worker exists, `eden destroy` still removes that Worker and its
 Container application, proven by the Worker as before. Once the Worker is
 gone, Eden cannot tell the application from another of the same name.

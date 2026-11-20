@@ -64,6 +64,12 @@
   such field, keeps the old behavior until a deploy by a newer Eden. A
   first deploy left half published is still destroyed while its Worker
   exists.
+- Eve `1.1.0` with `@workflow/world-postgres` `5.4.0` is the latest tested
+  pair, in place of `5.3.0`. The compatibility gate passed with it. Eden did
+  not change. `5.4.0` adds migration `0032`, one new column on the runs
+  table; `eden deploy` runs the World's `bootstrap` before it publishes, so
+  a project that moves from `5.3.0` needs only the new version and a
+  deploy. No deploy to Cloudflare with the Postgres World was run.
 
 ## 0.15.0 — 2026-11-20
 
