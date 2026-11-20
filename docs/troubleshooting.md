@@ -425,6 +425,13 @@ nothing in either:
 - `CLOUDFLARE_ACCOUNT_ID names an account this login does not have.` Unset
   the variable or set it to the account `cf auth whoami` shows.
 
+The Container read in this check is Eden's first read of Cloudflare's API.
+When `cf` is signed in and does not hand Eden its login's token, the
+remediation starts `cf is signed in, but Eden could not take its login's
+token, which it needs to read Cloudflare's API.` Confirm the login and
+retry. If it fails the same way, set `CLOUDFLARE_API_TOKEN`. See
+[How Eden reads Cloudflare's API](./security.md#how-eden-reads-cloudflares-api).
+
 #### Moving from the Wrangler login to cf
 
 Eden 0.14 and earlier used Wrangler and its saved login. Eden now runs
@@ -492,24 +499,14 @@ declarations.
 ### `VAL-HOST-006` — the public origin could not be proven
 
 Deploy could not learn the account's `workers.dev` subdomain, which is part
-of the deployment's URL. The check carries one of these messages:
-
-- `Cloudflare gave no workers.dev URL for a Worker of this account.` Register
-  the account's `workers.dev` subdomain at
-  `https://dash.cloudflare.com/<account id>/workers/onboarding`, then run the
-  command again. No account without a subdomain was available to test, so
-  this message has not been seen against Cloudflare.
-- `Eden deployed the temporary Worker <name> to read the account's
-  workers.dev subdomain and could not delete it.` Run
-  `npx cf@1.0.0-rc.2 workers delete <name> --force`, then run the command
-  again. The Worker has no URL and serves nothing.
-- `This Cloudflare account has no Worker yet, and the temporary Worker Eden
-  deploys to read the account's workers.dev subdomain could not be deployed
-  or read.` Run the command again. If it fails the same way, check the
-  onboarding page above.
-- `The authenticated Cloudflare read did not prove the exact workers.dev
-  origin before Eve initialization.` A `cf` read failed. Confirm the login
-  with `npx cf@1.0.0-rc.2 auth whoami` and retry.
+of the deployment's URL. The message is `The authenticated Cloudflare read did
+not prove the exact workers.dev origin before Eve initialization.` Eden
+reads the subdomain from Cloudflare's API
+(`GET /accounts/<account id>/workers/subdomain`). Confirm the login with
+`npx cf@1.0.0-rc.2 auth whoami` and retry. An account that never registered a
+`workers.dev` subdomain has none to read: register one at
+`https://dash.cloudflare.com/<account id>/workers/onboarding`. No such
+account was available to test.
 
 ### `EVE_ORIGIN_UNAVAILABLE`
 
@@ -517,21 +514,10 @@ The authenticated account and `workers.dev` subdomain were not returned by
 the read-only resolver, or the authenticated origin did not match the exact
 Worker target.
 
-`cf` has no command for the account's `workers.dev` subdomain. Eden reads it
-from the URL Cloudflare gives for any Worker the account already has
-(`cf workers list --per-page 1`).
-
-When the account has no Worker yet, `eden deploy` deploys a temporary Worker
-named `eden-origin-probe-<8 hex characters>` with `cf deploy --prebuilt`. It
-has no URL, no route, and no bindings, and answers nothing. Eden reads its
-`workers.dev` URL with `cf workers get` and deletes it with
-`cf workers delete --force`, all before the build. Human output shows one
-line that names it. On 2026-11-20 those three commands took about 20 seconds
-against Cloudflare. The account used for that run had other Workers, so the
-empty list itself was a stand-in. `eden preflight` never does this: it needs
-no origin and changes nothing.
-
-If this fails, the `VAL-HOST-006` check above says why and what to run.
+Eden reads the subdomain from Cloudflare's API, as
+[`VAL-HOST-006`](#val-host-006--the-public-origin-could-not-be-proven)
+describes. An account with no Worker yet needs nothing more: the read does
+not depend on a Worker.
 
 If the origin resolver rejects the Worker name or account subdomain
 (`HOST_ORIGIN_UNAVAILABLE`), the CLI reports its message under this code.
@@ -849,8 +835,7 @@ gate on the public URL, and the promotion of the generation.
 `The inline Eve deploy checks failed; nothing was published for this target.`
 The summary names the first failing check. Fix that check and retry. `eden
 preflight` runs the same checks and only reads remote state; it never mutates
-it. On a Cloudflare account with no Worker yet, deploy's checks deploy and
-delete one [temporary Worker](#eve_origin_unavailable).
+it.
 
 ### `EVE_PREFLIGHT_FAILED`
 
@@ -1411,6 +1396,23 @@ the rest. Do not run `cf workers delete` from a project folder for this:
 `cf` runs the nearest `cloudflare.config.ts` it finds from its folder upward
 and reads `.env` files beside it, so a file can choose another account.
 
+### `EVE_CF_LOGIN_TOKEN_UNAVAILABLE`
+
+`Eden could not take the token of cf's login, so it could not read
+Cloudflare's API; nothing was deleted.` `cf` is signed in to the recorded
+account, `CLOUDFLARE_API_TOKEN` is not set, and `cf` did not hand Eden its
+login's token when asked. [How Eden reads Cloudflare's API](./security.md#how-eden-reads-cloudflares-api)
+describes that step. Confirm the login and run the command again:
+
+```sh
+npx cf@1.0.0-rc.2 auth whoami --profile default
+```
+
+If it fails the same way, set `CLOUDFLARE_API_TOKEN` to an API token for the
+account. Eden then reads with that token and asks `cf` for nothing.
+`preflight` and `deploy` report the same cause in
+[`VAL-CLI-007-CLOUDFLARE-ACCESS`](#val-cli-007-cloudflare-access--cloudflare-access-is-blocked).
+
 ### `EVE_DESTROY_INDETERMINATE`
 
 The exact remote inventory could not be read completely, or a Worker or
@@ -1418,24 +1420,26 @@ Container deletion did not complete with a terminal result. Eden never treats
 an authentication, permission, network, malformed or incomplete inventory
 result as absence. Inspect the retained deployment record and Cloudflare
 inventory, then retry the exact target.
-Eden reads the Worker through `cf` (`cf workers deployments list`). When
-`cf` exits 0 and prints a list of deployments, each with an id, the Worker
-exists. It is absent only on Cloudflare's own single answer, as `cf` prints
-it: exit code 1, nothing on standard output, and exactly one error with code
-`10007` and status `404` for the exact request path of that account and
-Worker. `cf workers get` must then give the same answer for its own path,
-because Cloudflare's two reads can disagree for a while after a Worker is
-created or deleted. Any other answer about the Worker, output Eden cannot read, and no
-answer, are indeterminate. Eden reads a Container application list, empty or
-not, only when `cf` exits 0 and prints a JSON list; any other answer is
-indeterminate too. A delete counts as `absent` by the same rule, with code
-`10007` for the Worker and `1609` for the Container application. An
-unreadable registry listing is reported separately, as
-`EVE_DESTROY_IMAGES_RETAINED`. Rerun `eden destroy` with the same selectors;
-if it keeps failing, check the login with `npx cf@1.0.0-rc.2 auth whoami`.
+Eden reads the Worker from Cloudflare's API
+(`GET /accounts/<id>/workers/scripts/<name>/deployments`). A whole answer
+with status `200` that lists deployments, each with an id, means the Worker
+exists. It is absent only on the API's own answer: status `404`, `success`
+false, a null `result`, exactly one error with code `10007`, and no
+message beside it. The read of the Worker itself
+(`GET /accounts/<id>/workers/workers/<name>`) must then give the same
+answer, because Cloudflare's two reads can disagree for a while after a
+Worker is created or deleted. Any other answer, a redirect, a partial
+answer, a body that names a field twice, and no answer are indeterminate.
+What `cf` prints decides none of this. When a `cf` delete does not exit 0,
+Eden reads the API the same way to learn whether the object is gone, with
+code `1609` for a Container application. An unreadable registry listing
+is reported separately, as `EVE_DESTROY_IMAGES_RETAINED`. Rerun
+`eden destroy` with the same selectors; if it keeps failing, check the
+login with `npx cf@1.0.0-rc.2 auth whoami`.
 Eden lists Container applications by exact name
-(`cf containers applications list --name`) and follows the page tokens
-Cloudflare returns.
+(`GET /accounts/<id>/containers/applications?name=<name>`) and follows the
+page tokens Cloudflare returns, for at most twenty pages. A count or total
+that does not match the entries read is indeterminate.
 A full response without pagination metadata or a failed page read is
 indeterminate, never proof that the named application is absent.
 

@@ -135,12 +135,11 @@ never switches accounts silently. For each target it creates one Worker, one
 Container application, its Durable Objects, registry images, and, only when
 your project has schedules, one Cron Trigger. The exact names are listed in
 the [reference](./reference.md).
-On an account with no Worker yet, `eden deploy` also deploys and deletes one
-temporary Worker named `eden-origin-probe-<8 hex characters>`, which has no
-URL and no bindings, to read the account's `workers.dev` subdomain.
-Eden reads the target's state through `cf`. Eden sends requests of its own
-to one place only: `registry.cloudflare.com`. Those requests can change
-something. They name only repositories that the deployment record proves
+Eden reads the target's state from Cloudflare's API itself, with `GET`
+requests to `api.cloudflare.com` that change nothing; see
+[How Eden reads Cloudflare's API](#how-eden-reads-cloudflares-api). Eden
+sends requests of its own that can change something to one place only:
+`registry.cloudflare.com`. They name only repositories that the deployment record proves
 this target owns. When `eden destroy` or an update cleans up such a
 repository, Eden:
 
@@ -182,22 +181,84 @@ Eden does not store or print the credential.
 
 ### What Eden can and cannot read
 
-`cf auth login` keeps its OAuth token in the operating system's keychain
-when one is available. Eden cannot read it there and reads no OAuth token
-from disk. Eden 0.14 and earlier read Wrangler's saved token; this version
-only checks whether Wrangler's login file exists, to explain a signed-out
-`cf`, and never opens it.
+`cf auth login` keeps its login in the operating system's keychain when one
+is available, and in an encrypted file otherwise. Eden reads neither. Eden
+0.14 and earlier read Wrangler's saved token from disk; this version only
+checks whether Wrangler's login file exists, to explain a signed-out `cf`,
+and never opens it.
 
-Eden itself never reads or sends `CLOUDFLARE_API_TOKEN`; only `cf` uses it,
-as its login. A token made from Cloudflare's "Edit Cloudflare Workers"
-template, unchanged, ran preflight, a first deploy, an update, and a destroy
-on 2026-11-20. A narrower set of permissions was not tested. `cf` has no
-command for the account's `workers.dev` subdomain, so Eden reads it from the
-URL of any Worker the account already has (`cf workers list --per-page 1`).
-When the account has no Worker yet, `eden deploy` deploys one temporary
-Worker with no URL, reads its `workers.dev` URL, and deletes it, as
-[`EVE_ORIGIN_UNAVAILABLE`](./troubleshooting.md#eve_origin_unavailable)
-describes.
+### How Eden reads Cloudflare's API
+
+Eden decides that a Worker or a Container application exists, is absent, or
+is its own from the answers of Cloudflare's API themselves: the status, the
+`success` field, the errors, and the result. `cf` prints those answers as
+text and leaves parts of them out, so Eden makes these reads itself. They
+are `GET` requests to `https://api.cloudflare.com/client/v4` only, for the
+checked account:
+
+- the Worker's deployments, its versions, one version's bindings, and the
+  Worker itself;
+- the Container applications of the target's name, and one application;
+- the account's `workers.dev` subdomain.
+
+Eden changes nothing with them. Every change in your account goes through
+`cf`.
+
+The reads need a token. When `CLOUDFLARE_API_TOKEN` is set, Eden sends that
+token and takes nothing from `cf`. A token made from Cloudflare's "Edit
+Cloudflare Workers" template, unchanged, ran preflight, a first deploy, an
+update, and a destroy on 2026-11-20, on an earlier build of this version in
+which `cf` made the reads. A narrower set of permissions was not tested, and
+no API token was run against this build's own reads.
+
+Without the variable, Eden uses the token of your `cf` login.
+`cf 1.0.0-rc.2` has no command that prints it, so Eden gets it this way:
+
+1. Eden opens a listener on `127.0.0.1`, on a port the system picks, before
+   it starts `cf`.
+2. Eden runs `cf auth whoami` with `CLOUDFLARE_API_BASE_URL` set to that
+   listener, under a random path that only this `cf` process is given.
+3. `cf` asks the listener who it is and sends its login's token, as it would
+   to Cloudflare. Eden takes the token from the first request, and only when
+   that request has the random path, is a `GET` of `/accounts`,
+   `/memberships` or `/user`, and names `cf-cli/1.0.0-rc.2` as its user
+   agent.
+4. The listener answers `401`, sends the request nowhere, and closes. It
+   takes one request.
+
+The token stays in Eden's memory for that one command. Eden does not print
+it, write it to disk, or put it in a command line or an environment
+variable, and sends it nowhere but `api.cloudflare.com`. A login's token
+expires, so when Cloudflare answers `401` for it Eden takes it from `cf`
+once more. One command can ask `cf` several times. On 2026-11-20 one such
+`cf auth whoami` took about half a second.
+
+`eden preflight` makes these reads too. A `cf` that does not hand over its
+token fails there, at the
+[Cloudflare access check](./troubleshooting.md#val-cli-007-cloudflare-access--cloudflare-access-is-blocked),
+and not in the middle of a deploy. `eden destroy` stops with
+[`EVE_CF_LOGIN_TOKEN_UNAVAILABLE`](./troubleshooting.md#eve_cf_login_token_unavailable)
+and deletes nothing.
+
+What to know about this way of getting the token:
+
+- It relies on behavior Cloudflare does not document as a contract: that
+  `cf` honors `CLOUDFLARE_API_BASE_URL` and sends its login's token to that
+  address. Eden runs only the `cf` version it pins, and a `cf` that stops
+  doing this makes Eden stop, not guess.
+- Setting `CLOUDFLARE_API_TOKEN` avoids it: Eden then asks `cf` for
+  nothing.
+- Compared with Eden 0.14: that version read Wrangler's OAuth token from a
+  plain file in your home folder and sent it to `api.cloudflare.com` for
+  the same reads. Any program running as you could read that file at any
+  time. This version reads no token file. For the length of one
+  `cf auth whoami` the token crosses the loopback interface as an HTTP
+  header, not encrypted.
+- A program running as you can still get the token, now by running the same
+  `cf` command itself. A program running as another user cannot bind Eden's
+  listener or learn its path from Eden. It could capture loopback traffic
+  only with administrator rights. If another local program reaches the
+  listener first, Eden gets no token from it and stops.
 
 Every `cf` command runs in a fresh, private temporary folder that Eden
 creates outside the project and deletes afterwards. The folder holds an
@@ -235,9 +296,7 @@ the account in the deployment record, which the login must name:
 | `cf` command | When | Account |
 | --- | --- | --- |
 | `auth whoami` | preflight, deploy, destroy | The login's own; Eden requires exactly one, matching `CLOUDFLARE_ACCOUNT_ID` when you set it |
-| `containers applications list --name`, `containers applications get` | preflight, deploy, destroy | The checked account |
-| `workers deployments list`, `workers versions get`, `workers versions list` | preflight, deploy, destroy | The checked account |
-| `workers list --per-page 1` | preflight, deploy | The checked account |
+| `auth whoami` against Eden's own listener | preflight, deploy, destroy, when `CLOUDFLARE_API_TOKEN` is not set | The login's own; see [How Eden reads Cloudflare's API](#how-eden-reads-cloudflares-api) |
 | `containers push --tag` | deploy | The checked account |
 | `workers secrets bulk-edit` | deploy (an update, for Eden's deployment-control token) | The checked account |
 | `deploy --prebuilt` | deploy | The checked account, also named as `settings.accountId` in the Build Output's `config.json`, which `cf` reads before the variable |
@@ -264,17 +323,15 @@ login cannot act on the checked account, the command fails.
   If the Worker is already gone, the record, account, and exact names still
   permit cleanup of leftover Containers and images. Failed inventory reads
   are indeterminate, not proof of absence. A Worker or a Container application counts
-  as absent only on Cloudflare's own single answer, as `cf` prints it: exit
-  code 1, nothing on standard output, exactly one error with the expected
-  code (`10007` for a Worker, `1609` for a Container application) and
-  status `404`, for the exact request path of that account and name.
-  For a Worker, both `cf workers deployments list` and `cf workers get`
-  must give that answer.
-  Anything else is unknown, never absent. `cf` prints an API response's
-  messages in the same form as its errors, so Eden cannot tell which of the
-  two carried the code. A
-  Container application list counts only when `cf` exits 0 and prints a JSON
-  list.
+  as absent only on the API's own answer: status `404`, `success` false, a
+  null `result`, exactly one error with the expected code (`10007` for a
+  Worker, `1609` for a Container application), and no message beside it.
+  For a Worker, both the read of its deployments and the read of the Worker
+  itself must give that answer. Anything else is unknown, never absent: a
+  redirect, a partial answer, a body that names a field twice, a code in
+  `messages`, or no answer. A Container application list counts only as a
+  whole answer with status `200`, `success` true and no errors, read to its
+  last page within twenty pages, with counts that match its entries.
   Each read asks `cf` for the account once and runs every other command on
   that account, and destroy reads nothing from an account other than the
   recorded one. `cf` runs destroy's Worker, Container application, and

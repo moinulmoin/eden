@@ -44,13 +44,13 @@ Preflight reads the project tree, the optional environment file, the local
 deployment records under `.eden/eve-deploy/`, the Docker daemon, and the
 Cloudflare account.
 
-Preflight changes nothing in your Cloudflare account: it performs read-only
-`cf` commands (`cf auth whoami`, `cf containers applications list --name`
-and `get`, `cf workers deployments list`, `cf workers versions get`, and
-`cf workers list --per-page 1` for the `workers.dev` subdomain) and never
-uploads, publishes, or deletes. When the account has no Worker yet,
-preflight reads no subdomain, and `eden deploy` learns it from a
-[temporary Worker](./troubleshooting.md#eve_origin_unavailable). The login and Container reads run once before
+Preflight changes nothing in your Cloudflare account: it runs
+`cf auth whoami` and reads Cloudflare's API with `GET` requests (the
+Container applications of the target's name, the Worker's deployments and
+the version in service, and the `workers.dev` subdomain). It never
+uploads, publishes, or deletes. The reads use `CLOUDFLARE_API_TOKEN`, or
+the token of the `cf` login, which Eden
+[takes from `cf` for the length of the command](./security.md#how-eden-reads-cloudflares-api). The login and Container reads run once before
 the build and again with the target reads after it. Locally it writes one generation directory
 under `.eden/eve-deploy/generations/` and removes the Docker images it built.
 
@@ -163,16 +163,15 @@ with each object and the registry's answer for it. Anything else left
 behind, and a final listing that cannot be read in full, fails destroy with
 `EVE_DESTROY_IMAGES_RETAINED`.
 
-Each read asks `cf` for the account once and runs every other `cf` command
-on that account. Destroy reads nothing from an account other than the one in
-the record. It takes a Worker as absent only on Cloudflare's own single
-answer, as `cf` prints it: exit code 1, nothing on standard output, exactly
-one error with code `10007` and status `404`, for the exact request path of
-that account and Worker. Both `cf workers deployments list` and
-`cf workers get` must give that answer. Any other answer about the Worker that is not a
-list of its deployments stops destroy with `EVE_DESTROY_INDETERMINATE`. It
-reads a Container application list only when `cf` exits 0 and prints a JSON
-list. `cf` runs each delete with the recorded account set. Destroy removes `CURRENT` only if the pointer is still
+Each read asks `cf` for the account once and makes every other read and
+runs every `cf` command on that account. Destroy reads nothing from an account other than the one in
+the record. It takes a Worker as absent only on the API's own answer:
+status `404`, `success` false, a null `result`, exactly one error with
+code `10007`, and no message beside it. Both the read of the Worker's
+deployments and the read of the Worker itself must give that answer. Any
+other answer about the Worker that is not a whole list of its deployments
+stops destroy with `EVE_DESTROY_INDETERMINATE`. A Container application
+list counts only as a whole answer with status `200` and no errors. `cf` runs each delete with the recorded account set. Destroy removes `CURRENT` only if the pointer is still
 the file it read at the start; that check is not atomic.
 
 Destroy reads the local deployment records and the Cloudflare account, and

@@ -274,11 +274,12 @@ the agent sleeps takes about 10–15 seconds.
 - `VAL-CLI-007-CLOUDFLARE-ACCESS` with `CLOUDFLARE_API_TOKEN` or
   `CLOUDFLARE_ACCOUNT_ID` in its remediation: signing in again does not
   help. Correct or unset the variable it names.
-- First deploy on an account with no Worker yet: `eden deploy` deploys and
-  deletes a temporary Worker `eden-origin-probe-<id>` to read the
-  `workers.dev` subdomain. If check `VAL-HOST-006` fails, follow its
-  remediation: it names the page that registers a subdomain, or the command
-  that deletes a leftover temporary Worker.
+- `VAL-CLI-007-CLOUDFLARE-ACCESS` saying Eden `could not take its login's
+  token`, or `EVE_CF_LOGIN_TOKEN_UNAVAILABLE` from destroy: Eden reads
+  Cloudflare's API with the token of the `cf` login, which it takes from
+  `cf` on `127.0.0.1` for one command. Confirm the login with
+  `npx cf@1.0.0-rc.2 auth whoami` and retry, or have the user set
+  `CLOUDFLARE_API_TOKEN`, which Eden then uses and asks `cf` for nothing.
 - `node: <path>: not found` with exit status 9 and no JSON: the `--env-file`
   path does not exist. `npx` stopped before Eden started. Correct the path.
   With `--` before the package name (`npx -- @moinulmoin/eden preflight

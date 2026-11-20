@@ -90,9 +90,8 @@ until the checks in steps 1–4 have passed.
    Eden creates nothing. A version Cloudflare holds but does not serve does
    not count. If it does, the version must have exactly one binding for the
    Container class in this Worker. Eden then finishes the publish with `cf`
-   commands: it lists the Container applications of the target's name
-   (`cf containers applications list`) and reads the one it finds
-   (`cf containers applications get`). That application must have the
+   steps: it reads from Cloudflare's API the Container applications of the
+   target's name and then the one it finds. That application must have the
    listed ID, the name, the `durable_object` policy and the binding's
    namespace. When the account has none of that name, Eden creates it
    (`cf containers applications create`) and reads it back the same way.
@@ -344,17 +343,17 @@ touched. Data in the Durable Object (including the experimental Cloudflare
 World) is deleted with the Worker; your Postgres database is not touched.
 
 Destroy acts only on evidence it read itself. It asks `cf` which account
-is signed in, and reads the Worker and the Container application through
-`cf` under that account. If that is not the account in the
-record, it reads nothing. `cf` prints errors as text; Eden reads them in one
-place. A Worker is absent only on Cloudflare's own single answer: `cf` exits
-with code 1, prints nothing on standard output, and prints exactly one error
-with code `10007` and status `404` for the exact request path of that
-account and Worker. Eden asks twice, with `cf workers deployments list` and
-`cf workers get`, because the two can disagree for a while after a Worker is
-created or deleted. Both must give that answer. A Container application list counts only when `cf`
-exits 0 and prints a JSON list. A failed or unclear read of either stops
-destroy with `EVE_DESTROY_INDETERMINATE` and leaves the record alone. `cf`
+is signed in, and reads the Worker and the Container application from
+Cloudflare's API under that account. If that is not the account in the
+record, it reads nothing. A Worker is absent only on the API's own answer:
+status `404`, `success` false, a null `result`, exactly one error with
+code `10007`, and no message beside it. Eden asks twice, for the Worker's
+deployments and for the Worker itself, because the two can disagree for a
+while after a Worker is created or deleted. Both must give that answer. A
+Container application list counts only as a whole answer with status
+`200` and no errors. A failed or unclear read of either stops destroy
+with `EVE_DESTROY_INDETERMINATE` and leaves the record alone. What `cf`
+prints decides none of this. `cf`
 runs each delete with the recorded account set.
 
 When a Worker exists, destroy proves it from the bindings of the Worker

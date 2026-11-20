@@ -10,7 +10,7 @@
   login, so after upgrading run `npx cf@1.0.0-rc.2 auth login` once, or set
   `CLOUDFLARE_API_TOKEN`. Until then `preflight` and `deploy` stop with
   `VAL-CLI-007-CLOUDFLARE-ACCESS`, and its remediation says so when this
-  machine has a Wrangler login. Eden no longer reads any OAuth token from
+  machine has a Wrangler login. Eden no longer reads any token from
   disk, and `WRANGLER_HOME` is no longer used for credentials. Every `cf`
   command runs in a private temporary folder with a fixed environment and
   the checked account, so a project's `cloudflare.config.ts` or `.env`
@@ -57,10 +57,25 @@
 - **`eden destroy` stops when Cloudflare's reads of the Worker disagree.**
   A Worker that one read shows deployed and the next shows with no
   deployment is not proven, and nothing is deleted.
+- **Eden reads Cloudflare's API itself, with the token of the `cf` login.**
+  Whether a Worker or a Container application exists, is absent, or is
+  Eden's own is decided from the API's own answers, as in 0.14, and never
+  from what `cf` prints. The reads are `GET` requests to
+  `api.cloudflare.com`. With `CLOUDFLARE_API_TOKEN` set Eden sends that
+  token. Otherwise it takes the login's token from `cf`: it runs
+  `cf auth whoami` against a listener of its own on `127.0.0.1`, keeps
+  the token in memory for that command, and writes it nowhere. This relies
+  on `cf` behavior Cloudflare does not document as a contract;
+  `docs/security.md` describes it and compares it with 0.14. When `cf`
+  hands over no token, `preflight` and `deploy` stop at
+  `VAL-CLI-007-CLOUDFLARE-ACCESS` and `destroy` stops with the new code
+  `EVE_CF_LOGIN_TOKEN_UNAVAILABLE`.
 - **`eden destroy` calls a Worker absent only when two reads agree.**
   Cloudflare's deployments read and its Worker read can disagree for a
   while after a Worker is created or deleted. Both must answer that the
-  Worker does not exist.
+  Worker does not exist. A Container application list with a count or total
+  that does not match its entries, or one that runs past twenty pages, is
+  no proof of absence.
 - Eden 0.14.0 cannot deploy a target this version deployed: it exits 1
   with `DEPLOY_INDETERMINATE` and the live deployment keeps answering.
 - **`eden destroy` removes a first deploy that was only half published.**
@@ -73,15 +88,10 @@
   are uploaded as secrets in the same publish as the code, so both change
   together and a first deploy needs no Worker beforehand. Secrets the file
   does not name stay.
-- **The `workers.dev` subdomain is read from a Worker the account already
-  has.** `cf` has no command for it. On an account with no Worker yet,
-  `eden deploy` deploys a temporary Worker with no URL, named
-  `eden-origin-probe-<id>`, reads its `workers.dev` URL, and deletes it
-  before the build. `eden preflight` never does this. Eden no longer sends
-  `CLOUDFLARE_API_TOKEN` itself. When this fails, check `VAL-HOST-006` names
-  the page that registers a subdomain or the command that deletes the
-  temporary Worker. The message of `EVE_DEPLOY_CHECKS_FAILED` now ends
-  `nothing was published for this target`.
+- The `workers.dev` subdomain is read from Cloudflare's API, as in 0.14,
+  so a first deploy on an account with no Worker needs nothing more. The
+  message of `EVE_DEPLOY_CHECKS_FAILED` now ends `nothing was published for
+  this target`.
 - The generation folder holds a Build Output
   (`worker/.cloudflare/output/v1/`) instead of `worker/worker.ts` and
   `worker/wrangler.jsonc`.

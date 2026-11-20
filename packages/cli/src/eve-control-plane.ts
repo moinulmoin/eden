@@ -75,15 +75,18 @@ import {
   type EveRuntimeProtectedStore,
 } from "./eve-runtime-config.js";
 import {
-  CF_COMMAND,
   cfAuthCommand,
-  cloudflareApiAnswered,
   cloudflareCliError,
   cloudflareCliJson,
-  cloudflareResultInfo,
   runCloudflareCli,
   type CloudflareCliRunner,
 } from "./eve-cloudflare-cli.js";
+import {
+  cloudflareApiReader,
+  cloudflareApiTokenArrives,
+  type CloudflareApiAnswer,
+  type CloudflareApiRead,
+} from "./eve-cloudflare-api.js";
 import {
   EDEN_AFFINITY_CONTRACT,
   callDeploymentControlRpc,
@@ -261,8 +264,6 @@ export interface EveCloudflareReadResult {
   readonly containerAccess: "available" | "unavailable";
   readonly accountId?: string;
   readonly workersDevSubdomain?: string;
-  /** Why there is no subdomain, when the read knows and the user can act on it. */
-  readonly originProblem?: { readonly message: string; readonly remediation: string };
   readonly stableWorkersDevOrigin?: string;
   readonly target: {
     readonly state: EveCloudflareTargetState;
@@ -596,6 +597,8 @@ export interface EveDestroyTargetRead {
   readonly providerEvidence?: EveCloudflareReadResult["target"]["providerEvidence"];
   readonly containerApplicationId?: string;
   readonly accountId?: string;
+  /** cf is signed in to the recorded account and did not hand Eden its login's token, so nothing was read. */
+  readonly loginTokenUnavailable?: boolean;
   /**
    * Every ref the managed registry itself lists for the request's owned
    * repositories: `repository:tag` for a tag, including the
@@ -1584,105 +1587,63 @@ async function wranglerLoginSaved(): Promise<boolean> {
 }
 
 /**
- * The account's workers.dev subdomain. cf has no command for it, so it is
- * read from the URL of any Worker the account has. An account with no Worker
- * yet can only be asked directly, which needs CLOUDFLARE_API_TOKEN: cf keeps
- * its own login's token where Eden cannot read it.
+ * The result and result_info of an answer of Cloudflare's API that is whole:
+ * status 200, success true, no error, and no field named twice. Undefined
+ * for a partial answer (206), a redirect, or anything else.
  */
-interface WorkersDevRead {
-  readonly subdomain?: string;
-  /** Why there is no subdomain, when Eden knows and the user can act on it. */
-  readonly problem?: { readonly message: string; readonly remediation: string };
+function cloudflareApiResult(
+  answer: CloudflareApiAnswer | undefined,
+): { readonly result: unknown; readonly info: Readonly<Record<string, unknown>> | undefined } | undefined {
+  if (answer?.status !== 200) return undefined;
+  let body: unknown;
+  try {
+    body = JSON.parse(answer.body);
+  } catch {
+    return undefined;
+  }
+  if (
+    typeof body !== "object" || body === null || namesFieldTwice(answer.body) ||
+    !("success" in body) || body.success !== true || !("result" in body) || !("errors" in body) ||
+    (body.errors !== null && !(Array.isArray(body.errors) && body.errors.length === 0))
+  ) return undefined;
+  const info = "result_info" in body ? body.result_info : undefined;
+  if (info !== undefined && (typeof info !== "object" || info === null || Array.isArray(info))) return undefined;
+  return { result: body.result, info: info as Readonly<Record<string, unknown>> | undefined };
 }
 
 /**
- * The account's workers.dev subdomain. cf has no command for it, so Eden
- * reads it from the URL Cloudflare gives for any Worker of the account. For
- * a deploy, an account with no Worker gets a temporary one: it is deployed
- * with no URL, read, and deleted in this same call. Preflight changes nothing
- * and needs no origin, so it reads no subdomain there.
+ * Whether an answer of Cloudflare's API says the exact object does not
+ * exist: status 404, success false, a null result, one error with this
+ * code, and no message beside it. A body that names a field twice is no
+ * answer.
  */
-async function readWorkersDevSubdomain(
-  cf: CloudflareCliRunner,
-  accountId: string | undefined,
-  progress: ((stage: string) => void) | undefined,
-): Promise<WorkersDevRead> {
-  if (accountId === undefined) return {};
-  const unregistered = {
-    message: "Cloudflare gave no workers.dev URL for a Worker of this account.",
-    remediation:
-      `Register the account's workers.dev subdomain at https://dash.cloudflare.com/${accountId}/workers/onboarding, then run the command again.`,
-  };
-  const subdomainOf = (worker: unknown): WorkersDevRead => {
-    const url = typeof worker === "object" && worker !== null && "subdomain" in worker &&
-        typeof worker.subdomain === "object" && worker.subdomain !== null && "url" in worker.subdomain
-      ? worker.subdomain.url
-      : undefined;
-    const subdomain = typeof url === "string"
-      ? /^https:\/\/[^./]+\.([^./]+)\.workers\.dev$/u.exec(url)?.[1]
-      : undefined;
-    return subdomain !== undefined && EVE_NAME_PATTERN.test(subdomain) ? { subdomain } : { problem: unregistered };
-  };
-  const listed = cloudflareCliJson(
-    await cf({ args: ["workers", "list", "--per-page", "1"], accountId, timeoutMs: 30_000 }),
-  )?.value;
-  if (!Array.isArray(listed)) return {};
-  if (listed.length > 0) return subdomainOf(listed[0]);
-  if (progress === undefined) return {};
+function cloudflareApiMissing(answer: CloudflareApiAnswer | undefined, code: number): boolean {
+  if (answer?.status !== 404) return false;
+  const body = exactJson(answer.body);
+  if (
+    typeof body !== "object" || body === null ||
+    !("success" in body) || body.success !== false || !("result" in body) || body.result !== null
+  ) return false;
+  const errors = "errors" in body ? body.errors : undefined;
+  const messages = "messages" in body ? body.messages : undefined;
+  const error: unknown = Array.isArray(errors) && errors.length === 1 ? errors[0] : undefined;
+  return (messages === undefined || messages === null || (Array.isArray(messages) && messages.length === 0)) &&
+    typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
 
-  const name = `eden-origin-probe-${randomUUID().slice(0, 8)}`;
-  progress(
-    `this Cloudflare account has no Worker yet: deploying the temporary Worker ${name}, which gets no URL, to read the account's workers.dev subdomain, then deleting it`,
-  );
-  const output = ".cloudflare/output/v1";
-  let worker: unknown;
-  // A command that throws must not skip the delete below.
-  try {
-    await cf({
-      args: ["deploy", "--prebuilt"],
-      accountId,
-      timeoutMs: 120_000,
-      files: {
-        [`${output}/config.json`]: JSON.stringify({ settings: { accountId }, buildContext: { isPreview: false } }),
-        [`${output}/workers/default/worker.config.json`]: JSON.stringify({
-          name,
-          compatibilityDate: "2026-04-01",
-          workersDev: false,
-          manifest: { type: "complete", mainModule: "worker.js", modules: { "worker.js": { type: "esm" } } },
-        }),
-        [`${output}/workers/default/bundle/worker.js`]:
-          "export default { fetch() { return new Response(null, { status: 404 }); } };\n",
-      },
-    });
-    // Cloudflare can take a while to show a Worker it just accepted. On
-    // 2026-11-20 cf uploaded the Worker and then exited 1 because Cloudflare
-    // answered that it did not exist, so a failed deploy is read as well.
-    for (let attempt = 0; worker === undefined && attempt < 12; attempt += 1) {
-      if (attempt > 0) await waitForActivation(5_000);
-      worker = cloudflareCliJson(
-        await cf({ args: ["workers", "get", name], accountId, timeoutMs: 30_000 }),
-      )?.value;
-    }
-  } catch {
-    worker = undefined;
-  }
-  if (await defaultWorkerDelete(cf)({ accountId, name }) === "indeterminate") {
-    return {
-      problem: {
-        message: `Eden deployed the temporary Worker ${name} to read the account's workers.dev subdomain and could not delete it.`,
-        remediation: `Run ${CF_COMMAND} workers delete ${name} --force, then run the command again.`,
-      },
-    };
-  }
-  if (worker !== undefined) return subdomainOf(worker);
-  return {
-    problem: {
-      message:
-        "This Cloudflare account has no Worker yet, and the temporary Worker Eden deploys to read the account's workers.dev subdomain could not be deployed or read.",
-      remediation:
-        `Run the command again. If it fails the same way, check that the account has a workers.dev subdomain at https://dash.cloudflare.com/${accountId}/workers/onboarding.`,
-    },
-  };
+/** The account's workers.dev subdomain, as Cloudflare's API gives it. */
+async function readWorkersDevSubdomain(
+  api: CloudflareApiRead,
+  accountId: string | undefined,
+): Promise<string | undefined> {
+  if (accountId === undefined) return undefined;
+  const result = cloudflareApiResult(
+    await api(`/accounts/${encodeURIComponent(accountId)}/workers/subdomain`),
+  )?.result;
+  const subdomain = typeof result === "object" && result !== null && "subdomain" in result
+    ? result.subdomain
+    : undefined;
+  return typeof subdomain === "string" && EVE_NAME_PATTERN.test(subdomain) ? subdomain : undefined;
 }
 
 /**
@@ -1698,67 +1659,85 @@ export function exactTargetContainerEntries(
 }
 
 async function readTargetContainers(
-  cf: CloudflareCliRunner,
+  api: CloudflareApiRead,
   accountId: string,
   name: string,
 ): Promise<CloudflareJsonResult> {
-  // The exact name filter returns every match unless the API says there is
-  // another page, which cf prints on stderr as "result_info".
+  // This endpoint takes an exact name filter and gives
+  // result_info.next_page_token. No per_page means all. Every page is read
+  // the same way, whether it lists the application or not.
   const entries: unknown[] = [];
   const seenTokens = new Set<string>();
   let pageToken: string | undefined;
-  do {
-    const result = await cf({
-      args: [
-        "containers", "applications", "list", "--name", name,
-        ...(pageToken === undefined ? [] : ["--page-token", pageToken]),
-      ],
-      accountId,
-      timeoutMs: 30_000,
-    });
-    const read = cloudflareCliJson(result);
-    if (read === undefined || !Array.isArray(read.value)) return { failed: true };
-    const info = cloudflareResultInfo(result);
-    if (info === null) return { failed: true };
-    const next = info?.next_page_token;
-    if (next !== undefined && next !== null && typeof next !== "string") {
-      return { failed: true };
-    }
+  // No listing of one name runs to twenty pages.
+  for (let page = 0; page < 20; page += 1) {
+    const read = cloudflareApiResult(await api(
+      `/accounts/${encodeURIComponent(accountId)}/containers/applications`,
+      { name, ...(pageToken === undefined ? {} : { page_token: pageToken }) },
+    ));
+    if (read === undefined || !Array.isArray(read.result)) return { failed: true };
+    const next = read.info?.next_page_token;
+    if (next !== undefined && next !== null && typeof next !== "string") return { failed: true };
+    // A count that is not the number of entries on the page contradicts it.
+    const count = read.info?.count;
+    if (count !== undefined && count !== read.result.length) return { failed: true };
     // Missing pagination metadata on a full page cannot prove absence.
-    if (info === undefined && read.value.length >= 100) return { failed: true };
-    entries.push(...read.value);
+    if (read.info === undefined && read.result.length >= 100) return { failed: true };
+    entries.push(...read.result);
     pageToken = typeof next === "string" && next.length > 0 ? next : undefined;
-    if (pageToken !== undefined) {
-      if (seenTokens.has(pageToken)) return { failed: true };
-      seenTokens.add(pageToken);
+    if (pageToken === undefined) {
+      // Nor can a total that is not the number of entries read.
+      const total = read.info?.total_count;
+      return total !== undefined && total !== entries.length ? { failed: true } : { failed: false, value: entries };
     }
-  } while (pageToken !== undefined);
-  return { failed: false, value: entries };
+    if (seenTokens.has(pageToken)) return { failed: true };
+    seenTokens.add(pageToken);
+  }
+  return { failed: true };
 }
 
 /**
- * The exact Worker in the account: "deployed" or "undeployed" when cf lists
- * its deployments, "absent" only for Cloudflare's own answer that it does
- * not exist. That answer, read through cf on 2026-11-20, is one API error
- * with code 10007 and status 404 for this account's and Worker's exact
- * path, given by both the deployments read and the Worker read. Undefined for anything else, which proves nothing
- * either way: no answer, another status, code, or path, a second error or
- * message beside it, or output Eden cannot read.
+ * One Container application by ID: the API's result for it, "absent" only
+ * for the API's own answer that it does not exist (status 404, one error
+ * with code 1609, read on 2026-11-20), undefined for anything else.
+ */
+async function readContainerApplication(
+  api: CloudflareApiRead,
+  accountId: string,
+  applicationId: string,
+): Promise<Readonly<Record<string, unknown>> | "absent" | undefined> {
+  const answer = await api(
+    `/accounts/${encodeURIComponent(accountId)}/containers/applications/${encodeURIComponent(applicationId)}`,
+  );
+  const result = cloudflareApiResult(answer)?.result;
+  if (typeof result === "object" && result !== null && !Array.isArray(result)) {
+    return result as Readonly<Record<string, unknown>>;
+  }
+  return cloudflareApiMissing(answer, 1609) ? "absent" : undefined;
+}
+
+/**
+ * The exact Worker in the account: "deployed" or "undeployed" when the API
+ * lists its deployments (status 200), "absent" only for the API's own answer
+ * that it does not exist. That answer, read on 2026-11-19, is status 404
+ * with success false, a null result, and one error whose code is 10007.
+ * Cloudflare's two reads of a Worker can disagree for a while after it is
+ * created or deleted (seen on 2026-11-20), so both the deployments read and
+ * the Worker read must give it. Undefined for anything else, which proves
+ * nothing either way: no answer, a redirect, another status or error, a body
+ * that names a field twice, or one that says 10007 beside anything that
+ * contradicts it.
  */
 async function readWorkerPresence(
-  cf: CloudflareCliRunner,
+  api: CloudflareApiRead,
   accountId: string,
   workerName: string,
 ): Promise<"deployed" | "undeployed" | "absent" | undefined> {
-  const result = await cf({
-    args: ["workers", "deployments", "list", "--worker", workerName],
-    accountId,
-    timeoutMs: 30_000,
-  });
-  const read = cloudflareCliJson(result);
-  if (read !== undefined) {
-    const listed = read.value;
-    // Each deployment the API lists has an id.
+  const account = `/accounts/${encodeURIComponent(accountId)}/workers`;
+  const answer = await api(`${account}/scripts/${encodeURIComponent(workerName)}/deployments`);
+  if (answer?.status === 200) {
+    const listed = cloudflareApiResult(answer)?.result;
+    // Each deployment the API lists has an id; read on 2026-11-19.
     return typeof listed === "object" && listed !== null &&
         "deployments" in listed && Array.isArray(listed.deployments) &&
         listed.deployments.every((entry: unknown) =>
@@ -1768,17 +1747,8 @@ async function readWorkerPresence(
       ? listed.deployments.length > 0 ? "deployed" : "undeployed"
       : undefined;
   }
-  if (!cloudflareApiAnswered(result, {
-    status: 404,
-    code: 10007,
-    path: `/accounts/${accountId}/workers/scripts/${workerName}/deployments`,
-  })) return undefined;
-  // Cloudflare's two reads of a Worker can disagree for a while after it is
-  // created or deleted (seen on 2026-11-20), so both must say it is absent.
-  return cloudflareApiAnswered(
-      await cf({ args: ["workers", "get", workerName], accountId, timeoutMs: 30_000 }),
-      { status: 404, code: 10007, path: `/accounts/${accountId}/workers/workers/${workerName}` },
-    )
+  return cloudflareApiMissing(answer, 10007) &&
+      cloudflareApiMissing(await api(`${account}/workers/${encodeURIComponent(workerName)}`), 10007)
     ? "absent"
     : undefined;
 }
@@ -1789,16 +1759,16 @@ async function readWorkerPresence(
  * nothing.
  */
 async function readExactTargetInventory(
-  cf: CloudflareCliRunner,
+  api: CloudflareApiRead,
   accountId: string | undefined,
   workerName: string,
   containerApp: string,
 ) {
   if (accountId === undefined) return { containerEntries: undefined, worker: undefined };
-  const containers = await readTargetContainers(cf, accountId, containerApp);
+  const containers = await readTargetContainers(api, accountId, containerApp);
   return {
     containerEntries: containers.failed ? undefined : exactContainerEntries(containers.value, containerApp, true),
-    worker: await readWorkerPresence(cf, accountId, workerName),
+    worker: await readWorkerPresence(api, accountId, workerName),
   };
 }
 
@@ -1807,9 +1777,8 @@ async function defaultCloudflareRead(
   request: EveCloudflareReadRequest,
   /** The account the check before the build named. */
   checkedAccountId: string | undefined,
-  /** Given by deploy only: with it, an account with no Worker gets the temporary one. */
-  progress: ((stage: string) => void) | undefined,
 ): Promise<EveCloudflareReadResult> {
+  const api = cloudflareApiReader(cf);
   const account = await readCloudflareLogin(cf);
   const loginAccountId = authenticatedAccountId(account.value);
   // A login that now names another account is no access: nothing is read or written there.
@@ -1817,7 +1786,7 @@ async function defaultCloudflareRead(
     ? undefined
     : loginAccountId;
   const { containerEntries, worker } = await readExactTargetInventory(
-    cf,
+    api,
     accountId,
     request.name,
     boundedResourceName(request.name, "container"),
@@ -1828,11 +1797,7 @@ async function defaultCloudflareRead(
   const containerAccess = containerEntries === undefined
     ? "unavailable"
     : "available";
-  const { subdomain: workersDevSubdomain, problem: originProblem } = await readWorkersDevSubdomain(
-    cf,
-    accountId,
-    progress,
-  );
+  const workersDevSubdomain = await readWorkersDevSubdomain(api, accountId);
   if (
     accountAccess === "unavailable" ||
     containerAccess === "unavailable" ||
@@ -1869,14 +1834,13 @@ async function defaultCloudflareRead(
       ...(workersDevSubdomain === undefined
         ? {}
         : { workersDevSubdomain }),
-      ...(originProblem === undefined ? {} : { originProblem }),
       target: { state: "absent" },
     };
   }
   const workerPresent = worker !== "absent";
   const containerPresent = (containerEntries?.length ?? 0) > 0;
   const providerEvidence = await readProviderEvidence(
-    cf,
+    api,
     request.name,
     accountId,
     worker,
@@ -1907,84 +1871,65 @@ async function defaultCloudflareRead(
 }
 
 /**
- * The bindings of one Worker version, as `cf workers versions get` prints
- * them. For a "deployed" Worker it is the version the newest deployment
- * serves in full. For an "undeployed" one, which serves nothing, it is the
- * newest uploaded version. The caller says which it found; undefined when
- * the deployments read here disagrees with that, when the newest deployment
- * splits traffic, or when a read fails or is incomplete.
+ * The bindings of one Worker version, as Cloudflare's API gives them. For a
+ * "deployed" Worker it is the version the newest deployment serves in full.
+ * For an "undeployed" one, which serves nothing, it is the newest uploaded
+ * version. The caller says which it found; undefined when the deployments
+ * read here disagrees with that, when the newest deployment splits traffic,
+ * or when a read fails or is incomplete.
  */
 async function readLiveWorkerBindings(
-  cf: CloudflareCliRunner,
+  api: CloudflareApiRead,
   accountId: string,
   workerName: string,
   worker: "deployed" | "undeployed",
 ): Promise<readonly Record<string, unknown>[] | undefined> {
-  const listed = cloudflareCliJson(await cf({
-    args: ["workers", "deployments", "list", "--worker", workerName],
-    accountId,
-    timeoutMs: 30_000,
-  }))?.value;
+  const script = `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`;
+  const listed = cloudflareApiResult(await api(`${script}/deployments`))?.result;
   const deployments: unknown = typeof listed === "object" && listed !== null && "deployments" in listed
     ? listed.deployments
     : undefined;
   if (!Array.isArray(deployments) || (deployments.length === 0) !== (worker === "undeployed")) return undefined;
+  let versionId: string;
   if (deployments.length === 0) {
-    const read = await cf({
-      args: ["workers", "versions", "list", "--worker", workerName],
-      accountId,
-      timeoutMs: 30_000,
-    });
-    const versions = cloudflareCliJson(read)?.value;
-    const info = cloudflareResultInfo(read);
-    // Only a list cf says is whole names the newest version.
+    const read = cloudflareApiResult(await api(`${script}/versions`));
+    const versions: unknown = typeof read?.result === "object" && read.result !== null && "items" in read.result
+      ? read.result.items
+      : undefined;
+    // Only a list the API says is whole names the newest version.
     if (
-      !Array.isArray(versions) || versions.length === 0 || info === undefined || info === null ||
-      info.total_count !== versions.length ||
+      !Array.isArray(versions) || versions.length === 0 || read?.info?.total_count !== versions.length ||
       !versions.every((entry: unknown): entry is { readonly id: string; readonly number: number } =>
         typeof entry === "object" && entry !== null && "id" in entry && typeof entry.id === "string" &&
         "number" in entry && typeof entry.number === "number"
       )
     ) return undefined;
-    return readWorkerVersionBindings(
-      cf, accountId, workerName,
-      versions.reduce((newest, entry) => entry.number > newest.number ? entry : newest).id,
-    );
-  }
-  let newest: { readonly created_on: string; readonly versions?: unknown } | undefined;
-  for (const entry of deployments as readonly unknown[]) {
-    if (
-      typeof entry !== "object" || entry === null || !("created_on" in entry) ||
-      typeof entry.created_on !== "string" || Number.isNaN(Date.parse(entry.created_on))
-    ) return undefined;
-    if (newest === undefined || Date.parse(entry.created_on) > Date.parse(newest.created_on)) {
-      newest = entry as { readonly created_on: string; readonly versions?: unknown };
+    versionId = versions.reduce((newest, entry) => entry.number > newest.number ? entry : newest).id;
+  } else {
+    let newest: { readonly created_on: string; readonly versions?: unknown } | undefined;
+    for (const entry of deployments as readonly unknown[]) {
+      if (
+        typeof entry !== "object" || entry === null || !("created_on" in entry) ||
+        typeof entry.created_on !== "string" || Number.isNaN(Date.parse(entry.created_on))
+      ) return undefined;
+      if (newest === undefined || Date.parse(entry.created_on) > Date.parse(newest.created_on)) {
+        newest = entry as { readonly created_on: string; readonly versions?: unknown };
+      }
     }
+    const versions = newest?.versions;
+    const only: unknown = Array.isArray(versions) && versions.length === 1 ? versions[0] : undefined;
+    if (
+      typeof only !== "object" || only === null || !("version_id" in only) ||
+      typeof only.version_id !== "string" || !("percentage" in only) || only.percentage !== 100
+    ) return undefined;
+    versionId = only.version_id;
   }
-  const versions = newest?.versions;
-  const only: unknown = Array.isArray(versions) && versions.length === 1 ? versions[0] : undefined;
-  if (
-    typeof only !== "object" || only === null || !("version_id" in only) ||
-    typeof only.version_id !== "string" || !("percentage" in only) || only.percentage !== 100
-  ) return undefined;
-  return readWorkerVersionBindings(cf, accountId, workerName, only.version_id);
-}
-
-async function readWorkerVersionBindings(
-  cf: CloudflareCliRunner,
-  accountId: string,
-  workerName: string,
-  versionId: string,
-): Promise<readonly Record<string, unknown>[] | undefined> {
   if (!/^[0-9a-f-]{36}$/u.test(versionId)) return undefined;
-  const version = cloudflareCliJson(await cf({
-    args: ["workers", "versions", "get", versionId, "--worker", workerName],
-    accountId,
-    timeoutMs: 30_000,
-  }))?.value;
+  const version = cloudflareApiResult(await api(`${script}/versions/${versionId}`))?.result;
   const bindings: unknown = typeof version === "object" && version !== null && "id" in version &&
-      version.id === versionId && "bindings" in version
-    ? version.bindings
+      version.id === versionId && "resources" in version &&
+      typeof version.resources === "object" && version.resources !== null && "bindings" in version.resources
+    ? version.resources.bindings
     : undefined;
   return Array.isArray(bindings) &&
       bindings.every((binding: unknown) => typeof binding === "object" && binding !== null)
@@ -2004,7 +1949,7 @@ async function readWorkerVersionBindings(
  * Object namespace matching the Worker's binding namespace.
  */
 async function readProviderEvidence(
-  cf: CloudflareCliRunner,
+  api: CloudflareApiRead,
   workerName: string,
   accountId: string | undefined,
   worker: "deployed" | "undeployed" | "absent" | undefined,
@@ -2026,12 +1971,8 @@ async function readProviderEvidence(
       : { containerApplicationId: containerEntry.id }),
   };
   if (containerEntry !== undefined && accountId !== undefined) {
-    const info = cloudflareCliJson(await cf({
-      args: ["containers", "applications", "get", containerEntry.id],
-      accountId,
-      timeoutMs: 30_000,
-    }))?.value;
-    if (typeof info === "object" && info !== null) {
+    const info = await readContainerApplication(api, accountId, containerEntry.id);
+    if (typeof info === "object") {
       const infoRecord = info as {
         readonly scheduling_policy?: unknown;
         readonly durable_objects?: {
@@ -2049,7 +1990,7 @@ async function readProviderEvidence(
   }
   if (worker !== "absent" && accountId !== undefined) {
     // A Worker whose state the first read could not tell proves nothing.
-    const bindings = worker === undefined ? undefined : await readLiveWorkerBindings(cf, accountId, workerName, worker);
+    const bindings = worker === undefined ? undefined : await readLiveWorkerBindings(api, accountId, workerName, worker);
     evidence.settingsReadable = bindings !== undefined;
     const text = (name: string): string | undefined => {
       const stamps = bindings?.filter((binding) => binding.type === "plain_text" && binding.name === name) ?? [];
@@ -2199,14 +2140,12 @@ async function readEveCloudflareTarget(
   request: EveCloudflareReadRequest,
   options: EvePreflightOptions,
   checkedAccountId: string | undefined,
-  forDeploy = false,
 ): Promise<EveCloudflareReadResult> {
   const result = options.cloudflareRead === undefined
     ? await defaultCloudflareRead(
       options.cloudflareCli ?? runCloudflareCli,
       request,
       checkedAccountId,
-      forDeploy ? (stage) => eveProgress(options, stage) : undefined,
     )
     : await options.cloudflareRead(request);
   return resolveEveTargetOwnership(request, result);
@@ -2305,9 +2244,11 @@ type EveCloudflareAccess = Pick<
    * Why there is no account, when cf's answer says: cf is signed out and
    * Wrangler, which Eden 0.14 and earlier used, has a saved login; the API
    * token in the environment is not accepted or sees no account; or
-   * CLOUDFLARE_ACCOUNT_ID names an account the login does not have.
+   * CLOUDFLARE_ACCOUNT_ID names an account the login does not have. Or, with
+   * an account: cf did not hand Eden its login's token, so Eden cannot read
+   * Cloudflare's API.
    */
-  readonly loginProblem?: "wrangler-login-only" | "token-unusable" | "account-mismatch";
+  readonly loginProblem?: "wrangler-login-only" | "token-unusable" | "account-mismatch" | "login-token-unavailable";
 };
 
 /** The login and Container read that need no build, so they run before it. */
@@ -2334,20 +2275,33 @@ async function defaultCloudflareAccess(cf: CloudflareCliRunner, name: string): P
       ...(loginProblem === undefined ? {} : { loginProblem }),
     };
   }
-  const containers = await readTargetContainers(cf, accountId, boundedResourceName(name, "container"));
+  // This read is also the check that Eden has a token Cloudflare's API
+  // accepts for this account: every later read of the API uses the same.
+  const containers = await readTargetContainers(
+    cloudflareApiReader(cf), accountId, boundedResourceName(name, "container"),
+  );
   return {
     accountAccess: "available",
     containerAccess: containers.failed ? "unavailable" : "available",
     accountId,
+    ...(containers.failed && !await cloudflareApiTokenArrives(cf)
+      ? { loginProblem: "login-token-unavailable" as const }
+      : {}),
   };
 }
+
+/** For a cf that is signed in and did not hand Eden its login's token. */
+const LOGIN_TOKEN_REMEDIATION =
+  `cf is signed in, but Eden could not take its login's token, which it needs to read Cloudflare's API. Confirm the login with ${cfAuthCommand("whoami")} and retry. If it fails the same way, set CLOUDFLARE_API_TOKEN to an API token for the account: Eden then reads with that token and takes nothing from cf.`;
 
 function cloudflareAccessBlocked(result: EveCloudflareAccess): EvePreflightCheck {
   return check(
     "VAL-CLI-007-CLOUDFLARE-ACCESS",
     "blocked",
     "Authenticated Cloudflare account and Container access could not be verified without a mutating operation.",
-    result.accountAccess === "available"
+    result.loginProblem === "login-token-unavailable"
+      ? LOGIN_TOKEN_REMEDIATION
+      : result.accountAccess === "available"
       ? `cf is signed in, but the account's Containers could not be read. Confirm that the account ${cfAuthCommand("whoami")} shows is on the Workers Paid plan, or switch accounts with ${cfAuthCommand("login")}, then retry.`
       : result.loginProblem === "token-unusable"
       ? `CLOUDFLARE_API_TOKEN is set, and Cloudflare did not accept it or it can see no account. Signing in again changes nothing while the variable is set. Correct the token or unset CLOUDFLARE_API_TOKEN, confirm with ${cfAuthCommand("whoami")} that it shows exactly one account, then retry.`
@@ -2735,10 +2689,10 @@ const containerSettingsUnapplied = new WeakMap<object, string>();
  * version has no such binding or more than one candidate for it.
  */
 async function readServedRelease(
-  cf: CloudflareCliRunner,
+  api: CloudflareApiRead,
   request: EveDeploymentPublicationRequest,
 ): Promise<{ readonly namespaceId?: string } | undefined> {
-  const bindings = await readLiveWorkerBindings(cf, request.identity.accountId, request.identity.workerName, "deployed");
+  const bindings = await readLiveWorkerBindings(api, request.identity.accountId, request.identity.workerName, "deployed");
   const releases = bindings?.filter((binding) => binding.type === "plain_text" && binding.name === "EDEN_EVE_RELEASE_ID");
   if (
     bindings === undefined || releases?.length !== 1 ||
@@ -2764,27 +2718,22 @@ async function readServedRelease(
  * when the account has none of that name; undefined for anything else.
  */
 async function readPublishApplication(
-  cf: CloudflareCliRunner,
+  api: CloudflareApiRead,
   request: EveDeploymentPublicationRequest,
   namespaceId: string,
 ): Promise<"matches" | "absent" | undefined> {
   const accountId = request.identity.accountId;
   const name = request.hostConfig.container.applicationName;
-  const listed = await readTargetContainers(cf, accountId, name);
+  const listed = await readTargetContainers(api, accountId, name);
   const entries = listed.failed ? undefined : exactContainerEntries(listed.value, name, true);
   if (entries === undefined || entries.length > 1) return undefined;
   const entry = entries[0];
   if (entry === undefined) return "absent";
-  const application = cloudflareCliJson(await cf({
-    args: ["containers", "applications", "get", entry.id],
-    accountId,
-    timeoutMs: 30_000,
-  }))?.value;
-  return typeof application === "object" && application !== null &&
-      "id" in application && application.id === entry.id &&
-      "name" in application && application.name === name &&
-      "scheduling_policy" in application && application.scheduling_policy === "durable_object" &&
-      "durable_objects" in application && typeof application.durable_objects === "object" &&
+  const application = await readContainerApplication(api, accountId, entry.id);
+  return typeof application === "object" &&
+      application.id === entry.id && application.name === name &&
+      application.scheduling_policy === "durable_object" &&
+      typeof application.durable_objects === "object" &&
       application.durable_objects !== null && "namespace_id" in application.durable_objects &&
       application.durable_objects.namespace_id === namespaceId
     ? "matches"
@@ -2793,6 +2742,7 @@ async function readPublishApplication(
 
 async function finishPublication(
   cf: CloudflareCliRunner,
+  api: CloudflareApiRead,
   request: EveDeploymentPublicationRequest,
   /** Waits that long, or until the publish deadline if that comes first. */
   pause: (ms: number) => Promise<unknown>,
@@ -2805,14 +2755,14 @@ async function finishPublication(
   let served: Awaited<ReturnType<typeof readServedRelease>>;
   const started = performance.now();
   for (let attempt = 0; ; attempt += 1) {
-    served = await readServedRelease(cf, request);
+    served = await readServedRelease(api, request);
     if (served !== undefined) break;
     if (attempt === 24 || performance.now() - started > 120_000) return "not-uploaded";
     await pause(5_000);
   }
   const namespaceId = served.namespaceId;
   if (namespaceId === undefined) return "unfinished";
-  const application = await readPublishApplication(cf, request, namespaceId);
+  const application = await readPublishApplication(api, request, namespaceId);
   if (application === undefined) return "unfinished";
   if (application === "absent") {
     const created = await cf({
@@ -2827,7 +2777,7 @@ async function finishPublication(
       accountId,
     });
     // cf's exit code is not the proof: the application is read back.
-    if (created.exitCode !== 0 || await readPublishApplication(cf, request, namespaceId) !== "matches") {
+    if (created.exitCode !== 0 || await readPublishApplication(api, request, namespaceId) !== "matches") {
       return "unfinished";
     }
   }
@@ -2881,6 +2831,11 @@ function defaultPublicationRunner(
         ? { exitCode: undefined, stdout: "", stderr: "Not started: the publish deadline had passed." }
         : run({ ...step, timeoutMs: Math.min(step.timeoutMs ?? 120_000, left) });
     };
+    const read = cloudflareApiReader(run);
+    const api: CloudflareApiRead = async (path, query, timeoutMs = 30_000) => {
+      const left = deadline - performance.now();
+      return left <= 0 ? undefined : read(path, query, Math.min(timeoutMs, left));
+    };
     const pause = (ms: number) => waitForActivation(Math.max(0, Math.min(ms, deadline - performance.now())));
     // The Build Output names the same account, and cf reads it before the variable.
     const deployed = await cf({
@@ -2900,7 +2855,7 @@ function defaultPublicationRunner(
         const result = await cf(step);
         log.push(`cf ${step.args.slice(0, 3).join(" ")}: exit ${result.exitCode}\n${safeText(result.stderr)}`);
         return result;
-      }, request, pause).finally(() =>
+      }, api, request, pause).finally(() =>
         writeFile(join(request.buildOutputPath, "cf-deploy.log"), log.join("\n"), { mode: 0o600 })
           .catch(() => undefined)
       );
@@ -2927,8 +2882,8 @@ function defaultPublicationRunner(
       attempt += 1
     ) {
       if (attempt > 0) await pause(5_000);
-      const namespaceId = (await readServedRelease(cf, request))?.namespaceId;
-      if (namespaceId !== undefined && await readPublishApplication(cf, request, namespaceId) === "matches") {
+      const namespaceId = (await readServedRelease(api, request))?.namespaceId;
+      if (namespaceId !== undefined && await readPublishApplication(api, request, namespaceId) === "matches") {
         published = true;
         break;
       }
@@ -4636,7 +4591,6 @@ async function collectEvePreflight(
         },
         options,
         checkedAccountId,
-        true,
       );
     } catch {
       await discardPackagingImage();
@@ -4696,10 +4650,8 @@ async function collectEvePreflight(
         check(
           "VAL-HOST-006",
           "failed",
-          cloudflare.originProblem?.message ??
-            "The authenticated Cloudflare read did not prove the exact workers.dev origin before Eve initialization.",
-          cloudflare.originProblem?.remediation ??
-            "Return one authenticated account ID, one workers.dev subdomain, and the exact Worker-origin binding.",
+          "The authenticated Cloudflare read did not prove the exact workers.dev origin before Eve initialization.",
+          "Return one authenticated account ID, one workers.dev subdomain, and the exact Worker-origin binding.",
         ),
       );
     }
@@ -5699,6 +5651,7 @@ async function defaultDestroyTargetRead(
   request: EveDestroyCloudflareReadRequest,
   registry: CloudflareRegistry,
 ): Promise<EveDestroyTargetRead> {
+  const api = cloudflareApiReader(cf);
   const account = await readCloudflareLogin(cf);
   const accountId = authenticatedAccountId(account.value);
   if (accountId !== undefined && accountId !== request.accountId) {
@@ -5706,7 +5659,10 @@ async function defaultDestroyTargetRead(
     return { workerExists: false, accountId };
   }
   const { containerEntries: entries, worker } =
-    await readExactTargetInventory(cf, accountId, request.workerName, request.containerApplicationName);
+    await readExactTargetInventory(api, accountId, request.workerName, request.containerApplicationName);
+  if ((entries === undefined || worker === undefined) && accountId !== undefined && !await cloudflareApiTokenArrives(cf)) {
+    return { workerExists: false, accountId, inventoryComplete: false, loginTokenUnavailable: true };
+  }
   const workerExists = worker === "deployed" || worker === "undeployed";
   const firstContainer = entries === undefined ? undefined : entries[0];
   let registryTagsPresent: string[] | undefined;
@@ -5726,7 +5682,7 @@ async function defaultDestroyTargetRead(
     inventoryComplete: !account.failed && accountId !== undefined &&
       entries !== undefined && entries.length <= 1 && worker !== undefined,
     providerEvidence: await readProviderEvidence(
-      cf, request.workerName, accountId, worker, firstContainer,
+      api, request.workerName, accountId, worker, firstContainer,
     ),
     ...(firstContainer === undefined
       ? {}
@@ -5739,9 +5695,9 @@ async function defaultDestroyTargetRead(
 }
 
 /**
- * Each delete is "absent" only on Cloudflare's own single answer that the
- * exact object does not exist, read through cf on 2026-11-20. Any other
- * failure is "indeterminate".
+ * A delete cf did not finish is "absent" only when Eden's own reads of
+ * Cloudflare's API then say the exact object does not exist. What cf printed
+ * decides nothing. Any other failure is "indeterminate".
  */
 function defaultWorkerDelete(cf: CloudflareCliRunner): EveWorkerDeleteRunner {
   return async (request) => {
@@ -5750,11 +5706,7 @@ function defaultWorkerDelete(cf: CloudflareCliRunner): EveWorkerDeleteRunner {
       accountId: request.accountId,
     });
     if (result.exitCode === 0) return "deleted";
-    return cloudflareApiAnswered(result, {
-        status: 404,
-        code: 10007,
-        path: `/accounts/${request.accountId}/workers/workers/${request.name}`,
-      })
+    return await readWorkerPresence(cloudflareApiReader(cf), request.accountId, request.name) === "absent"
       ? "absent"
       : "indeterminate";
   };
@@ -5767,11 +5719,7 @@ function defaultContainerDelete(cf: CloudflareCliRunner): EveContainerDeleteRunn
       accountId: request.accountId,
     });
     if (result.exitCode === 0) return "deleted";
-    return cloudflareApiAnswered(result, {
-        status: 404,
-        code: 1609,
-        path: `/accounts/${request.accountId}/containers/applications/${request.applicationId}`,
-      })
+    return await readContainerApplication(cloudflareApiReader(cf), request.accountId, request.applicationId) === "absent"
       ? "absent"
       : "indeterminate";
   };
@@ -5792,6 +5740,33 @@ const REGISTRY_DELETE_PASSES = 3;
 const REGISTRY_PAGE_ENTRIES = 1_000;
 /** A tag, or the `sha256:` entry the registry lists for each manifest. */
 const REGISTRY_ENTRY = /^(?:sha256:[0-9a-f]{64}|[A-Za-z0-9_][A-Za-z0-9._-]{0,127})$/u;
+
+/**
+ * True when an object in this JSON text names a field twice. JSON.parse
+ * keeps only the last of the two, so such a text says two things at once.
+ * The text must already have parsed.
+ */
+function namesFieldTwice(text: string): boolean {
+  const objects: (Set<string> | undefined)[] = [];
+  for (let at = 0; at < text.length; at += 1) {
+    const char = text[at];
+    if (char === "{") objects.push(new Set());
+    else if (char === "[") objects.push(undefined);
+    else if (char === "}" || char === "]") objects.pop();
+    else if (char === '"') {
+      const start = at;
+      for (at += 1; text[at] !== '"'; at += 1) if (text[at] === "\\") at += 1;
+      const names = objects.at(-1);
+      let next = at + 1;
+      while (" \t\n\r".includes(text[next] ?? "x")) next += 1;
+      if (names === undefined || text[next] !== ":") continue;
+      const name = JSON.parse(text.slice(start, at + 1)) as string;
+      if (names.has(name)) return true;
+      names.add(name);
+    }
+  }
+  return false;
+}
 
 function exactJson(text: string): unknown {
   const squeezed = (value: string): string => value.replace(/\s/gu, "");
@@ -6544,6 +6519,9 @@ async function runEveDestroyLocked(
       ((read: EveDestroyCloudflareReadRequest) => defaultDestroyTargetRead(cf, read, registry));
     eveProgress(options, "reading the exact remote inventory");
     const before = await readTarget();
+    if (before.loginTokenUnavailable === true) {
+      fail("EVE_CF_LOGIN_TOKEN_UNAVAILABLE", "Eden could not take the token of cf's login, so it could not read Cloudflare's API; nothing was deleted.", LOGIN_TOKEN_REMEDIATION);
+    }
     if (before.inventoryComplete === false) {
       fail("EVE_DESTROY_INDETERMINATE", "The exact remote inventory could not be read completely; nothing was deleted. Retry the read. If Cloudflare returned a full Container page without the exact target, inspect and delete only the named Container application in the Cloudflare dashboard, then retry destroy.");
     }

@@ -66,6 +66,8 @@ export interface CloudflareCliRequest {
   /** Files written into the command's private folder before it runs, by relative path. */
   readonly files?: Readonly<Record<string, string | Buffer>>;
   readonly timeoutMs?: number;
+  /** Where this one command finds Cloudflare's API, in place of Cloudflare's own address. */
+  readonly apiBaseUrl?: string;
 }
 
 export interface CloudflareCliResult {
@@ -157,7 +159,10 @@ async function runCf(
     return await new Promise<CloudflareCliResult>((resolveResult) => {
       const started = spawn(process.execPath, [installedCloudflareCli().entrypoint, ...request.args], {
         cwd,
-        env: environment(request.accountId),
+        env: {
+          ...environment(request.accountId),
+          ...(request.apiBaseUrl === undefined ? {} : { CLOUDFLARE_API_BASE_URL: request.apiBaseUrl }),
+        },
         stdio: ["ignore", "pipe", "pipe"],
       });
       child = started;
@@ -200,66 +205,6 @@ export function cloudflareCliJson(result: CloudflareCliResult): { readonly value
   }
 }
 
-/**
- * The paging facts cf printed for a list, which it writes to stderr as one
- * `result_info: {...}` line. Undefined when cf printed none; null when what
- * it printed cannot be read as exactly one.
- */
-export function cloudflareResultInfo(
-  result: CloudflareCliResult,
-): Readonly<Record<string, unknown>> | undefined | null {
-  const lines = result.stderr.split("\n").filter((line) => line.startsWith("result_info:"));
-  if (lines.length === 0) return undefined;
-  if (lines.length > 1) return null;
-  try {
-    const value = JSON.parse((lines[0] as string).slice("result_info:".length)) as unknown;
-    return typeof value === "object" && value !== null && !Array.isArray(value)
-      ? value as Readonly<Record<string, unknown>>
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-export interface CloudflareApiError {
-  /** Each error or message Cloudflare's API sent, in order. */
-  readonly entries: readonly { readonly code?: number; readonly message: string }[];
-  readonly status: number;
-  /** The request path after /client/v4, with its query. */
-  readonly path: string;
-}
-
-/**
- * The one Cloudflare API error cf 1.0.0-rc.2 printed, or undefined for
- * anything else. cf prints errors as text, read on 2026-11-20:
- *
- *   ┌ APIError
- *   │ [10007] This Worker does not exist on your account.
- *   │ 404 Not Found · HTTP /accounts/<id>/workers/scripts/<name>/deployments
- *   └
- *
- * Only a normal exit with code 1, an empty stdout, and exactly one such box
- * whose every line is accounted for is an answer. Whatever does not fit is
- * undefined, and no caller reads undefined as "absent".
- */
-export function cloudflareApiError(result: CloudflareCliResult): CloudflareApiError | undefined {
-  const text = errorBox(result, "APIError");
-  if (text === undefined || text.length < 2) return undefined;
-  const tail = /^(\d{3}) [A-Za-z' -]+ · HTTP (\/\S+)$/u.exec(text[text.length - 1] ?? "");
-  if (tail === null) return undefined;
-  const entries: { code?: number; message: string }[] = [];
-  for (const line of text.slice(0, -1)) {
-    if (line.length === 0) continue;
-    const coded = /^\[(\d+)\] (.*)$/u.exec(line);
-    const plain = /^\[error\] (.*)$/u.exec(line);
-    if (coded !== null) entries.push({ code: Number(coded[1]), message: coded[2] ?? "" });
-    else if (plain !== null) entries.push({ message: plain[1] ?? "" });
-    else return undefined;
-  }
-  if (entries.length === 0) return undefined;
-  return { entries, status: Number(tail[1]), path: tail[2] ?? "" };
-}
-
 /** The lines of the one error box with this title that cf printed and exited 1 on, and nothing else. */
 function errorBox(result: CloudflareCliResult, title: string): readonly string[] | undefined {
   if (result.exitCode !== 1 || result.stdout.length > 0) return undefined;
@@ -294,14 +239,4 @@ export function cloudflareCliError(result: CloudflareCliResult): string | undefi
   return text === undefined || text.length === 0 || text.some((line) => line.length === 0)
     ? undefined
     : text.join(" ");
-}
-
-/** True only for Cloudflare's own single answer with this status, code, and exact request path. */
-export function cloudflareApiAnswered(
-  result: CloudflareCliResult,
-  expected: { readonly status: number; readonly code: number; readonly path: string },
-): boolean {
-  const error = cloudflareApiError(result);
-  return error !== undefined && error.status === expected.status && error.path === expected.path &&
-    error.entries.length === 1 && error.entries[0]?.code === expected.code;
 }

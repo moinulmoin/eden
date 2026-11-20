@@ -58,8 +58,9 @@ const fakeCf = vi.hoisted(() => ({
  * registry lists `entries` or gets `answer(ref)` for a delete, and cf's
  * `containers images delete` and `containers registries credentials generate`
  * run against the same state. `auth whoami` names `whoamiAccountId()`, and
- * the exact Worker and Container application are reported absent, in the
- * forms cf 1.0.0-rc.2 printed on 2026-11-20. Any other cf command fails.
+ * Cloudflare's API, read with CLOUDFLARE_API_TOKEN, reports the exact Worker
+ * and Container application absent, in the forms it answered with on
+ * 2026-11-20. Any other cf command fails.
  */
 const fakeRegistry = vi.hoisted(() => {
   type Answer =
@@ -209,7 +210,6 @@ vi.mock("node:child_process", async (importOriginal) => {
   /** What cf prints and exits with while the fake registry runs. */
   const registryCf = (
     args: readonly string[],
-    env: NodeJS.ProcessEnv,
   ): { readonly exitCode: number; readonly stdout?: string; readonly stderr?: string } => {
     const line = args.join(" ");
     if (line === "auth whoami") {
@@ -245,20 +245,6 @@ vi.mock("node:child_process", async (importOriginal) => {
       );
       return { exitCode: 0 };
     }
-    if (line.startsWith("containers applications list ")) return { exitCode: 0, stdout: "[]" };
-    if (line.startsWith("workers get ")) {
-      return {
-        exitCode: 1,
-        stderr: `\n┌ APIError\n│ [10007] This Worker does not exist on your account.\n│ 404 Not Found · HTTP /accounts/${env.CLOUDFLARE_ACCOUNT_ID}/workers/workers/${args[2]}\n└\n`,
-      };
-    }
-    if (line.startsWith("workers deployments list --worker ")) {
-      fakeRegistry.onRead(fakeRegistry.reads++);
-      return {
-        exitCode: 1,
-        stderr: `\n┌ APIError\n│ [10007] This Worker does not exist on your account.\n│ 404 Not Found · HTTP /accounts/${env.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${args[4]}/deployments\n└\n`,
-      };
-    }
     return { exitCode: 1, stderr: `Unexpected cf call: ${line}` };
   };
   return {
@@ -275,7 +261,7 @@ vi.mock("node:child_process", async (importOriginal) => {
         fakeCf.pending = args;
         answer = fakeCf.answers.shift() ?? { exitCode: 1 };
       } else {
-        answer = registryCf(args, (spawnArgs[2] as { readonly env: NodeJS.ProcessEnv }).env);
+        answer = registryCf(args);
       }
       const child = Object.assign(new EventEmitter(), {
         stdout: new EventEmitter(),
@@ -322,6 +308,19 @@ type FakeRegistrySetup = {
 };
 
 function startFakeRegistry(setup: FakeRegistrySetup): void {
+  vi.stubEnv("CLOUDFLARE_API_TOKEN", "an-api-token");
+  vi.stubGlobal("fetch", async (input: string | URL) => {
+    const path = new URL(String(input)).pathname;
+    if (!String(input).startsWith("https://api.cloudflare.com/client/v4/accounts/")) throw new TypeError("fetch failed");
+    if (path.endsWith("/containers/applications")) {
+      return new Response('{"success":true,"result":[],"errors":[],"messages":[],"result_info":{}}');
+    }
+    if (path.endsWith("/deployments")) fakeRegistry.onRead(fakeRegistry.reads++);
+    return new Response(
+      '{"result":null,"success":false,"errors":[{"code":10007,"message":"This Worker does not exist on your account."}],"messages":[]}',
+      { status: 404 },
+    );
+  });
   Object.assign(fakeRegistry, {
     active: true,
     entries: new Map(Object.entries(setup.entries).map(([name, entries]) => [name, [...entries]])),
@@ -470,6 +469,8 @@ const runtimeCleanup = {
 };
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -1658,9 +1659,8 @@ describe("top-level Eden Deploy commands", () => {
 
     // The publish, then the reads that find no version of this publish to finish.
     expect(calls[0]).toEqual({ args: ["deploy", "--prebuilt"], timeoutMs: 600_000 });
-    expect(calls.slice(1)).toEqual(Array(25).fill(
-      { args: ["workers", "deployments", "list", "--worker", "eve-publish-deadline"], timeoutMs: 30_000 },
-    ));
+    // cf gives no login token here, so nothing of Cloudflare's API is read.
+    expect(calls.slice(1)).toEqual([{ args: ["auth", "whoami"], timeoutMs: 30_000 }]);
     expect(errors.join("\n")).toContain("DEPLOY_INDETERMINATE");
   });
 
@@ -3002,6 +3002,8 @@ describe("eden destroy", () => {
         args: ["workers", "delete", "eve-destroy-fixture", "--force"],
         timeoutMs: 120_000,
       },
+      // The delete did not finish, so Eden asks Cloudflare's API whether the Worker is there, and needs cf's token for it.
+      { args: ["auth", "whoami"], timeoutMs: 30_000 },
     ]);
     expect(JSON.parse(output[0] as string)).toMatchObject({
       error: { code: "EVE_DESTROY_INDETERMINATE" },

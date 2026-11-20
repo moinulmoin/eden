@@ -575,13 +575,24 @@ async function cf(args) {
   const env = { ...baseEnvironment, NO_COLOR: "1", CF_DELEGATION: "1", CLOUDFLARE_API_BASE_URL: "https://api.cloudflare.com/client/v4", ...(registryAccount === undefined ? {} : { CLOUDFLARE_ACCOUNT_ID: registryAccount }) };
   return run(cfCli, args, { cwd: cfRoot, env, timeoutMs: 120_000, interruptible: false });
 }
-// True when cf printed Cloudflare's one answer that the Worker does not exist, for this request's own path.
-async function workerAbsent(result, path) {
-  const { cloudflareApiAnswered } = await import(pathToFileURL(join(repoRoot, "packages/cli/dist/eve-cloudflare-cli.js")).href);
-  return cloudflareApiAnswered(
-    { exitCode: result.code, stdout: result.stdout, stderr: result.stderr },
-    { status: 404, code: 10007, path: "/accounts/" + registryAccount + path },
-  );
+// True when Cloudflare's API itself answers that the Worker does not exist:
+// 404, one error with code 10007, and nothing beside it. Read as Eden reads
+// it, with CLOUDFLARE_API_TOKEN or the token of cf's login.
+let readApi;
+async function workerAbsent(path) {
+  if (readApi === undefined) {
+    const load = (file) => import(pathToFileURL(join(repoRoot, "packages/cli/dist", file)).href);
+    readApi = (await load("eve-cloudflare-api.js")).cloudflareApiReader((await load("eve-cloudflare-cli.js")).runCloudflareCli);
+  }
+  const answer = await readApi("/accounts/" + registryAccount + path);
+  if (answer?.status !== 404) return false;
+  try {
+    const body = JSON.parse(answer.body);
+    return body.success === false && body.result === null && Array.isArray(body.errors) && body.errors.length === 1 &&
+      body.errors[0].code === 10007 && (body.messages ?? []).length === 0;
+  } catch {
+    return false;
+  }
 }
 
 // What Cloudflare's registry itself lists for this run's repositories: each
@@ -617,11 +628,11 @@ async function verifyGone() {
     else problems.push("URL returned " + response + ", expected 404");
   }
   if (
-    await workerAbsent(await cf(["workers", "deployments", "list", "--worker", target]), "/workers/scripts/" + target + "/deployments") &&
-    await workerAbsent(await cf(["workers", "get", target]), "/workers/workers/" + target)
+    await workerAbsent("/workers/scripts/" + target + "/deployments") &&
+    await workerAbsent("/workers/workers/" + target)
   ) notes.push("no Worker");
-  else problems.push("Worker " + target + " still answers cf workers deployments list");
-  if (await workerAbsent(await cf(["workers", "secrets", "list", "--worker", target]), "/workers/scripts/" + target + "/secrets")) notes.push("no secrets");
+  else problems.push("Cloudflare's API does not say that Worker " + target + " is gone");
+  if (await workerAbsent("/workers/scripts/" + target + "/secrets")) notes.push("no secrets");
   else problems.push("Worker secrets for " + target + " can still be listed");
   const containers = await cf(["containers", "applications", "list", "--name", target + "-container"]);
   if (containers.code !== 0) problems.push("cf containers applications list failed: " + tail(containers.stderr, 3));
