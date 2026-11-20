@@ -184,41 +184,52 @@ behavior and the warning that an Eve upgrade can strand sessions.
 - **The version switch:** Cloudflare does not move the Worker and its
   Durable Objects to the new version at the same instant. On 2026-11-20
   they ran different releases for between half a second and 20 seconds, in
-  either order. Each Worker stamps its release ID on the request, and the
-  published Worker names the one release it replaces, taken from the
-  deployment record.
-  - The Container object serves a request from its own release and from
-    the release it replaces. For any other release it resets itself, so
-    that an object still on old code restarts on the new code. A deploy
-    from a project folder that does not hold the previous deploy's record
-    names a different release, so its object resets for the old Workers.
+  either order. Each caller stamps its release ID on a request, with the
+  release it replaced. `eden deploy` reads the replaced release from the
+  live Worker's settings when it starts, not from the local record.
+  - A Container object and the World object serve their own release and
+    the one they replaced.
+  - An object resets itself only for the release that names it as the one
+    it replaced. That proves the caller is newer, and the object restarts
+    on the new code. Any other release gets `503` with `Retry-After: 5`
+    and no reset, so two releases cannot reset each other. Such an object
+    changes version when Cloudflare moves it.
+  - A reset says nothing about whether a request in flight ran. Eden
+    repeats only a GET or HEAD, and the health read it sends before any
+    other request. It never sends a POST, PUT, PATCH or DELETE twice, and
+    never a World call: when a reset loses the answer, the client or Eve
+    gets `503` with `Retry-After: 1` and the request may have run.
   - A reset object can come back on the old code until Cloudflare has the
-    new version where the object runs. The Worker tries again for about
-    30 seconds, then answers `503` with `Retry-After: 5`. A request body
-    is sent only once, after the object answered on the right release.
+    new version where the object runs. The Worker starts no new try later
+    than 30 seconds after the request arrived, then answers `503` with
+    `Retry-After: 5`. This covers every object the request needs,
+    including a retained version's object. The wait for a starting
+    Container is separate and unchanged.
   - If a Worker of the replaced release names a version the new release no
     longer routes, the object answers `503` with `Retry-After: 1`.
   - Requests that arrive while the object replaces the Container wait for
     the one new Container.
-  - The World object holds the list of versions. A container of a release
-    the World object does not know resets it the same way, so it does not
-    keep the old list after an upgrade. The object on the old release must
-    already carry this check, so it works from the second deploy made with
-    a CLI that has it.
+  - The first request of a release, which is the deploy's health check,
+    also asks the World object to place the release. So `eden deploy`
+    reports healthy only after a World object on the replaced release has
+    restarted. A World object deployed by Eden `0.13.0` or earlier does
+    not have this check: after the first Eve upgrade made with a newer
+    CLI it can keep the old list of versions until Cloudflare moves it,
+    2 minutes 20 seconds when measured, and new sessions get Eve's
+    `500` for that time although the deploy reported healthy.
 
-  Measured with a request every 250 ms through two same-version updates
-  and an upgrade: 2 of about 2,700 requests got Cloudflare's error 1101
-  page (HTTP 500), both with Cloudflare's "Internal error in Durable Object
-  storage caused object to be reset"; none in the two minutes after each
-  deploy returned. Before these rules, 5 of about 1,400 requests through
-  two updates got error 1101. Two earlier HTTP 500 answers, at least 20
-  seconds after a switch, are not proven to have one of these causes.
+  Two deploys of one target that overlap can both name the same replaced
+  release. The objects of the one published last then answer `503` to the
+  other's Workers until Cloudflare has switched them all. Eden does not
+  lock a target against a second deploy.
 
-  What can still return error 1101 around a switch: Cloudflare's own
-  Durable Object errors, such as the storage reset above, which Eden does
-  not retry; and a request with a body when the object is reset after it
-  answered the release check and before it took the body, because Eden
-  sends a body only once.
+  What can still return Cloudflare's error 1101 page (HTTP 500) around a
+  switch: Cloudflare's own Durable Object errors, such as "Internal error
+  in Durable Object storage caused object to be reset", which Eden does not
+  retry. The measurements are in the
+  [compatibility history](./eve-compatibility-history.md). Two earlier HTTP
+  500 answers, at least 20 seconds after a switch, left no log and are not
+  proven to have one of these causes.
 - **Same Eve version:** update in place. Eden carries
   `/workspace/.eve/sandbox-cache/just-bash/sessions` through Durable Object
   storage, up to 1 GiB compressed (using the sleep-time copy if asleep).
