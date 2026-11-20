@@ -265,6 +265,8 @@ export interface EveCloudflareReadResult {
   readonly containerAccess: "available" | "unavailable";
   readonly accountId?: string;
   readonly workersDevSubdomain?: string;
+  /** Cloudflare's API answered that the account has registered no workers.dev subdomain. */
+  readonly workersDevSubdomainUnregistered?: true;
   readonly stableWorkersDevOrigin?: string;
   readonly target: {
     readonly state: EveCloudflareTargetState;
@@ -1632,19 +1634,24 @@ function cloudflareApiMissing(answer: CloudflareApiAnswer | undefined, code: num
     typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
-/** The account's workers.dev subdomain, as Cloudflare's API gives it. */
+/**
+ * The account's workers.dev subdomain, as Cloudflare's API gives it, or
+ * that the API says the account has none: 404 with the one error 10007,
+ * which is the code cf 1.0.0-rc.2 reads as "no subdomain registered".
+ * Neither field when the read proved nothing.
+ */
 async function readWorkersDevSubdomain(
   api: CloudflareApiRead,
   accountId: string | undefined,
-): Promise<string | undefined> {
-  if (accountId === undefined) return undefined;
-  const result = cloudflareApiResult(
-    await api(`/accounts/${encodeURIComponent(accountId)}/workers/subdomain`),
-  )?.result;
+): Promise<Pick<EveCloudflareReadResult, "workersDevSubdomain" | "workersDevSubdomainUnregistered">> {
+  if (accountId === undefined) return {};
+  const answer = await api(`/accounts/${encodeURIComponent(accountId)}/workers/subdomain`);
+  if (cloudflareApiMissing(answer, 10007)) return { workersDevSubdomainUnregistered: true };
+  const result = cloudflareApiResult(answer)?.result;
   const subdomain = typeof result === "object" && result !== null && "subdomain" in result
     ? result.subdomain
     : undefined;
-  return typeof subdomain === "string" && EVE_NAME_PATTERN.test(subdomain) ? subdomain : undefined;
+  return typeof subdomain === "string" && EVE_NAME_PATTERN.test(subdomain) ? { workersDevSubdomain: subdomain } : {};
 }
 
 /**
@@ -1806,7 +1813,7 @@ async function defaultCloudflareRead(
   const containerAccess = containerEntries === undefined
     ? "unavailable"
     : "available";
-  const workersDevSubdomain = await readWorkersDevSubdomain(api, accountId);
+  const workersDev = await readWorkersDevSubdomain(api, accountId);
   if (
     accountAccess === "unavailable" ||
     containerAccess === "unavailable" ||
@@ -1818,9 +1825,7 @@ async function defaultCloudflareRead(
       ...(accountId === undefined
         ? {}
         : { accountId }),
-      ...(workersDevSubdomain === undefined
-        ? {}
-        : { workersDevSubdomain }),
+      ...workersDev,
       target: {
         state: "ambiguous",
         message:
@@ -1840,9 +1845,7 @@ async function defaultCloudflareRead(
       ...(accountId === undefined
         ? {}
         : { accountId }),
-      ...(workersDevSubdomain === undefined
-        ? {}
-        : { workersDevSubdomain }),
+      ...workersDev,
       target: { state: "absent" },
     };
   }
@@ -1863,9 +1866,7 @@ async function defaultCloudflareRead(
     ...(accountId === undefined
       ? {}
       : { accountId }),
-    ...(workersDevSubdomain === undefined
-      ? {}
-      : { workersDevSubdomain }),
+    ...workersDev,
     target: {
       // The read-only inventory proves the exact target exists but cannot
       // prove who created it; Eden's immutable deployment record resolves
@@ -4691,13 +4692,26 @@ async function collectEvePreflight(
     }
     publicOrigin = await resolvedCloudflareOrigin(cloudflare, request.name);
     if (publicOrigin === undefined) {
+      // Three cases a user acts on differently: the account has no
+      // subdomain, the subdomain could not be read, and anything else.
+      const account = cloudflare.accountId;
+      const retry = `Confirm the login with ${cfAuthCommand("whoami")}, then run eden deploy again. Nothing was changed on Cloudflare.`;
       checks.push(
-        check(
-          "VAL-HOST-006",
-          "failed",
-          "The authenticated Cloudflare read did not prove the exact workers.dev origin before Eve initialization.",
-          "Return one authenticated account ID, one workers.dev subdomain, and the exact Worker-origin binding.",
-        ),
+        account !== undefined && cloudflare.workersDevSubdomainUnregistered === true
+          ? check(
+            "VAL-HOST-006",
+            "failed",
+            `Cloudflare account ${account} has no workers.dev subdomain, which is part of the deployment's URL.`,
+            `Register one at https://dash.cloudflare.com/${account}/workers/onboarding, then run eden deploy again. Nothing was changed on Cloudflare.`,
+          )
+          : check(
+            "VAL-HOST-006",
+            "failed",
+            account !== undefined && cloudflare.workersDevSubdomain === undefined
+              ? `Eden could not read the workers.dev subdomain of Cloudflare account ${account}, which is part of the deployment's URL. Cloudflare's API did not say that the account has none.`
+              : "The authenticated Cloudflare read did not prove the exact workers.dev origin before Eve initialization.",
+            retry,
+          ),
       );
     }
     if (!allChecksClear(checks)) {

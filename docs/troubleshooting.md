@@ -527,14 +527,27 @@ declarations.
 ### `VAL-HOST-006` — the public origin could not be proven
 
 Deploy could not learn the account's `workers.dev` subdomain, which is part
-of the deployment's URL. The message is `The authenticated Cloudflare read did
-not prove the exact workers.dev origin before Eve initialization.` Eden
-reads the subdomain from Cloudflare's API
-(`GET /accounts/<account id>/workers/subdomain`). Confirm the login with
-`npx cf@1.0.0-rc.2 auth whoami` and retry. An account that never registered a
-`workers.dev` subdomain has none to read: register one at
-`https://dash.cloudflare.com/<account id>/workers/onboarding`. No such
-account was available to test.
+of the deployment's URL. Eden reads the subdomain from Cloudflare's API
+(`GET /accounts/<account id>/workers/subdomain`), before it changes anything
+on Cloudflare. The message says which of three things happened:
+
+- `Cloudflare account <account id> has no workers.dev subdomain, which is
+  part of the deployment's URL.` The API answered `404` with the one error
+  code `10007`, which is the code `cf` `1.0.0-rc.2` reads as "no subdomain
+  registered". Register one at
+  `https://dash.cloudflare.com/<account id>/workers/onboarding`, then run
+  `eden deploy` again. No such account was available to test: the answer is
+  known from `cf`'s code, not from a run on Cloudflare.
+- `Eden could not read the workers.dev subdomain of Cloudflare account
+  <account id> ... Cloudflare's API did not say that the account has none.`
+  The read got no answer, an error such as an authentication error, or an
+  answer Eden could not use. Confirm the login with
+  `npx cf@1.0.0-rc.2 auth whoami` and run `eden deploy` again.
+- `The authenticated Cloudflare read did not prove the exact workers.dev
+  origin before Eve initialization.` Any other case, such as an account
+  that could not be read; the `VAL-CLI-007-CLOUDFLARE-ACCESS` check beside
+  it then says why. Confirm the login the same way and run `eden deploy`
+  again.
 
 ### `EVE_ORIGIN_UNAVAILABLE`
 

@@ -25,6 +25,14 @@
   service that comes before each try. Until now only that read's own time
   limit and the publish's 15-minute deadline ended it. No trigger was
   deployed after the two minutes before this change either.
+- `VAL-HOST-006` now says what to do. When Cloudflare's API answers that
+  the account has no `workers.dev` subdomain, the check names the account
+  and the dashboard page where one is registered. When the subdomain could
+  not be read, it says so and names the `cf auth whoami` command to run.
+  Until now both cases got one message whose remediation told the user to
+  "return" an account ID and a subdomain. The no-subdomain answer is the one
+  `cf` `1.0.0-rc.2` reads; no account without a subdomain was available to
+  test it on Cloudflare.
 
 ## 0.15.0 — 2026-11-20
 

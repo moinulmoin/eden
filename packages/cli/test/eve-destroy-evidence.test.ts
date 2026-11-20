@@ -82,6 +82,8 @@ const cloud = vi.hoisted(() => {
     secrets: [] as string[],
     /** Each image cf pushed, as account/repository:tag. */
     pushed: [] as string[],
+    /** When set, the API's answer to the read of the account's workers.dev subdomain. */
+    subdomainAnswer: undefined as { readonly status: number; readonly body: string } | undefined,
     /** How many times "cf workers triggers deploy" answers that the Worker does not exist. */
     triggerFailures: 0,
     /** When set, how "cf deploy" exits 1: before it uploads anything, or with the Worker version live and no Container application. */
@@ -323,7 +325,9 @@ async function cloudflareApi(input: string | URL | Request, init?: RequestInit):
     });
   }
   cloud.onRead();
-  if (path === "workers/subdomain") return found({ subdomain: "account" });
+  if (path === "workers/subdomain") {
+    return cloud.subdomainAnswer === undefined ? found({ subdomain: "account" }) : json(cloud.subdomainAnswer.status, cloud.subdomainAnswer.body);
+  }
   if (path === "containers/applications") {
     const entries = [...cloud.containers].flatMap((entry) => {
       const [owner, named = ""] = entry.split("/");
@@ -526,6 +530,7 @@ beforeEach(() => {
     deleted: [],
     secrets: [],
     pushed: [],
+    subdomainAnswer: undefined,
   });
   vi.stubEnv("CLOUDFLARE_API_TOKEN", "");
   vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "");
@@ -1554,6 +1559,34 @@ describe("Eden reads Cloudflare's API with the token of cf's login, or with CLOU
     for (const entry of kept.filter((file) => file.isFile())) {
       expect(await readFile(join(entry.parentPath, entry.name), "utf8")).not.toContain(cloud.loginToken);
     }
+  });
+
+  test.each([
+    [
+      "has no workers.dev subdomain is told where to register one",
+      refused(404, 10007, "There is not a workers.dev subdomain registered for this account."),
+      /^Cloudflare account 1{32} has no workers\.dev subdomain/u,
+      /^Register one at https:\/\/dash\.cloudflare\.com\/1{32}\/workers\/onboarding, then run eden deploy again/u,
+    ],
+    [
+      "does not show its workers.dev subdomain is told to check the login, not to register",
+      refused(403, 10000, "Authentication error"),
+      /^Eden could not read the workers\.dev subdomain of Cloudflare account 1{32}/u,
+      /^Confirm the login with npx cf@1\.0\.0-rc\.2 auth whoami --profile default, then run eden deploy again/u,
+    ],
+  ] as const)("an account that %s, before any write", async (_name, answer, message, remediation) => {
+    const root = await deployableProject();
+    cloud.whoami = () => account;
+    cloud.subdomainAnswer = answer;
+    const { exitCode, result } = await deploy(root, "generation-one", { account, push: true, ownChecks: true });
+    expect({ exitCode, code: result.error?.code }).toEqual({ exitCode: 1, code: "EVE_DEPLOY_CHECKS_FAILED" });
+    expect(result.checks?.filter((check) => check.status === "failed")).toEqual([{
+      id: "VAL-HOST-006",
+      status: "failed",
+      message: expect.stringMatching(message) as unknown,
+      remediation: expect.stringMatching(remediation) as unknown,
+    }]);
+    expect({ pinned: cloud.pinned, pushed: cloud.pushed, workers: [...cloud.workers] }).toEqual({ pinned: [], pushed: [], workers: [] });
   });
 
   test("with CLOUDFLARE_API_TOKEN set, Eden reads with it and asks cf for nothing", async () => {
