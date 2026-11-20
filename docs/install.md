@@ -23,8 +23,7 @@ node --version
 The result must be `v24.22.0` or newer on the 24 line, or `v26.12.0` or newer
 on the 26 line; the `cf` CLI that Eden runs declares those lines.
 On any other Node, `preflight`, `deploy`, and `destroy` stop with
-[`EVE_NODE_UNSUPPORTED`](./troubleshooting.md#eve_node_unsupported). Eden
-intentionally has no artificial upper Node major-version bound.
+[`EVE_NODE_UNSUPPORTED`](./troubleshooting.md#eve_node_unsupported).
 
 ## Install the CLI
 
