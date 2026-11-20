@@ -551,24 +551,30 @@ function startTail() {
 function tailExceptions() {
   const lines = [];
   for (const file of tailFiles) {
-    // Wrangler prints one indented JSON object per invocation.
-    for (const part of readFileSync(file, "utf8").split(/\n(?=\{\n)/u)) {
-      let event;
+    let text = "";
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    // Wrangler prints one indented JSON object per invocation. Diagnostics
+    // only: a part that cannot be read is skipped, never a failure.
+    for (const part of text.split(/\n(?=\{\n)/u)) {
       try {
-        event = JSON.parse(part);
+        const event = JSON.parse(part);
+        if (event.outcome === "ok" || event.outcome === "canceled") continue;
+        const request = event.event?.request;
+        lines.push([
+          new Date(event.eventTimestamp).toISOString(),
+          event.entrypoint ?? "Worker",
+          "version " + String(event.scriptVersion?.id).slice(0, 8),
+          event.outcome,
+          request === undefined ? "" : request.method + " " + new URL(request.url).pathname,
+          (event.exceptions ?? []).map((exception) => exception.name + ": " + exception.message).join("; "),
+        ].join(" "));
       } catch {
         continue;
       }
-      if (event.outcome === "ok" || event.outcome === "canceled") continue;
-      const request = event.event?.request;
-      lines.push([
-        new Date(event.eventTimestamp).toISOString(),
-        event.entrypoint ?? "Worker",
-        "version " + String(event.scriptVersion?.id).slice(0, 8),
-        event.outcome,
-        request === undefined ? "" : request.method + " " + new URL(request.url).pathname,
-        (event.exceptions ?? []).map((exception) => exception.name + ": " + exception.message).join("; "),
-      ].join(" "));
     }
   }
   return lines;
