@@ -1622,6 +1622,7 @@ describe("destroy deletes a Container application left without its Worker only w
     ["a number", '"containerApplicationId":123'],
     ["a string that is no ID", '"containerApplicationId":"container-123"'],
     ["two IDs", '"containerApplicationId":"' + "a".repeat(32) + '","containerApplicationId":"' + "a".repeat(32) + '"'],
+    ["missing beside a field written twice", '"note":1,"note":2'],
   ] as const)("a record whose ID is %s is not a record without one: destroy stops and deletes nothing", async (_name, member) => {
     const { root, current: pointer } = await deployedProject("gen-destroy-1", member);
     cloud.containers.add("account-test/eve-destroy-fixture-container#" + "a".repeat(32));

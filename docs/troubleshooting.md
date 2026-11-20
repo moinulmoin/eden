@@ -1481,8 +1481,7 @@ In both cases destroy deletes nothing, the registry included, and leaves
 the record and `CURRENT` as they are. Look at that application in the
 Cloudflare dashboard of the account the message names. If it is yours to
 remove, delete it there, then run `eden destroy` again with the same
-`--project`, `--env`, and `--name`; it removes the rest and clears
-`CURRENT`. If it belongs to something else, leave it and keep the `.eden`
+`--project`, `--env`, and `--name`; it removes what is left. If it belongs to something else, leave it and keep the `.eden`
 folder.
 
 A record written by Eden `0.15.0` or older has no

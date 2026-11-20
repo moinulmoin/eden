@@ -5456,10 +5456,11 @@ async function parseEveDestroyRecord(
     }
     Object.assign(metadata, { [key]: value });
   }
-  if ("containerApplicationId" in identity) {
+  const twice = namesFieldTwice(raw);
+  if (twice || "containerApplicationId" in identity) {
     const id = identity.containerApplicationId;
     Object.assign(metadata, {
-      containerApplicationId: typeof id === "string" && /^[0-9a-f]{32}$/u.test(id) && !namesFieldTwice(raw) ? id : null,
+      containerApplicationId: !twice && typeof id === "string" && /^[0-9a-f]{32}$/u.test(id) ? id : null,
     });
   }
   const verified: VerifiedEveDestroyIdentity = {
