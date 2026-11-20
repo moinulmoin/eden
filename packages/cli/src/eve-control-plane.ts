@@ -646,9 +646,10 @@ export type EveRegistryRepositoryDeleteRunner = (
     readonly accountId: string;
     /**
      * When set, only this image is deleted and the rest of the repository is
-     * left alone: `tag` and then the image's `sha256:` entry, and only when
-     * the registry lists `tag` and resolves it to `digest`. Otherwise
-     * nothing is deleted and the outcome is `absent`.
+     * left alone: the one delete is of `tag`, and only when the registry
+     * lists `tag` and resolves it to `digest`. Otherwise nothing is deleted
+     * and the outcome is `absent`. `deleted` means the tag and the image's
+     * `sha256:` entry then left the listing.
      */
     readonly image?: { readonly digest: string; readonly tag: string };
   },
@@ -4040,11 +4041,7 @@ async function runEveDeployment(
     } catch {
       deleted = "indeterminate";
     }
-    if (typeof deleted === "object") {
-      registryObjectsKept.push(...deleted.kept);
-      if (deleted.unproven === true) deleted = "indeterminate";
-    }
-    if (deleted === "indeterminate") {
+    if (deleted === "indeterminate" || typeof deleted === "object") {
       // The deployment is promoted and healthy; a cleanup that could not be shown does not fail it.
       resultWarnings.push({
         id: "EVE_SUPERSEDED_IMAGE_NOT_DELETED",
@@ -4061,9 +4058,7 @@ async function runEveDeployment(
         : check(
           "VAL-LIFE-007",
           "passed",
-          deleted === "deleted"
-            ? "The superseded image was deleted from the registry by its tag after promotion."
-            : "Eden asked the registry to delete the superseded image after promotion. Cloudflare's registry still lists it; see EVE_REGISTRY_OBJECTS_KEPT.",
+          "The superseded image was deleted from the registry by its tag after promotion.",
         );
     }
   }
@@ -5947,9 +5942,8 @@ function cloudflareRegistry(): CloudflareRegistry {
  * an owned repository: every tag (the tags Eden pushed, and the tags
  * Cloudflare added for container snapshots) and every `sha256:` entry,
  * which the registry lists for each manifest, tagged or not. Given
- * `image`, it deletes only that image's tag and entry, when the registry
- * resolves the tag to it, and reads the listing as if it held nothing
- * else. A tag gets its
+ * `image`, it deletes only that image's tag instead, when the registry
+ * resolves the tag to it. A tag gets its
  * own Wrangler delete, which also collects unreferenced layers. A `sha256:`
  * entry gets Eden's delete by digest, because Wrangler lists and deletes
  * tags only.
@@ -5976,22 +5970,33 @@ function registryRepositoryDeleter(
   registry: CloudflareRegistry = cloudflareRegistry(),
 ): EveRegistryRepositoryDeleteRunner {
   return async ({ repository, accountId, image }) => {
-    // For one image: its own entry, and the tags proved below to name it.
-    let only: string[] | undefined;
-    const list = async (): Promise<{ readonly at: number; readonly entries: readonly string[] | undefined }> => {
-      const at = performance.now();
-      const listed = await registry.list(accountId, repository);
-      return { at, entries: only === undefined ? listed : listed?.filter((entry) => only?.includes(entry)) };
-    };
+    const list = async (): Promise<{ readonly at: number; readonly entries: readonly string[] | undefined }> => ({
+      at: performance.now(),
+      entries: await registry.list(accountId, repository),
+    });
     if (image !== undefined) {
+      // One image: the only delete is Wrangler's, of its tag. The digest is
+      // used to check what the tag names and to see the image leave.
       const listed = await registry.list(accountId, repository);
       if (listed === undefined) return "indeterminate";
-      // Without its tag the image is left alone: a delete by digest does not remove it.
       if (!listed.includes(image.tag)) return "absent";
       const named = await registry.resolve(accountId, repository, image.tag).catch(() => undefined);
       if (named === undefined) return "indeterminate";
       if (named !== image.digest) return "absent";
-      only = [image.tag, image.digest];
+      const deleted = await runWranglerWithInput(
+        ["containers", "images", "delete", `${repository}:${image.tag}`, "--skip-confirmation"],
+        accountId,
+      );
+      if (deleted.exitCode !== 0) return "indeterminate";
+      // A tagged image left the listing about 15 seconds after its tag was deleted.
+      const deletedAt = performance.now();
+      for (;;) {
+        const { at, entries } = await list();
+        if (entries === undefined) return "indeterminate";
+        if (!entries.includes(image.tag) && !entries.includes(image.digest)) return "deleted";
+        if (at - deletedAt >= REGISTRY_REMOVAL_WAIT_MS) return "indeterminate";
+        await waitForActivation(5_000);
+      }
     }
     let listing = await list();
     if (listing.entries === undefined) return "indeterminate";

@@ -4516,6 +4516,7 @@ describe("eden deploy in-place update", () => {
         images.set(`${repository}:candidate`, manifest("c"));
         fakeRegistry.entries.set(repository, ["candidate", manifest("c"), manifest("e")]);
       }
+      const requestsBefore = fakeRegistry.registryRequests.length;
       const second = await deploy("generation-three", manifest("d"));
       expect(second.code).toBe(0);
       expect(second.result.ok).toBe(true);
@@ -4529,9 +4530,18 @@ describe("eden deploy in-place update", () => {
         expect(fakeRegistry.listed(repository)).toEqual(["candidate", promotedTag, manifest("c"), manifest("d"), manifest("e")]);
         expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).toBe("skipped");
       } else {
+        // Every request of the cleanup: a listing, what the tag names, Wrangler's delete of
+        // that tag, and listings until the image has left. Eden sends no delete of its own.
         expect(fakeRegistry.wranglerDeletes).toEqual([`${repository}:${priorTag}`]);
+        // A listing is two requests: its page, and the empty page that ends it.
+        const listing = [`GET ${repository}`, `GET ${repository}`];
+        expect(fakeRegistry.registryRequests.slice(requestsBefore).map((sent) => `${String(sent.method)} ${sent.ref}`)).toEqual([
+          ...listing,
+          `HEAD ${repository}:${priorTag}`,
+          ...listing,
+          ...listing,
+        ]);
         expect(fakeRegistry.listed(repository)).toEqual([promotedTag, manifest("d")]);
-        expect(registryDeletes()).toEqual([`${repository}@${manifest("c")}`]);
         expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")).toMatchObject({
           status: "passed",
           message: "The superseded image was deleted from the registry by its tag after promotion.",

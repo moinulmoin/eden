@@ -707,7 +707,7 @@ the command produced them.
 | `name` | string | The exact target name |
 | `checks` | array | `id`, `status` (`passed`, `failed`, `blocked`, `skipped`), `message`, and `remediation` when present |
 | `warnings` | array | `id`, `message`, and `remediation` when present |
-| `registryObjectsKept` | array of objects, on deploy with the warning `EVE_REGISTRY_OBJECTS_KEPT` | Each object of a superseded version's repository, or the superseded image of a same-version update, that Cloudflare's registry still lists after Eden's delete, with the same `ref` and `class` as on destroy |
+| `registryObjectsKept` | array of objects, on deploy with the warning `EVE_REGISTRY_OBJECTS_KEPT` | Each object of a superseded version's repository that Cloudflare's registry still lists after Eden's delete, with the same `ref` and `class` as on destroy |
 | `candidate` | object or `null` | `generationId`, `sourceDigest`, `outputDigest`, and `imageDigest` when the image was built |
 | `deployment` | object, on deploy | `status`, `operation` (`create` or `update`), `targetKey`, `deploymentId`, `workerName`, `containerApplicationName`, `stableContainerInstanceName`, `stableWorkersDevOrigin`, `imageReference`, `supersededGenerationId` and `supersededImageReference` on an update, `runtimeVariableNames`, and `evidenceRetained`. `reason` and `evidenceLocation` explain the outcome and where to find its local evidence; an indeterminate result may omit identity fields |
 

@@ -240,9 +240,10 @@ login cannot act on the checked account, the command fails.
   only the image it replaced, after the new deployment is healthy and
   promoted. The deployment record names that image's repository, its
   digest, and its tag: the release ID of the deploy that pushed it
-  (`eve-deploy-<uuid>`). Eden deletes that tag, and then the image's
-  `sha256:` entry, only when the registry lists the tag and resolves it to
-  that digest. Wrangler's delete of a tag carries no digest, so this rests
+  (`eve-deploy-<uuid>`). Eden deletes that tag, and nothing else, only when the registry
+  lists the tag and resolves it to that digest. It sends no delete by
+  digest here; it reads the listing until the tag and the image's
+  `sha256:` entry have left. Wrangler's delete of a tag carries no digest, so this rests
   on a release tag being unique to one push and never moved: Eden generates
   it and pushes it once. Do not push to or retag a release tag by hand.
   Eden never deletes `candidate` here, the tag Eden `0.13.x` and older
