@@ -795,6 +795,8 @@ export function generateEveHostWorkerSource(
 
 export interface EveHostForwardingMetadata {
   readonly releaseId?: string;
+  /** The release this Worker's release replaced. */
+  readonly previousReleaseId?: string;
   readonly publicOrigin: string;
   readonly deploymentId: string;
   readonly generationId: string;
@@ -860,6 +862,9 @@ export function createTrustedEveRequest(
   headers.set("x-eden-eve-public-origin", metadata.publicOrigin);
   headers.set("x-eden-eve-deployment-id", metadata.deploymentId);
   headers.set("x-eden-eve-release-id", metadata.releaseId ?? metadata.deploymentId);
+  if (metadata.previousReleaseId !== undefined) {
+    headers.set("x-eden-eve-previous-release-id", metadata.previousReleaseId);
+  }
   headers.set("x-eden-eve-generation-id", metadata.generationId);
   headers.set("x-eden-eve-correlation-id", metadata.correlationId);
   if (metadata.runtimeRevisionHandle !== undefined) {
