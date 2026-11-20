@@ -149,6 +149,12 @@
 
 ### Changed
 
+- Eve `1.0.2` with `@workflow/world-postgres` `5.3.0` is the latest tested
+  pair, in place of `5.2.1`. The compatibility gate passed with it. The
+  published `5.3.0` package has the same files as `5.2.1` except
+  `package.json`, which pins newer `@workflow/errors`, `@workflow/utils`,
+  `@workflow/world`, and `@workflow/world-local`. Eden did not change, and a
+  project on `5.2.1` needs no change.
 - Eden reads the Worker's deployments from Cloudflare's API itself, in
   preflight, deploy, and destroy, instead of running
   `wrangler deployments list`. Like Eden's other API reads, this request

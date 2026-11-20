@@ -1177,7 +1177,7 @@ It checks the two known durable Worlds. Match the World's `@workflow/core`
 or `@workflow/world` dependency to Eve's `@workflow/core` major and, if both
 declare one, prerelease family. The tested pairs are: for Eve `1.0.2`, which
 bundles `@workflow/world` `5.2.0`, the tested pair is
-`@workflow/world-postgres@5.2.1`; for Eve `0.91.0`, which bundles
+`@workflow/world-postgres@5.3.0`; for Eve `0.91.0`, which bundles
 `@workflow/world` `5.0.5`, it is `@workflow/world-postgres@5.0.5`.
 
 The Cloudflare World must also declare `eden.capabilities.worldRpcAuth`.

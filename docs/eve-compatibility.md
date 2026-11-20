@@ -22,7 +22,7 @@ for what happens to running sessions.
 | Eve | Postgres World | Cloudflare World | Tested |
 | --- | --- | --- | --- |
 | `0.91.0`, the oldest supported | `@workflow/world-postgres` `5.0.5` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
-| `1.0.2`, the latest stable | `@workflow/world-postgres` `5.2.1` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
+| `1.0.2`, the latest stable | `@workflow/world-postgres` `5.3.0` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
 
 From `1.0.0-rc.6`, Eve refuses to start a session unless the World creates the
 session's run and its start hook together. Older Worlds fail every new session

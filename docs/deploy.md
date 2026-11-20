@@ -510,7 +510,7 @@ packaging build, before booting the runtime image.
 For Eve `1.0.2`, which bundles `@workflow/world` `5.2.0`:
 
 ```sh
-npm add @workflow/world-postgres@5.2.1
+npm add @workflow/world-postgres@5.3.0
 ```
 
 Eve `1.0.0-rc.6` and later refuse to start a session unless the World creates the
