@@ -72,7 +72,19 @@ export function cloudflareCliEnvironment(accountId: string | undefined): NodeJS.
  * beside it, so the folder holds an empty config and nothing else of the
  * user's: no file on disk chooses the account or the credentials.
  */
-export const runCloudflareCli: CloudflareCliRunner = async (request) => {
+export const runCloudflareCli: CloudflareCliRunner = createCloudflareCliRunner();
+
+/** `environment` replaces the variables cf gets; the live check uses it to put a failing API in front of one command. */
+export function createCloudflareCliRunner(
+  environment: (accountId: string | undefined) => NodeJS.ProcessEnv = cloudflareCliEnvironment,
+): CloudflareCliRunner {
+  return (request) => runCf(request, environment);
+}
+
+async function runCf(
+  request: CloudflareCliRequest,
+  environment: (accountId: string | undefined) => NodeJS.ProcessEnv,
+): Promise<CloudflareCliResult> {
   const cwd = await mkdtemp(join(tmpdir(), "eden-cf-"));
   try {
     await writeFile(join(cwd, "cloudflare.config.ts"), "export default {};\n", { mode: 0o600 });
@@ -83,7 +95,7 @@ export const runCloudflareCli: CloudflareCliRunner = async (request) => {
     return await new Promise<CloudflareCliResult>((resolveResult) => {
       const child = spawn(process.execPath, [cfEntrypoint, ...request.args], {
         cwd,
-        env: cloudflareCliEnvironment(request.accountId),
+        env: environment(request.accountId),
         stdio: ["ignore", "pipe", "pipe"],
       });
       const stdout: Buffer[] = [];
@@ -111,7 +123,7 @@ export const runCloudflareCli: CloudflareCliRunner = async (request) => {
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
-};
+}
 
 /** What cf returned on stdout as JSON, only when cf exited 0 and printed one JSON value. */
 export function cloudflareCliJson(result: CloudflareCliResult): { readonly value: unknown } | undefined {

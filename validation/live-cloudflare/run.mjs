@@ -29,6 +29,7 @@ import { registryCatalogRefs } from "./registry-catalog.mjs";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const edenCli = join(repoRoot, "packages/cli/dist/index.js");
 const cfCli = join(repoRoot, "node_modules/.bin/cf");
+const interruptedDeploy = join(repoRoot, "validation/live-cloudflare/interrupted-deploy.mjs");
 const TARGET_PATTERN = /^eden-live-\d{8}-[0-9a-f]{8}$/u;
 const WORLD = "@moinulmoin/eden-world-cloudflare";
 const MODEL_KEY = "AI_GATEWAY_API_KEY";
@@ -240,11 +241,12 @@ async function step(title, body) {
 
 // Every Eden command goes through here, so nothing but this run's generated
 // temporary target can be deployed to or destroyed.
-async function eden(command, { withEnvFile = true, interruptible = true } = {}) {
+async function eden(command, { withEnvFile = true, interruptible = true, interrupted = false } = {}) {
   if (!TARGET_PATTERN.test(target) || !project.endsWith("/" + target)) {
     throw new Error("Refusing to run eden " + command + ": " + target + " is not this run's temporary target.");
   }
-  const args = [edenCli, command, "--project", project, "--env", "preview", "--name", target, "--json"];
+  // interrupted-deploy.mjs is eden deploy with cf deploy made to fail halfway.
+  const args = [...(interrupted ? [interruptedDeploy] : [edenCli, command]), "--project", project, "--env", "preview", "--name", target, "--json"];
   if (withEnvFile) args.push("--env-file", envFile);
   const result = await run(process.execPath, args, { env: edenEnvironment, timeoutMs: 1_800_000, interruptible });
   let output;
@@ -258,6 +260,10 @@ async function eden(command, { withEnvFile = true, interruptible = true } = {}) 
   if (result.code !== 0 || output.ok !== true) {
     const failed = (output.checks ?? []).filter((check) => check.status === "failed").map((check) => check.id + ": " + check.message);
     throw new Error(["eden " + command + " failed (exit " + result.code + "): " + (output.error?.code ?? "no error code") + " " + (output.error?.message ?? ""), ...failed, tail(result.stderr, 15)].filter(Boolean).join("\n"));
+  }
+  if (interrupted) {
+    const line = result.stderr.split("\n").find((entry) => entry.startsWith("interrupted-deploy: "));
+    output.interrupted = line === undefined ? undefined : JSON.parse(line.slice("interrupted-deploy: ".length));
   }
   return output;
 }
@@ -530,9 +536,19 @@ async function newSession(label, expectedEve) {
   return turn.sessionId + " ran bash on Eve " + turn.eveVersion;
 }
 
-async function deploy(expectUpdate, expectImageReplaced = false) {
+async function deploy(expectUpdate, expectImageReplaced = false, interrupted = false) {
   const started = Date.now();
-  const output = await eden("deploy");
+  const output = await eden("deploy", { interrupted });
+  let finished = "";
+  if (interrupted) {
+    // cf deploy must have failed after its upload, and Eden must have set up the rest itself.
+    const commands = output.interrupted?.commands ?? [];
+    const ran = (command, exitCode) => commands.some((entry) => entry.command.startsWith(command) && entry.exitCode === exitCode);
+    if (!(output.interrupted?.injected > 0) || !ran("deploy --prebuilt", 1)) throw new Error("cf deploy was not interrupted: " + JSON.stringify(output.interrupted));
+    if (commands.filter((entry) => entry.command.startsWith("deploy --prebuilt")).length !== 1) throw new Error("cf deploy ran more than once: " + JSON.stringify(commands));
+    if (!ran("containers applications create", 0) || !ran("workers triggers deploy", 0)) throw new Error("Eden did not finish the publish itself: " + JSON.stringify(commands));
+    finished = "\ncf deploy exited 1 after " + output.interrupted.injected + " refused read(s) of the uploaded version; Eden then ran containers applications create and workers triggers deploy, both exit 0";
+  }
   const origin = output.deployment?.stableWorkersDevOrigin;
   if (typeof origin !== "string" || !origin.startsWith("https://")) throw new Error("The deploy result has no deployment.stableWorkersDevOrigin.");
   if (output.name !== target) throw new Error("The deploy result names " + output.name + ", not " + target + ".");
@@ -547,7 +563,7 @@ async function deploy(expectUpdate, expectImageReplaced = false) {
   if (expectImageReplaced && (cleanup?.status !== "passed" || (output.registryObjectsKept ?? []).length > 0 || warnings.includes("EVE_SUPERSEDED_IMAGE_NOT_DELETED"))) {
     throw new Error("The update did not delete the image it replaced: VAL-LIFE-007 " + (cleanup?.status ?? "missing") + ", kept " + JSON.stringify(output.registryObjectsKept ?? []) + ", warnings " + warnings.join(", "));
   }
-  return origin + " in " + deployed + " s, health ready after " + healthy + " s more" + (warnings.length === 0 ? "" : ", warnings: " + warnings.join(", ")) + (cleanup === undefined ? "" : "\nVAL-LIFE-007 " + cleanup.status + ": " + cleanup.message);
+  return origin + " in " + deployed + " s, health ready after " + healthy + " s more" + (warnings.length === 0 ? "" : ", warnings: " + warnings.join(", ")) + (cleanup === undefined ? "" : "\nVAL-LIFE-007 " + cleanup.status + ": " + cleanup.message) + finished;
 }
 
 // cf runs in a folder of its own, where no project file can choose the
@@ -635,9 +651,10 @@ try {
     const warnings = (output.warnings ?? []).map((warning) => warning.id);
     return output.checks.length + " checks passed" + (warnings.length === 0 ? ", no warnings" : ", warnings: " + warnings.join(", "));
   });
-  await step("eden deploy (fresh)", () => {
+  // The first publish is interrupted on purpose: see interrupted-deploy.mjs.
+  await step("eden deploy (fresh, cf deploy interrupted after its upload)", () => {
     deployStarted = true;
-    return deploy(false);
+    return deploy(false, false, true);
   });
   await step("Unauthenticated session is refused", async () => {
     const response = await request("/eve/v1/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "hello" }) });
