@@ -22,9 +22,10 @@ when it wakes: target `eden-live-20261121-426fe222`, `16:44:28Z` to
 none `accepted-still-listed`.
 
 Neither run reaches any of the three changes. It cannot make a container
-slow to stop, and it has no way to hold a Container object on the replaced release while the World object is on the
-new one. It shows that the deploy, update, upgrade, sleep and destroy still
-work with the World object stamping its deliveries.
+slow to stop, and it has no way to hold a Container object on the replaced
+release while the World object is on the new one. They show that the
+deploy, update, upgrade, sleep and destroy still work with the World object
+stamping its deliveries.
 
 ## Live check for release 0.15.1 (2026-11-21)
 
