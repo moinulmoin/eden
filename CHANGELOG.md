@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- A request that arrives during an update is no longer answered by the
+  replaced image. Eden waits 10 seconds for the old container to stop. When
+  it was still running after that, Eden served the request from it and
+  reported the new release as started. The request now gets `503` with
+  `Retry-After: 5`, and the next request asks the container to stop again.
+- With the Cloudflare World, a queued step is no longer run on the replaced
+  image after a deploy. Cloudflare can run the World object on the new
+  release while a Container object is still on the old one. That object ran
+  the step on the old image, and stopped a container the new release had
+  already started to do it. It now runs nothing, the step stays queued, and
+  the World object sends it again. This holds from the second deploy made
+  with this version: both objects need it.
+- A Container object that wakes on the replaced release no longer stops a
+  running container of a version the new release made. It read the missing
+  route as a retired version. It now stops nothing on wake; a retired
+  container is stopped only when the World object orders its retirement.
+- The live Cloudflare check reaches none of these three changes. They are
+  shown by tests with stand-ins for Cloudflare.
+
 ## 0.15.1 — 2026-11-21
 
 Fixes to names, locks, and `eden destroy`, and clearer messages for two

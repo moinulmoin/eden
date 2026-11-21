@@ -104,6 +104,8 @@ async function sendWhileSwitching(
 
 /** A retained version's object could not place this release; see `placeCaller`. */
 const EVE_HOST_RETAINED_SWITCHING = new Error("A retained deployment is switching versions.");
+/** The container of the replaced image is still running; nothing is served from it. */
+const EVE_HOST_OLD_IMAGE_RUNNING = new Error("The container of the replaced image has not stopped.");
 
 type EveWorldNamespace = { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
 const worldsOnThisRelease = new WeakSet<EveWorldNamespace>();
@@ -372,9 +374,9 @@ type EveSandboxImportResult = "source-export-failed" | "carry-limit-exceeded" | 
 
 interface EveContainerLoopbackNamespace {
   getByName(name: string): {
-    loopbackFetch(request: Request, claim?: EveQueueDeliveryClaim): Promise<Response>;
+    loopbackFetch(request: Request, claim?: EveQueueDeliveryClaim, world?: Record<string, string>): Promise<Response>;
     exportSandboxSessions(deploymentId: string, sessionId: string): Promise<Response>;
-    importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string): Promise<EveSandboxImportResult>;
+    importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string, world?: Record<string, string>): Promise<EveSandboxImportResult>;
     retire(deploymentId: string): Promise<void>;
   };
 }
@@ -426,7 +428,7 @@ export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnviro
           const target = namespace.getByName(deploymentInstance(env, deploymentId));
           if (message.sourceDeploymentId && message.sourceDeploymentId !== deploymentId && message.sandboxSessionId) {
             try {
-              const result = await target.importSandboxSessions(message.sourceDeploymentId, deploymentId, message.messageId, message.sandboxSessionId);
+              const result = await target.importSandboxSessions(message.sourceDeploymentId, deploymentId, message.messageId, message.sandboxSessionId, releaseHeaders(env));
               if (result === "source-export-failed" || result === "carry-limit-exceeded") {
                 await settleUnstarted();
                 return { ok: false, sandboxTransferFailed: true };
@@ -449,7 +451,7 @@ export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnviro
                   "x-vqs-message-attempt": String(message.attempt),
                 },
                 body: message.body as Uint8Array<ArrayBuffer>,
-              }), deploymentId), { messageId: message.messageId, attempt: message.attempt },
+              }), deploymentId), { messageId: message.messageId, attempt: message.attempt }, releaseHeaders(env),
             );
             // Body transport errors must remain retryable; an HTTP status alone
             // is not an acknowledgement of a streamed Container response.
@@ -844,16 +846,14 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
           const stored = await this.ctx.storage.get<string>("eden.eve.host.deployment-id");
           const namespace = env.EVE_CONTAINER as DurableObjectNamespace;
           const owner = stored ?? (this.ctx.id.equals(namespace.idFromName(env.EVE_CONTAINER_INSTANCE_NAME!)) ? "eden-cloudflare" : undefined);
-          if (owner !== undefined && deploymentImages(env)[owner] === undefined) {
-            // Removed routes must not make the constructor fail before the
-            // retirement RPC can destroy a still-running legacy container.
-            await runtime.destroy(new Error("deployment-retired"));
-            this.recordContainerStopped();
-            await this.ctx.storage.deleteAlarm();
-            return;
+          // This release has no route for the owner. That is true of a
+          // retired version, and also of a newer version when Cloudflare
+          // wakes the object on the release before. It proves neither, so
+          // nothing is stopped here: `retire` stops a retired container.
+          if (owner === undefined || deploymentImages(env)[owner] !== undefined) {
+            await this.identifyDeployment();
+            await this.registerLoopbackIntercept(runtime);
           }
-          await this.identifyDeployment();
-          await this.registerLoopbackIntercept(runtime);
         }
         await runtime.setInactivityTimeout(this.inactivityTimeoutMs);
         this.attachMonitor(runtime);
@@ -1073,6 +1073,8 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     while (runtime.running && Date.now() - stoppedAt < 10_000) {
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
+    // Readiness would find the old container running and pass on it.
+    if (runtime.running) throw EVE_HOST_OLD_IMAGE_RUNNING;
   }
 
   /**
@@ -1380,7 +1382,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     try {
       response = await this.forwardToEve(request);
     } catch (error: unknown) {
-      if (error !== EVE_HOST_RETAINED_SWITCHING) throw error;
+      if (error !== EVE_HOST_RETAINED_SWITCHING && error !== EVE_HOST_OLD_IMAGE_RUNNING) throw error;
       return switchingVersions(5);
     }
     // Reporting the verified start back lets deploy health-gate promotion on
@@ -1482,7 +1484,8 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   }
 
   /** Retry-idempotent imports finish before the migrated queue is dispatched. */
-  async importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string): Promise<EveSandboxImportResult> {
+  async importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string, world?: Record<string, string>): Promise<EveSandboxImportResult> {
+    this.refuseNewerWorld(world);
     await this.identifyDeployment(deploymentId);
     const key = `eden.eve.host.sandbox-import.v2.${sourceDeploymentId}.${sessionId}.${transferId}`;
     if (await this.ctx.storage.get<boolean>(key)) {
@@ -1568,11 +1571,32 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   }
 
   /**
+   * The World object stamps its queue deliveries and file transfers like any
+   * other caller. An object still on the release that World's release
+   * replaced would run them on the replaced image, and replace a container
+   * the new release already started. It runs nothing and the World sends
+   * the delivery again. It does not reset itself, so work it is already
+   * running is left alone.
+   */
+  private refuseNewerWorld(world: Record<string, string> | undefined): void {
+    if (placeCaller(this.env, new Headers(world), world?.["x-eden-eve-release-id"]) === "newer") {
+      throw new Error("This Container object is on the release before the World object's.");
+    }
+  }
+
+  /**
    * Queue deliveries and loopback traffic enter here: same readiness and
    * forwarding as `fetch` without the deployment-header echo rules (the
    * loopback path is not a deployment-health signal).
    */
-  async loopbackFetch(request: Request, claim?: EveQueueDeliveryClaim): Promise<Response> {
+  async loopbackFetch(request: Request, claim?: EveQueueDeliveryClaim, world?: Record<string, string>): Promise<Response> {
+    try {
+      this.refuseNewerWorld(world);
+    } catch (error: unknown) {
+      // Nothing started, so the World may send this delivery again.
+      await this.settleQueueDelivery(claim);
+      throw error;
+    }
     await this.identifyDeployment(request.headers.get("x-eden-eve-deployment-id") ?? undefined);
     return this.forwardToEve(request, claim);
   }
