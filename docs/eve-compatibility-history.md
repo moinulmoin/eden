@@ -4,6 +4,23 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for the eden#28 review follow-ups (2026-11-21)
+
+Run on macOS with Node `24.22.3`, against the maintainer's Cloudflare
+account, with `cf` `1.0.0-rc.2` and an OAuth login, at `cccff20`.
+`CLOUDFLARE_API_TOKEN` was not set.
+
+Full run of `pnpm run check:live`, target `eden-live-20261121-2ce477cd`,
+`16:17:16Z` to `16:32:10Z`, Eve `0.91.0` to `1.1.0`, the World packed
+from this workspace. All 18 steps passed on the first run. `eden destroy`
+reported 12 objects in `EVE_REGISTRY_OBJECTS_KEPT`, none of them
+`accepted-still-listed`, and the check found nothing else of the target.
+
+The run does not reach either change. It cannot make a container slow to
+stop, and it has no way to hold a Container object on the replaced release while the World object is on the
+new one. It shows that the deploy, update, upgrade, sleep and destroy still
+work with the World object stamping its deliveries.
+
 ## Live check for release 0.15.1 (2026-11-21)
 
 Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
