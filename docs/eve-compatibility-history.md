@@ -4,6 +4,47 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for release 0.15.1 (2026-11-21)
+
+Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
+Cloudflare account, with `cf` `1.0.0-rc.2` and an OAuth login, on main at
+`a80bd02`. `CLOUDFLARE_API_TOKEN` was not set. The `0.15.1` release commit
+differs from `a80bd02` only by version numbers, the lockfile, the
+changelog, and docs.
+
+Full run of `pnpm run check:live`, target `eden-live-20261121-f9303b8a`,
+`15:15:04Z` to `15:28:51Z`, Eve `0.91.0` to `1.1.0`, the World packed from
+this workspace (version `0.15.0`), a 90-second idle window. All 18 steps
+passed on the first run.
+
+- `eden preflight` passed 14 checks with no warnings in 81 seconds.
+- `cf deploy` was interrupted and exited 1 after 5 refused reads of the
+  uploaded version. Eden then ran `cf containers applications create` and
+  `cf workers triggers deploy`, both exit 0, and the fresh deploy took 153
+  seconds.
+- The same-version update took 100 seconds and the deploy on Eve `1.1.0`
+  170 seconds, on the same URL. Both carried `EVE_UPDATE_IN_FLIGHT`. The
+  update reported `VAL-LIFE-007` passed: `The superseded image was deleted
+  from the registry by its tag after promotion.`
+- The first session answered after each deploy and after the sleep, with its
+  earlier turns in its stream and its file intact. A new session started
+  after the update, and one ran bash on Eve `1.1.0` after the upgrade.
+  After 165 seconds with no requests the first health request took 5.7
+  seconds, and the server process was 7 seconds old.
+- No `queueAuthMode` line on Eve `1.1.0`. An unauthenticated session request
+  got `401`, and the two workflow queue routes answered `404`.
+- `eden destroy` ended in 45 seconds and reported 12 objects in
+  `EVE_REGISTRY_OBJECTS_KEPT`: 9 `refused-snapshot` and 3
+  `refused-singleton-artifact`, none of them `accepted-still-listed`.
+- The check's catalog read found those 12 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+
+The run did not reach what `0.15.1` changed in refusals: no two commands
+ran at once on one name, no name near the 63-character cut was used, and
+destroy ran while the Worker existed. The `0.15.1` packages from npm were
+not deployed.
+
 ## Postgres World 5.4.0 checks (2026-11-21)
 
 Run on macOS with Docker and Postgres 16, Node `24.22.3`, on main at
