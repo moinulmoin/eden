@@ -16,8 +16,13 @@ from this workspace. All 18 steps passed on the first run. `eden destroy`
 reported 12 objects in `EVE_REGISTRY_OBJECTS_KEPT`, none of them
 `accepted-still-listed`, and the check found nothing else of the target.
 
-The run does not reach either change. It cannot make a container slow to
-stop, and it has no way to hold a Container object on the replaced release while the World object is on the
+A second full run at `b8d36a9`, after the change to what an object stops
+when it wakes: target `eden-live-20261121-426fe222`, `16:44:28Z` to
+`16:58:34Z`, all 18 steps on the first run, 12 objects kept by destroy and
+none `accepted-still-listed`.
+
+Neither run reaches any of the three changes. It cannot make a container
+slow to stop, and it has no way to hold a Container object on the replaced release while the World object is on the
 new one. It shows that the deploy, update, upgrade, sleep and destroy still
 work with the World object stamping its deliveries.
 
