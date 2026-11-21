@@ -256,11 +256,14 @@ function hostContainer(
   options: {
     readonly deploymentId?: string;
     readonly abort?: (reason?: string) => void;
-    readonly env?: Record<string, string>;
+    readonly env?: Record<string, unknown>;
+    /** The object's instance name, for a target with deployment affinity. */
+    readonly instance?: string;
   } = {},
 ) {
   const container = new EveHostDurableContainer(
     {
+      id: { equals: (other: unknown) => other === options.instance },
       container: runtime,
       waitUntil: (promise: Promise<unknown>) => { void promise; },
       abort: options.abort ?? ((reason?: string) => {
@@ -507,6 +510,115 @@ describe("World object after a deploy", () => {
     } finally {
       vi.useRealTimers();
       world.close();
+    }
+  });
+});
+
+describe("World deliveries after a deploy", () => {
+  const origin = "https://eden-eve-preview.account.workers.dev";
+  const instance = `${IDENTITY.stableContainerInstanceName}:dep-a`;
+  const { encode } = createRequire(
+    import.meta.resolve("@moinulmoin/eden-world-cloudflare"),
+  )("cbor-x") as { encode(value: unknown): Uint8Array };
+
+  /** The World object on release-2, and one Container object that Cloudflare moves between releases. */
+  function deliveryFixture(runtime: FakeContainerRuntime) {
+    const sql = new NodeSqliteAdapter();
+    const background: Promise<void>[] = [];
+    const shared = {
+      EVE_PUBLIC_ORIGIN: origin,
+      EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
+      EDEN_EVE_DEPLOYMENT_ID: "dep-a",
+      EDEN_EVE_DEPLOYMENTS: JSON.stringify({ "dep-a": { image: "eve", generationId: IDENTITY.generationId } }),
+      EDEN_EVE_WORLD_CLOUDFLARE: true,
+    };
+    const stored = new Map<string, unknown>([["eden.eve.host.started-image", CURRENT_IMAGE]]);
+    const world: EdenWorldDurableObject = new EdenWorldDurableObject({
+      storage: {
+        sql,
+        transactionSync: sql.transactionSync.bind(sql),
+        setAlarm: async () => undefined,
+        deleteAlarm: async () => undefined,
+      },
+      blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(),
+      waitUntil: (promise: Promise<void>) => { background.push(promise); },
+    } as never, {
+      ...shared,
+      EDEN_EVE_RELEASE_ID: "release-2",
+      EDEN_EVE_PREVIOUS_RELEASE_ID: "release-1",
+      EVE_CONTAINER: { getByName: () => fixture.container },
+      EDEN_WORLD: { getByName: () => world },
+    } as never);
+    const containerOn = (release: string, previous: string | undefined, image: string): EveHostDurableContainer => {
+      runtime.images.eve = image;
+      return hostContainer(stored, runtime, undefined, {
+        deploymentId: "dep-a",
+        instance,
+        env: {
+          ...shared,
+          EDEN_EVE_RELEASE_ID: release,
+          ...(previous === undefined ? {} : { EDEN_EVE_PREVIOUS_RELEASE_ID: previous }),
+          EVE_CONTAINER: { idFromName: (name: string) => name },
+          EDEN_WORLD: { getByName: () => world },
+        },
+      });
+    };
+    const fixture = {
+      world,
+      container: containerOn("release-1", undefined, OLD_IMAGE),
+      /** Cloudflare moves the Container object to the new release. */
+      moveContainer: () => { fixture.container = containerOn("release-2", "release-1", CURRENT_IMAGE); },
+      async deliver() {
+        await world.alarm();
+        await Promise.all(background.splice(0));
+      },
+      enqueue: () => world.fetch(new Request(`${origin}/__eden/world/rpc`, {
+        method: "POST",
+        body: encode({ op: "queue.enqueue", args: ["workflow", { runId: "proof" }, { deploymentId: "dep-a" }] }) as Uint8Array<ArrayBuffer>,
+      })),
+      message: () => sql.exec("SELECT completed,attempt FROM workflow_queue_messages").toArray()[0],
+      openClaims: () => sql.exec("SELECT COUNT(*) AS n FROM workflow_delivery_claims WHERE settled=0").toArray()[0]?.n,
+      close: () => sql.close(),
+    };
+    return fixture;
+  }
+
+  test("a queued step is not run by a Container object still on the replaced release; it stays queued and runs on the new image once the object has moved", async () => {
+    // The new release already started its container; the object came back on the old code.
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const fixture = deliveryFixture(runtime);
+    try {
+      await fixture.enqueue();
+      await fixture.deliver();
+      expect(runtime.state.timeline).toEqual([]);
+      expect(runtime.state.image).toBe(CURRENT_IMAGE);
+      expect(fixture.message()).toEqual({ completed: 0, attempt: 2 });
+      expect(fixture.openClaims()).toBe(0);
+
+      fixture.moveContainer();
+      vi.setSystemTime(Date.now() + 1_000);
+      await fixture.deliver();
+      expect(runtime.state.timeline).toEqual(["health", "forward"]);
+      expect(runtime.state.destroyCalls).toBe(0);
+      expect(fixture.message()).toEqual({ completed: 1, attempt: 3 });
+      expect(fixture.openClaims()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      fixture.close();
+    }
+  });
+
+  test("a file transfer from the new release's World is refused by a Container object still on the replaced release", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
+    const fixture = deliveryFixture(runtime);
+    try {
+      const world = { "x-eden-eve-release-id": "release-2", "x-eden-eve-previous-release-id": "release-1" };
+      await expect(fixture.container.importSandboxSessions("dep-old", "dep-a", "transfer", "session", world))
+        .rejects.toThrow("on the release before the World object's");
+      expect(runtime.state.timeline).toEqual([]);
+    } finally {
+      fixture.close();
     }
   });
 });

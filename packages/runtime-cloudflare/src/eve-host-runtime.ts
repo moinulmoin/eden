@@ -374,9 +374,9 @@ type EveSandboxImportResult = "source-export-failed" | "carry-limit-exceeded" | 
 
 interface EveContainerLoopbackNamespace {
   getByName(name: string): {
-    loopbackFetch(request: Request, claim?: EveQueueDeliveryClaim): Promise<Response>;
+    loopbackFetch(request: Request, claim?: EveQueueDeliveryClaim, world?: Record<string, string>): Promise<Response>;
     exportSandboxSessions(deploymentId: string, sessionId: string): Promise<Response>;
-    importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string): Promise<EveSandboxImportResult>;
+    importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string, world?: Record<string, string>): Promise<EveSandboxImportResult>;
     retire(deploymentId: string): Promise<void>;
   };
 }
@@ -428,7 +428,7 @@ export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnviro
           const target = namespace.getByName(deploymentInstance(env, deploymentId));
           if (message.sourceDeploymentId && message.sourceDeploymentId !== deploymentId && message.sandboxSessionId) {
             try {
-              const result = await target.importSandboxSessions(message.sourceDeploymentId, deploymentId, message.messageId, message.sandboxSessionId);
+              const result = await target.importSandboxSessions(message.sourceDeploymentId, deploymentId, message.messageId, message.sandboxSessionId, releaseHeaders(env));
               if (result === "source-export-failed" || result === "carry-limit-exceeded") {
                 await settleUnstarted();
                 return { ok: false, sandboxTransferFailed: true };
@@ -451,7 +451,7 @@ export class EdenWorldDurableObject extends DurableObject<EveHostContainerEnviro
                   "x-vqs-message-attempt": String(message.attempt),
                 },
                 body: message.body as Uint8Array<ArrayBuffer>,
-              }), deploymentId), { messageId: message.messageId, attempt: message.attempt },
+              }), deploymentId), { messageId: message.messageId, attempt: message.attempt }, releaseHeaders(env),
             );
             // Body transport errors must remain retryable; an HTTP status alone
             // is not an acknowledgement of a streamed Container response.
@@ -1486,7 +1486,8 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   }
 
   /** Retry-idempotent imports finish before the migrated queue is dispatched. */
-  async importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string): Promise<EveSandboxImportResult> {
+  async importSandboxSessions(sourceDeploymentId: string, deploymentId: string, transferId: string, sessionId: string, world?: Record<string, string>): Promise<EveSandboxImportResult> {
+    this.refuseNewerWorld(world);
     await this.identifyDeployment(deploymentId);
     const key = `eden.eve.host.sandbox-import.v2.${sourceDeploymentId}.${sessionId}.${transferId}`;
     if (await this.ctx.storage.get<boolean>(key)) {
@@ -1572,11 +1573,32 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
   }
 
   /**
+   * The World object stamps its queue deliveries and file transfers like any
+   * other caller. An object still on the release that World's release
+   * replaced would run them on the replaced image, and replace a container
+   * the new release already started. It runs nothing and the World sends
+   * the delivery again. It does not reset itself, so work it is already
+   * running is left alone.
+   */
+  private refuseNewerWorld(world: Record<string, string> | undefined): void {
+    if (placeCaller(this.env, new Headers(world), world?.["x-eden-eve-release-id"]) === "newer") {
+      throw new Error("This Container object is on the release before the World object's.");
+    }
+  }
+
+  /**
    * Queue deliveries and loopback traffic enter here: same readiness and
    * forwarding as `fetch` without the deployment-header echo rules (the
    * loopback path is not a deployment-health signal).
    */
-  async loopbackFetch(request: Request, claim?: EveQueueDeliveryClaim): Promise<Response> {
+  async loopbackFetch(request: Request, claim?: EveQueueDeliveryClaim, world?: Record<string, string>): Promise<Response> {
+    try {
+      this.refuseNewerWorld(world);
+    } catch (error: unknown) {
+      // Nothing started, so the World may send this delivery again.
+      await this.settleQueueDelivery(claim);
+      throw error;
+    }
     await this.identifyDeployment(request.headers.get("x-eden-eve-deployment-id") ?? undefined);
     return this.forwardToEve(request, claim);
   }

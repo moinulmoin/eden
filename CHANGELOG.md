@@ -7,6 +7,13 @@
   it was still running after that, Eden served the request from it and
   reported the new release as started. The request now gets `503` with
   `Retry-After: 5`, and the next request asks the container to stop again.
+- With the Cloudflare World, a queued step is no longer run on the replaced
+  image after a deploy. Cloudflare can run the World object on the new
+  release while a Container object is still on the old one. That object ran
+  the step on the old image, and stopped a container the new release had
+  already started to do it. It now runs nothing, the step stays queued, and
+  the World object sends it again. This holds from the second deploy made
+  with this version: both objects need it.
 
 ## 0.15.1 — 2026-11-21
 

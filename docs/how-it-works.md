@@ -234,6 +234,14 @@ behavior and the warning that an Eve upgrade can strand sessions.
     Cloudflare moves it.
   - The World object answers every caller as before, apart from that one
     reset.
+  - The World object stamps its queue deliveries and file transfers the
+    same way. A Container object still on the release that the World
+    object's release replaced runs none of them. It would run the step on
+    the replaced image, and replace a Container the new release had
+    started. The delivery stays queued and the World object sends it
+    again. The Container object does not reset for it. Both objects need
+    Eden newer than `0.15.1`, so this holds from the second deploy made
+    with it.
   - A reset says nothing about whether a request in flight ran. Eden
     repeats only a GET or HEAD, and the health read it sends before any
     other request. It never sends a POST, PUT, PATCH or DELETE twice, and
