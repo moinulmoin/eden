@@ -14,6 +14,12 @@
   already started to do it. It now runs nothing, the step stays queued, and
   the World object sends it again. This holds from the second deploy made
   with this version: both objects need it.
+- A Container object that wakes on the replaced release no longer stops a
+  running container of a version the new release made. It read the missing
+  route as a retired version. It now stops nothing on wake; a retired
+  container is stopped only when the World object orders its retirement.
+- The live Cloudflare check reaches none of these three changes. They are
+  shown by tests with stand-ins for Cloudflare.
 
 ## 0.15.1 — 2026-11-21
 

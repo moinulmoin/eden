@@ -516,23 +516,38 @@ describe("World object after a deploy", () => {
 
 describe("World deliveries after a deploy", () => {
   const origin = "https://eden-eve-preview.account.workers.dev";
-  const instance = `${IDENTITY.stableContainerInstanceName}:dep-a`;
-  const { encode } = createRequire(
+  const { encode, decode } = createRequire(
     import.meta.resolve("@moinulmoin/eden-world-cloudflare"),
-  )("cbor-x") as { encode(value: unknown): Uint8Array };
+  )("cbor-x") as { encode(value: unknown): Uint8Array; decode(value: Uint8Array): unknown };
+  const route = { image: "eve", generationId: IDENTITY.generationId };
 
-  /** The World object on release-2, and one Container object that Cloudflare moves between releases. */
-  function deliveryFixture(runtime: FakeContainerRuntime) {
+  /**
+   * The World object on release-2, and the Container object of `deployment`
+   * that Cloudflare runs on release-1 or release-2. Release-1 routes only
+   * `oldDeployment`.
+   */
+  function deliveryFixture(runtime: FakeContainerRuntime, deployment = "dep-a", oldDeployment = deployment) {
     const sql = new NodeSqliteAdapter();
     const background: Promise<void>[] = [];
     const shared = {
       EVE_PUBLIC_ORIGIN: origin,
       EVE_CONTAINER_INSTANCE_NAME: IDENTITY.stableContainerInstanceName,
-      EDEN_EVE_DEPLOYMENT_ID: "dep-a",
-      EDEN_EVE_DEPLOYMENTS: JSON.stringify({ "dep-a": { image: "eve", generationId: IDENTITY.generationId } }),
       EDEN_EVE_WORLD_CLOUDFLARE: true,
     };
-    const stored = new Map<string, unknown>([["eden.eve.host.started-image", CURRENT_IMAGE]]);
+    const releases = {
+      "release-1": {
+        EDEN_EVE_DEPLOYMENT_ID: oldDeployment,
+        EDEN_EVE_RELEASE_ID: "release-1",
+        EDEN_EVE_DEPLOYMENTS: JSON.stringify({ [oldDeployment]: route }),
+      },
+      "release-2": {
+        EDEN_EVE_DEPLOYMENT_ID: deployment,
+        EDEN_EVE_RELEASE_ID: "release-2",
+        EDEN_EVE_PREVIOUS_RELEASE_ID: "release-1",
+        EDEN_EVE_DEPLOYMENTS: JSON.stringify({ [oldDeployment]: route, [deployment]: route }),
+      },
+    };
+    const stored = new Map<string, unknown>();
     const world: EdenWorldDurableObject = new EdenWorldDurableObject({
       storage: {
         sql,
@@ -544,65 +559,118 @@ describe("World deliveries after a deploy", () => {
       waitUntil: (promise: Promise<void>) => { background.push(promise); },
     } as never, {
       ...shared,
-      EDEN_EVE_RELEASE_ID: "release-2",
-      EDEN_EVE_PREVIOUS_RELEASE_ID: "release-1",
+      ...releases["release-2"],
       EVE_CONTAINER: { getByName: () => fixture.container },
       EDEN_WORLD: { getByName: () => world },
     } as never);
-    const containerOn = (release: string, previous: string | undefined, image: string): EveHostDurableContainer => {
-      runtime.images.eve = image;
-      return hostContainer(stored, runtime, undefined, {
-        deploymentId: "dep-a",
-        instance,
-        env: {
-          ...shared,
-          EDEN_EVE_RELEASE_ID: release,
-          ...(previous === undefined ? {} : { EDEN_EVE_PREVIOUS_RELEASE_ID: previous }),
-          EVE_CONTAINER: { idFromName: (name: string) => name },
-          EDEN_WORLD: { getByName: () => world },
-        },
-      });
-    };
     const fixture = {
-      world,
-      container: containerOn("release-1", undefined, OLD_IMAGE),
-      /** Cloudflare moves the Container object to the new release. */
-      moveContainer: () => { fixture.container = containerOn("release-2", "release-1", CURRENT_IMAGE); },
+      container: undefined as unknown as EveHostDurableContainer,
+      /** Cloudflare runs the Container object on `release` from here on. */
+      async containerOn(release: keyof typeof releases) {
+        runtime.images.eve = release === "release-1" ? OLD_IMAGE : CURRENT_IMAGE;
+        fixture.container = hostContainer(stored, runtime, undefined, {
+          instance: `${IDENTITY.stableContainerInstanceName}:${deployment}`,
+          env: {
+            ...shared,
+            ...releases[release],
+            EVE_CONTAINER: {
+              idFromName: (name: string) => name,
+              // The kept version's object accepts the schedule fence.
+              getByName: () => ({ fetch: async () => new Response(null, { status: 204 }) }),
+            },
+            EDEN_WORLD: { getByName: () => world },
+          },
+        });
+        // The constructor's work on a running container.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      },
+      /** A client request through the release-2 Worker. */
+      client: () => fixture.container.fetch(new Request(`${origin}/eve/v1/health`, {
+        headers: {
+          "x-eden-eve-deployment-id": deployment,
+          "x-eden-eve-release-id": "release-2",
+          "x-eden-eve-previous-release-id": "release-1",
+        },
+      })),
+      enqueue: () => world.fetch(new Request(`${origin}/__eden/world/rpc`, {
+        method: "POST",
+        body: encode({ op: "queue.enqueue", args: ["workflow", { runId: "proof" }, { deploymentId: deployment }] }) as Uint8Array<ArrayBuffer>,
+      })),
+      /** One World alarm: every delivery that is due, to its end. */
       async deliver() {
         await world.alarm();
         await Promise.all(background.splice(0));
       },
-      enqueue: () => world.fetch(new Request(`${origin}/__eden/world/rpc`, {
-        method: "POST",
-        body: encode({ op: "queue.enqueue", args: ["workflow", { runId: "proof" }, { deploymentId: "dep-a" }] }) as Uint8Array<ArrayBuffer>,
-      })),
-      message: () => sql.exec("SELECT completed,attempt FROM workflow_queue_messages").toArray()[0],
-      openClaims: () => sql.exec("SELECT COUNT(*) AS n FROM workflow_delivery_claims WHERE settled=0").toArray()[0]?.n,
+      /** Messages the World still holds for the deployment, as `eden deploy` reads them. */
+      async pending() {
+        const response = await world.controlFetch(new Request(`${origin}/__eden/world/rpc`, {
+          method: "POST",
+          body: encode({ op: "deployments.drainState", args: [{ deploymentIds: [deployment] }] }) as Uint8Array<ArrayBuffer>,
+        }));
+        const answer = decode(new Uint8Array(await response.arrayBuffer())) as { result: Record<string, { pendingMessages: number }> };
+        return answer.result[deployment]?.pendingMessages;
+      },
       close: () => sql.close(),
     };
     return fixture;
   }
 
   test("a queued step is not run by a Container object still on the replaced release; it stays queued and runs on the new image once the object has moved", async () => {
-    // The new release already started its container; the object came back on the old code.
-    const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
     vi.useFakeTimers({ toFake: ["Date"] });
+    const runtime = fakeContainerRuntime();
     const fixture = deliveryFixture(runtime);
     try {
+      await fixture.containerOn("release-2");
+      expect((await fixture.client()).headers.get("x-eden-eve-started-deployment")).toBe("release-2");
+      runtime.state.timeline.length = 0;
+
+      // Cloudflare brings the object back on the old code.
+      await fixture.containerOn("release-1");
       await fixture.enqueue();
       await fixture.deliver();
       expect(runtime.state.timeline).toEqual([]);
       expect(runtime.state.image).toBe(CURRENT_IMAGE);
-      expect(fixture.message()).toEqual({ completed: 0, attempt: 2 });
-      expect(fixture.openClaims()).toBe(0);
+      expect(await fixture.pending()).toBe(1);
 
-      fixture.moveContainer();
+      await fixture.containerOn("release-2");
       vi.setSystemTime(Date.now() + 1_000);
       await fixture.deliver();
       expect(runtime.state.timeline).toEqual(["health", "forward"]);
       expect(runtime.state.destroyCalls).toBe(0);
-      expect(fixture.message()).toEqual({ completed: 1, attempt: 3 });
-      expect(fixture.openClaims()).toBe(0);
+      expect(await fixture.pending()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      fixture.close();
+    }
+  });
+
+  test("after an Eve upgrade, a delivery that wakes the new version's object on the replaced release stops nothing: the container keeps serving and the step stays queued", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const runtime = fakeContainerRuntime();
+    // The upgrade made dep-b; release-1 routes only dep-a.
+    const fixture = deliveryFixture(runtime, "dep-b", "dep-a");
+    try {
+      await fixture.containerOn("release-2");
+      expect((await fixture.client()).headers.get("x-eden-eve-started-deployment")).toBe("release-2");
+      runtime.state.timeline.length = 0;
+
+      await fixture.enqueue();
+      await fixture.containerOn("release-1");
+      await fixture.deliver();
+      expect(runtime.state.timeline).toEqual([]);
+      expect(runtime.running).toBe(true);
+      expect(await fixture.pending()).toBe(1);
+
+      await fixture.containerOn("release-2");
+      const served = await fixture.client();
+      expect(served.status).toBe(200);
+      expect(await served.json()).toEqual({ status: "ready" });
+      vi.setSystemTime(Date.now() + 1_000);
+      await fixture.deliver();
+      // Readiness on the running container, the client's request, the step.
+      expect(runtime.state.timeline).toEqual(["health", "health", "forward"]);
+      expect(runtime.state.destroyCalls).toBe(0);
+      expect(await fixture.pending()).toBe(0);
     } finally {
       vi.useRealTimers();
       fixture.close();
@@ -613,6 +681,7 @@ describe("World deliveries after a deploy", () => {
     const runtime = fakeContainerRuntime({ running: true, inspectImage: CURRENT_IMAGE });
     const fixture = deliveryFixture(runtime);
     try {
+      await fixture.containerOn("release-1");
       const world = { "x-eden-eve-release-id": "release-2", "x-eden-eve-previous-release-id": "release-1" };
       await expect(fixture.container.importSandboxSessions("dep-old", "dep-a", "transfer", "session", world))
         .rejects.toThrow("on the release before the World object's");
@@ -1883,6 +1952,7 @@ describe("EveHostDurableContainer lifecycle", () => {
         const response = await pending;
         expect(response.status).toBe(503);
         expect(response.headers.get("retry-after")).toBe("5");
+        expect(await response.text()).toBe("Eden is switching versions. Retry the request.\n");
         expect(response.headers.get("x-eden-eve-started-deployment")).toBeNull();
         expect(Date.now() - started).toBe(10_000);
       }

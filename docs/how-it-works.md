@@ -242,6 +242,19 @@ behavior and the warning that an Eve upgrade can strand sessions.
     again. The Container object does not reset for it. Both objects need
     Eden newer than `0.15.1`, so this holds from the second deploy made
     with it.
+  - The World object has no limit on sending a refused or failed delivery
+    again. It waits 1 second, then twice as long each time up to 60
+    seconds, and the message stays pending until a Container object runs
+    it. That is what makes the refusal safe: nothing is dropped. A
+    deployment with a pending message does not count as drained.
+  - A Container object that wakes with a container running stops nothing
+    because its release has no route for that container's version. An
+    object on the replaced release has no route for a version the new
+    release made, so the missing route does not prove the version was
+    retired. Only the retirement the World object orders stops a retired
+    container.
+  - The live check reaches neither this refusal nor the 10-second stop
+    below. Both are shown only by tests with stand-ins for Cloudflare.
   - A reset says nothing about whether a request in flight ran. Eden
     repeats only a GET or HEAD, and the health read it sends before any
     other request. It never sends a POST, PUT, PATCH or DELETE twice, and

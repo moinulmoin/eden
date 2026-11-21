@@ -846,16 +846,14 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
           const stored = await this.ctx.storage.get<string>("eden.eve.host.deployment-id");
           const namespace = env.EVE_CONTAINER as DurableObjectNamespace;
           const owner = stored ?? (this.ctx.id.equals(namespace.idFromName(env.EVE_CONTAINER_INSTANCE_NAME!)) ? "eden-cloudflare" : undefined);
-          if (owner !== undefined && deploymentImages(env)[owner] === undefined) {
-            // Removed routes must not make the constructor fail before the
-            // retirement RPC can destroy a still-running legacy container.
-            await runtime.destroy(new Error("deployment-retired"));
-            this.recordContainerStopped();
-            await this.ctx.storage.deleteAlarm();
-            return;
+          // This release has no route for the owner. That is true of a
+          // retired version, and also of a newer version when Cloudflare
+          // wakes the object on the release before. It proves neither, so
+          // nothing is stopped here: `retire` stops a retired container.
+          if (owner === undefined || deploymentImages(env)[owner] !== undefined) {
+            await this.identifyDeployment();
+            await this.registerLoopbackIntercept(runtime);
           }
-          await this.identifyDeployment();
-          await this.registerLoopbackIntercept(runtime);
         }
         await runtime.setInactivityTimeout(this.inactivityTimeoutMs);
         this.attachMonitor(runtime);
