@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased
+## 0.15.1 — 2026-11-21
+
+Fixes to names, locks, and `eden destroy`, and clearer messages for two
+failures. Only `@moinulmoin/eden` changed; update it.
+`@moinulmoin/eden-runtime-cloudflare` and
+`@moinulmoin/eden-world-cloudflare` `0.15.1` have the same code as
+`0.15.0`.
+
+The full live check passed on Cloudflare at the commit this release was cut
+from, through the `cf` OAuth login: a fresh deploy with `cf deploy`
+interrupted on purpose, a same-version update, an upgrade from Eve `0.91.0`
+to `1.1.0`, a sleep and wake, and a destroy. That run does not reach the
+new refusals: it runs one command at a time, uses a short name, and
+destroys a target whose Worker exists. The record is in
+`docs/eve-compatibility-history.md`.
+
+### Upgrading from 0.15.0
+
+- No action is needed.
+- A target deployed by `0.15.0` or older keeps name-only cleanup of a
+  leftover Container application until its next deploy. That deploy writes
+  the application's ID into the record, and from then on `eden destroy`
+  deletes a Container application left without its Worker only under that
+  ID.
+
+### Changed
 
 - One name is now locked in both environments. `--env preview` and
   `--env production` with the same `--name` are the same Worker, and until
