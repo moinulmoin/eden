@@ -104,6 +104,8 @@ async function sendWhileSwitching(
 
 /** A retained version's object could not place this release; see `placeCaller`. */
 const EVE_HOST_RETAINED_SWITCHING = new Error("A retained deployment is switching versions.");
+/** The container of the replaced image is still running; nothing is served from it. */
+const EVE_HOST_OLD_IMAGE_RUNNING = new Error("The container of the replaced image has not stopped.");
 
 type EveWorldNamespace = { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
 const worldsOnThisRelease = new WeakSet<EveWorldNamespace>();
@@ -1073,6 +1075,8 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     while (runtime.running && Date.now() - stoppedAt < 10_000) {
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
+    // Readiness would find the old container running and pass on it.
+    if (runtime.running) throw EVE_HOST_OLD_IMAGE_RUNNING;
   }
 
   /**
@@ -1380,7 +1384,7 @@ export class EveHostDurableContainer extends DurableObject<EveHostContainerEnvir
     try {
       response = await this.forwardToEve(request);
     } catch (error: unknown) {
-      if (error !== EVE_HOST_RETAINED_SWITCHING) throw error;
+      if (error !== EVE_HOST_RETAINED_SWITCHING && error !== EVE_HOST_OLD_IMAGE_RUNNING) throw error;
       return switchingVersions(5);
     }
     // Reporting the verified start back lets deploy health-gate promotion on

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A request that arrives during an update is no longer answered by the
+  replaced image. Eden waits 10 seconds for the old container to stop. When
+  it was still running after that, Eden served the request from it and
+  reported the new release as started. The request now gets `503` with
+  `Retry-After: 5`, and the next request asks the container to stop again.
+
 ## 0.15.1 — 2026-11-21
 
 Fixes to names, locks, and `eden destroy`, and clearer messages for two

@@ -247,7 +247,10 @@ behavior and the warning that an Eve upgrade can strand sessions.
     including a retained version's object. The wait for a starting
     Container is separate and unchanged.
   - Requests that arrive while the object replaces the Container wait for
-    the one new Container.
+    the one new Container. The object waits 10 seconds for the old
+    Container to stop. If it is still running then, the requests get `503`
+    with `Retry-After: 5` and nothing is served from the old image; the
+    next request asks it to stop again.
   - Before a World call, a container sends the World object one read. A
     World object on the replaced release resets for it, and the container
     waits up to 30 seconds for it to come back. The deploy's health check

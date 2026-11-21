@@ -1749,6 +1749,45 @@ describe("EveHostDurableContainer lifecycle", () => {
     );
   });
 
+  test("an old container that has not stopped after 10 seconds gets the client a retryable 503, and nothing is served from the old image", async () => {
+    const runtime = fakeContainerRuntime({ running: true, inspectImage: OLD_IMAGE });
+    let stops = false;
+    vi.spyOn(runtime, "destroy").mockImplementation(async () => {
+      runtime.state.timeline.push("destroy");
+      if (stops) runtime.state.running = false;
+    });
+    const object = hostContainer(new Map(), runtime);
+    const worker = createEveHostWorker({
+      publicOrigin: "https://eden-eve-preview.account.workers.dev",
+      ...IDENTITY,
+    });
+    const env = { EVE_CONTAINER: { getByName: () => ({ fetch: (request: Request) => object.fetch(new Request(request)) }) } };
+    vi.useFakeTimers();
+    try {
+      for (const init of [{}, { method: "POST", body: "{}" }]) {
+        const started = Date.now();
+        const pending = worker.fetch(new Request("https://client.invalid/eve/v1/session", init), env);
+        await vi.runAllTimersAsync();
+        const response = await pending;
+        expect(response.status).toBe(503);
+        expect(response.headers.get("retry-after")).toBe("5");
+        expect(response.headers.get("x-eden-eve-started-deployment")).toBeNull();
+        expect(Date.now() - started).toBe(10_000);
+      }
+      expect(runtime.state.timeline).toEqual(["carry-out", "destroy", "carry-out", "destroy"]);
+
+      stops = true;
+      const pending = worker.fetch(new Request("https://client.invalid/eve/v1/session"), env);
+      await vi.runAllTimersAsync();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-eden-eve-started-deployment")).toBe(IDENTITY.deploymentId);
+      expect(runtime.lastStart?.image).toBe(CURRENT_IMAGE);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("restores a stored snapshot only when its image matches the configured image", async () => {
     const stored = new Map<string, unknown>([
       ["eden.eve.host.workspace-snapshot", {
