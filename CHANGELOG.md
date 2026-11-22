@@ -20,6 +20,10 @@
   container is stopped only when the World object orders its retirement.
 - The live Cloudflare check reaches none of these three changes. They are
   shown by tests with stand-ins for Cloudflare.
+- Eve `1.2.0` is now the latest tested Eve, with `@workflow/world-postgres`
+  `5.4.0` and the Cloudflare World. Eden, the project, and both Worlds need
+  no change for it. Eve `0.91.0` stays the oldest supported version. Eve
+  `1.1.0` still deploys, but the compatibility gate no longer tests it.
 
 ## 0.15.1 — 2026-11-21
 

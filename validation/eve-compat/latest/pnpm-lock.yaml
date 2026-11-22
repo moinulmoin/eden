@@ -15,8 +15,8 @@ importers:
         specifier: 7.0.173
         version: 7.0.173(zod@4.5.4)
       eve:
-        specifier: 1.1.0
-        version: 1.1.0(ai@7.0.173(zod@4.5.4))(just-bash@3.6.1(supports-color@7.2.0))
+        specifier: 1.2.0
+        version: 1.2.0(ai@7.0.173(zod@4.5.4))(just-bash@3.6.1(supports-color@7.2.0))
       just-bash:
         specifier: 3.6.1
         version: 3.6.1(supports-color@7.2.0)
@@ -488,8 +488,8 @@ packages:
     resolution: {integrity: sha512-WUj2qlxaQtO4g6Pq5c29GTcWGDyd8itL8zTlipgECz3JesAiiOKotd8JU6otB3PACgG6xkJUyVhboMS+bje/jA==}
     engines: {node: '>=6'}
 
-  eve@1.1.0:
-    resolution: {integrity: sha512-Dblzqj5FENNljN1cPkEPWGjG6OZG8DTUhfxowwVeyAMtbbRgZcVWgTmD4giYIiq8gl3M5AFWpPjhcHrPuET8lQ==}
+  eve@1.2.0:
+    resolution: {integrity: sha512-l051+5qaf5pv/FS5JxZMQRAIhA5YdBmDwyPcucbJKyjgYQJMphpzfX95Xb0MmYDI0oSYUSOdtTOxpCgBq4A9gQ==}
     engines: {node: '>=24'}
     hasBin: true
     peerDependencies:
@@ -1249,7 +1249,7 @@ snapshots:
 
   escalade@3.2.0: {}
 
-  eve@1.1.0(ai@7.0.173(zod@4.5.4))(just-bash@3.6.1(supports-color@7.2.0)):
+  eve@1.2.0(ai@7.0.173(zod@4.5.4))(just-bash@3.6.1(supports-color@7.2.0)):
     dependencies:
       ai: 7.0.173(zod@4.5.4)
       nitro: 3.0.261103-rc
