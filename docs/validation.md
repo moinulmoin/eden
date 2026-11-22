@@ -8,7 +8,7 @@ This is the maintainer runbook. First-time users should start with
 
 The gate tests two frozen fixtures: `validation/eve-compat/floor/` pins Eve
 0.91.0 and `@workflow/world-postgres` 5.0.5; `validation/eve-compat/latest/`
-pins Eve 1.2.0 and World 5.4.0. Renovate updates only the latest fixture's
+pins Eve 1.3.0 and World 5.4.0. Renovate updates only the latest fixture's
 Eve, World, and `just-bash` exact pins, in separate pull requests without
 automerge, once a release is one day old; the floor stays frozen.
 
