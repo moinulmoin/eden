@@ -1,6 +1,27 @@
 # Changelog
 
-## Unreleased
+## 0.15.2 — 2026-11-23
+
+Three fixes to the runtime on Cloudflare during an update, and Eve `1.3.0`
+as the latest tested Eve. Only `@moinulmoin/eden-runtime-cloudflare`
+changed. `@moinulmoin/eden` `0.15.2` has the same code as `0.15.1` and
+depends on the new runtime; update it. `@moinulmoin/eden-world-cloudflare`
+`0.15.2` has the same code as `0.15.1`.
+
+The full live check passed on Cloudflare at the commit this release was cut
+from, through the `cf` OAuth login: a fresh deploy with `cf deploy`
+interrupted on purpose, a same-version update, an upgrade from Eve `0.91.0`
+to `1.3.0`, a sleep and wake, and a destroy. That run does not reach the
+three runtime fixes below. The record is in
+`docs/eve-compatibility-history.md`.
+
+### Upgrading from 0.15.1
+
+- No action is needed.
+- The runtime fixes hold from the second deploy made with `0.15.2`. During
+  the first one, the release it replaces still runs the older runtime.
+
+### Changed
 
 - A request that arrives during an update is no longer answered by the
   replaced image. Eden waits 10 seconds for the old container to stop. When
