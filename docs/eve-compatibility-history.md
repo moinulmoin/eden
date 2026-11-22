@@ -4,6 +4,45 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check with Eve 1.2.0 (2026-11-22)
+
+Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
+Cloudflare account, with `cf` `1.0.0-rc.2` and an OAuth login, on the
+branch that moves the latest fixture to Eve `1.2.0`, at `8c005d8`.
+`CLOUDFLARE_API_TOKEN` was not set. That branch changes no Eden code: it is
+main at `9d4cf73` plus the fixture pin and docs.
+
+Full run of `pnpm run check:live`, target `eden-live-20261122-f638f0c3`,
+`17:29:34Z` to `17:44:03Z`, Eve `0.91.0` to `1.2.0`, the World packed from
+this workspace (version `0.15.1`), a 90-second idle window. All 18 steps
+passed on the first run.
+
+- `eden preflight` passed 14 checks with no warnings in 86 seconds.
+- `cf deploy` was interrupted and exited 1 after 5 refused reads of the
+  uploaded version. Eden then ran `cf containers applications create` and
+  `cf workers triggers deploy`, both exit 0, and the fresh deploy took 164
+  seconds.
+- The same-version update took 105 seconds and the deploy on Eve `1.2.0`
+  183 seconds, on the same URL. Both carried `EVE_UPDATE_IN_FLIGHT`. The
+  update reported `VAL-LIFE-007` passed: `The superseded image was deleted
+  from the registry by its tag after promotion.`
+- The first session answered after each deploy and after the sleep, with its
+  earlier turns in its stream and its file intact. A new session started
+  after the update, and one ran bash on Eve `1.2.0` after the upgrade.
+  After 165 seconds with no requests the first health request took 7.3
+  seconds, and the server process was 8 seconds old.
+- No `queueAuthMode` line on Eve `1.2.0`. An unauthenticated session request
+  got `401`, and the two workflow queue routes answered `404`.
+- `eden destroy` ended in 50 seconds and reported 12 objects in
+  `EVE_REGISTRY_OBJECTS_KEPT`: 9 `refused-snapshot` and 3
+  `refused-singleton-artifact`, none of them `accepted-still-listed`.
+- The check's catalog read found those 12 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+
+Eve `1.2.0` with Eve's local World was not run on Cloudflare, and no project
+on the Postgres World was deployed to Cloudflare.
+
 ## Live check for the eden#28 review follow-ups (2026-11-21)
 
 Run on macOS with Node `24.22.3`, against the maintainer's Cloudflare

@@ -22,20 +22,22 @@ for what happens to running sessions.
 | Eve | Postgres World | Cloudflare World | Tested |
 | --- | --- | --- | --- |
 | `0.91.0`, the oldest supported | `@workflow/world-postgres` `5.0.5` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
-| `1.1.0`, the latest stable | `@workflow/world-postgres` `5.4.0` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
+| `1.2.0`, the latest tested | `@workflow/world-postgres` `5.4.0` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
 
-Versions between the two, such as `1.0.2`, are still accepted by `eden
-preflight` and `eden deploy`, but the gate no longer tests them. A project on
-`1.0.2` needs no change to keep deploying. Eve `1.1.0` needs no change in
-Eden, in the project, or in either World. It bundles `@workflow/world`
-`5.2.2`. `@workflow/world-postgres` `5.4.0` pins `@workflow/world` `5.3.0`
-and installs its own copy; the gate passed with the two together.
+Versions between the two, such as `1.0.2` and `1.1.0`, are still accepted by
+`eden preflight` and `eden deploy`, but the gate no longer tests them. A
+project on `1.1.0` needs no change to keep deploying. Eve `1.2.0` needs no
+change in Eden, in the project, or in either World. It bundles
+`@workflow/world` `5.3.0`, the version `@workflow/world-postgres` `5.4.0`
+pins. Eve's release notes ask Postgres World projects to run the World's
+`bootstrap` before deploying `1.2.0`; `eden deploy` already runs it before
+it publishes.
 
 From `1.0.0-rc.6`, Eve refuses to start a session unless the World creates the
 session's run and its start hook together. Older Worlds fail every new session
 with HTTP 500, so preflight stops them with `EVE_WORLD_PAIRING`.
 
-New Eve `1.1.0` projects pin `engines.node` to `26.x`. Eden builds and runs
+New Eve `1.2.0` projects pin `engines.node` to `26.x`. Eden builds and runs
 every project on Node.js `24.17.0`, which Eve still supports, so the pin needs
 no change.
 
