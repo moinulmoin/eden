@@ -4,6 +4,42 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Postgres World 5.4.1 checks (2026-11-22)
+
+Run on macOS with Docker `29.8.2`, Postgres `16.16` in Docker, and Node
+`24.22.3`, on main at `d33d560` with the fixture change, without
+Cloudflare credentials. No live Cloudflare run was made: the Eden leg
+removes `@workflow/world-postgres` from the project, so the Cloudflare path
+does not load it. No project with the Postgres World was deployed to
+Cloudflare.
+
+- The compatibility gate passed both legs for both fixtures: Eve `0.91.0`
+  with `@workflow/world-postgres` `5.0.5`, and Eve `1.3.0` with `5.4.1`.
+  `EVE_WORLD_PAIRING` passed in both. No model key was set, so the model
+  and tool eval was skipped.
+- The published `5.4.0` and `5.4.1` packages were unpacked and compared.
+  The migrations and the `bootstrap` binary are the same. The code changes
+  are in the queue, storage, retention, run lease, job lease, and Kubernetes
+  backlog modules. A zero-retention run's data is now deleted after its
+  final write commits, and that write also adds a backstop job on a new
+  Graphile Worker task, `<jobPrefix>purge`. Queries now use
+  `GRAPHILE_WORKER_SCHEMA` everywhere. A new `skipWorkers` option, or
+  `WORKFLOW_POSTGRES_SKIP_WORKERS=1`, starts the World without workers.
+  Eden sets neither variable.
+- `5.4.1` still pins `@workflow/world` `5.3.0`, the version Eve `1.3.0`
+  bundles, and `graphile-worker` `0.16.6`. It moves `@workflow/world-local`
+  to `5.5.1` and `@workflow/errors` to `5.1.5`. `@workflow/errors` `5.1.5`
+  adds `DynamicWorkflowsNotEnabledError`; `@workflow/world-local` `5.5.1`
+  changes only that dependency.
+- On one empty database, `bootstrap` from `5.4.0`, then from `5.4.1`
+  twice, then from `5.4.0` again all exited 0. After each run the database
+  had 33 World migrations and 18 Graphile Worker migrations applied, and
+  `pg_dump --schema-only` printed the same schema, apart from the random
+  key on its `\restrict` line. No run data was in that database.
+- Both versions declare `queueAuthMode: "skip"`, and declare deployment
+  affinity only when `deploymentId` or `WORKFLOW_POSTGRES_DEPLOYMENT_ID` is
+  set. Eden sets neither.
+
 ## Eve 1.3.0 checks and live check (2026-11-22)
 
 Run on macOS with Docker `29.8.2` and Node `24.22.3`, on the branch that
