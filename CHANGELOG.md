@@ -25,8 +25,11 @@
   no change for Eve `1.2.0` or `1.3.0`. Eve `0.91.0` stays the oldest
   supported version. Eve `1.1.0` and `1.2.0` still deploy, but the
   compatibility gate no longer tests them. The full live check passed on
-  Cloudflare with an upgrade from Eve `0.91.0` to `1.2.0`; the record is in
-  `docs/eve-compatibility-history.md`.
+  Cloudflare with an upgrade from Eve `0.91.0` to `1.2.0`, and again to
+  `1.3.0`: the session started on `0.91.0` answered on `1.3.0` with its
+  history and files. Eve `1.3.0`'s fix for sessions started before Eve `1.0`
+  does not apply on the Cloudflare World, which declares deployment
+  affinity. The records are in `docs/eve-compatibility-history.md`.
 
 ## 0.15.1 — 2026-11-21
 
