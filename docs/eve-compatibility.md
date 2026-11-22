@@ -22,14 +22,14 @@ for what happens to running sessions.
 | Eve | Postgres World | Cloudflare World | Tested |
 | --- | --- | --- | --- |
 | `0.91.0`, the oldest supported | `@workflow/world-postgres` `5.0.5` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
-| `1.3.0`, the latest tested | `@workflow/world-postgres` `5.4.0` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
+| `1.3.0`, the latest tested | `@workflow/world-postgres` `5.4.1` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
 
 Versions between the two, such as `1.1.0` and `1.2.0`, are still accepted by
 `eden preflight` and `eden deploy`, but the gate no longer tests them. A
 project on `1.2.0` needs no change to keep deploying. Eve `1.3.0` needs no
 change in Eden, in the project, or in either World. It bundles the same
 Workflow packages as `1.2.0`, including `@workflow/world` `5.3.0`, the
-version `@workflow/world-postgres` `5.4.0` pins. Eve's `1.2.0` release notes
+version `@workflow/world-postgres` `5.4.1` pins. Eve's `1.2.0` release notes
 ask Postgres World projects to run the World's `bootstrap` before deploying;
 `eden deploy` already runs it before it publishes.
 
