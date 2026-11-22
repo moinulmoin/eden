@@ -4,6 +4,81 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Eve 1.3.0 checks and live check (2026-11-22)
+
+Run on macOS with Docker `29.8.2` and Node `24.22.3`, on the branch that
+moves the latest fixture to Eve `1.3.0`, at `8a98aeb`. That branch changes
+no Eden code: it is main at `afd16a5` plus the fixture pin and docs.
+
+What `1.3.0` changes for sessions:
+
+- The published `1.2.0` and `1.3.0` packages were unpacked and compared.
+  The only change to session handling is in
+  `execution/legacy-session/inbox.js`: before it resumes a pre-1.0 session
+  that never moved to a 1.0 inbox, Eve now calls
+  `assertRunnableSessionOwner`. That function returns at once when the World
+  declares `capabilities.deploymentAffinity` as `true`. The files that
+  route session messages, `session-inbox/owner.js`, `session-inbox/resume.js`,
+  and `workflow-runtime.js`, are byte-identical. Eve's notes link this fix
+  to vercel/eve#6646 and vercel/eve#6653.
+- Both versions bundle `@workflow/core` `5.7.0`, `@workflow/world`
+  `5.3.0`, and `@workflow/world-local` `5.5.0`. The other changes are a
+  Solid binding, a lazily loaded MCP client, custom skill scopes, a build fix
+  for nested extension mounts, and version stamps.
+- The Cloudflare World declares `deploymentAffinity: true` on its World
+  object and in `eden.capabilities` in its `package.json`; the published
+  `0.11.2` already has both. The Postgres World declares affinity only with a
+  deployment ID, which Eden does not set.
+- `npx eve@1.3.0 init` writes the same project as `1.2.0` apart from the Eve
+  version.
+
+On a local Postgres World (Postgres 16 in Docker), two projects started on
+Eve `0.91.0` with `@workflow/world-postgres` `5.0.5`. In each, a session ran
+bash and wrote a file. Each project was then upgraded in place, one to Eve
+`1.2.0` and one to `1.3.0`, both with World `5.4.0` and its `bootstrap`.
+
+- On both versions, two messages to the old session's ID got HTTP 409
+  `{"code":"session_stranded","error":"This session is no longer available.","ok":false,"eveVersion":"0.91.0"}`.
+- On both versions, Eve logged `Skipping replay of stranded session run …
+  (owner eve 0.91.0, current …)`, and a new session ran bash.
+
+The local gate, `pnpm run compat:eve:local`, passed both legs on `floor`
+(`0.91.0`) and `latest` (`1.3.0`), with `EVE_WORLD_PAIRING` passed in
+both.
+
+Full run of `pnpm run check:live` against the maintainer's Cloudflare
+account, with `cf` `1.0.0-rc.2` and an OAuth login; `CLOUDFLARE_API_TOKEN`
+was not set. Target `eden-live-20261122-604f32c8`, `18:11:12Z` to
+`18:27:15Z`, Eve `0.91.0` to `1.3.0`, the World packed from this workspace
+(version `0.15.1`), a 90-second idle window. All 18 steps passed on the
+first run.
+
+- `eden preflight` passed 14 checks with no warnings in 102 seconds.
+- `cf deploy` was interrupted and exited 1 after 5 refused reads of the
+  uploaded version. Eden then ran `cf containers applications create` and
+  `cf workers triggers deploy`, both exit 0, and the fresh deploy took 178
+  seconds.
+- The same-version update took 168 seconds and the deploy on Eve `1.3.0`
+  191 seconds, on the same URL. Both carried `EVE_UPDATE_IN_FLIGHT`. The
+  update reported `VAL-LIFE-007` passed.
+- The session started on Eve `0.91.0` answered after each deploy and after
+  the sleep, with its earlier turns in its stream and its file intact. A new
+  session started after the update, and one ran bash on Eve `1.3.0` after
+  the upgrade. After 165 seconds with no requests the first health request
+  took 4.8 seconds, and the server process was 7 seconds old.
+- No `queueAuthMode` line on Eve `1.3.0`. An unauthenticated session request
+  got `401`, and the two workflow queue routes answered `404`.
+- `eden destroy` ended in 53 seconds and reported 15 registry objects it
+  could not delete: 12 `refused-snapshot` and 3
+  `refused-singleton-artifact`, none of them `accepted-still-listed`.
+- The check's catalog read found those 15 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+
+Not run: a message to a pre-1.0 session through a channel address, which is
+the path the `1.3.0` fix changes; Eve `1.3.0` with Eve's local World on
+Cloudflare; and a project on the Postgres World deployed to Cloudflare.
+
 ## Live check with Eve 1.2.0 (2026-11-22)
 
 Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's

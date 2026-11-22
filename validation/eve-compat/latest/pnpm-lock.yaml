@@ -15,8 +15,8 @@ importers:
         specifier: 7.0.173
         version: 7.0.173(zod@4.5.4)
       eve:
-        specifier: 1.2.0
-        version: 1.2.0(ai@7.0.173(zod@4.5.4))(just-bash@3.6.1(supports-color@7.2.0))
+        specifier: 1.3.0
+        version: 1.3.0(ai@7.0.173(zod@4.5.4))(just-bash@3.6.1(supports-color@7.2.0))
       just-bash:
         specifier: 3.6.1
         version: 3.6.1(supports-color@7.2.0)
@@ -488,8 +488,8 @@ packages:
     resolution: {integrity: sha512-WUj2qlxaQtO4g6Pq5c29GTcWGDyd8itL8zTlipgECz3JesAiiOKotd8JU6otB3PACgG6xkJUyVhboMS+bje/jA==}
     engines: {node: '>=6'}
 
-  eve@1.2.0:
-    resolution: {integrity: sha512-l051+5qaf5pv/FS5JxZMQRAIhA5YdBmDwyPcucbJKyjgYQJMphpzfX95Xb0MmYDI0oSYUSOdtTOxpCgBq4A9gQ==}
+  eve@1.3.0:
+    resolution: {integrity: sha512-cL1aaSwPLiUYPIp5ksivpd7GJpnl3H7xptT8/31utYC6HLWHJkf9gut++p46LaI2DhmVY1AdrrJ254BZGtlD6Q==}
     engines: {node: '>=24'}
     hasBin: true
     peerDependencies:
@@ -504,6 +504,7 @@ packages:
       just-bash: ^3.6.0
       next: ^16.0.0
       react: ^19.0.0
+      solid-js: ^2.0.0
       svelte: ^5.0.0
       vite: ^8.3.3
       vue: ^3.5.0
@@ -527,6 +528,8 @@ packages:
       next:
         optional: true
       react:
+        optional: true
+      solid-js:
         optional: true
       svelte:
         optional: true
@@ -1249,7 +1252,7 @@ snapshots:
 
   escalade@3.2.0: {}
 
-  eve@1.2.0(ai@7.0.173(zod@4.5.4))(just-bash@3.6.1(supports-color@7.2.0)):
+  eve@1.3.0(ai@7.0.173(zod@4.5.4))(just-bash@3.6.1(supports-color@7.2.0)):
     dependencies:
       ai: 7.0.173(zod@4.5.4)
       nitro: 3.0.261103-rc
