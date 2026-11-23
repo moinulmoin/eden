@@ -62,5 +62,5 @@ fixture.
 4. Get the maintainer's approval. Commit explicit paths, push `main`, then
    push the tag `vX.Y.Z`. The Publish workflow tests, publishes to npm with
    provenance, smoke-tests the installers, and creates the GitHub release.
-5. Deploy the site: `pnpm --dir site run deploy`. It reads the version from
-   `packages/cli/package.json`.
+5. Deploy the site: `pnpm --dir site run deploy`. It runs `cf deploy` with
+   the same `cf` login and reads the version from `packages/cli/package.json`.
