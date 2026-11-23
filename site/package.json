@@ -8,13 +8,13 @@
     "dev": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
-    "deploy": "astro build && wrangler deploy"
+    "deploy": "astro build && cf deploy dist"
   },
   "dependencies": {
     "@lucide/astro": "1.48.0",
     "astro": "7.3.5"
   },
   "devDependencies": {
-    "wrangler": "4.120.0"
+    "cf": "1.0.0-rc.2"
   }
 }
