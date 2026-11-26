@@ -17,13 +17,16 @@
   to collect unused layers. On 2026-11-26 the registry sent no answer to that
   request within 300 seconds, so cf ran into its 120 second limit, and Eden
   reported `EVE_SUPERSEDED_IMAGE_NOT_DELETED` even though the tag was gone.
-  Every live check has failed this step since 2026-11-22. Eden now
-  reads the registry's listing in that case: when the tag and the image are
-  gone, `VAL-LIFE-007` passes. An update still waits up to two minutes for cf
-  while the registry does not answer.
+  Every live check has failed this step since 2026-11-22. When cf runs out
+  of time and has stopped, Eden now reads the listing, and then the manifest
+  of the tag and of the digest. `VAL-LIFE-007` passes only when the listing
+  has neither and the registry answers both reads with `MANIFEST_UNKNOWN`.
+  When cf may still run, Eden reads nothing and warns. In the observed runs
+  the registry did not answer, and an update then waited the full two
+  minutes for cf.
 - `EVE_SUPERSEDED_IMAGE_NOT_DELETED` now ends with the step that failed: the
-  listing, the tag lookup, cf's own error, or an image still listed after
-  the delete.
+  listing, the tag lookup, cf's own error, cf still running, a manifest the
+  registry still serves, or an image still listed after the delete.
 
 ## 0.15.2 — 2026-11-23
 

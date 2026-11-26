@@ -83,6 +83,8 @@ export interface CloudflareCliResult {
   readonly stderr: string;
   /** Set when cf was started, was told to stop, and did not report that it had stopped. */
   readonly running?: true;
+  /** Set when cf ran out of its time and Eden stopped it; with `running`, cf may still run. */
+  readonly timedOut?: true;
 }
 
 export type CloudflareCliRunner = (
@@ -204,6 +206,7 @@ async function runCf(
           stdout: Buffer.concat(stdout).toString("utf8"),
           stderr: Buffer.concat(stderr).toString("utf8"),
           ...(running ? { running: true as const } : {}),
+          ...(timedOut ? { timedOut: true as const } : {}),
         });
       };
       // Out of time: cf is killed, and the result waits until it is gone.

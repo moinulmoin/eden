@@ -77,11 +77,18 @@ const fakeRegistry = vi.hoisted(() => {
     /** Whether cf's delete of a tag succeeds; the tag then leaves the listing. */
     deletable: (() => true) as (ref: string) => boolean,
     /**
-     * Whether cf is stopped at its time limit instead of exiting, after its
-     * delete of a tag, as cf 1.0.0-rc.2 was from 2026-11-22: the registry did
-     * not answer the request to collect layers that cf sends after the delete.
+     * Whether cf's delete of a tag never exits, as cf 1.0.0-rc.2's did on
+     * 2026-11-26 when the registry did not answer the request to collect
+     * layers that cf sends after the tag delete: `after-delete` deletes the
+     * tag first, `before-delete` deletes nothing.
      */
-    cfStops: false,
+    cfHangs: undefined as "after-delete" | "before-delete" | undefined,
+    /** Whether a cf that never exits stops when it is killed. */
+    cfStopsOnKill: true,
+    /** Set while a cf that never exits is running. */
+    cfHanging: false,
+    /** The registry's answer to a GET of a manifest; by default 200 for a listed entry, else MANIFEST_UNKNOWN. */
+    manifestRead: (() => undefined) as (ref: string) => Answer | undefined,
     /** The registry's answer to Eden's own delete; `leavesAfterMs` takes the entry out of the listing that much later. */
     answer: (() => ({ status: 404, body: "" })) as (ref: string) => Answer,
     /**
@@ -172,6 +179,11 @@ vi.mock("node:https", async (importOriginal) => {
             ? fakeRegistry.listing(repository, fakeRegistry.listings - 1, last)
             : options.method === "HEAD"
             ? { status: named === undefined ? 404 : 200, body: "", ...(named === undefined ? {} : { digest: named }) }
+            : options.method === "GET"
+            ? fakeRegistry.manifestRead(ref) ?? (fakeRegistry.listed(repository).includes(entry)
+              ? { status: 200, body: "{}" }
+              // The registry's answer on 2026-11-26 for a tag or digest it does not know.
+              : { status: 404, body: JSON.stringify({ errors: [{ code: "MANIFEST_UNKNOWN", message: "manifest unknown", detail: { Tag: entry } }] }) })
             : fakeRegistry.answer(ref);
           if (answer === undefined) {
             const tags = fakeRegistry.listed(repository)
@@ -216,7 +228,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   /** What cf prints and exits with while the fake registry runs. */
   const registryCf = (
     args: readonly string[],
-  ): { readonly exitCode: number | undefined; readonly stdout?: string; readonly stderr?: string } => {
+  ): { readonly exitCode: number | undefined; readonly stdout?: string; readonly stderr?: string; readonly hangs?: true } => {
     const line = args.join(" ");
     if (line === "auth whoami") {
       return {
@@ -240,8 +252,8 @@ vi.mock("node:child_process", async (importOriginal) => {
       const ref = args[3] ?? "";
       const [repository = "", tag = ""] = ref.split(":");
       fakeRegistry.cfDeletes.push(ref);
+      if (fakeRegistry.cfHangs === "before-delete") return { exitCode: undefined, hangs: true };
       if (!fakeRegistry.deletable(ref)) {
-        if (fakeRegistry.cfStops) return { exitCode: undefined };
         // cf prints its own errors on stderr in this form, a long message wrapped at spaces (read on 2026-11-20).
         const wrapped = fakeRegistry.cfFailure(ref).replaceAll(" (digest: ", "\n│ (digest:\n│ ").replace(/ Forbidden$/u, "\n│ Forbidden");
         return { exitCode: 1, stderr: "\n┌ Error\n│ " + wrapped + "\n└\n" };
@@ -250,7 +262,7 @@ vi.mock("node:child_process", async (importOriginal) => {
         repository,
         (fakeRegistry.entries.get(repository) ?? []).filter((present) => present !== tag),
       );
-      return { exitCode: fakeRegistry.cfStops ? undefined : 0 };
+      return fakeRegistry.cfHangs === "after-delete" ? { exitCode: undefined, hangs: true } : { exitCode: 0 };
     }
     return { exitCode: 1, stderr: `Unexpected cf call: ${line}` };
   };
@@ -263,7 +275,7 @@ vi.mock("node:child_process", async (importOriginal) => {
         (!fakeRegistry.active && !fakeCf.intercept)
       ) return actual.spawn(...spawnArgs);
       const args = argv.slice(1);
-      let answer: (typeof fakeCf.answers)[number];
+      let answer: (typeof fakeCf.answers)[number] | ReturnType<typeof registryCf>;
       if (fakeCf.intercept) {
         fakeCf.pending = args;
         answer = fakeCf.answers.shift() ?? { exitCode: 1 };
@@ -273,8 +285,21 @@ vi.mock("node:child_process", async (importOriginal) => {
       const child = Object.assign(new EventEmitter(), {
         stdout: new EventEmitter(),
         stderr: new EventEmitter(),
-        kill: () => true,
+        kill: () => {
+          if ("hangs" in answer && fakeRegistry.cfStopsOnKill) {
+            setImmediate(() => {
+              fakeRegistry.cfHanging = false;
+              child.emit("exit", null, "SIGKILL");
+              child.emit("close", null, "SIGKILL");
+            });
+          }
+          return true;
+        },
       });
+      if ("hangs" in answer) {
+        fakeRegistry.cfHanging = true;
+        return child;
+      }
       setImmediate(() => {
         if (answer.stdout !== undefined) child.stdout.emit("data", Buffer.from(answer.stdout));
         if (answer.stderr !== undefined) child.stderr.emit("data", Buffer.from(answer.stderr));
@@ -334,7 +359,10 @@ function startFakeRegistry(setup: FakeRegistrySetup): void {
     digests: new Map(),
     pageSize: setup.pageSize ?? 1_000,
     deletable: setup.deletable ?? (() => true),
-    cfStops: false,
+    cfHangs: undefined,
+    cfStopsOnKill: true,
+    cfHanging: false,
+    manifestRead: () => undefined,
     answer: setup.answer ?? (() => ({ status: 404, body: "" })),
     listing: setup.listing ?? (() => undefined),
     whoamiAccountId: setup.whoamiAccountId ?? (() => "account-test"),
@@ -4546,31 +4574,75 @@ describe("eden deploy in-place update", () => {
     }
   });
 
-  test("an update deletes the image it replaced when cf is stopped at its time limit after the tag delete", async () => {
+  /** While a cf that never exits runs, its time limit, and the wait for an exit after a kill that fails, take no time. */
+  function shortCfTimeouts(): () => void {
+    const realSetTimeout = globalThis.setTimeout;
+    const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(
+      ((handler: () => void, timeoutMs?: number) => realSetTimeout(
+        handler,
+        fakeRegistry.cfHanging && (timeoutMs === 120_000 || (timeoutMs === 2_000 && !fakeRegistry.cfStopsOnKill)) ? 0 : timeoutMs,
+      )) as unknown as typeof setTimeout,
+    );
+    return () => timers.mockRestore();
+  }
+
+  test.each([
+    ["cf ran out of time after its tag delete, and the registry knows neither the tag nor the digest", "unknown"],
+    ["cf ran out of time and did not stop", "still-running"],
+    ["cf ran out of time, and the listing omits the image while the registry still serves its manifest", "stale-listing"],
+    ["cf ran out of time before its tag delete", "not-deleted"],
+  ] as const)("a same-version update whose cf delete never exits: %s", async (_name, scenario) => {
     const root = await createRoot();
     const { state, deploy, stop } = await inPlaceUpdates(root);
+    const restore = shortCfTimeouts();
     try {
       const { repository } = await deploy("generation-two", manifest("c"));
-      fakeRegistry.cfStops = true;
+      const prior = state.pushed[0] as string;
+      const tag = prior.slice(repository.length + 1);
+      fakeRegistry.cfHangs = scenario === "not-deleted" ? "before-delete" : "after-delete";
+      fakeRegistry.cfStopsOnKill = scenario !== "still-running";
+      if (scenario === "stale-listing") fakeRegistry.manifestRead = () => ({ status: 200, body: "{}" });
+      const requestsBefore = fakeRegistry.registryRequests.length;
       const second = await deploy("generation-three", manifest("d"));
       expect(second.code).toBe(0);
       expect(second.result.ok).toBe(true);
-      expect(fakeRegistry.cfDeletes).toEqual([state.pushed[0]]);
-      // The listing, read after cf, is what shows the tag and the image gone.
-      expect(fakeRegistry.listed(repository)).toEqual([(state.pushed[1] as string).slice(repository.length + 1), manifest("d")]);
-      expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")).toMatchObject({
-        status: "passed",
-        message: "The superseded image was deleted from the registry by its tag after promotion.",
-      });
-      expect(second.result.warnings.map((warning) => warning.id)).not.toContain("EVE_SUPERSEDED_IMAGE_NOT_DELETED");
+      expect(fakeRegistry.cfDeletes).toEqual([prior]);
+      const listing = [`GET ${repository}`, `GET ${repository}`];
+      const sent = fakeRegistry.registryRequests.slice(requestsBefore).map((request) => `${String(request.method)} ${request.ref}`);
+      const warning = second.result.warnings.find((entry) => entry.id === "EVE_SUPERSEDED_IMAGE_NOT_DELETED") as
+        { readonly message?: string } | undefined;
+      const lead = `The update is healthy and promoted, but Eden could not show that the superseded image ${repository}@${manifest("c")} left Cloudflare's registry. `;
+      const stopped = " cf containers images delete ran out of time and was stopped.";
+      if (scenario === "unknown") {
+        // The listing, then the registry's own answer for the tag and for the digest.
+        expect(sent).toEqual([...listing, `HEAD ${prior}`, ...listing, ...listing, `GET ${prior}`, `GET ${repository}@${manifest("c")}`]);
+        expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")).toMatchObject({
+          status: "passed",
+          message: "The superseded image was deleted from the registry by its tag after promotion.",
+        });
+        expect(warning).toBeUndefined();
+        return;
+      }
+      expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).not.toBe("passed");
+      if (scenario === "still-running") {
+        // Nothing is read while cf may still run.
+        expect(sent).toEqual([...listing, `HEAD ${prior}`]);
+        expect(warning?.message).toBe(lead + "cf containers images delete ran out of time and did not stop, so it may still run. Eden did not read the registry after it.");
+      } else if (scenario === "stale-listing") {
+        expect(sent).toEqual([...listing, `HEAD ${prior}`, ...listing, ...listing, `GET ${prior}`]);
+        expect(warning?.message).toBe(lead + `The listing no longer had the tag ${tag} or the image's sha256: entry, but the registry did not answer a manifest read for the tag with MANIFEST_UNKNOWN.` + stopped);
+      } else {
+        expect(sent.filter((request) => request.startsWith("GET ") && request.includes(":") && !request.endsWith(repository))).toEqual([]);
+        expect(warning?.message).toBe(lead + `The registry still listed the tag ${tag} in a listing begun 30 seconds after cf returned.` + stopped);
+      }
     } finally {
+      restore();
       stop();
     }
   });
 
   test.each([
     ["cf reports a failure", "cf-fails"],
-    ["cf is stopped and the tag stays listed", "cf-stops"],
     ["the tag names no image", "unresolved"],
   ] as const)("the warning for a superseded image that was not deleted says which step failed: %s", async (_name, failure) => {
     const root = await createRoot();
@@ -4581,7 +4653,6 @@ describe("eden deploy in-place update", () => {
       const tag = prior.slice(repository.length + 1);
       if (failure === "unresolved") images.delete(prior);
       else state.tagsDeletable = false;
-      fakeRegistry.cfStops = failure === "cf-stops";
       const second = await deploy("generation-three", manifest("d"));
       expect(second.code).toBe(0);
       expect(second.result.ok).toBe(true);
@@ -4591,7 +4662,6 @@ describe("eden deploy in-place update", () => {
       expect(warning?.message).toBe(
         `The update is healthy and promoted, but Eden could not show that the superseded image ${repository}@${manifest("c")} left Cloudflare's registry. ` + {
           "cf-fails": `cf containers images delete exited 1: Failed to delete ${prior} (digest: sha256:${"0".repeat(64)}): 403 Forbidden`,
-          "cf-stops": `The registry still listed the tag ${tag} 30 seconds after the delete. cf containers images delete did not exit within its time limit.`,
           unresolved: `The registry did not answer a HEAD for the tag ${tag} with one digest.`,
         }[failure],
       );

@@ -317,10 +317,12 @@ behavior and the warning that an Eve upgrade can strand sessions.
   image. Eden never deletes it earlier. It takes the replaced image's
   repository, digest and release tag from the deployment record, and
   deletes the tag only when the registry resolves it to that digest. The
-  delete counts as shown only when a later listing no longer has the tag or
-  the image's `sha256:` entry. cf deletes the tag and then asks the
-  registry to collect unused layers; when cf does not exit within its 120
-  second limit, that listing still decides. It deletes nothing when the
+  delete counts as shown when cf exits 0 and a later listing no longer has
+  the tag or the image's `sha256:` entry. cf deletes the tag and then asks
+  the registry to collect unused layers. When cf runs out of its 120 second
+  limit and stops, cf's exit is missing, so Eden also reads the manifest of
+  the tag and of the digest. Both must get the registry's `404`
+  `MANIFEST_UNKNOWN`. When cf may still run, Eden reads nothing more. It deletes nothing when the
   repository also holds the image of a kept version or of a version whose
   retirement the record still names. If the delete cannot be shown, the
   update still succeeds with the warning
