@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- Anonymous usage telemetry, on by default. When `eden preflight`,
+  `eden deploy`, or `eden destroy` ends, Eden sends one event: the command,
+  its exit code and failure code, a duration bucket, the OS, CPU
+  architecture, Node major version, Eden version, the project's Eve version
+  and World kind, whether it runs in CI, and a random install ID. It never
+  sends names, account IDs, paths, URLs, error messages, or secrets; a
+  version or failure code outside Eden's fixed patterns is sent as
+  `other`. The first send prints a notice on stderr. `EDEN_TELEMETRY=0` or
+  `DO_NOT_TRACK=1` turns it off; then nothing is sent and no install ID is
+  created. Everything telemetry does ends within one second of the
+  command's end, and it never changes the exit code or the output. The
+  README's Telemetry section lists every field.
+
 ### Changed
 
 - Eve `1.5.0` with `@workflow/world-postgres` `5.5.0` is now the latest

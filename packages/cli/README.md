@@ -148,6 +148,16 @@ Run `eden <command> --help` for command-specific options.
   4 GiB) and does not promise horizontal scaling or custom domains.
 - Bun is an installer only; Node remains the runtime.
 
+## Telemetry
+
+Eden sends one anonymous usage event when `eden preflight`, `eden deploy`,
+or `eden destroy` ends: the command, its outcome, a duration bucket, OS,
+CPU architecture, Node, Eden, and Eve versions, World kind, whether it runs
+in CI, and a random install ID. It never sends names, account IDs, paths,
+URLs, error messages, or secrets. Turn it off with `EDEN_TELEMETRY=0` or
+`DO_NOT_TRACK=1`. Every field is listed in the
+[Telemetry section](https://github.com/moinulmoin/eden#telemetry).
+
 ## Documentation
 
 - [Documentation index](https://github.com/moinulmoin/eden/blob/main/docs/README.md)

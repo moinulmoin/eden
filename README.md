@@ -377,6 +377,65 @@ Things that differ from Vercel, and what Eden does about each:
 Run `eden <command> --help` for options and `eden --version` for the installed
 version.
 
+## Telemetry
+
+Eden sends one anonymous usage event when `eden preflight`, `eden deploy`,
+or `eden destroy` ends. It is on by default. It tells the maintainer which
+commands people run, which ones fail and with which code, and which Eden,
+Eve, and Node versions are still in use. `--help`, `--version`, and
+`eden skill` send nothing.
+
+Turn it off with either variable:
+
+```sh
+export EDEN_TELEMETRY=0   # false and off work too
+export DO_NOT_TRACK=1
+```
+
+When it is off, Eden sends nothing and creates no install ID.
+
+The first time Eden sends, it prints a three-line notice on stderr. It
+prints nothing else, and nothing on stdout, so `--json` output stays one
+JSON object. Telemetry reads no project file: the Eve version and World come
+from what the command already resolved. Its DNS lookup, connection, and
+request end within one second of the command's end; then Eden closes what is
+still open and exits. A send is tried once and dropped if it fails. It never
+changes the exit code. When `telemetry.json` or its folder is a symbolic
+link, unreadable, or not a valid Eden file, Eden sends nothing and leaves it
+as it is.
+
+The event has exactly these fields:
+
+| Field | What it holds |
+| --- | --- |
+| `schema` | `1`, the version of this event shape |
+| `installId` | A random UUID made the first time Eden sends, kept in `$XDG_CONFIG_HOME/eden/telemetry.json` (`~/.config/eden/telemetry.json` when `XDG_CONFIG_HOME` is unset or not an absolute path). It is not derived from anything, but it stays the same, so it links the events from one machine. Delete the file to get a new one |
+| `command` | `preflight`, `deploy`, or `destroy` |
+| `edenVersion` | The Eden version, such as `0.15.2` |
+| `exitCode` | `0` or `1` |
+| `failureCode` | One of Eden's own failure codes, such as `EVE_PREFLIGHT_FAILED`, from a fixed list the collector shares; `other` for any other code; `null` when the command succeeded |
+| `duration` | One of `<10s`, `10s-1m`, `1m-5m`, `5m-15m`, `15m-1h`, `>1h` |
+| `os` | `darwin`, `linux`, `win32`, or `other` |
+| `arch` | `arm64`, `x64`, or `other` |
+| `nodeMajor` | The major version of Node, such as `24` |
+| `eveVersion` | The Eve version the command itself resolved, as the project declares it: from the build for preflight and deploy, from the deployment record for destroy, such as `1.3.0` or `1.0.0-rc.7`. It is sent only when it is a plain release, or a prerelease labeled `alpha`, `beta`, `rc`, `canary`, `next`, or `preview`, with numbers of at most three digits. Any other version, and a command that stopped before resolving one, sends `other` |
+| `world` | `cloudflare`, `postgres`, `local`, or `other`: the World the preflight or deploy build selected. `other` for any other World, for destroy, and for a command that stopped before the build |
+| `ci` | `true` when one of `CI`, `CONTINUOUS_INTEGRATION`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `CIRCLECI`, `TRAVIS`, `JENKINS_URL`, `TEAMCITY_VERSION`, `TF_BUILD`, `BITBUCKET_BUILD_NUMBER`, or `CODEBUILD_BUILD_ID` is set to anything but an empty value, `0`, or `false`. No value is sent |
+
+Eden never sends project, target, or Worker names, Cloudflare account or
+user IDs, emails, URLs, file paths, hostnames, the values of environment
+variables, error messages, or anything from the env file or secrets. It does
+not hash any of these and send the hash instead: they are not sent at all.
+
+The event goes in an HTTPS `POST` to
+`https://telemetry.eden.ideaplexa.com/v1/events`, a Cloudflare Worker whose
+code is in [`telemetry/`](./telemetry). It accepts only this exact shape, up
+to 1 KB, and writes it to a Workers Analytics Engine dataset on the
+maintainer's Cloudflare account, which keeps it for three months. The Worker
+does not store or log the IP address, headers, or user agent, and its Workers
+Logs are off. `EDEN_TELEMETRY_URL` sends the event to another endpoint
+instead, for tests or your own collector.
+
 ## Develop from source
 
 The repository is a pnpm workspace with TypeScript project references. It works
@@ -398,7 +457,8 @@ node packages/cli/dist/index.js --help
 ```
 
 The landing page at eden.ideaplexa.com lives in `site/` (Astro). Run it with
-`pnpm --filter @moinulmoin/eden-site dev`.
+`pnpm --filter @moinulmoin/eden-site dev`. The telemetry collector lives in
+`telemetry/`; see [its README](./telemetry/README.md).
 
 ## Documentation
 
@@ -409,8 +469,8 @@ The landing page at eden.ideaplexa.com lives in `site/` (Astro). Run it with
   durability, and current limits
 - [How Eden works](./docs/how-it-works.md): the Worker, Durable Object, and
   Container, deploy steps, sleep and wake, updates, and where data lives
-- [Security](./docs/security.md): secrets, what is public, the sandbox, and
-  what Eden can change in your account
+- [Security](./docs/security.md): secrets, what is public, the sandbox,
+  what Eden can change in your account, and telemetry
 - [FAQ](./docs/faq.md): cost, project changes, timings, and comparisons
 - [Reference](./docs/reference.md): commands, flags, env-file rules, and what
   Eden creates

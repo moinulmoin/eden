@@ -15,6 +15,8 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 
@@ -3181,6 +3183,45 @@ describe("Workflow World warnings", () => {
       }),
     };
   }
+  test("the usage event carries the Eve version and World the preflight resolved", async () => {
+    const bodies: string[] = [];
+    const server = createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk: Buffer) => { body += chunk.toString("utf8"); });
+      request.on("end", () => { bodies.push(body); response.writeHead(204).end(); });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const config = await mkdtemp(join(tmpdir(), "eden-telemetry-config-"));
+    roots.push(config);
+    vi.stubEnv("EDEN_TELEMETRY", "");
+    vi.stubEnv("DO_NOT_TRACK", "");
+    vi.stubEnv("XDG_CONFIG_HOME", config);
+    vi.stubEnv("EDEN_TELEMETRY_URL", "http://127.0.0.1:" + String((server.address() as AddressInfo).port) + "/v1/events");
+    const root = await createRoot();
+    await writeFixtureProject(root);
+    const builder = fakeBuilder(async (request) => {
+      await writeFile(
+        join(request.snapshotRoot, ".output/.eve/compile/compiled-agent-manifest.json"),
+        JSON.stringify({ config: { experimental: { workflow: { world: "@workflow/world-postgres" } } } }),
+        "utf8",
+      );
+    });
+    try {
+      await runEdenCli(["preflight", "--project", root, "--name", "eve-telemetry", "--json"], {
+        cwd: root,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        telemetry: true,
+        eveControlPlane: passingControlPlane(root, builder),
+      });
+    } finally {
+      await new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); });
+    }
+    expect(bodies.map((body) => JSON.parse(body) as Record<string, unknown>)).toMatchObject([
+      { command: "preflight", eveVersion: "0.91.0", world: "postgres" },
+    ]);
+  });
+
   test("rejects installed Eve 0.90.x before building and accepts the 0.91.0 floor", async () => {
     for (const version of ["0.90.9", "0.91.0"]) {
       const root = await createRoot();
