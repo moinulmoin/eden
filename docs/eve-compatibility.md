@@ -36,8 +36,10 @@ already runs it before it publishes.
 
 Eve `1.5.0` no longer sets `WORKFLOW_SPEC_VERSION=9`, so new runs use the
 spec version the World declares. The Postgres World `5.5.0` declares spec 10.
-The Cloudflare World declares spec 8 in every release, so its runs do not
-change.
+The Cloudflare World declares spec 8 in every release, so its runs stay on
+Workflow's earlier execution engine, nothing in Eve `1.5.0` needs more from
+it, and only `rateLimit` from `eve/experimental/workflow`, which needs a
+spec 10 run, cannot be used there.
 
 Eve `1.3.0` changes one thing for sessions started before Eve `1.0`. Its
 release notes say that on a World without deployment affinity, a message
