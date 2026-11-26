@@ -441,7 +441,7 @@ export async function runEdenCli(
   const stderr = options.stderr ?? defaultStderr;
   const startedAt = Date.now();
   let telemetryCommand: EveCliExecutionRequest["command"] | undefined;
-  let projectRoot: string | undefined;
+  let resolved: { readonly eveVersion?: string; readonly world?: string } = {};
   let failure: unknown;
   try {
     if (
@@ -493,7 +493,6 @@ export async function runEdenCli(
       if (json) flushJson();
       return 0;
     }
-    projectRoot = resolve(options.cwd ?? process.cwd(), parsed.projectRoot);
     // The CLI that Eden runs for deploys needs this Node.
     const node = options.nodeVersion ?? process.versions.node;
     const [major = 0, minor = 0] = node.split(".").map(Number);
@@ -511,6 +510,13 @@ export async function runEdenCli(
       ...options,
       stdout,
       stderr,
+      eveControlPlane: {
+        ...options.eveControlPlane,
+        onResolved: (value) => {
+          resolved = { ...resolved, ...value };
+          options.eveControlPlane?.onResolved?.(value);
+        },
+      },
     });
     if (json) flushJson();
     return 0;
@@ -535,7 +541,8 @@ export async function runEdenCli(
             ? failure.code
             : "EVE_EXECUTION_FAILED",
         durationMs: Date.now() - startedAt,
-        projectRoot,
+        eveVersion: resolved.eveVersion,
+        world: resolved.world,
       }, process.env, options.stderr ?? noticeStderr);
     }
   }

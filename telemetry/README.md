@@ -12,6 +12,12 @@ IP address, headers other than `content-type` and `content-length`, or the
 user agent. `cloudflare.config.ts` turns off `workers.dev`, Preview URLs,
 and Workers Logs.
 
+It accepts only the failure codes in
+`packages/cli/src/failure-codes.ts`, the list the CLI sends from, bundled
+into the Worker at build. After you add a code there, deploy the collector
+before you release a CLI that sends it; until then the collector refuses
+those events.
+
 ## Deploy
 
 With your `cf` login, on the account that owns `ideaplexa.com`:
@@ -49,8 +55,8 @@ The columns:
 | `blob5` | `duration` |
 | `blob6` | `os` |
 | `blob7` | `arch` |
-| `blob8` | `eveVersion`, empty when unknown |
-| `blob9` | `world`, empty when unknown |
+| `blob8` | `eveVersion` |
+| `blob9` | `world` |
 | `blob10` | `ci`, `true` or `false` |
 | `double1` | `exitCode` |
 | `double2` | `nodeMajor` |

@@ -464,13 +464,13 @@ The event has exactly these fields:
 | `command` | `preflight`, `deploy`, or `destroy` |
 | `edenVersion` | The Eden version, such as `0.15.2` |
 | `exitCode` | `0` or `1` |
-| `failureCode` | One of Eden's own failure codes, such as `EVE_PREFLIGHT_FAILED`, from a fixed list; `other` for any other code; `null` when the command succeeded |
+| `failureCode` | One of Eden's own failure codes, such as `EVE_PREFLIGHT_FAILED`, from a fixed list the collector shares; `other` for any other code; `null` when the command succeeded |
 | `duration` | One of `<10s`, `10s-1m`, `1m-5m`, `5m-15m`, `15m-1h`, `>1h` |
 | `os` | `darwin`, `linux`, `win32`, or `other` |
 | `arch` | `arm64`, `x64`, or `other` |
 | `nodeMajor` | The major version of Node, such as `24` |
-| `eveVersion` | The project's Eve version (installed, else from its lockfile), such as `1.3.0` or `1.0.0-rc.7`. A version that is not a plain release, or a prerelease labeled `alpha`, `beta`, `rc`, `canary`, `next`, or `preview` with small numbers, is sent as `other`, so no label from the project is sent. `null` when none is found |
-| `world` | `cloudflare`, `postgres`, `local`, or `other`, inferred from the World package names in the project's `package.json` dependencies, not from the World the project selects; `local` when none is listed; `null` when there is no readable `package.json` |
+| `eveVersion` | The Eve version the command itself resolved, as the project declares it: from the build for preflight and deploy, from the deployment record for destroy, such as `1.3.0` or `1.0.0-rc.7`. It is sent only when it is a plain release, or a prerelease labeled `alpha`, `beta`, `rc`, `canary`, `next`, or `preview`, with numbers of at most three digits. Any other version, and a command that stopped before resolving one, sends `other` |
+| `world` | `cloudflare`, `postgres`, `local`, or `other`: the World the preflight or deploy build selected. `other` for any other World, for destroy, and for a command that stopped before the build |
 | `ci` | `true` when one of `CI`, `CONTINUOUS_INTEGRATION`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `CIRCLECI`, `TRAVIS`, `JENKINS_URL`, `TEAMCITY_VERSION`, `TF_BUILD`, `BITBUCKET_BUILD_NUMBER`, or `CODEBUILD_BUILD_ID` is set to anything but an empty value, `0`, or `false`. No value is sent |
 
 Eden never sends project, target, or Worker names, Cloudflare account or
@@ -483,8 +483,8 @@ Where it goes: an HTTPS `POST` to
 `EDEN_TELEMETRY_URL` when you set it. The collector is the Worker in
 [`telemetry/`](../telemetry). It answers `4xx` to anything but a JSON
 `POST` of this exact shape, serialized exactly as the CLI does, up to 1 KB.
-It checks the same version pattern and enums as the CLI and an allowlist
-pattern for failure codes. It writes accepted events to the
+It checks the same version pattern, enums, and list of failure codes as the
+CLI. It writes accepted events to the
 `eden_telemetry` Workers Analytics Engine dataset on the maintainer's
 Cloudflare account, which keeps data for three months. It does not store or
 log the IP address, headers, or user agent, and its Workers Logs are off.
@@ -493,15 +493,16 @@ Cloudflare receives the request as it does any request to a Cloudflare site.
 What a user sees: a three-line notice on stderr the first time Eden sends,
 and nothing after that. Only the run that creates the install ID prints it.
 Eden never writes telemetry to stdout, and a closed stderr does not change
-the exit code. Everything telemetry does, reading the project's metadata,
-the install ID, DNS, the connection, TLS, and the request, ends within one
-second of the command's end; then Eden cancels the DNS query and closes the
-socket, so nothing keeps the process running. It reads only regular files
-and never waits on a FIFO or device. A send is tried once, is never queued
-on disk, and is dropped silently if it fails. It never changes the exit
-code.
+the exit code. Telemetry reads no project file: the Eve version and World
+are what the command already resolved, sent as the project declares them
+when they match the pattern above. DNS, the connection, TLS, and the request
+end within one second of the command's end; then Eden cancels the DNS query
+and closes the socket, so nothing network-related keeps the process running.
+A send is tried once, is never queued on disk, and is dropped silently if it
+fails. It never changes the exit code.
 
-The only file it writes is `telemetry.json` with the install ID. Eden creates
+The only file telemetry reads or writes is `telemetry.json` with the install
+ID, and it reads it only when it is a small regular file. Eden creates
 it without overwriting anything: it writes a new file next to it and links it
 into place, which fails if `telemetry.json` already exists. It never writes
 through a symbolic link. When `telemetry.json` or the `eden` folder is a

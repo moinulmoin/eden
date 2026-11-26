@@ -8,15 +8,15 @@ import { isIP } from "net";
 import { homedir } from "os";
 import { isAbsolute, join } from "path";
 
-import { readEveVersion } from "./eve-packaging.js";
+import { EDEN_FAILURE_CODES } from "./failure-codes.js";
 
 /** Where events go unless EDEN_TELEMETRY_URL names another endpoint. See README.md#telemetry. */
 export const TELEMETRY_URL = "https://telemetry.eden.ideaplexa.com/v1/events";
 
 /** Everything telemetry does, from reading the project to the response, ends by then. */
 const DEADLINE_MS = 1_000;
-/** Larger files are not read; a pnpm lockfile of a large project stays well under this. */
-const MAX_READ_BYTES = 8 * 1024 * 1024;
+/** Larger ID files are not read. */
+const MAX_READ_BYTES = 4096;
 
 const NOTICE = [
   "Eden sends anonymous usage data after each preflight, deploy, and destroy: the command, its outcome, a rough duration, and versions.",
@@ -40,42 +40,6 @@ const CI_VARIABLES = [
   "CODEBUILD_BUILD_ID",
 ];
 
-/**
- * Eden's own stable failure codes. Any other code is sent as "other". Add a
- * new code here when you add it to docs/troubleshooting.md.
- */
-export const TELEMETRY_FAILURE_CODES: ReadonlySet<string> = new Set([
-  "CLEANUP_UNVERIFIED", "COMMAND_UNKNOWN", "DEPENDENCY_AMBIGUITY", "DEPLOY_INDETERMINATE",
-  "DOCKER_PLATFORM_BLOCKED", "EVE_AFFINITY_CONTROL_ACTIVATION_TIMEOUT",
-  "EVE_AFFINITY_DRAIN_UNPROVEN", "EVE_AFFINITY_LIMIT", "EVE_AFFINITY_REQUIRED",
-  "EVE_AFFINITY_RETIRE_UNPROVEN", "EVE_AI_GATEWAY_KEY_MISSING", "EVE_ARGUMENT_UNKNOWN",
-  "EVE_BUILD_FAILED", "EVE_CF_LOGIN_TOKEN_UNAVAILABLE", "EVE_CF_UNAVAILABLE", "EVE_COMMAND_UNKNOWN",
-  "EVE_DEPLOYMENT_FAILED", "EVE_DEPLOY_BUSY", "EVE_DEPLOY_CHECKS_FAILED",
-  "EVE_DEPLOY_LOCK_RELEASE_UNPROVEN", "EVE_DEPLOY_PROMOTION_FAILED", "EVE_DESTROY_ABSENCE_UNPROVEN",
-  "EVE_DESTROY_FAILED", "EVE_DESTROY_IMAGES_RETAINED", "EVE_DESTROY_INDETERMINATE",
-  "EVE_DESTROY_OWNERSHIP_UNPROVEN", "EVE_DESTROY_POINTER_UNCLEARED", "EVE_DESTROY_RECORD_MISMATCH",
-  "EVE_DESTROY_RECORD_UNPROVEN", "EVE_ENV_FILE_DUPLICATE", "EVE_ENV_FILE_ENCODING",
-  "EVE_ENV_FILE_INVALID", "EVE_ENV_FILE_MALFORMED", "EVE_ENV_FILE_NOT_FOUND", "EVE_ENV_FILE_RACE",
-  "EVE_ENV_FILE_REPEATED", "EVE_ENV_FILE_UNREADABLE", "EVE_ENV_FILE_UNSUPPORTED", "EVE_ENV_INVALID",
-  "EVE_ENV_REPEATED", "EVE_ENV_RESERVED_VARIABLE", "EVE_EXECUTION_FAILED", "EVE_HEALTH_FAILED",
-  "EVE_HOST_BUNDLE_UNAVAILABLE", "EVE_HOST_CONFIG_INVALID", "EVE_IMAGE_IDENTITY_MISMATCH",
-  "EVE_IMAGE_IDENTITY_UNAVAILABLE", "EVE_JUST_BASH_MISSING", "EVE_NAME_CONTAINER_SHARED",
-  "EVE_NAME_DERIVATION_FAILED", "EVE_NAME_INVALID", "EVE_NAME_REPEATED", "EVE_NAME_REQUIRED",
-  "EVE_NODE_UNSUPPORTED", "EVE_NPM_INSTALL_SCRIPTS_SKIPPED", "EVE_OPTION_UNKNOWN",
-  "EVE_OPTION_VALUE_MISSING", "EVE_ORIGIN_UNAVAILABLE", "EVE_PREFLIGHT_FAILED",
-  "EVE_PROJECT_INVALID", "EVE_PROJECT_REPEATED", "EVE_PROJECT_ROOT_INVALID",
-  "EVE_REGISTRY_OBJECTS_KEPT", "EVE_RUNTIME_IMAGE_CLEANUP_FAILED", "EVE_RUNTIME_INJECTION_INVALID",
-  "EVE_RUNTIME_LOCAL_INJECTION_UNSUPPORTED", "EVE_RUNTIME_PROTECTED_STORE_UNAVAILABLE",
-  "EVE_RUNTIME_PROTECTED_UPLOAD_FAILED", "EVE_SANDBOX_PROVIDER", "EVE_SCHEDULE_UNSUPPORTED",
-  "EVE_SUPERSEDED_IMAGE_NOT_DELETED", "EVE_UNAUTHENTICATED_VERSIONS_RETIRED",
-  "EVE_UPDATE_IN_FLIGHT", "EVE_UPDATE_RECORD_UNAVAILABLE", "EVE_UPDATE_WORLD_SWITCH",
-  "EVE_VERCEL_CONNECT", "EVE_VERSION_UNSUPPORTED", "EVE_WORLD_LOCAL", "EVE_WORLD_PAIRING",
-  "EVE_WORLD_POSTGRES_POOLED", "ROOT_INVALID", "RUNTIME_CLOSURE_INCOMPLETE",
-  "SECRET_EXCLUSION_FAILED", "SINGLETON_ARTIFACT_EXISTS", "SOURCE_RACE", "UNSUPPORTED_EVE_OUTPUT",
-  "UNSUPPORTED_HOST_REQUIREMENT", "UNSUPPORTED_TOOLCHAIN", "VERSION_UNAVAILABLE",
-  "WORLD_MIGRATION_FAILED",
-]);
-
 /** A release version with small numbers and a known prerelease label; anything else is "other". */
 const VERSION_PATTERN = /^(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})(?:-(?:alpha|beta|rc|canary|next|preview)(?:\.(?:0|[1-9]\d{0,2}))?)?$/u;
 
@@ -88,8 +52,10 @@ export interface TelemetryRun {
   /** The code of the failure; undefined when the command succeeded. */
   readonly failureCode: string | undefined;
   readonly durationMs: number;
-  /** The selected project folder, read only for its Eve version and World package. */
-  readonly projectRoot: string | undefined;
+  /** The Eve version the command resolved, if it got that far. */
+  readonly eveVersion: string | undefined;
+  /** The World package the command resolved, such as @workflow/world-postgres, or "local". */
+  readonly world: string | undefined;
 }
 
 function isSet(value: string | undefined): boolean {
@@ -102,9 +68,15 @@ function telemetryOff(env: NodeJS.ProcessEnv): boolean {
   return eden === "0" || eden === "false" || eden === "off" || isSet(env.DO_NOT_TRACK);
 }
 
-function boundedVersion(version: string | undefined): string | null {
-  if (version === undefined) return null;
-  return VERSION_PATTERN.test(version) ? version : "other";
+function boundedVersion(version: string | undefined): string {
+  return version !== undefined && VERSION_PATTERN.test(version) ? version : "other";
+}
+
+function worldKind(world: string | undefined): "cloudflare" | "postgres" | "local" | "other" {
+  if (world === "@moinulmoin/eden-world-cloudflare") return "cloudflare";
+  if (world === "@workflow/world-postgres") return "postgres";
+  if (world === "local" || world === "@workflow/world-local") return "local";
+  return "other";
 }
 
 function durationBucket(ms: number): string {
@@ -118,8 +90,8 @@ function durationBucket(ms: number): string {
 }
 
 /**
- * Reads a regular file without following a symbolic link at its path and
- * without waiting on a FIFO or device; undefined for anything else.
+ * Reads the ID file only when it is a small regular file, without following
+ * a symbolic link at its path or waiting on a FIFO or device.
  */
 async function readRegularFile(path: string): Promise<string | undefined> {
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(() => undefined);
@@ -133,24 +105,6 @@ async function readRegularFile(path: string): Promise<string | undefined> {
   } finally {
     await handle.close().catch(() => undefined);
   }
-}
-
-async function worldKind(projectRoot: string): Promise<"cloudflare" | "postgres" | "local" | "other" | null> {
-  let manifest: unknown;
-  try {
-    manifest = JSON.parse(await readRegularFile(join(projectRoot, "package.json")) ?? "");
-  } catch {
-    return null;
-  }
-  if (manifest === null || typeof manifest !== "object") return null;
-  const names = ["dependencies", "devDependencies", "optionalDependencies"].flatMap((field) => {
-    const deps = (manifest as Record<string, unknown>)[field];
-    return deps !== null && typeof deps === "object" ? Object.keys(deps) : [];
-  });
-  if (names.includes("@moinulmoin/eden-world-cloudflare")) return "cloudflare";
-  if (names.includes("@workflow/world-postgres")) return "postgres";
-  if (names.some((name) => name.startsWith("@workflow/world-") && name !== "@workflow/world-local")) return "other";
-  return "local";
 }
 
 /** The saved ID, undefined when the file is missing, or null when it is there but not Eden's. */
@@ -255,34 +209,33 @@ async function deliver(
       try { notice(line); } catch { break; }
     }
   }
-  const eveVersion = run.projectRoot === undefined ? undefined : await readEveVersion(run.projectRoot, readRegularFile);
-  const world = run.projectRoot === undefined ? null : await worldKind(run.projectRoot);
   if (expired()) return;
   const body = JSON.stringify({
     schema: 1,
     installId: install.id,
     command: run.command,
-    edenVersion: boundedVersion(run.edenVersion()) ?? "other",
+    edenVersion: boundedVersion(run.edenVersion()),
     exitCode: run.failureCode === undefined ? 0 : 1,
     failureCode: run.failureCode === undefined
       ? null
-      : TELEMETRY_FAILURE_CODES.has(run.failureCode) ? run.failureCode : "other",
+      : EDEN_FAILURE_CODES.has(run.failureCode) ? run.failureCode : "other",
     duration: durationBucket(run.durationMs),
     os: ["darwin", "linux", "win32"].includes(process.platform) ? process.platform : "other",
     arch: ["arm64", "x64"].includes(process.arch) ? process.arch : "other",
     nodeMajor: Number(process.versions.node.split(".")[0]),
-    eveVersion: boundedVersion(eveVersion),
-    world,
+    eveVersion: boundedVersion(run.eveVersion),
+    world: worldKind(run.world),
     ci: CI_VARIABLES.some((name) => isSet(env[name])),
   });
   await post(new URL(env.EDEN_TELEMETRY_URL || TELEMETRY_URL), body, cleanups, expired);
 }
 
 /**
- * Sends one anonymous event for a finished command. Everything it does ends
- * within one second: at the deadline it stops waiting and closes every
- * socket and DNS query it opened, so nothing holds the process. It never
- * throws and prints nothing but the first-run notice.
+ * Sends one anonymous event for a finished command. It reads no project
+ * file: the Eve version and World come from the command. Its network work
+ * ends within one second: at the deadline it stops waiting and closes every
+ * socket and DNS query it opened. It never throws and prints nothing but
+ * the first-run notice.
  */
 export async function sendTelemetry(
   run: TelemetryRun,

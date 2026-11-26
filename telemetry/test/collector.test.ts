@@ -61,7 +61,10 @@ test.each([
   ["build metadata in a version", { ...event, edenVersion: "0.16.0+planted" }],
   ["a long version number", { ...event, eveVersion: "123456789.0.0" }],
   ["an invented uppercase failure code", { ...event, failureCode: "PLANTED_HOST_EXAMPLE_COM" }],
+  ["an invented failure code with Eden's prefix", { ...event, failureCode: "EVE_PLANTED_HOST_EXAMPLE_COM" }],
   ["an unknown World", { ...event, world: "acme" }],
+  ["a null World", { ...event, world: null }],
+  ["a null Eve version", { ...event, eveVersion: null }],
 ])("an event with %s gets 400 and is not written", async (_case, body) => {
   const { points, send } = collector();
   expect((await send(JSON.stringify(body))).status).toBe(400);
@@ -70,9 +73,17 @@ test.each([
 
 test("versions and failure codes outside Eden's own are accepted only as other", async () => {
   const { points, send } = collector();
-  const response = await send(JSON.stringify({ ...event, edenVersion: "other", failureCode: "other", eveVersion: "other" }));
+  const response = await send(JSON.stringify({ ...event, edenVersion: "other", failureCode: "other", eveVersion: "other", world: "other" }));
   expect(response.status).toBe(204);
   expect(points).toHaveLength(1);
+});
+
+test("each of Eden's own failure codes is accepted", async () => {
+  const { points, send } = collector();
+  for (const failureCode of ["EVE_DESTROY_RECORD_UNPROVEN", "DEPLOY_INDETERMINATE", "WORLD_MIGRATION_FAILED"]) {
+    expect((await send(JSON.stringify({ ...event, failureCode }))).status).toBe(204);
+  }
+  expect(points).toHaveLength(3);
 });
 
 test("a body that is not exactly the CLI's serialization gets 400 and is not written", async () => {

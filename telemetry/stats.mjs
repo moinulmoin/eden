@@ -20,7 +20,7 @@ const reports = [
   },
   {
     title: `Eve versions and Worlds, last ${days} days`,
-    sql: `SELECT if(blob8 = '', 'unknown', blob8) AS eve, if(blob9 = '', 'unknown', blob9) AS world, count(DISTINCT blob1) AS installs FROM eden_telemetry WHERE ${since} GROUP BY eve, world ORDER BY installs DESC`,
+    sql: `SELECT if(blob8 = '', 'other', blob8) AS eve, if(blob9 = '', 'other', blob9) AS world, count(DISTINCT blob1) AS installs FROM eden_telemetry WHERE ${since} GROUP BY eve, world ORDER BY installs DESC`,
   },
   {
     title: `Platforms, last ${days} days`,

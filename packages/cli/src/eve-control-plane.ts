@@ -603,6 +603,11 @@ export interface EvePreflightOptions {
   readonly deleteWorker?: EveWorkerDeleteRunner;
   readonly deleteContainer?: EveContainerDeleteRunner;
   readonly deleteRegistryRepository?: EveRegistryRepositoryDeleteRunner;
+  /**
+   * Called with the Eve version and World package the command resolved, for
+   * the anonymous usage event; telemetry reads no project file itself.
+   */
+  readonly onResolved?: (resolved: { readonly eveVersion?: string; readonly world?: string }) => void;
 }
 
 export interface EveDestroyTargetRead {
@@ -4608,6 +4613,7 @@ async function collectEvePreflight(
 
   const candidate = packaging.candidate;
   const workflowWorld = await readCompiledWorldSpecifier(candidate);
+  options.onResolved?.({ eveVersion: candidate.eveVersion, world: workflowWorld ?? "local" });
   if (workflowWorld === "@moinulmoin/eden-world-cloudflare") {
     checks.push(check("EVE-WORLD", "passed", "world: Cloudflare Durable Object"));
   }
@@ -6607,6 +6613,7 @@ async function runEveDestroyLocked(
       );
     }
     const record = found as Exclude<typeof found, "outside-project" | undefined>;
+    if (record.identity.eveVersion !== undefined) options.onResolved?.({ eveVersion: record.identity.eveVersion });
     const expectedWorker: string = record.identity.workerName;
     const expectedContainer: string = record.identity.containerApplicationName;
     if (

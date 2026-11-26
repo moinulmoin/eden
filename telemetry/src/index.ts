@@ -4,6 +4,8 @@
  * itself: no IP address, headers, or user agent. See README.md#telemetry.
  */
 
+import { EDEN_FAILURE_CODES } from "../../packages/cli/src/failure-codes.js";
+
 interface AnalyticsEngineDataset {
   writeDataPoint(point: { blobs?: string[]; doubles?: number[]; indexes?: string[] }): void;
 }
@@ -17,8 +19,6 @@ export const MAX_BODY_BYTES = 1024;
 
 /** The same bounded versions the CLI sends; it sends "other" for anything else. */
 const VERSION = /^(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})(?:-(?:alpha|beta|rc|canary|next|preview)(?:\.(?:0|[1-9]\d{0,2}))?)?$/u;
-/** The shape of Eden's own failure codes. */
-const FAILURE_CODE = /^(?:EVE|DEPLOY|COMMAND|VERSION|CLEANUP|DOCKER|RUNTIME|SECRET|UNSUPPORTED|WORLD|ROOT|SOURCE|DEPENDENCY|SINGLETON)_[A-Z0-9_]{2,60}$/u;
 
 const oneOf = (...values: readonly unknown[]) => (value: unknown) => values.includes(value);
 const version = (value: unknown) => value === "other" || (typeof value === "string" && VERSION.test(value));
@@ -31,13 +31,13 @@ const FIELDS: readonly (readonly [string, (value: unknown) => boolean])[] = [
   ["command", oneOf("preflight", "deploy", "destroy")],
   ["edenVersion", version],
   ["exitCode", oneOf(0, 1)],
-  ["failureCode", (value) => value === null || value === "other" || (typeof value === "string" && FAILURE_CODE.test(value))],
+  ["failureCode", (value) => value === null || value === "other" || (typeof value === "string" && EDEN_FAILURE_CODES.has(value))],
   ["duration", oneOf("<10s", "10s-1m", "1m-5m", "5m-15m", "15m-1h", ">1h")],
   ["os", oneOf("darwin", "linux", "win32", "other")],
   ["arch", oneOf("arm64", "x64", "other")],
   ["nodeMajor", (value) => Number.isInteger(value) && (value as number) >= 0 && (value as number) < 100],
-  ["eveVersion", (value) => value === null || version(value)],
-  ["world", oneOf(null, "cloudflare", "postgres", "local", "other")],
+  ["eveVersion", version],
+  ["world", oneOf("cloudflare", "postgres", "local", "other")],
   ["ci", oneOf(true, false)],
 ];
 
@@ -52,8 +52,8 @@ type Event = {
   os: string;
   arch: string;
   nodeMajor: number;
-  eveVersion: string | null;
-  world: string | null;
+  eveVersion: string;
+  world: string;
   ci: boolean;
 };
 
@@ -131,8 +131,8 @@ export default {
         event.duration,
         event.os,
         event.arch,
-        event.eveVersion ?? "",
-        event.world ?? "",
+        event.eveVersion,
+        event.world,
         String(event.ci),
       ],
       doubles: [event.exitCode, event.nodeMajor, event.schema],

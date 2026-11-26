@@ -115,8 +115,9 @@ test("the event holds exactly the documented fields and nothing that names the p
     failureCode: "EVE_DESTROY_RECORD_UNPROVEN",
     duration: "<10s",
     nodeMajor: Number(process.versions.node.split(".")[0]),
-    eveVersion: "1.3.0",
-    world: "cloudflare",
+    // Destroy stopped before it read a deployment record, so it resolved neither.
+    eveVersion: "other",
+    world: "other",
     ci: true,
   });
   for (const planted of ["planted-project-acme", "planted-target", ACCOUNT_ID, where.root, hostname()]) {
@@ -210,7 +211,7 @@ test.each([
   ["the installed Eve manifest", { "node_modules/eve/package.json": JSON.stringify({ version: "1.3.0-" + PLANTED_HOST }) }],
   ["the npm lockfile", { "package-lock.json": JSON.stringify({ packages: { "node_modules/eve": { version: "1.3.0+" + PLANTED_HOST } } }) }],
   ["the pnpm lockfile", { "pnpm-lock.yaml": "importers:\n  .:\n    dependencies:\n      eve:\n        specifier: 1.3.0\n        version: 1.3.0-" + PLANTED_HOST + "\n" }],
-])("a version label planted in %s is sent as other and never reaches the body or the dataset", async (_source, files) => {
+])("telemetry reads no project file: a version planted in %s never reaches the body or the dataset", async (_source, files) => {
   const where = await machine();
   await rm(join(where.project, "node_modules"), { recursive: true });
   for (const [path, text] of Object.entries(files)) {
