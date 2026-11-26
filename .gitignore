@@ -3,6 +3,7 @@ dist/
 coverage/
 .eden/
 .wrangler/
+.cloudflare/
 .dev/
 *.tsbuildinfo
 .DS_Store

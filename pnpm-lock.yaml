@@ -93,6 +93,15 @@ importers:
         specifier: 1.0.0-rc.2
         version: 1.0.0-rc.2(@types/node@24.0.0)
 
+  telemetry:
+    devDependencies:
+      cf:
+        specifier: 1.0.0-rc.2
+        version: 1.0.0-rc.2(@types/node@24.0.0)
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
+
 packages:
 
   '@astrojs/compiler-binding-android-arm64@0.5.1':

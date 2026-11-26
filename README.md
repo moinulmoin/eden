@@ -377,6 +377,60 @@ Things that differ from Vercel, and what Eden does about each:
 Run `eden <command> --help` for options and `eden --version` for the installed
 version.
 
+## Telemetry
+
+Eden sends one anonymous usage event when `eden preflight`, `eden deploy`,
+or `eden destroy` ends. It is on by default. It tells the maintainer which
+commands people run, which ones fail and with which code, and which Eden,
+Eve, and Node versions are still in use. `--help`, `--version`, and
+`eden skill` send nothing.
+
+Turn it off with either variable:
+
+```sh
+export EDEN_TELEMETRY=0   # false and off work too
+export DO_NOT_TRACK=1
+```
+
+When it is off, Eden sends nothing and creates no install ID.
+
+The first time Eden sends, it prints a three-line notice on stderr. It
+prints nothing else, and nothing on stdout, so `--json` output stays one
+JSON object. A send waits at most one second, is tried once, and is dropped
+if it fails. It never changes the exit code.
+
+The event has exactly these fields:
+
+| Field | What it holds |
+| --- | --- |
+| `schema` | `1`, the version of this event shape |
+| `installId` | A random UUID made the first time Eden sends, kept in `$XDG_CONFIG_HOME/eden/telemetry.json` (`~/.config/eden/telemetry.json` when `XDG_CONFIG_HOME` is not set). It is not derived from anything; delete the file to get a new one |
+| `command` | `preflight`, `deploy`, or `destroy` |
+| `edenVersion` | The Eden version, such as `0.15.2` |
+| `exitCode` | `0` or `1` |
+| `failureCode` | The stable failure code, such as `EVE_PREFLIGHT_FAILED`, or `null` when the command succeeded |
+| `duration` | One of `<10s`, `10s-1m`, `1m-5m`, `5m-15m`, `15m-1h`, `>1h` |
+| `os` | `darwin`, `linux`, `win32`, or `other` |
+| `arch` | `arm64`, `x64`, or `other` |
+| `nodeMajor` | The major version of Node, such as `24` |
+| `eveVersion` | The project's Eve version (installed, else from its lockfile), such as `1.3.0`, or `null` |
+| `world` | `cloudflare`, `postgres`, `local`, or `other`, from the World package the project's `package.json` lists; `null` when it has none to read |
+| `ci` | `true` when one of `CI`, `CONTINUOUS_INTEGRATION`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `CIRCLECI`, `TRAVIS`, `JENKINS_URL`, `TEAMCITY_VERSION`, `TF_BUILD`, `BITBUCKET_BUILD_NUMBER`, or `CODEBUILD_BUILD_ID` is set. Only whether it is set is read |
+
+Eden never sends project, target, or Worker names, Cloudflare account or
+user IDs, emails, URLs, file paths, hostnames, the values of environment
+variables, error messages, or anything from the env file or secrets. It does
+not hash any of these and send the hash instead: they are not sent at all.
+
+The event goes in an HTTPS `POST` to
+`https://telemetry.eden.ideaplexa.com/v1/events`, a Cloudflare Worker whose
+code is in [`telemetry/`](./telemetry). It accepts only this exact shape, up
+to 1 KB, and writes it to a Workers Analytics Engine dataset on the
+maintainer's Cloudflare account, which keeps it for three months. The Worker
+does not store or log the IP address, headers, or user agent, and its Workers
+Logs are off. `EDEN_TELEMETRY_URL` sends the event to another endpoint
+instead, for tests or your own collector.
+
 ## Develop from source
 
 The repository is a pnpm workspace with TypeScript project references. It works
@@ -398,7 +452,8 @@ node packages/cli/dist/index.js --help
 ```
 
 The landing page at eden.ideaplexa.com lives in `site/` (Astro). Run it with
-`pnpm --filter @moinulmoin/eden-site dev`.
+`pnpm --filter @moinulmoin/eden-site dev`. The telemetry collector lives in
+`telemetry/`; see [its README](./telemetry/README.md).
 
 ## Documentation
 
@@ -409,8 +464,8 @@ The landing page at eden.ideaplexa.com lives in `site/` (Astro). Run it with
   durability, and current limits
 - [How Eden works](./docs/how-it-works.md): the Worker, Durable Object, and
   Container, deploy steps, sleep and wake, updates, and where data lives
-- [Security](./docs/security.md): secrets, what is public, the sandbox, and
-  what Eden can change in your account
+- [Security](./docs/security.md): secrets, what is public, the sandbox,
+  what Eden can change in your account, and telemetry
 - [FAQ](./docs/faq.md): cost, project changes, timings, and comparisons
 - [Reference](./docs/reference.md): commands, flags, env-file rules, and what
   Eden creates

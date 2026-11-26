@@ -379,6 +379,12 @@ function unsupportedEveVersion(version: string): {
 export async function checkEveVersion(projectRoot: string): Promise<{
   code: "EVE_VERSION_UNSUPPORTED"; message: string; remediation: string;
 } | undefined> {
+  const version = await readEveVersion(projectRoot);
+  return version === undefined ? undefined : unsupportedEveVersion(version);
+}
+
+/** The project's Eve version: installed, else locked by npm, else locked by pnpm. */
+export async function readEveVersion(projectRoot: string): Promise<string | undefined> {
   const object = (value: unknown): Record<string, unknown> =>
     value !== null && typeof value === "object" && !Array.isArray(value)
       ? value as Record<string, unknown> : {};
@@ -393,7 +399,7 @@ export async function checkEveVersion(projectRoot: string): Promise<{
   const locked = object(object(lock.packages)["node_modules/eve"]).version;
   const version = typeof installed.version === "string" ? installed.version
     : typeof locked === "string" ? locked : pnpmVersion;
-  return typeof version === "string" ? unsupportedEveVersion(version) : undefined;
+  return typeof version === "string" ? version : undefined;
 }
 
 /**

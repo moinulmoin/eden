@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Anonymous usage telemetry, on by default. When `eden preflight`,
+  `eden deploy`, or `eden destroy` ends, Eden sends one event: the command,
+  its exit code and failure code, a duration bucket, the OS, CPU
+  architecture, Node major version, Eden version, the project's Eve version
+  and World kind, whether it runs in CI, and a random install ID. It never
+  sends names, account IDs, paths, URLs, error messages, or secrets. The
+  first send prints a notice on stderr. `EDEN_TELEMETRY=0` or
+  `DO_NOT_TRACK=1` turns it off; then nothing is sent and no install ID is
+  created. A send waits at most one second and never changes the exit code
+  or the output. The README's Telemetry section lists every field.
+
 ## 0.15.2 — 2026-11-23
 
 Three fixes to the runtime on Cloudflare during an update, and Eve `1.3.0`

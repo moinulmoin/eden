@@ -1,0 +1,15 @@
+{
+  "name": "@moinulmoin/eden-telemetry",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The Worker that receives Eden's anonymous usage events.",
+  "scripts": {
+    "deploy": "node build.mjs && cf deploy --prebuilt",
+    "stats": "node stats.mjs"
+  },
+  "devDependencies": {
+    "cf": "1.0.0-rc.2",
+    "esbuild": "0.28.2"
+  }
+}

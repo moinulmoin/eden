@@ -30,6 +30,7 @@ export default defineConfig({
           include: [
             "test/**/*.test.mjs",
             "packages/**/test/**/*.test.ts",
+            "telemetry/test/**/*.test.ts",
           ],
           exclude: [
             "**/node_modules/**",

@@ -307,8 +307,15 @@ function parseCommand(
 }
 
 
+const TELEMETRY_HELP = `
+Environment:
+  EDEN_TELEMETRY=0     Send no anonymous usage event (also false or off)
+  DO_NOT_TRACK=1       Same as EDEN_TELEMETRY=0
+  EDEN_TELEMETRY_URL   Send the event to this endpoint instead
+`;
+
 export function eveHelpText(scope: EveCliHelp["scope"]): string {
-  return EVE_COMMAND_USAGE[scope].trimEnd();
+  return `${EVE_COMMAND_USAGE[scope].trimEnd()}\n${TELEMETRY_HELP.trimEnd()}`;
 }
 
 export function parseEveArguments(

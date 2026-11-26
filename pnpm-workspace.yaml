@@ -1,6 +1,7 @@
 packages:
   - "packages/*"
   - "site"
+  - "telemetry"
 linkWorkspacePackages: true
 allowBuilds:
   '@swc/core': false

@@ -30,6 +30,7 @@ import {
   type ParsedEveInvocation,
 } from "./eve.js";
 import { pinnedCliProblem } from "./eve-cloudflare-cli.js";
+import { sendTelemetry } from "./telemetry.js";
 import {
   EveRuntimeConfigError,
   readEveRuntimeConfig,
@@ -185,6 +186,8 @@ export interface EdenCliRunOptions {
   readonly nodeVersion?: string;
   /** The installed cf version to check instead of the real one; null for none installed. */
   readonly cfVersion?: string | null;
+  /** Send one anonymous usage event when the command ends, as the eden binary does. See README.md#telemetry. */
+  readonly telemetry?: boolean;
 }
 
 
@@ -202,6 +205,10 @@ environment, and a target name derived from package.json. destroy and
 --env production always require an explicit --name.
 Run eden <preflight|deploy|destroy> --help for command-specific options.
 Run eden --version to print the installed version.
+
+Telemetry: preflight, deploy, and destroy each send one anonymous usage
+event when they end. EDEN_TELEMETRY=0 or DO_NOT_TRACK=1 turns it off. The
+Telemetry section of the README lists every field.
 `;
 
 /** Reads the version from this package's manifest, which npm always ships next to dist/. */
@@ -426,6 +433,10 @@ export async function runEdenCli(
       typeof value === "string" ? redactEveRuntimeOutput(value) : value));
   };
   const stderr = options.stderr ?? defaultStderr;
+  const startedAt = Date.now();
+  let telemetryCommand: EveCliExecutionRequest["command"] | undefined;
+  let projectRoot: string | undefined;
+  let failure: unknown;
   try {
     if (
       args.length === 0 ||
@@ -464,16 +475,19 @@ export async function runEdenCli(
         message: `Unknown Eden command "${args[0] ?? ""}".`,
       });
     }
+    telemetryCommand = args[0] as EveCliExecutionRequest["command"];
     const parsed: ParsedEveInvocation = parseEveArguments(args);
     if (
       typeof parsed === "object" &&
       "kind" in parsed &&
       parsed.kind === "help"
     ) {
+      telemetryCommand = undefined;
       stdout(eveHelpText(parsed.scope));
       if (json) flushJson();
       return 0;
     }
+    projectRoot = resolve(options.cwd ?? process.cwd(), parsed.projectRoot);
     // The CLI that Eden runs for deploys needs this Node.
     const node = options.nodeVersion ?? process.versions.node;
     const [major = 0, minor = 0] = node.split(".").map(Number);
@@ -495,6 +509,7 @@ export async function runEdenCli(
     if (json) flushJson();
     return 0;
   } catch (error: unknown) {
+    failure = error;
     if (json) {
       flushJson(error);
       return 1;
@@ -503,13 +518,27 @@ export async function runEdenCli(
       stderr(redactEveRuntimeOutput(line));
     }
     return 1;
+  } finally {
+    if (options.telemetry === true && telemetryCommand !== undefined) {
+      await sendTelemetry({
+        command: telemetryCommand,
+        edenVersion,
+        failureCode: failure === undefined
+          ? undefined
+          : failure instanceof EveCliError || failure instanceof EveRuntimeConfigError
+            ? failure.code
+            : "EVE_EXECUTION_FAILED",
+        durationMs: Date.now() - startedAt,
+        projectRoot,
+      }, process.env, stderr);
+    }
   }
 }
 
 export async function main(
   args: readonly string[] = process.argv.slice(2),
 ): Promise<number> {
-  return runEdenCli(args);
+  return runEdenCli(args, { telemetry: true });
 }
 
 if (

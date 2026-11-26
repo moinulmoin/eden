@@ -51,6 +51,11 @@ Docs: https://github.com/moinulmoin/eden (failure and warning codes:
   CLI signed in: `npx cf@1.0.0-rc.2 auth login` (the user must do this in a
   browser), or `CLOUDFLARE_API_TOKEN` set. `cf` does not read a Wrangler
   login, which Eden 0.14 and earlier used.
+- Eden sends one anonymous usage event when preflight, deploy, or destroy
+  ends, and prints a three-line notice about it on stderr the first time.
+  The notice is not an error, and `--json` stdout is unchanged. If the user
+  wants it off, set `EDEN_TELEMETRY=0` or `DO_NOT_TRACK=1`. The README's
+  Telemetry section lists every field.
 
 ## Project setup Cloudflare needs
 

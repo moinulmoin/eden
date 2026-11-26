@@ -152,7 +152,11 @@ for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 
 // pnpm run exports npm_* settings that point npm at this repository; children
 // must see the environment a user's shell would give them.
-const baseEnvironment = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(?:npm_|pnpm_|INIT_CWD$)/iu.test(name)));
+// The live check's own runs stay out of Eden's usage numbers.
+const baseEnvironment = {
+  ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(?:npm_|pnpm_|INIT_CWD$)/iu.test(name))),
+  EDEN_TELEMETRY: "0",
+};
 
 function run(file, args, { cwd = repoRoot, env = baseEnvironment, timeoutMs = 600_000, interruptible = true } = {}) {
   return new Promise((resolvePromise, reject) => {

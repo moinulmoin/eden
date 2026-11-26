@@ -1,8 +1,8 @@
 # Security
 
 This page covers what Eden does with your secrets, what is public once you
-deploy, what Eden can touch in your Cloudflare account, and where the sandbox
-stops protecting you. For the overall design see
+deploy, what Eden can touch in your Cloudflare account, where the sandbox
+stops protecting you, and the anonymous usage event Eden sends. For the overall design see
 [How Eden works](./how-it-works.md).
 
 ## Secrets and the env file
@@ -446,6 +446,53 @@ login cannot act on the checked account, the command fails.
   image storage per account in Cloudflare's Containers limits.
 - **Production is explicit.** `--env production` and `destroy` always require
   `--name`.
+
+## Telemetry
+
+Eden sends one anonymous usage event when `eden preflight`, `eden deploy`,
+or `eden destroy` ends. It is on by default. `EDEN_TELEMETRY=0` (or
+`false`, or `off`) or `DO_NOT_TRACK=1` turns it off; then Eden sends
+nothing and creates no install ID. `DO_NOT_TRACK=1` also reaches `cf`,
+which has telemetry of its own.
+
+The event has exactly these fields:
+
+| Field | What it holds |
+| --- | --- |
+| `schema` | `1`, the version of this event shape |
+| `installId` | A random UUID made the first time Eden sends, kept in `$XDG_CONFIG_HOME/eden/telemetry.json` (`~/.config/eden/telemetry.json` when `XDG_CONFIG_HOME` is not set). It is not derived from anything; delete the file to get a new one |
+| `command` | `preflight`, `deploy`, or `destroy` |
+| `edenVersion` | The Eden version, such as `0.15.2` |
+| `exitCode` | `0` or `1` |
+| `failureCode` | The stable failure code, such as `EVE_PREFLIGHT_FAILED`, or `null` when the command succeeded |
+| `duration` | One of `<10s`, `10s-1m`, `1m-5m`, `5m-15m`, `15m-1h`, `>1h` |
+| `os` | `darwin`, `linux`, `win32`, or `other` |
+| `arch` | `arm64`, `x64`, or `other` |
+| `nodeMajor` | The major version of Node, such as `24` |
+| `eveVersion` | The project's Eve version (installed, else from its lockfile), such as `1.3.0`, or `null` |
+| `world` | `cloudflare`, `postgres`, `local`, or `other`, from the World package the project's `package.json` lists; `null` when it has none to read |
+| `ci` | `true` when one of `CI`, `CONTINUOUS_INTEGRATION`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `CIRCLECI`, `TRAVIS`, `JENKINS_URL`, `TEAMCITY_VERSION`, `TF_BUILD`, `BITBUCKET_BUILD_NUMBER`, or `CODEBUILD_BUILD_ID` is set. Only whether it is set is read |
+
+Eden never sends project, target, or Worker names, Cloudflare account or
+user IDs, emails, URLs, file paths, hostnames, the values of environment
+variables, error messages, or anything from the env file or secrets. It does
+not hash any of these and send the hash instead: they are not sent at all.
+
+Where it goes: an HTTPS `POST` to
+`https://telemetry.eden.ideaplexa.com/v1/events`, or to
+`EDEN_TELEMETRY_URL` when you set it. The collector is the Worker in
+[`telemetry/`](../telemetry). It answers `4xx` to anything but a JSON
+`POST` of this exact shape up to 1 KB, and writes accepted events to the
+`eden_telemetry` Workers Analytics Engine dataset on the maintainer's
+Cloudflare account, which keeps data for three months. It does not store or
+log the IP address, headers, or user agent, and its Workers Logs are off.
+Cloudflare receives the request as it does any request to a Cloudflare site.
+
+What a user sees: a three-line notice on stderr the first time Eden sends,
+and nothing after that. Eden never writes telemetry to stdout. A send waits
+at most one second, is tried once, is never queued on disk, and is dropped
+silently if it fails. It never changes the exit code. The only file it writes
+is `telemetry.json` with the install ID.
 
 ## What Eden changes in Eve
 
