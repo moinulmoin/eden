@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@workflow/world-postgres':
-        specifier: 5.4.1
-        version: 5.4.1(@types/pg@8.23.1)(sql.js@1.15.2)(supports-color@7.2.0)(typescript@5.9.3)
+        specifier: 5.4.2
+        version: 5.4.2(@types/pg@8.23.1)(sql.js@1.15.2)(supports-color@7.2.0)(typescript@5.9.3)
       ai:
         specifier: 7.0.173
         version: 7.0.173(zod@4.5.4)
@@ -263,8 +263,8 @@ packages:
     resolution: {integrity: sha512-UycprH3T6n3jH0k44NHMa7pnFHGu/N05MjojYr+Mc6I7obkoLIJujSWwin1pCvdy/eOxrI/l3uDLQsmcrOb4ug==}
     engines: {node: '>= 20'}
 
-  '@workflow/errors@5.1.5':
-    resolution: {integrity: sha512-3fD7I6ybv+MYM/bZJVdksbNNYTZejQ7WhhUO4W9u54uT798rIh825yMXwes2gmlhyKtOmRqZY84GlIfZKcTxwQ==}
+  '@workflow/errors@5.1.6':
+    resolution: {integrity: sha512-91FiPnU8zjPCyqqj8MTKkEVIVG0SZlxErSaU/dxO+P8O6JIPmjd+fdf/9RGDMyila4oF3dPo711aaqWACuUAvw==}
 
   '@workflow/serde@4.1.0':
     resolution: {integrity: sha512-pav4F2BoirECWR7Nf1TKt+2eETcBj7jj4cBefQ8VXQCA6NPkaKeLfj/zMgi+3zYV5ZIBT4GuUiphsj0/b9hPQQ==}
@@ -272,8 +272,8 @@ packages:
   '@workflow/utils@5.1.1':
     resolution: {integrity: sha512-Ew38LKcOoO3Lg1uxB6bCykJICNgRoUbscks8YqNbDRa8IX+wJe+ZqA9a2RGaXgDCXYId+v0wMVAj8iKGtv3XNA==}
 
-  '@workflow/world-local@5.5.1':
-    resolution: {integrity: sha512-NOFydu2BPuwoBF/D6UgYpnc9B3vTRw+/2BM8fTamHS6Iq26tQIojvr7bFhIsPF447V8ItM4Fu1bL6sN1MuKqAA==}
+  '@workflow/world-local@5.5.2':
+    resolution: {integrity: sha512-0ETUGJukVmWkIydCra1wjIS2cmCUSi/vFyKvbimUJJv5OREBHSNVOmelrsZ+JhIn2FHLNNH3QQMsaa9Ws6q16w==}
     engines: {node: '>=22.13.0'}
     peerDependencies:
       '@opentelemetry/api': '1'
@@ -281,12 +281,12 @@ packages:
       '@opentelemetry/api':
         optional: true
 
-  '@workflow/world-postgres@5.4.1':
-    resolution: {integrity: sha512-Y8Dt6s6Wfyb9nAGZttMYJ1hPCQDxDwJjYxNbpAHvYC/ovGs6GXuK7Gac5sy0d/35G1gHdbZICBfpUj95Jcm2ow==}
+  '@workflow/world-postgres@5.4.2':
+    resolution: {integrity: sha512-8grQrNwQe0TyotHe01mvGs0L3+PjC3cOrFlDCnIGi5LasPlXStk65FFwIFfhZcOo4+B6j1ox7NqQODipZHn/lQ==}
     hasBin: true
 
-  '@workflow/world@5.3.0':
-    resolution: {integrity: sha512-bSgxxSMYwYzON+NTqgVx374qBuHRYltANjNI6TeqPO9ysX3Ne8i9+7tAtQZiOCm7UtS/vCg886syC0oP/G8IHg==}
+  '@workflow/world@5.3.1':
+    resolution: {integrity: sha512-Vmay6zgRNIgwjAgJQla9RNcCNshFNujhO5bx8JbOzctWQ4owIPPpjzRFrJuht5hZSmyTBbrxiIoH8taUxsxAfQ==}
 
   ai@7.0.173:
     resolution: {integrity: sha512-dLea37zT1h7cjkUsBprU4Rq35HJqhtHHaq1jTAXjHQoyfpeswpgCrhjZJWdWc10gjEAxmz114py7iLGQ3xIMxw==}
@@ -1077,10 +1077,10 @@ snapshots:
 
   '@vercel/oidc@3.2.0': {}
 
-  '@workflow/errors@5.1.5':
+  '@workflow/errors@5.1.6':
     dependencies:
       '@workflow/utils': 5.1.1
-      '@workflow/world': 5.3.0
+      '@workflow/world': 5.3.1
       ms: 2.1.3
 
   '@workflow/serde@4.1.0': {}
@@ -1089,22 +1089,22 @@ snapshots:
     dependencies:
       ms: 2.1.3
 
-  '@workflow/world-local@5.5.1':
+  '@workflow/world-local@5.5.2':
     dependencies:
-      '@workflow/errors': 5.1.5
+      '@workflow/errors': 5.1.6
       '@workflow/utils': 5.1.1
-      '@workflow/world': 5.3.0
+      '@workflow/world': 5.3.1
       async-sema: 3.1.1
       ulid: 3.0.2
       undici: 7.30.2
       zod: 4.6.7
 
-  '@workflow/world-postgres@5.4.1(@types/pg@8.23.1)(sql.js@1.15.2)(supports-color@7.2.0)(typescript@5.9.3)':
+  '@workflow/world-postgres@5.4.2(@types/pg@8.23.1)(sql.js@1.15.2)(supports-color@7.2.0)(typescript@5.9.3)':
     dependencies:
-      '@workflow/errors': 5.1.5
+      '@workflow/errors': 5.1.6
       '@workflow/utils': 5.1.1
-      '@workflow/world': 5.3.0
-      '@workflow/world-local': 5.5.1
+      '@workflow/world': 5.3.1
+      '@workflow/world-local': 5.5.2
       cbor-x: 1.6.9
       dotenv: 17.4.2
       drizzle-orm: 0.45.4(@types/pg@8.23.1)(pg@8.23.1)(sql.js@1.15.2)
@@ -1146,8 +1146,9 @@ snapshots:
       - supports-color
       - typescript
 
-  '@workflow/world@5.3.0':
+  '@workflow/world@5.3.1':
     dependencies:
+      '@workflow/utils': 5.1.1
       ulid: 3.0.2
       zod: 4.6.7
 
