@@ -218,7 +218,7 @@ async function post(url: URL, body: string, cleanups: (() => void)[], expired: (
     // A cancellable resolver: getaddrinfo, which Node uses by default, cannot be stopped.
     const resolver = new Resolver({ timeout: DEADLINE_MS, tries: 1 });
     cleanups.push(() => resolver.cancel());
-    const addresses = await resolver.resolve4(hostname).catch(() => resolver.resolve6(hostname));
+    const addresses = await resolver.resolve4(hostname).catch(() => expired() ? [] : resolver.resolve6(hostname));
     if (addresses[0] === undefined) return;
     address = addresses[0];
   }
