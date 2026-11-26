@@ -22,16 +22,24 @@ for what happens to running sessions.
 | Eve | Postgres World | Cloudflare World | Tested |
 | --- | --- | --- | --- |
 | `0.91.0`, the oldest supported | `@workflow/world-postgres` `5.0.5` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
-| `1.3.0`, the latest tested | `@workflow/world-postgres` `5.4.1` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
+| `1.5.0`, the latest tested | `@workflow/world-postgres` `5.5.0` | `@moinulmoin/eden-world-cloudflare` `0.11.2` or later | CI and Publish: the pinned Postgres World and the workspace Cloudflare World |
 
-Versions between the two, such as `1.1.0` and `1.2.0`, are still accepted by
+Versions between the two, such as `1.3.0` and `1.4.0`, are still accepted by
 `eden preflight` and `eden deploy`, but the gate no longer tests them. A
-project on `1.2.0` needs no change to keep deploying. Eve `1.3.0` needs no
-change in Eden, in the project, or in either World. It bundles the same
-Workflow packages as `1.2.0`, including `@workflow/world` `5.3.0`, the
-version `@workflow/world-postgres` `5.4.1` pins. Eve's `1.2.0` release notes
-ask Postgres World projects to run the World's `bootstrap` before deploying;
-`eden deploy` already runs it before it publishes.
+project on `1.3.0` needs no change to keep deploying. Eve `1.5.0` needs no
+change in Eden or in the Cloudflare World. It bundles Workflow `5.8.0`,
+including `@workflow/world` `5.4.0`, the version `@workflow/world-postgres`
+`5.5.0` pins. With the Postgres World, move to `5.5.0` together with Eve
+`1.5.0`. Its migration adds a rate limit table, and Eve's release notes ask
+projects to run the World's `bootstrap` before deploying; `eden deploy`
+already runs it before it publishes.
+
+Eve `1.5.0` no longer sets `WORKFLOW_SPEC_VERSION=9`, so new runs use the
+spec version the World declares. The Postgres World `5.5.0` declares spec 10.
+The Cloudflare World declares spec 8 in every release, so its runs stay on
+Workflow's earlier execution engine, nothing in Eve `1.5.0` needs more from
+it, and only `rateLimit` from `eve/experimental/workflow`, which needs a
+spec 10 run, cannot be used there.
 
 Eve `1.3.0` changes one thing for sessions started before Eve `1.0`. Its
 release notes say that on a World without deployment affinity, a message
@@ -40,16 +48,19 @@ a fresh one, where the session used to stay stuck. Eve skips this check on a
 World that declares `deploymentAffinity`. The Cloudflare World declares it,
 so sessions there still move to the new version. The Postgres World
 declares it only when given a deployment ID, which Eden does not set, so the
-change applies there. A message sent to a session's ID over HTTP is not
-affected: on the Postgres World, a session started on `0.91.0` answered
-HTTP 409 `session_stranded` after an upgrade to `1.2.0` and to `1.3.0`
-alike.
+change applies there. Eve `1.4.0` adds to it, again only on a World without
+deployment affinity: after an upgrade, Eve parks a turn the earlier version
+started instead of replaying it, and cancels a connection event subscription
+the earlier version started, so the agent must watch those events again. A
+message sent to a session's ID over HTTP is not affected: on the Postgres
+World, a session started on `0.91.0` answered HTTP 409 `session_stranded`
+after an upgrade to `1.2.0`, `1.3.0` and `1.5.0` alike.
 
 From `1.0.0-rc.6`, Eve refuses to start a session unless the World creates the
 session's run and its start hook together. Older Worlds fail every new session
 with HTTP 500, so preflight stops them with `EVE_WORLD_PAIRING`.
 
-New Eve `1.3.0` projects pin `engines.node` to `26.x`. Eden builds and runs
+New Eve `1.5.0` projects pin `engines.node` to `26.x`. Eden builds and runs
 every project on Node.js `24.17.0`, which Eve still supports, so the pin needs
 no change.
 

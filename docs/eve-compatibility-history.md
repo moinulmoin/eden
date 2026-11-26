@@ -4,6 +4,80 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Eve 1.5.0 and Postgres World 5.5.0 checks (2026-11-26)
+
+Run on macOS with Docker `29.8.2`, Postgres `16.16` in Docker, and Node
+`24.22.3`, on main at `184ba9d` with the fixture change (commit
+`ba4d81f`). That commit changes no Eden code.
+
+What the new versions change for Eden, from the published `eve` `1.3.0`,
+`1.4.0`, `1.5.0` and `@workflow/world-postgres` `5.4.1`, `5.4.2`,
+`5.5.0` packages, unpacked and compared:
+
+- Eve `1.5.0` bundles `@workflow/core` `5.8.0`, `@workflow/world` `5.4.0`
+  and `@workflow/world-local` `5.6.0`; `1.4.0` still bundles `5.7.0`,
+  `5.3.0` and `5.5.0`. `@workflow/world-postgres` `5.5.0` pins
+  `@workflow/world` `5.4.0`. Eve's runtime dependencies (nitro, rolldown,
+  undici) and its World validation are unchanged.
+- `@workflow/core` `5.8.0` makes no World call that `5.7.0` did not. It
+  creates runs at the World's declared spec version and asks for rate limit
+  support only for spec 10. Eve `1.5.0` no longer sets
+  `WORKFLOW_SPEC_VERSION=9`. The Cloudflare World declares spec 8.
+- Eve `1.4.0` parks a turn and cancels a connection event subscription that
+  an earlier Eve started, on a World without deployment affinity. The guard
+  returns at once when the World declares `deploymentAffinity`, as the
+  Cloudflare World does.
+- The Worker reserves `/__eden/` and refuses only
+  `/.well-known/workflow/v1/flow` and `/step` from the internet. Nothing
+  under `/eve/v1/`, which Eve `1.5.0` reserves, is routed or blocked by
+  Eden.
+- `5.4.2` changes the executor and queue modules only. `5.5.0` adds
+  migration `0033_add_rate_limits` (table `workflow.workflow_rate_limits`)
+  and declares spec 10. `bootstrap` is unchanged in both.
+- `npx eve@1.5.0 init` writes the same project as `1.3.0` apart from the
+  Eve version, with `engines.node` `26.x`.
+
+Checks:
+
+- Frozen install, build, typecheck, lint and test: 14 files, 635 passed, 7
+  skipped.
+- `pnpm run compat:eve:local` passed both legs on `floor` (`0.91.0` with
+  `5.0.5`) and `latest` (`1.5.0` with `5.5.0`), with
+  `EVE_WORLD_PAIRING` passed in both. No model key was set, so the model
+  and tool eval was skipped.
+- On one empty database, `bootstrap` from `5.4.1` then `5.5.0` twice, then
+  `5.4.1` again, all exited 0. After `5.4.1` the database had 33 World
+  migrations; after `5.5.0` it had 34 and the rate limit table. Graphile
+  Worker stayed at 18 migrations.
+- On a local Postgres World, a project started on Eve `0.91.0` with
+  `5.0.5`, and a session ran bash and wrote a file. The project was upgraded
+  in place to Eve `1.5.0` with `5.5.0` and its `bootstrap`. Two messages to
+  the old session's ID got HTTP 409
+  `{"code":"session_stranded","error":"This session is no longer available.","ok":false,"eveVersion":"0.91.0"}`.
+  Eve logged `Skipping replay of stranded session run …`, and a new session
+  ran bash. The old session's runs are at spec 8, the new one's at spec 10.
+
+Two runs of `pnpm run check:live` against the maintainer's Cloudflare
+account at `ba4d81f`, with `cf` `1.0.0-rc.2` and an OAuth login;
+`CLOUDFLARE_API_TOKEN` was not set. Both failed at the same step, before the
+upgrade to Eve `1.5.0`:
+
+- Targets `eden-live-20261126-7f5b7a8c` (`10:50:36Z` to `11:03:15Z`) and
+  `eden-live-20261126-d6822f30` (`11:04:18Z` to `11:17:31Z`), Eve
+  `0.91.0`, the World packed from this workspace (`0.15.2`).
+- Preflight, the interrupted fresh deploy, the `401` and `404` checks, and a
+  session that ran bash passed in both.
+- The same-version update on Eve `0.91.0` was promoted but reported
+  `EVE_SUPERSEDED_IMAGE_NOT_DELETED` and no `VAL-LIFE-007`, so the check
+  failed it. The last run that passed this step was on 2026-11-22.
+- `eden destroy` then ended each target. The URL returned 404, and the
+  check found no Worker, no secrets and no Container application. Each kept 8
+  registry objects (6 `refused-snapshot`, 2 `refused-singleton-artifact`),
+  and the registry listed nothing else.
+
+Not run: the live upgrade to Eve `1.5.0` on Cloudflare, and a project on the
+Postgres World deployed to Cloudflare.
+
 ## Live check for release 0.15.2 (2026-11-22)
 
 Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's

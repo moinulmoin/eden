@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Eve `1.5.0` with `@workflow/world-postgres` `5.5.0` is now the latest
+  tested pair. Neither needs a change in Eden or in the Cloudflare World.
+  With the Postgres World, move to `5.5.0` together with Eve `1.5.0`: it adds
+  a migration, and `eden deploy` runs the World's `bootstrap` before it
+  publishes. The gate passed both legs on both fixtures.
+
 ## 0.15.2 — 2026-11-23
 
 Three fixes to the runtime on Cloudflare during an update, and Eve `1.3.0`
