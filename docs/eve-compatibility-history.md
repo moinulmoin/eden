@@ -27,6 +27,21 @@ Run on macOS with Docker `29.8.2` and Node `24.22.3`, with `cf`
   destroy. Destroy reported 18 kept objects (14 `refused-snapshot`, 4
   `refused-singleton-artifact`, none `accepted-still-listed`), and the
   registry listed nothing else for the target.
+- After review, a cf that ran out of time counts only once it has stopped,
+  and only with `404` `MANIFEST_UNKNOWN` for a `GET` of the tag's and the
+  digest's manifest. A `HEAD` of an unknown tag or digest got `404` with no
+  body, and a `GET` got
+  `{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown","detail":{"Tag":"<entry>"}}]}`.
+  A `GET` of a listed manifest got `200`, with the manifest media types or
+  `application/json` in `Accept`.
+- The full `pnpm run check:live` passed all 18 steps again at `7c44519`, on
+  target `eden-live-20261126-88b9a315` (`12:33:59Z` to `12:55:05Z`). The
+  same-version update passed `VAL-LIFE-007` with no warning, and ended on
+  Eve `1.5.0`. The update took 257 seconds; passing runs before 2026-11-22
+  took 99 to 176. The output does not say which branch passed, and the
+  added time matches cf's 120 second limit. Destroy reported 15 kept
+  objects (12 `refused-snapshot`, 3 `refused-singleton-artifact`, none
+  `accepted-still-listed`), and the registry listed nothing else.
 
 ## Eve 1.5.0 and Postgres World 5.5.0 checks (2026-11-26)
 
