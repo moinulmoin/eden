@@ -509,10 +509,10 @@ easy to miss; `eden preflight` warns when it sees a pooled URL.
 
 Use the tested pairs below. Eden checks the installed World after the
 packaging build, before booting the runtime image.
-For Eve `1.3.0`, which bundles `@workflow/world` `5.3.0`:
+For Eve `1.5.0`, which bundles `@workflow/world` `5.4.0`:
 
 ```sh
-npm add @workflow/world-postgres@5.4.1
+npm add @workflow/world-postgres@5.5.0
 ```
 
 Eve `1.0.0-rc.6` and later refuse to start a session unless the World creates the
