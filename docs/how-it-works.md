@@ -316,7 +316,11 @@ behavior and the warning that an Eve upgrade can strand sessions.
   replaced image by its tag, and Cloudflare's registry then removes the
   image. Eden never deletes it earlier. It takes the replaced image's
   repository, digest and release tag from the deployment record, and
-  deletes the tag only when the registry resolves it to that digest. It deletes nothing when the
+  deletes the tag only when the registry resolves it to that digest. The
+  delete counts as shown only when a later listing no longer has the tag or
+  the image's `sha256:` entry. cf deletes the tag and then asks the
+  registry to collect unused layers; when cf does not exit within its 120
+  second limit, that listing still decides. It deletes nothing when the
   repository also holds the image of a kept version or of a version whose
   retirement the record still names. If the delete cannot be shown, the
   update still succeeds with the warning

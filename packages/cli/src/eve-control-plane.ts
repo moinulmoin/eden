@@ -659,13 +659,14 @@ export interface EveRegistryObjectKept {
 /**
  * The object form: each `kept` object is still listed, with the registry's
  * own answer for it. Everything else is gone, unless `unproven` is set: then
- * the runner could not show that.
+ * the runner could not show that, and `reason` says which step failed when
+ * the runner knows.
  */
 export type EveRegistryRepositoryDeleteOutcome =
   | "deleted"
   | "absent"
   | "indeterminate"
-  | { readonly kept: readonly EveRegistryObjectKept[]; readonly unproven?: true };
+  | { readonly kept: readonly EveRegistryObjectKept[]; readonly unproven?: true; readonly reason?: string };
 
 export type EveRegistryRepositoryDeleteRunner = (
   request: {
@@ -4280,9 +4281,10 @@ async function runEveDeployment(
     }
     if (deleted === "indeterminate" || typeof deleted === "object") {
       // The deployment is promoted and healthy; a cleanup that could not be shown does not fail it.
+      const reason = typeof deleted === "object" && deleted.reason !== undefined ? deleted.reason : "The delete stopped on an unexpected error.";
       resultWarnings.push({
         id: "EVE_SUPERSEDED_IMAGE_NOT_DELETED",
-        message: `The update is healthy and promoted, but Eden could not show that the superseded image ${inPlaceRepository}@${supersededImage.digest} left Cloudflare's registry.`,
+        message: `The update is healthy and promoted, but Eden could not show that the superseded image ${inPlaceRepository}@${supersededImage.digest} left Cloudflare's registry. ${reason}`,
         remediation: "Nothing is needed now, and do not redeploy for this. A later deploy does not try this image again. eden destroy tries to delete everything the registry lists for the target, and so does the retirement of this Eve version after an upgrade. Eden reads the registry with direct requests to registry.cloudflare.com and never uses a proxy for them.",
       });
     } else {
@@ -6261,24 +6263,36 @@ function registryRepositoryDeleter(
     if (image !== undefined) {
       // One image: the only delete is cf's, of its tag. The digest is
       // used to check what the tag names and to see the image leave.
+      const unproven = (reason: string) => ({ kept: [], unproven: true as const, reason });
       const listed = await registry.list(accountId, repository);
-      if (listed === undefined) return "indeterminate";
+      if (listed === undefined) return unproven("Eden could not read the registry's listing of the repository before the delete.");
       if (!listed.includes(image.tag)) return "absent";
       const named = await registry.resolve(accountId, repository, image.tag).catch(() => undefined);
-      if (named === undefined) return "indeterminate";
+      if (named === undefined) return unproven(`The registry did not answer a HEAD for the tag ${image.tag} with one digest.`);
       if (named !== image.digest) return "absent";
       const deleted = await cf({
         args: ["containers", "images", "delete", `${repository}:${image.tag}`, "--force"],
         accountId,
       });
-      if (deleted.exitCode !== 0) return "indeterminate";
+      // cf deletes the tag and then asks the registry to collect layers. On
+      // 2026-11-26 the registry sent no answer to that second request within
+      // 300 seconds, so cf is stopped at its time limit after the tag delete.
+      // Only a failure that cf itself reports ends here; otherwise the listing
+      // shows whether the tag and the image are gone.
+      if (deleted.exitCode !== undefined && deleted.exitCode !== 0) {
+        const error = cloudflareCliError(deleted);
+        return unproven(`cf containers images delete exited ${deleted.exitCode}${error === undefined ? "." : `: ${safeText(error)}`}`);
+      }
+      const cfNote = deleted.exitCode === undefined ? " cf containers images delete did not exit within its time limit." : "";
       // A tagged image left the listing about 15 seconds after its tag was deleted.
       const deletedAt = performance.now();
       for (;;) {
         const { at, entries } = await list();
-        if (entries === undefined) return "indeterminate";
+        if (entries === undefined) return unproven(`Eden could not read the registry's listing of the repository after the delete.${cfNote}`);
         if (!entries.includes(image.tag) && !entries.includes(image.digest)) return "deleted";
-        if (at - deletedAt >= REGISTRY_REMOVAL_WAIT_MS) return "indeterminate";
+        if (at - deletedAt >= REGISTRY_REMOVAL_WAIT_MS) {
+          return unproven(`The registry still listed ${entries.includes(image.tag) ? `the tag ${image.tag}` : "the image's sha256: entry"} ${REGISTRY_REMOVAL_WAIT_MS / 1_000} seconds after the delete.${cfNote}`);
+        }
         await waitForActivation(5_000);
       }
     }

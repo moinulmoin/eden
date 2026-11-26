@@ -10,6 +10,21 @@
   a migration, and `eden deploy` runs the World's `bootstrap` before it
   publishes. The gate passed both legs on both fixtures.
 
+### Fixed
+
+- A same-version update deletes the image it replaced again. After it
+  deletes the tag, `cf containers images delete` asks Cloudflare's registry
+  to collect unused layers. On 2026-11-26 the registry sent no answer to that
+  request within 300 seconds, so cf ran into its 120 second limit, and Eden
+  reported `EVE_SUPERSEDED_IMAGE_NOT_DELETED` even though the tag was gone.
+  Every live check has failed this step since 2026-11-22. Eden now
+  reads the registry's listing in that case: when the tag and the image are
+  gone, `VAL-LIFE-007` passes. An update still waits up to two minutes for cf
+  while the registry does not answer.
+- `EVE_SUPERSEDED_IMAGE_NOT_DELETED` now ends with the step that failed: the
+  listing, the tag lookup, cf's own error, or an image still listed after
+  the delete.
+
 ## 0.15.2 — 2026-11-23
 
 Three fixes to the runtime on Cloudflare during an update, and Eve `1.3.0`

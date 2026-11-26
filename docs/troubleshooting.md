@@ -1086,10 +1086,30 @@ same exact target after resolving that check.
 
 A warning on a successful same-version update: `The update is healthy and
 promoted, but Eden could not show that the superseded image
-<repository>@sha256:<digest> left Cloudflare's registry.` The deploy
+<repository>@sha256:<digest> left Cloudflare's registry. <reason>` The deploy
 succeeded and nothing is needed now. Do not redeploy for this: a later
 deploy does not try this image again. The image may or may not still be in
 the registry, with or without its tag.
+
+The reason names the step that failed:
+
+- `Eden could not read the registry's listing of the repository before the
+  delete.` or `… after the delete.`: a listing page was not in the form
+  the registry sends, or got no answer.
+- `The registry did not answer a HEAD for the tag <tag> with one digest.`:
+  Eden could not tie the tag to the image, so it deleted nothing.
+- `cf containers images delete exited <code>: <cf's error>`: cf reported a
+  failure of its own, such as `403 Forbidden` from the registry.
+- `The registry still listed the tag <tag> 30 seconds after the delete.`, or
+  the image's `sha256:` entry instead of the tag.
+
+When cf did not exit within its time limit, the reason ends with `cf
+containers images delete did not exit within its time limit.` After its tag
+delete, cf asks the registry to collect unused layers. On 2026-11-26 the
+registry sent no answer to that request within 300 seconds, so cf is
+stopped after 120 seconds. Eden then reads the listing: when the tag and the image's
+`sha256:` entry are gone, the update passes `VAL-LIFE-007` with no
+warning.
 
 - `eden destroy` tries to delete everything the registry lists for the
   target, and reports what Cloudflare keeps.
