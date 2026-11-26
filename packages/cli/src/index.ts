@@ -238,6 +238,12 @@ function defaultStderr(line: string): void {
   process.stderr.write(`${line}\n`);
 }
 
+/** Best effort: a closed stderr must not turn the telemetry notice into a process error. */
+function noticeStderr(line: string): void {
+  if (process.stderr.listenerCount("error") === 0) process.stderr.on("error", () => undefined);
+  process.stderr.write(`${line}\n`, () => undefined);
+}
+
 async function selectedEveProjectRoot(
   projectRoot: string,
   cwd: string,
@@ -530,7 +536,7 @@ export async function runEdenCli(
             : "EVE_EXECUTION_FAILED",
         durationMs: Date.now() - startedAt,
         projectRoot,
-      }, process.env, stderr);
+      }, process.env, options.stderr ?? noticeStderr);
     }
   }
 }

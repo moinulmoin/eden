@@ -57,9 +57,39 @@ test.each([
   ["a free-form failure code", { ...event, failureCode: "could not reach acme.example.com" }],
   ["an exact duration", { ...event, duration: 61_234 }],
   ["an install ID that is not a random UUID", { ...event, installId: "moinul" }],
+  ["a hostname in a prerelease label", { ...event, eveVersion: "1.3.0-build.planted-host.example.com" }],
+  ["build metadata in a version", { ...event, edenVersion: "0.16.0+planted" }],
+  ["a long version number", { ...event, eveVersion: "123456789.0.0" }],
+  ["an invented uppercase failure code", { ...event, failureCode: "PLANTED_HOST_EXAMPLE_COM" }],
+  ["an unknown World", { ...event, world: "acme" }],
 ])("an event with %s gets 400 and is not written", async (_case, body) => {
   const { points, send } = collector();
   expect((await send(JSON.stringify(body))).status).toBe(400);
+  expect(points).toEqual([]);
+});
+
+test("versions and failure codes outside Eden's own are accepted only as other", async () => {
+  const { points, send } = collector();
+  const response = await send(JSON.stringify({ ...event, edenVersion: "other", failureCode: "other", eveVersion: "other" }));
+  expect(response.status).toBe(204);
+  expect(points).toHaveLength(1);
+});
+
+test("a body that is not exactly the CLI's serialization gets 400 and is not written", async () => {
+  const { points, send } = collector();
+  const text = JSON.stringify(event);
+  expect((await send(text.replace('"command":"deploy",', '"command":"destroy","command":"deploy",'))).status).toBe(400);
+  expect((await send(JSON.stringify(event, null, 1))).status).toBe(400);
+  const { schema, ...rest } = event;
+  expect((await send(JSON.stringify({ ...rest, schema }))).status).toBe(400);
+  expect(points).toEqual([]);
+});
+
+test("a body longer or shorter than its declared length is refused and not written", async () => {
+  const { points, send } = collector();
+  const text = JSON.stringify(event);
+  expect((await send(text + "x".repeat(2 * MAX_BODY_BYTES), { headers: { "content-length": "10" } })).status).toBe(413);
+  expect((await send(text, { headers: { "content-length": String(text.length + 5) } })).status).toBe(400);
   expect(points).toEqual([]);
 });
 

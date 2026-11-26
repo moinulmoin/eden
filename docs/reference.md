@@ -400,7 +400,7 @@ in the account.
 | `NODE_EXTRA_CA_CERTS`, `XDG_CONFIG_HOME`, `CLOUDFLARE_ACCOUNT_ID` | `cf` (configuration/account selection also checked by Eden) | Trusted shell settings for certificate trust, configuration location, and account selection; Eden still requires exactly one authenticated account, matching `CLOUDFLARE_ACCOUNT_ID` when set. After that check Eden sets `CLOUDFLARE_ACCOUNT_ID` to the checked account for every other `cf` command it runs |
 | `EDEN_TELEMETRY` | `eden preflight`, `eden deploy`, `eden destroy` | `0`, `false`, or `off` turns off the anonymous usage event: Eden sends nothing and creates no install ID. See [Telemetry](./security.md#telemetry) |
 | `DO_NOT_TRACK` | Eden and `cf` | Any value but empty, `0`, or `false` (the standard is `1`) turns off Eden's usage event, as `EDEN_TELEMETRY=0` does. Also passed to `cf` unchanged |
-| `EDEN_TELEMETRY_URL` | `eden preflight`, `eden deploy`, `eden destroy` | Where the usage event is posted instead of `https://telemetry.eden.ideaplexa.com/v1/events`, for tests or your own collector. Eden posts the event as JSON once and waits at most one second |
+| `EDEN_TELEMETRY_URL` | `eden preflight`, `eden deploy`, `eden destroy` | Where the usage event is posted instead of `https://telemetry.eden.ideaplexa.com/v1/events`, for tests or your own collector. Eden posts the event as JSON once and gives up one second after the command ends. It resolves the host name with DNS, not `/etc/hosts`; `localhost` and IP addresses work as they are |
 | `XDG_CONFIG_HOME` | Eden | When it is an absolute path, the usage event's install ID is kept in `$XDG_CONFIG_HOME/eden/telemetry.json`; otherwise in `~/.config/eden/telemetry.json` |
 | `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `CF_SEND_TELEMETRY`, `DO_NOT_TRACK` | `cf` | Passed from your shell to `cf` unchanged. `cf` gets no other variable of yours: Eden also sets `CLOUDFLARE_API_BASE_URL` to `https://api.cloudflare.com/client/v4`, `NO_COLOR=1`, and `CF_QUIET=1` for every `cf` command |
 
@@ -570,6 +570,8 @@ Outside the project, Eden writes one file: `telemetry.json` in
 set), mode `0600`. It holds only `installId`, the random UUID of the
 [usage event](./security.md#telemetry), and is created the first time Eden
 sends one. With `EDEN_TELEMETRY=0` or `DO_NOT_TRACK=1` it is not created.
+Eden never overwrites it: when it is a symbolic link, unreadable, or not
+valid, telemetry is skipped and the file is left as it is.
 
 ### Local Docker images
 

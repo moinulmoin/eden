@@ -15,25 +15,31 @@ export interface Env {
 /** The largest body accepted. An event is about 300 bytes. */
 export const MAX_BODY_BYTES = 1024;
 
-const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u;
+/** The same bounded versions the CLI sends; it sends "other" for anything else. */
+const VERSION = /^(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})(?:-(?:alpha|beta|rc|canary|next|preview)(?:\.(?:0|[1-9]\d{0,2}))?)?$/u;
+/** The shape of Eden's own failure codes. */
+const FAILURE_CODE = /^(?:EVE|DEPLOY|COMMAND|VERSION|CLEANUP|DOCKER|RUNTIME|SECRET|UNSUPPORTED|WORLD|ROOT|SOURCE|DEPENDENCY|SINGLETON)_[A-Z0-9_]{2,60}$/u;
 
-/** Each field the CLI sends, and the only values it may hold. */
-const FIELDS: Readonly<Record<string, (value: unknown) => boolean>> = {
-  schema: (value) => value === 1,
-  installId: (value) => typeof value === "string" &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value),
-  command: (value) => value === "preflight" || value === "deploy" || value === "destroy",
-  edenVersion: (value) => typeof value === "string" && value.length <= 64 && VERSION.test(value),
-  exitCode: (value) => value === 0 || value === 1,
-  failureCode: (value) => value === null || (typeof value === "string" && /^[A-Z][A-Z0-9_]{0,63}$/u.test(value)),
-  duration: (value) => ["<10s", "10s-1m", "1m-5m", "5m-15m", "15m-1h", ">1h"].includes(value as string),
-  os: (value) => ["darwin", "linux", "win32", "other"].includes(value as string),
-  arch: (value) => ["arm64", "x64", "other"].includes(value as string),
-  nodeMajor: (value) => Number.isInteger(value) && (value as number) >= 0 && (value as number) < 1000,
-  eveVersion: (value) => value === null || (typeof value === "string" && value.length <= 64 && VERSION.test(value)),
-  world: (value) => value === null || ["cloudflare", "postgres", "local", "other"].includes(value as string),
-  ci: (value) => typeof value === "boolean",
-};
+const oneOf = (...values: readonly unknown[]) => (value: unknown) => values.includes(value);
+const version = (value: unknown) => value === "other" || (typeof value === "string" && VERSION.test(value));
+
+/** Each field the CLI sends, in the order it sends them, and the only values each may hold. */
+const FIELDS: readonly (readonly [string, (value: unknown) => boolean])[] = [
+  ["schema", oneOf(1)],
+  ["installId", (value) => typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value)],
+  ["command", oneOf("preflight", "deploy", "destroy")],
+  ["edenVersion", version],
+  ["exitCode", oneOf(0, 1)],
+  ["failureCode", (value) => value === null || value === "other" || (typeof value === "string" && FAILURE_CODE.test(value))],
+  ["duration", oneOf("<10s", "10s-1m", "1m-5m", "5m-15m", "15m-1h", ">1h")],
+  ["os", oneOf("darwin", "linux", "win32", "other")],
+  ["arch", oneOf("arm64", "x64", "other")],
+  ["nodeMajor", (value) => Number.isInteger(value) && (value as number) >= 0 && (value as number) < 100],
+  ["eveVersion", (value) => value === null || version(value)],
+  ["world", oneOf(null, "cloudflare", "postgres", "local", "other")],
+  ["ci", oneOf(true, false)],
+];
 
 type Event = {
   schema: 1;
@@ -59,12 +65,39 @@ function parseEvent(text: string): Event | undefined {
     return undefined;
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const entries = Object.entries(value);
-  if (entries.length !== Object.keys(FIELDS).length) return undefined;
-  if (!entries.every(([key, field]) => Object.hasOwn(FIELDS, key) && FIELDS[key]?.(field) === true)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (!FIELDS.every(([key, valid]) => Object.hasOwn(record, key) && valid(record[key]))) return undefined;
+  // Exactly the CLI's serialization: every field once, in order, no extra keys or spacing.
+  if (JSON.stringify(Object.fromEntries(FIELDS.map(([key]) => [key, record[key]]))) !== text) return undefined;
   const event = value as Event;
   if ((event.exitCode === 0) !== (event.failureCode === null)) return undefined;
   return event;
+}
+
+/** The body as text, or a status when it is larger than the cap or not the declared length. */
+async function readBody(request: Request, declared: number): Promise<string | number> {
+  if (request.body === null) return 400;
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BODY_BYTES) {
+      await reader.cancel();
+      return 413;
+    }
+    chunks.push(value);
+  }
+  if (size !== declared) return 400;
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
 const empty = (status: number): Response => new Response(null, { status });
@@ -76,12 +109,17 @@ export default {
     if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
       return empty(415);
     }
-    const length = Number(request.headers.get("content-length"));
-    if (!Number.isInteger(length) || length <= 0) return empty(411);
-    if (length > MAX_BODY_BYTES) return empty(413);
-    const body = await request.arrayBuffer();
-    if (body.byteLength > MAX_BODY_BYTES) return empty(413);
-    const event = parseEvent(new TextDecoder().decode(body));
+    const declared = Number(request.headers.get("content-length"));
+    if (!Number.isInteger(declared) || declared <= 0) return empty(411);
+    if (declared > MAX_BODY_BYTES) return empty(413);
+    let body: string | number;
+    try {
+      body = await readBody(request, declared);
+    } catch {
+      return empty(400);
+    }
+    if (typeof body === "number") return empty(body);
+    const event = parseEvent(body);
     if (event === undefined) return empty(400);
     env.EVENTS.writeDataPoint({
       indexes: [event.installId],

@@ -396,26 +396,30 @@ When it is off, Eden sends nothing and creates no install ID.
 
 The first time Eden sends, it prints a three-line notice on stderr. It
 prints nothing else, and nothing on stdout, so `--json` output stays one
-JSON object. A send waits at most one second, is tried once, and is dropped
-if it fails. It never changes the exit code.
+JSON object. Everything telemetry does, from reading the project to the
+reply, ends within one second of the command's end; then Eden closes what is
+still open and exits. A send is tried once and dropped if it fails. It never
+changes the exit code. When `telemetry.json` or its folder is a symbolic
+link, unreadable, or not a valid Eden file, Eden sends nothing and leaves it
+as it is.
 
 The event has exactly these fields:
 
 | Field | What it holds |
 | --- | --- |
 | `schema` | `1`, the version of this event shape |
-| `installId` | A random UUID made the first time Eden sends, kept in `$XDG_CONFIG_HOME/eden/telemetry.json` (`~/.config/eden/telemetry.json` when `XDG_CONFIG_HOME` is not set). It is not derived from anything; delete the file to get a new one |
+| `installId` | A random UUID made the first time Eden sends, kept in `$XDG_CONFIG_HOME/eden/telemetry.json` (`~/.config/eden/telemetry.json` when `XDG_CONFIG_HOME` is unset or not an absolute path). It is not derived from anything, but it stays the same, so it links the events from one machine. Delete the file to get a new one |
 | `command` | `preflight`, `deploy`, or `destroy` |
 | `edenVersion` | The Eden version, such as `0.15.2` |
 | `exitCode` | `0` or `1` |
-| `failureCode` | The stable failure code, such as `EVE_PREFLIGHT_FAILED`, or `null` when the command succeeded |
+| `failureCode` | One of Eden's own failure codes, such as `EVE_PREFLIGHT_FAILED`, from a fixed list; `other` for any other code; `null` when the command succeeded |
 | `duration` | One of `<10s`, `10s-1m`, `1m-5m`, `5m-15m`, `15m-1h`, `>1h` |
 | `os` | `darwin`, `linux`, `win32`, or `other` |
 | `arch` | `arm64`, `x64`, or `other` |
 | `nodeMajor` | The major version of Node, such as `24` |
-| `eveVersion` | The project's Eve version (installed, else from its lockfile), such as `1.3.0`, or `null` |
-| `world` | `cloudflare`, `postgres`, `local`, or `other`, from the World package the project's `package.json` lists; `null` when it has none to read |
-| `ci` | `true` when one of `CI`, `CONTINUOUS_INTEGRATION`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `CIRCLECI`, `TRAVIS`, `JENKINS_URL`, `TEAMCITY_VERSION`, `TF_BUILD`, `BITBUCKET_BUILD_NUMBER`, or `CODEBUILD_BUILD_ID` is set. Only whether it is set is read |
+| `eveVersion` | The project's Eve version (installed, else from its lockfile), such as `1.3.0` or `1.0.0-rc.7`. A version that is not a plain release, or a prerelease labeled `alpha`, `beta`, `rc`, `canary`, `next`, or `preview` with small numbers, is sent as `other`, so no label from the project is sent. `null` when none is found |
+| `world` | `cloudflare`, `postgres`, `local`, or `other`, inferred from the World package names in the project's `package.json` dependencies, not from the World the project selects; `local` when none is listed; `null` when there is no readable `package.json` |
+| `ci` | `true` when one of `CI`, `CONTINUOUS_INTEGRATION`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `CIRCLECI`, `TRAVIS`, `JENKINS_URL`, `TEAMCITY_VERSION`, `TF_BUILD`, `BITBUCKET_BUILD_NUMBER`, or `CODEBUILD_BUILD_ID` is set to anything but an empty value, `0`, or `false`. No value is sent |
 
 Eden never sends project, target, or Worker names, Cloudflare account or
 user IDs, emails, URLs, file paths, hostnames, the values of environment

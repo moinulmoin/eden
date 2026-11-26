@@ -5,8 +5,8 @@ The Worker that receives Eden's anonymous usage events at
 what it never sends, is in the README's
 [Telemetry section](../README.md#telemetry).
 
-`src/index.ts` answers `204` to a JSON `POST` of the exact event shape up
-to 1 KB and writes it to the `eden_telemetry` Workers Analytics Engine
+`src/index.ts` answers `204` to a JSON `POST` of the exact event shape,
+serialized exactly as the CLI does, up to 1 KB, and writes it to the `eden_telemetry` Workers Analytics Engine
 dataset. Anything else gets a `4xx` and is not written. It never reads the
 IP address, headers other than `content-type` and `content-length`, or the
 user agent. `cloudflare.config.ts` turns off `workers.dev`, Preview URLs,
@@ -14,7 +14,7 @@ and Workers Logs.
 
 ## Deploy
 
-With the `cf` login of the account that owns `ideaplexa.com`:
+With your `cf` login, on the account that owns `ideaplexa.com`:
 
 ```sh
 pnpm --dir telemetry run deploy
@@ -30,7 +30,8 @@ Worker and its custom domain.
 pnpm --dir telemetry run stats
 ```
 
-It runs `cf analytics-engine sql query` with the same `cf` login and prints
+It runs `cf analytics-engine sql query` with your `cf` login (`cf auth
+login`, or `CLOUDFLARE_API_TOKEN` with Account Analytics read) and prints
 active installs, commands by outcome, Eden versions, Eve versions and
 Worlds, and platforms for the last 7 days. Analytics Engine keeps three
 months of data.

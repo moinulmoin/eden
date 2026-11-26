@@ -383,18 +383,24 @@ export async function checkEveVersion(projectRoot: string): Promise<{
   return version === undefined ? undefined : unsupportedEveVersion(version);
 }
 
-/** The project's Eve version: installed, else locked by npm, else locked by pnpm. */
-export async function readEveVersion(projectRoot: string): Promise<string | undefined> {
+/**
+ * The project's Eve version: installed, else locked by npm, else locked by
+ * pnpm. `read` returns a file's text, or undefined when it cannot.
+ */
+export async function readEveVersion(
+  projectRoot: string,
+  read: (path: string) => Promise<string | undefined> = (path) => readFile(path, "utf8").catch(() => undefined),
+): Promise<string | undefined> {
   const object = (value: unknown): Record<string, unknown> =>
     value !== null && typeof value === "object" && !Array.isArray(value)
       ? value as Record<string, unknown> : {};
   const json = async (path: string): Promise<Record<string, unknown>> => {
-    try { return object(JSON.parse(await readFile(join(projectRoot, path), "utf8"))); }
+    try { return object(JSON.parse(await read(join(projectRoot, path)) ?? "")); }
     catch { return {}; }
   };
   const installed = await json("node_modules/eve/package.json");
   const lock = await json("package-lock.json");
-  const pnpmLock = await readFile(join(projectRoot, "pnpm-lock.yaml"), "utf8").catch(() => "");
+  const pnpmLock = await read(join(projectRoot, "pnpm-lock.yaml")) ?? "";
   const pnpmVersion = /^\s{6}eve:\s*\r?\n\s{8}specifier:[^\n]*\r?\n\s{8}version:\s*['"]?(\d+\.\d+\.\d+(?:-[^('"\s]+)?)/mu.exec(pnpmLock)?.[1];
   const locked = object(object(lock.packages)["node_modules/eve"]).version;
   const version = typeof installed.version === "string" ? installed.version
