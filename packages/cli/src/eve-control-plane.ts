@@ -6235,10 +6235,12 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
         ? (parsed as { readonly errors: unknown }).errors
         : undefined;
       if (!Array.isArray(errors) || errors.length !== 1) return false;
-      const error = errors[0] as { readonly code?: unknown; readonly message?: unknown; readonly detail?: unknown } | null;
-      const detail = typeof error?.detail === "object" && error.detail !== null ? error.detail as Record<string, unknown> : undefined;
-      return error?.code === "MANIFEST_UNKNOWN" && error.message === "manifest unknown" &&
-        detail !== undefined && Object.keys(detail).join() === "Tag" && detail.Tag === entry;
+      const error: unknown = errors[0];
+      if (typeof error !== "object" || error === null || Object.keys(error).sort().join() !== "code,detail,message") return false;
+      const { code, message, detail } = error as { readonly code: unknown; readonly message: unknown; readonly detail: unknown };
+      return code === "MANIFEST_UNKNOWN" && message === "manifest unknown" &&
+        typeof detail === "object" && detail !== null && !Array.isArray(detail) &&
+        Object.keys(detail).join() === "Tag" && (detail as { readonly Tag: unknown }).Tag === entry;
     },
   };
 }

@@ -4590,6 +4590,7 @@ describe("eden deploy in-place update", () => {
     ["cf ran out of time after its tag delete, and the registry knows neither the tag nor the digest", "unknown"],
     ["cf ran out of time and did not stop", "still-running"],
     ["cf ran out of time, and the listing omits the image while the registry still serves its manifest", "stale-listing"],
+    ["cf ran out of time, and the registry's 404 for the tag says more than MANIFEST_UNKNOWN for it", "extra-field"],
     ["cf ran out of time before its tag delete", "not-deleted"],
   ] as const)("a same-version update whose cf delete never exits: %s", async (_name, scenario) => {
     const root = await createRoot();
@@ -4602,6 +4603,14 @@ describe("eden deploy in-place update", () => {
       fakeRegistry.cfHangs = scenario === "not-deleted" ? "before-delete" : "after-delete";
       fakeRegistry.cfStopsOnKill = scenario !== "still-running";
       if (scenario === "stale-listing") fakeRegistry.manifestRead = () => ({ status: 200, body: "{}" });
+      if (scenario === "extra-field") {
+        fakeRegistry.manifestRead = (ref) => ({
+          status: 404,
+          body: JSON.stringify({ errors: [{
+            code: "MANIFEST_UNKNOWN", message: "manifest unknown", detail: { Tag: ref.slice(repository.length + 1) }, repository: "another-repository",
+          }] }),
+        });
+      }
       const requestsBefore = fakeRegistry.registryRequests.length;
       const second = await deploy("generation-three", manifest("d"));
       expect(second.code).toBe(0);
@@ -4628,7 +4637,7 @@ describe("eden deploy in-place update", () => {
         // Nothing is read while cf may still run.
         expect(sent).toEqual([...listing, `HEAD ${prior}`]);
         expect(warning?.message).toBe(lead + "cf containers images delete ran out of time and did not stop, so it may still run. Eden did not read the registry after it.");
-      } else if (scenario === "stale-listing") {
+      } else if (scenario === "stale-listing" || scenario === "extra-field") {
         expect(sent).toEqual([...listing, `HEAD ${prior}`, ...listing, ...listing, `GET ${prior}`]);
         expect(warning?.message).toBe(lead + `The listing no longer had the tag ${tag} or the image's sha256: entry, but the registry did not answer a manifest read for the tag with MANIFEST_UNKNOWN.` + stopped);
       } else {
