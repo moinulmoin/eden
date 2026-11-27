@@ -188,7 +188,13 @@ Eden does not store or print the credential.
 ### What Eden can and cannot read
 
 `cf auth login` keeps its login in the operating system's keychain when one
-is available, and in an encrypted file otherwise. Eden reads neither. Eden
+is available, and in an encrypted file otherwise. Eden reads neither.
+In `cf` `1.0.0-rc.6`, a new login asks for `cf`'s default scopes, which
+include `billing:read` and `billing:write`. Eden never uses them: none of
+its own reads calls a billing endpoint, and in the code of `cf`
+`1.0.0-rc.6` none of the `cf` commands below does either. A login made
+before keeps the scopes it has. You can revoke `cf`'s access under
+[Manage OAuth authorizations](https://dash.cloudflare.com/?to=/profile/access-management/authorization) in the Cloudflare dashboard; `cf` is then signed out. Eden
 0.14 and earlier read Wrangler's saved token from disk; this version only
 checks whether Wrangler's login file exists, to explain a signed-out `cf`,
 and never opens it.

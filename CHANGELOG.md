@@ -21,7 +21,9 @@
 
 - Eden now runs Cloudflare's `cf` CLI `1.0.0-rc.6` instead of `1.0.0-rc.2`.
   Run `npx cf@1.0.0-rc.6 auth whoami` to check your login; an existing
-  `cf` login keeps working. `cf deploy` now refuses a
+  `cf` login keeps working and keeps its scopes. A new `cf auth login` also
+  asks for billing read and write access, which Eden never uses; you can
+  revoke `cf`'s access in the Cloudflare dashboard. `cf deploy` now refuses a
   `CLOUDFLARE_ACCOUNT_ID` that differs from the account in the Build
   Output. Eden writes the checked account into both, and a
   `CLOUDFLARE_ACCOUNT_ID` your login does not have still stops

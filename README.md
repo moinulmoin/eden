@@ -109,7 +109,10 @@ nothing on Cloudflare.
   ```
 
   Eden 0.14 and earlier used the Wrangler login. `cf` does not read it, so
-  sign in once after upgrading.
+  sign in once after upgrading. A new `cf` login also asks for billing read
+  and write access, which Eden never uses. A login you already have keeps
+  its scopes, and you can revoke `cf`'s access under
+  [Manage OAuth authorizations](https://dash.cloudflare.com/?to=/profile/access-management/authorization) in the Cloudflare dashboard.
 
 - Docker or OrbStack with Linux/amd64 container support
 - an Eve project with one root `package-lock.json`, or an exact

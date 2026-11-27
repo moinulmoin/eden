@@ -50,7 +50,9 @@ Docs: https://github.com/moinulmoin/eden (failure and warning codes:
 - Cloudflare Workers Paid plan (Containers need it), and Cloudflare's `cf`
   CLI signed in: `npx cf@1.0.0-rc.6 auth login` (the user must do this in a
   browser), or `CLOUDFLARE_API_TOKEN` set. `cf` does not read a Wrangler
-  login, which Eden 0.14 and earlier used.
+  login, which Eden 0.14 and earlier used. A new `cf` login also asks for
+  billing read and write access, which Eden never uses; an existing login
+  keeps its scopes.
 - Eden sends one anonymous usage event when preflight, deploy, or destroy
   ends, and prints a three-line notice about it on stderr the first time.
   The notice is not an error, and `--json` stdout is unchanged. If the user

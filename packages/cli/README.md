@@ -42,6 +42,10 @@ Bun can install Eden, but Eden still runs on Node. Do not use `bunx --bun`.
   npx cf@1.0.0-rc.6 auth login
   ```
 
+  A new `cf` login also asks for billing read and write access, which Eden
+  never uses. A login you already have keeps its scopes, and you can revoke
+  `cf`'s access under [Manage OAuth authorizations](https://dash.cloudflare.com/?to=/profile/access-management/authorization) in the Cloudflare dashboard.
+
 - Docker or OrbStack with Linux/amd64 container support
 - an Eve project on `0.91.0` or later, with one root `package-lock.json` or
   an exact `packageManager: "pnpm@..."` pin and matching `pnpm-lock.yaml`

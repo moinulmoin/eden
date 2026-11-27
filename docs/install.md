@@ -71,6 +71,11 @@ Cloudflare account that owns the target Workers:
 npx cf@1.0.0-rc.6 auth login
 ```
 
+`cf` `1.0.0-rc.6` asks for its default scopes, which include billing read
+and write (`billing:read`, `billing:write`). Eden never uses them. A login
+made before keeps the scopes it has. You can revoke `cf`'s access under
+[Manage OAuth authorizations](https://dash.cloudflare.com/?to=/profile/access-management/authorization) in the Cloudflare dashboard; `cf` is then signed out.
+
 Confirm the selected account:
 
 ```sh
