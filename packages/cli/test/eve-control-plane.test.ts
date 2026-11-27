@@ -66,7 +66,7 @@ const fakeCf = vi.hoisted(() => ({
  */
 const fakeRegistry = vi.hoisted(() => {
   type Answer =
-    | { readonly status: number; readonly body: string; readonly link?: string; readonly digest?: string; readonly location?: string; readonly leavesAfterMs?: number }
+    | { readonly status: number; readonly body: string; readonly link?: string; readonly digest?: string; readonly location?: string; readonly leavesAfterMs?: number; readonly takesMs?: number }
     | "error"
     | "stall";
   const state = {
@@ -191,6 +191,8 @@ vi.mock("node:https", async (importOriginal) => {
             request.emit("error", new Error("The connection failed."));
             return;
           }
+          // An answer that takes this long moves the clock before it arrives.
+          if (answer.takesMs !== undefined) fakeRegistry.clock += answer.takesMs;
           if (answer.leavesAfterMs !== undefined) {
             fakeRegistry.leaving.push({ repository, entry, at: fakeRegistry.clock + answer.leavesAfterMs });
           }
@@ -2712,6 +2714,11 @@ describe("eden destroy", () => {
     ["a 403 with the message under another code", { status: 403, body: snapshotRefusal.replace("DENIED", "UNAUTHORIZED") }, undefined],
     ["a 403 with a second error beside the refusal", { status: 403, body: JSON.stringify({ errors: [...(JSON.parse(snapshotRefusal) as { errors: unknown[] }).errors, { code: "UNKNOWN", message: "other" }] }) }, undefined],
     ["a 403 that says errors twice, the refusal last", { status: 403, body: snapshotRefusal.replace("{", "{\"errors\":[],") }, undefined],
+    ["a 403 whose detail names another repository", { status: 403, body: snapshotRefusal.replace("\"detail\":null", "\"detail\":{\"repository\":\"another-repository\",\"Tag\":\"rootfs-snapshot-aaa\"}") }, undefined],
+    ["a 403 whose detail names this tag", { status: 403, body: snapshotRefusal.replace("\"detail\":null", "\"detail\":{\"Tag\":\"rootfs-snapshot-aaa\"}") }, undefined],
+    ["a 403 without a detail", { status: 403, body: snapshotRefusal.replace(",\"detail\":null", "") }, undefined],
+    ["a 403 whose error has another field", { status: 403, body: snapshotRefusal.replace("\"detail\":null", "\"detail\":null,\"repository\":\"another-repository\"") }, undefined],
+    ["a 403 with another field beside errors", { status: 403, body: snapshotRefusal.replace(/\}$/u, ",\"repository\":\"another-repository\"}") }, undefined],
     ["a 401 with the refusal body", { status: 401, body: snapshotRefusal }, undefined],
     ["a 500 with the refusal body", { status: 500, body: snapshotRefusal }, undefined],
     ["a 307 redirect with the refusal body", { status: 307, body: snapshotRefusal }, undefined],
@@ -2740,6 +2747,8 @@ describe("eden destroy", () => {
     const result = JSON.parse(output[0] as string) as Record<string, unknown>;
     expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
     expect(result).not.toHaveProperty("registryObjectsKept");
+    // The tag is not kept by Cloudflare, so the target's CURRENT pointer and record stay.
+    await expect(lstat(currentPointer(root))).resolves.toBeDefined();
   });
 
   test("deletes every tag with one DELETE of its own, on its own connection, and sends nothing else", async () => {
@@ -4608,6 +4617,7 @@ describe("eden deploy in-place update", () => {
     ["the listing omits the image while the registry still serves its manifest", "stale-listing"],
     ["the registry's 404 for the tag says more than MANIFEST_UNKNOWN for it", "extra-field"],
     ["the registry accepts the DELETE and still lists the tag", "still-listed"],
+    ["the registry answers both manifest reads with MANIFEST_UNKNOWN, but only after 16 seconds each", "slow-reads"],
     ["the registry answers the DELETE with 500", "refused"],
     ["the registry answers the DELETE with a redirect", "redirect"],
     ["the registry does not answer the DELETE", "no-answer"],
@@ -4635,6 +4645,13 @@ describe("eden deploy in-place update", () => {
         images.set(`${other}:${tag}`, manifest("c"));
       }
       if (scenario === "stale-listing") fakeRegistry.manifestRead = () => ({ status: 200, body: "{}" });
+      if (scenario === "slow-reads") {
+        fakeRegistry.manifestRead = (ref) => ({
+          status: 404,
+          body: JSON.stringify({ errors: [{ code: "MANIFEST_UNKNOWN", message: "manifest unknown", detail: { Tag: ref.slice(repository.length + 1) } }] }),
+          takesMs: 16_000,
+        });
+      }
       if (scenario === "extra-field") {
         fakeRegistry.manifestRead = (ref) => ({
           status: 404,
@@ -4679,12 +4696,17 @@ describe("eden deploy in-place update", () => {
           "no-answer": `Eden got no answer it could use to its DELETE of the tag ${tag}, so it does not know whether the registry deleted it. Eden did not send the DELETE again.`,
         }[scenario]);
       } else if (scenario === "still-listed") {
-        expect(warning?.message).toBe(lead + `The registry still listed the tag ${tag} in a listing begun 30 seconds after it accepted the DELETE.`);
+        expect(warning?.message).toBe(lead + `The registry still listed the tag ${tag}. The 30 seconds Eden allows after the registry accepted the DELETE ran out.`);
+      } else if (scenario === "slow-reads") {
+        // Both answers are right, but the second arrives 37 seconds after the DELETE was accepted.
+        expect(sent).toEqual([...listing, `HEAD ${prior}`, `DELETE ${prior}`, ...listing, ...listing, `GET ${prior}`, `GET ${repository}@${manifest("c")}`]);
+        expect(fakeRegistry.clock - startedAt).toBe(37_000);
+        expect(warning?.message).toBe(lead + `The listing no longer had the tag ${tag} or the image's sha256: entry, but the registry did not answer a manifest read for the digest with MANIFEST_UNKNOWN in time. The 30 seconds Eden allows after the registry accepted the DELETE ran out.`);
       } else {
         // Each listing that omits the image is followed by a read of the tag's manifest, for 30 seconds.
         expect(sent.slice(0, 6)).toEqual([...listing, `HEAD ${prior}`, `DELETE ${prior}`, ...listing]);
         expect(sent.filter((request) => request === `GET ${prior}`).length).toBeGreaterThan(1);
-        expect(warning?.message).toBe(lead + `The listing no longer had the tag ${tag} or the image's sha256: entry, but the registry did not answer a manifest read for the tag with MANIFEST_UNKNOWN 30 seconds after it accepted the DELETE.`);
+        expect(warning?.message).toBe(lead + `The listing no longer had the tag ${tag} or the image's sha256: entry, but the registry did not answer a manifest read for the tag with MANIFEST_UNKNOWN in time. The 30 seconds Eden allows after the registry accepted the DELETE ran out.`);
       }
     } finally {
       stop();

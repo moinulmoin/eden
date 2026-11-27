@@ -5980,17 +5980,24 @@ function registryObjectsKeptWarning(kept: readonly EveRegistryObjectKept[]): Eve
   };
 }
 
-/** True only for the registry's structured refusal to delete a snapshot manifest. */
+/**
+ * True only for the registry's refusal to delete a snapshot tag or
+ * manifest, exactly as it answered on 2026-11-18 and since: status 403 and
+ * `{"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}`,
+ * with no other field anywhere. The refusal names no repository or entry,
+ * so an answer that names any, or says anything else, is not this refusal.
+ */
 function isSnapshotDeleteRefusal(status: number, body: string): boolean {
   if (status !== 403) return false;
   const parsed = exactJson(body);
-  const errors = typeof parsed === "object" && parsed !== null
-    ? (parsed as { readonly errors?: unknown }).errors
+  const errors = typeof parsed === "object" && parsed !== null && Object.keys(parsed).join() === "errors"
+    ? (parsed as { readonly errors: unknown }).errors
     : undefined;
   if (!Array.isArray(errors) || errors.length !== 1) return false;
-  const error = errors[0] as { readonly code?: unknown; readonly message?: unknown } | null;
-  return typeof error === "object" && error !== null &&
-    error.code === "DENIED" && error.message === SNAPSHOT_DELETE_REFUSAL;
+  const error: unknown = errors[0];
+  if (typeof error !== "object" || error === null || Object.keys(error).sort().join() !== "code,detail,message") return false;
+  const { code, message, detail } = error as { readonly code: unknown; readonly message: unknown; readonly detail: unknown };
+  return code === "DENIED" && message === SNAPSHOT_DELETE_REFUSAL && detail === null;
 }
 
 /**
@@ -6080,9 +6087,10 @@ interface CloudflareRegistry {
    * `sha256:` entry per manifest, which cf's image list leaves out.
    * Empty for a repository the registry does not know. Undefined when the
    * listing could not be read in full: any page that is not exactly what
-   * `registryListingPage` accepts, or no end within 100 pages.
+   * `registryListingPage` accepts, or no end within 100 pages. With
+   * `deadline` (a `performance.now()` time), no request runs past it.
    */
-  readonly list: (accountId: string, repository: string) => Promise<readonly string[] | undefined>;
+  readonly list: (accountId: string, repository: string, deadline?: number) => Promise<readonly string[] | undefined>;
   /**
    * The registry's answer to one DELETE of an entry, a tag or a `sha256:`
    * digest: its status, and `answer` when it accepted the delete or refused
@@ -6106,8 +6114,9 @@ interface CloudflareRegistry {
    * a `sha256:` entry with 404 and its own error for exactly that entry:
    * `{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown","detail":{"Tag":"<entry>"}}]}`,
    * as it did on 2026-11-26. A HEAD's 404 has no body, so it cannot say this.
+   * With `deadline`, the request does not run past it.
    */
-  readonly unknown: (accountId: string, repository: string, entry: string) => Promise<boolean>;
+  readonly unknown: (accountId: string, repository: string, entry: string, deadline?: number) => Promise<boolean>;
 }
 
 /**
@@ -6137,6 +6146,7 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
     rest: string,
     bodyFor: readonly number[],
     maxBytes: number,
+    deadline = Number.POSITIVE_INFINITY,
   ): Promise<{ readonly status: number; readonly body: string; readonly link?: string; readonly digest?: string } | undefined> => {
     if (
       credentialUnavailable ||
@@ -6175,11 +6185,13 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
       };
     }
     const sentAt = performance.now();
+    const timeoutMs = Math.floor(Math.min(30_000, REGISTRY_UNANSWERED_BUDGET_MS - unansweredMs, deadline - sentAt));
+    if (timeoutMs < 1) return undefined;
     const response = await registryRequest(
       method,
       `/v2/${accountId}/${repository}/${rest}`,
       credential.authorization,
-      Math.floor(Math.min(30_000, REGISTRY_UNANSWERED_BUDGET_MS - unansweredMs)),
+      timeoutMs,
       bodyFor,
       maxBytes,
     );
@@ -6196,14 +6208,14 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
     return response;
   };
   return {
-    list: async (accountId, repository) => {
+    list: async (accountId, repository, deadline) => {
       const entries: string[] = [];
       // The registry pages by the last entry of the page before and ends with an empty page.
       for (let page = 0; page < 100; page += 1) {
         const last = entries.at(-1);
         const rest = `tags/list?n=${REGISTRY_PAGE_ENTRIES}${last === undefined ? "" : `&last=${encodeURIComponent(last)}`}`;
         const read = registryListingPage(
-          await send("GET", accountId, repository, rest, [200], 1_048_576),
+          await send("GET", accountId, repository, rest, [200], 1_048_576, deadline),
           `/v2/${accountId}/${repository}/${rest}`,
           `${accountId}/${repository}`,
           last,
@@ -6233,9 +6245,9 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
         ? response.digest
         : undefined;
     },
-    unknown: async (accountId, repository, entry) => {
+    unknown: async (accountId, repository, entry, deadline) => {
       if (!REGISTRY_ENTRY.test(entry)) return false;
-      const response = await send("GET", accountId, repository, `manifests/${entry}`, [404], 4_096);
+      const response = await send("GET", accountId, repository, `manifests/${entry}`, [404], 4_096, deadline);
       if (response?.status !== 404) return false;
       const parsed = exactJson(response.body);
       const errors = typeof parsed === "object" && parsed !== null && Object.keys(parsed).join() === "errors"
@@ -6300,22 +6312,29 @@ function registryRepositoryDeleter(registry: CloudflareRegistry): EveRegistryRep
         return unproven(`The registry answered Eden's DELETE of the tag ${image.tag} with ${deleted.status}${deleted.status >= 300 && deleted.status < 400 ? ", a redirect, which Eden does not follow" : ""}.`);
       }
       // A tagged image left the listing about 15 seconds after its tag was
-      // deleted. It is gone only when the listing has neither the tag nor the
-      // digest, and the registry answers a read of each with MANIFEST_UNKNOWN.
-      const deletedAt = performance.now();
+      // deleted. It is gone only when, before one deadline that starts at the
+      // registry's acceptance, a listing has neither the tag nor the digest
+      // and the registry answers a read of each with MANIFEST_UNKNOWN. A read
+      // that ends after the deadline does not count.
+      const deadline = performance.now() + REGISTRY_REMOVAL_WAIT_MS;
+      const expired = (seen: string) =>
+        unproven(`${seen} The ${REGISTRY_REMOVAL_WAIT_MS / 1_000} seconds Eden allows after the registry accepted the DELETE ran out.`);
+      let seen = "Eden's first listing after the delete did not finish in time.";
       for (;;) {
-        const { at, entries } = await list();
+        const entries = await registry.list(accountId, repository, deadline);
+        if (performance.now() >= deadline) return expired(seen);
         if (entries === undefined) return unproven("Eden could not read the registry's listing of the repository after the delete.");
-        const left = !entries.includes(image.tag) && !entries.includes(image.digest);
-        const tagUnknown = left && await registry.unknown(accountId, repository, image.tag).catch(() => false);
-        const digestUnknown = tagUnknown && await registry.unknown(accountId, repository, image.digest).catch(() => false);
-        if (digestUnknown) return "deleted";
-        if (at - deletedAt >= REGISTRY_REMOVAL_WAIT_MS) {
-          return unproven(left
-            ? `The listing no longer had the tag ${image.tag} or the image's sha256: entry, but the registry did not answer a manifest read for the ${tagUnknown ? "digest" : "tag"} with MANIFEST_UNKNOWN ${REGISTRY_REMOVAL_WAIT_MS / 1_000} seconds after it accepted the DELETE.`
-            : `The registry still listed ${entries.includes(image.tag) ? `the tag ${image.tag}` : "the image's sha256: entry"} in a listing begun ${REGISTRY_REMOVAL_WAIT_MS / 1_000} seconds after it accepted the DELETE.`);
+        if (!entries.includes(image.tag) && !entries.includes(image.digest)) {
+          const tagUnknown = await registry.unknown(accountId, repository, image.tag, deadline).catch(() => false);
+          const digestUnknown = tagUnknown && await registry.unknown(accountId, repository, image.digest, deadline).catch(() => false);
+          if (digestUnknown && performance.now() < deadline) return "deleted";
+          seen = `The listing no longer had the tag ${image.tag} or the image's sha256: entry, but the registry did not answer a manifest read for the ${tagUnknown ? "digest" : "tag"} with MANIFEST_UNKNOWN in time.`;
+        } else {
+          seen = `The registry still listed ${entries.includes(image.tag) ? `the tag ${image.tag}` : "the image's sha256: entry"}.`;
         }
-        await waitForActivation(5_000);
+        const left = deadline - performance.now();
+        if (left <= 0) return expired(seen);
+        await waitForActivation(Math.min(5_000, left));
       }
     }
     let listing = await list();

@@ -1108,19 +1108,24 @@ The reason names the step that failed:
   does not know whether the registry deleted it. Eden did not send the
   DELETE again.`: no answer within 30 seconds, a failed connection, or a
   registry credential the registry refused. Eden reads nothing after it.
-- `The registry still listed the tag <tag> in a listing begun 30 seconds
-  after it accepted the DELETE.`, or the image's `sha256:` entry instead of
-  the tag.
+- `The registry still listed the tag <tag>.`, or the image's `sha256:` entry
+  instead of the tag, followed by `The 30 seconds Eden allows after the
+  registry accepted the DELETE ran out.`
 - `The listing no longer had the tag <tag> or the image's sha256: entry, but
   the registry did not answer a manifest read for the tag with
-  MANIFEST_UNKNOWN 30 seconds after it accepted the DELETE.`, or for the
-  digest: the registry may still hold the image.
+  MANIFEST_UNKNOWN in time.`, or for the digest, followed by the same
+  sentence: the registry may still hold the image, or its answers came after
+  the 30 seconds.
+- `Eden's first listing after the delete did not finish in time.`, followed
+  by the same sentence.
 
 Eden counts the image as deleted only when the registry accepted the
 `DELETE` of its tag, and then the listing has neither the tag nor its
 `sha256:` entry and the registry answers a `GET` of the manifest of each
-with `404` `MANIFEST_UNKNOWN` for that exact entry. The update then passes
-`VAL-LIFE-007` with no warning.
+with `404` `MANIFEST_UNKNOWN` for that exact entry. Every one of those reads
+must finish within 30 seconds of the registry's acceptance; a read that
+finishes later does not count, however it was answered. The update then
+passes `VAL-LIFE-007` with no warning.
 
 - `eden destroy` tries to delete everything the registry lists for the
   target, and reports what Cloudflare keeps.
@@ -1697,7 +1702,7 @@ observed on 2026-11-18:
 
 | `class` | The registry's answer to the delete | Where it was seen |
 | --- | --- | --- |
-| `refused-snapshot` | `403` with one error: code `DENIED`, message `snapshot manifests cannot be deleted through this API` | A container snapshot: its tags, seen so far as `rootfs-snapshot-*` and `rootfs-set-*`, and its manifest. A target has them once it has slept or moved to a new Eve version. |
+| `refused-snapshot` | `403` with exactly `{"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}`: one error, no other field, and a `detail` of `null`. An answer that names a repository or tag, or adds any field, is not this answer | A container snapshot: its tags, seen so far as `rootfs-snapshot-*` and `rootfs-set-*`, and its manifest. A target has them once it has slept or moved to a new Eve version. |
 | `refused-singleton-artifact` | `409` with the code `SINGLETON_ARTIFACT_EXISTS`, the artifact type `application/vnd.cloudchamber.btrfs-chain.v1` and two digests | The chain artifact that Cloudflare makes for each pushed image. Eden does not know whether either digest in the answer is the one it asked to delete. |
 | `accepted-still-listed` | A delete by digest answered `202` or `204`, and a listing Eden began at least 30 seconds later still has the entry | The earlier image of a repository that got a second push under the same tag, as Eden `0.13.x` and older pushed. It had no tag. |
 

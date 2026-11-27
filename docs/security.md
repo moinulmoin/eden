@@ -155,7 +155,8 @@ repository, Eden:
   accepted the `DELETE` of its tag, reads the manifest of that tag and of
   that digest with `GET`. Only the registry's `404` `MANIFEST_UNKNOWN`
   for exactly that tag and that digest, with neither in the listing,
-  counts as proof that they are gone.
+  counts as proof that they are gone, and only when every one of those
+  reads finished within 30 seconds of the registry's acceptance.
 
 Eden does not ask the registry to collect unused layers. `cf containers
 images delete` sends `PUT /v2/gc/layers` after its tag delete; Eden does

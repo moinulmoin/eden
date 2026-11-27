@@ -320,10 +320,10 @@ behavior and the warning that an Eve upgrade can strand sessions.
   repository, digest and release tag from the deployment record, and
   deletes the tag only when the registry resolves it to that digest. Eden
   sends that `DELETE` to the registry itself, once. The delete counts as
-  shown when the registry accepts it, and then, within 30 seconds, a
-  listing no longer has the tag or the image's `sha256:` entry and the
-  registry answers a `GET` of the manifest of each with `404`
-  `MANIFEST_UNKNOWN`. Eden does not ask the registry to collect unused
+  shown when the registry accepts it, and then a listing no longer has the
+  tag or the image's `sha256:` entry and the registry answers a `GET` of
+  the manifest of each with `404` `MANIFEST_UNKNOWN`. Every one of those
+  reads must finish within 30 seconds of the acceptance. Eden does not ask the registry to collect unused
   layers. It deletes nothing when the
   repository also holds the image of a kept version or of a version whose
   retirement the record still names. If the delete cannot be shown, the

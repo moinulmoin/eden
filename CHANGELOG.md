@@ -43,16 +43,23 @@
 - A same-version update deletes the image it replaced again, without
   waiting for `cf`. Eden used `cf containers images delete` for the tag.
   After the tag delete, cf asks Cloudflare's registry to collect unused
-  layers, and since about 2026-11-22 the registry has not answered that
-  request. cf then ran into Eden's 120 second limit, and Eden reported
-  `EVE_SUPERSEDED_IMAGE_NOT_DELETED` even though the tag was gone; every live
-  check failed this step. Eden now sends the tag `DELETE` to the registry
-  itself, once. `VAL-LIFE-007` passes only when the registry accepts it, and
-  then, within 30 seconds, the listing has neither the tag nor the image's
+  layers, and the registry did not answer that request in any probe on
+  2026-11-26 and 2026-11-27. cf then ran into Eden's 120 second limit. Two
+  live checks on 2026-11-26 reported `EVE_SUPERSEDED_IMAGE_NOT_DELETED`
+  although the tag was gone; with the fallback added after them, the update
+  passed but waited the full two minutes. Eden now sends the tag `DELETE` to
+  the registry itself, once. `VAL-LIFE-007` passes only when the registry
+  accepts it, and then the listing has neither the tag nor the image's
   `sha256:` entry and the registry answers a `GET` of the manifest of each
-  with `404` `MANIFEST_UNKNOWN`.
+  with `404` `MANIFEST_UNKNOWN`, all within 30 seconds of the acceptance. A
+  read that finishes later does not count.
 - `eden destroy`, and the retirement of an Eve version after an upgrade,
   delete tags the same way, so they no longer wait for `cf` on each tag.
+- `eden destroy` and the retirement sweep keep a tag or manifest as
+  `refused-snapshot` only on the registry's exact snapshot refusal: `403`
+  with one `DENIED` error, its message, a `detail` of `null`, and no other
+  field. Any other `403` leaves the entry unproven, so destroy fails with
+  `EVE_DESTROY_IMAGES_RETAINED` and keeps the target's record.
 - A tag delete no longer follows a redirect. cf followed a redirect to
   another repository of the same account with the same credential, so a
   redirected delete could remove a tag Eden never meant to touch. Eden reads
@@ -67,8 +74,9 @@
   frees that storage.
 - `EVE_SUPERSEDED_IMAGE_NOT_DELETED` now ends with the step that failed: the
   listing, the tag lookup, the registry's answer to the `DELETE` (with its
-  status, and whether it was a redirect), no answer to it, a manifest the
-  registry still serves, or an image still listed after the delete.
+  status, and whether it was a redirect), no usable answer to it (none, or a
+  refused credential), a manifest the registry still serves, or an image
+  still listed when the 30 seconds after the delete ran out.
 
 ## 0.15.2 — 2026-11-23
 
