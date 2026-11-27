@@ -4,6 +4,45 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Same-version update cleanup fix (2026-11-26)
+
+Run on macOS with Docker `29.8.2` and Node `24.22.3`, with `cf`
+`1.0.0-rc.2` and an OAuth login; `CLOUDFLARE_API_TOKEN` was not set.
+
+- With temporary logging of each registry request, a run on Eve `0.91.0`
+  (deploy, same-version update, destroy; target
+  `eden-live-20261126-7371820d`) showed which step failed. The listing and
+  the `HEAD` of the replaced image's tag got `200`, and the tag named the
+  recorded digest. `cf containers images delete --force` printed nothing and
+  was stopped at its 120 second limit. The next listing no longer had the tag
+  or the image's `sha256:` entry.
+- After its tag delete, cf sends `PUT /v2/gc/layers` to the registry, with
+  no time limit; `1.0.0-rc.6` sends the same request. That request, sent on
+  its own with a fresh registry credential, got no response headers within
+  301 seconds.
+- The full `pnpm run check:live` then passed all 18 steps at `c2320ea`, on
+  target `eden-live-20261126-503cec25` (`11:55:24Z` to `12:17:05Z`): the
+  same-version update on Eve `0.91.0` passed `VAL-LIFE-007` with no
+  warning, then the upgrade to Eve `1.5.0`, the sleep and wake, and
+  destroy. Destroy reported 18 kept objects (14 `refused-snapshot`, 4
+  `refused-singleton-artifact`, none `accepted-still-listed`), and the
+  registry listed nothing else for the target.
+- After review, a cf that ran out of time counts only once it has stopped,
+  and only with `404` `MANIFEST_UNKNOWN` for a `GET` of the tag's and the
+  digest's manifest. A `HEAD` of an unknown tag or digest got `404` with no
+  body, and a `GET` got
+  `{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown","detail":{"Tag":"<entry>"}}]}`.
+  A `GET` of a listed manifest got `200`, with the manifest media types or
+  `application/json` in `Accept`.
+- The full `pnpm run check:live` passed all 18 steps again at `7c44519`, on
+  target `eden-live-20261126-88b9a315` (`12:33:59Z` to `12:55:05Z`). The
+  same-version update passed `VAL-LIFE-007` with no warning, and ended on
+  Eve `1.5.0`. The update took 257 seconds; passing runs before 2026-11-22
+  took 99 to 176. The output does not say which branch passed, and the
+  added time matches cf's 120 second limit. Destroy reported 15 kept
+  objects (12 `refused-snapshot`, 3 `refused-singleton-artifact`, none
+  `accepted-still-listed`), and the registry listed nothing else.
+
 ## Eve 1.5.0 and Postgres World 5.5.0 checks (2026-11-26)
 
 Run on macOS with Docker `29.8.2`, Postgres `16.16` in Docker, and Node

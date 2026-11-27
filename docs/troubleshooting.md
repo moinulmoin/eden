@@ -1086,10 +1086,39 @@ same exact target after resolving that check.
 
 A warning on a successful same-version update: `The update is healthy and
 promoted, but Eden could not show that the superseded image
-<repository>@sha256:<digest> left Cloudflare's registry.` The deploy
+<repository>@sha256:<digest> left Cloudflare's registry. <reason>` The deploy
 succeeded and nothing is needed now. Do not redeploy for this: a later
 deploy does not try this image again. The image may or may not still be in
 the registry, with or without its tag.
+
+The reason names the step that failed:
+
+- `Eden could not read the registry's listing of the repository before the
+  delete.` or `… after the delete.`: a listing page was not in the form
+  the registry sends, or got no answer.
+- `The registry did not answer a HEAD for the tag <tag> with one digest.`:
+  Eden could not tie the tag to the image, so it deleted nothing.
+- `cf containers images delete exited <code>: <cf's error>`: cf reported a
+  failure of its own, such as `403 Forbidden` from the registry.
+- `The registry still listed the tag <tag> in a listing begun 30 seconds
+  after cf returned.`, or the image's `sha256:` entry instead of the tag.
+- `cf containers images delete ran out of time and did not stop, so it may
+  still run. Eden did not read the registry after it.`
+- `cf containers images delete ended without an exit code of its own.`: cf
+  did not start, or something other than Eden stopped it.
+- `The listing no longer had the tag <tag> or the image's sha256: entry, but
+  the registry did not answer a manifest read for the tag with
+  MANIFEST_UNKNOWN.`, or for the digest: the registry may still hold the
+  image.
+
+When cf ran out of time and stopped, the reason ends with `cf containers
+images delete ran out of time and was stopped.` After its tag delete, cf
+asks the registry to collect unused layers. On 2026-11-26 the registry sent
+no answer to that request within 300 seconds, so cf was stopped after 120
+seconds. Without cf's exit 0, Eden counts the image as deleted only when the
+listing has neither the tag nor its `sha256:` entry and the registry answers
+a `GET` of the manifest of each with `404` `MANIFEST_UNKNOWN` for that exact
+entry. The update then passes `VAL-LIFE-007` with no warning.
 
 - `eden destroy` tries to delete everything the registry lists for the
   target, and reports what Cloudflare keeps.

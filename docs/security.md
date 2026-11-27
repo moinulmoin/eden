@@ -151,7 +151,13 @@ repository, Eden:
 - repeats the delete of a tag when the registry answered `cf`'s delete
   of that tag with `403`, to read the registry's answer, because `cf`
   prints only the status. Eden repeats no tag delete after any other
-  `cf` failure.
+  `cf` failure;
+- for the image a same-version update replaced, when `cf`'s tag delete
+  ran out of time and `cf` stopped, reads the manifest of that tag and of
+  that digest with `GET`. Only the registry's `404` `MANIFEST_UNKNOWN`
+  for exactly that tag and that digest counts as proof that they are gone.
+  Eden sends no delete of its own there, and reads nothing while `cf` may
+  still run.
 
 For these, Eden asks `cf` for a registry credential
 (`cf containers registries credentials generate`)
