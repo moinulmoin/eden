@@ -57,16 +57,16 @@ const fakeCf = vi.hoisted(() => ({
 
 /**
  * A stand-in for Cloudflare's registry. While `active`, a request to the
- * registry lists `entries` or gets `answer(ref)` for a delete, and cf's
- * `containers images delete` and `containers registries credentials generate`
- * run against the same state. `auth whoami` names `whoamiAccountId()`, and
+ * registry lists `entries`, and a DELETE takes a deletable tag out of them
+ * or gets `answer(ref)`. cf's `containers registries credentials generate`
+ * gives a credential for it. `auth whoami` names `whoamiAccountId()`, and
  * Cloudflare's API, read with CLOUDFLARE_API_TOKEN, reports the exact Worker
  * and Container application absent, in the forms it answered with on
  * 2026-11-20. Any other cf command fails.
  */
 const fakeRegistry = vi.hoisted(() => {
   type Answer =
-    | { readonly status: number; readonly body: string; readonly link?: string; readonly digest?: string; readonly leavesAfterMs?: number }
+    | { readonly status: number; readonly body: string; readonly link?: string; readonly digest?: string; readonly location?: string; readonly leavesAfterMs?: number }
     | "error"
     | "stall";
   const state = {
@@ -76,22 +76,11 @@ const fakeRegistry = vi.hoisted(() => {
     /** The digest the registry answers a HEAD for a listed `repository:tag` with; any other tag gets 404. */
     digests: new Map<string, string>(),
     pageSize: 1_000,
-    /** Whether cf's delete of a tag succeeds; the tag then leaves the listing. */
+    /** Whether a DELETE of a listed tag is answered 204, as the registry did on 2026-11-27; the tag then leaves the listing. */
     deletable: (() => true) as (ref: string) => boolean,
-    /**
-     * Whether cf's delete of a tag never exits, as cf 1.0.0-rc.2's did on
-     * 2026-11-26 when the registry did not answer the request to collect
-     * layers that cf sends after the tag delete: `after-delete` deletes the
-     * tag first, `before-delete` deletes nothing.
-     */
-    cfHangs: undefined as "after-delete" | "before-delete" | undefined,
-    /** Whether a cf that never exits stops when it is killed. */
-    cfStopsOnKill: true,
-    /** Set while a cf that never exits is running. */
-    cfHanging: false,
     /** The registry's answer to a GET of a manifest; by default 200 for a listed entry, else MANIFEST_UNKNOWN. */
     manifestRead: (() => undefined) as (ref: string) => Answer | undefined,
-    /** The registry's answer to Eden's own delete; `leavesAfterMs` takes the entry out of the listing that much later. */
+    /** The registry's answer to any other DELETE; `leavesAfterMs` takes the entry out of the listing that much later. */
     answer: (() => ({ status: 404, body: "" })) as (ref: string) => Answer,
     /**
      * Called for each page of a listing, with the listing's number from 0
@@ -103,14 +92,10 @@ const fakeRegistry = vi.hoisted(() => {
     /** Called when destroy reads the target, with the read's number from 0. */
     onRead: (() => undefined) as (nth: number) => void,
     reads: 0,
-    cfFailure: ((ref) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 403 Forbidden`) as (
-      ref: string,
-    ) => string,
     credentialAccountId: "account-test",
     /** What `performance.now()` returns while a command runs against the fake registry. */
     clock: 0,
     leaving: [] as { readonly repository: string; readonly entry: string; readonly at: number }[],
-    cfDeletes: [] as string[],
     credentialCalls: 0,
     listings: 0,
     registryRequests: [] as {
@@ -186,6 +171,8 @@ vi.mock("node:https", async (importOriginal) => {
               ? { status: 200, body: "{}" }
               // The registry's answer on 2026-11-26 for a tag or digest it does not know.
               : { status: 404, body: JSON.stringify({ errors: [{ code: "MANIFEST_UNKNOWN", message: "manifest unknown", detail: { Tag: entry } }] }) })
+            : !entry.startsWith("sha256:") && fakeRegistry.listed(repository).includes(entry) && fakeRegistry.deletable(ref)
+            ? { status: 204, body: "", leavesAfterMs: 0 }
             : fakeRegistry.answer(ref);
           if (answer === undefined) {
             const tags = fakeRegistry.listed(repository)
@@ -212,6 +199,7 @@ vi.mock("node:https", async (importOriginal) => {
             headers: {
               ...(answer.link === undefined ? {} : { link: answer.link }),
               ...(answer.digest === undefined ? {} : { "docker-content-digest": answer.digest }),
+              ...(answer.location === undefined ? {} : { location: answer.location }),
             },
           });
           onResponse(response);
@@ -230,7 +218,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   /** What cf prints and exits with while the fake registry runs. */
   const registryCf = (
     args: readonly string[],
-  ): { readonly exitCode: number | undefined; readonly stdout?: string; readonly stderr?: string; readonly hangs?: true } => {
+  ): { readonly exitCode: number | undefined; readonly stdout?: string; readonly stderr?: string } => {
     const line = args.join(" ");
     if (line === "auth whoami") {
       return {
@@ -249,22 +237,6 @@ vi.mock("node:child_process", async (importOriginal) => {
           password: "registry-password",
         }),
       };
-    }
-    if (line.startsWith("containers images delete ")) {
-      const ref = args[3] ?? "";
-      const [repository = "", tag = ""] = ref.split(":");
-      fakeRegistry.cfDeletes.push(ref);
-      if (fakeRegistry.cfHangs === "before-delete") return { exitCode: undefined, hangs: true };
-      if (!fakeRegistry.deletable(ref)) {
-        // cf prints its own errors on stderr in this form, a long message wrapped at spaces (read on 2026-11-20).
-        const wrapped = fakeRegistry.cfFailure(ref).replaceAll(" (digest: ", "\n│ (digest:\n│ ").replace(/ Forbidden$/u, "\n│ Forbidden");
-        return { exitCode: 1, stderr: "\n┌ Error\n│ " + wrapped + "\n└\n" };
-      }
-      fakeRegistry.entries.set(
-        repository,
-        (fakeRegistry.entries.get(repository) ?? []).filter((present) => present !== tag),
-      );
-      return fakeRegistry.cfHangs === "after-delete" ? { exitCode: undefined, hangs: true } : { exitCode: 0 };
     }
     return { exitCode: 1, stderr: `Unexpected cf call: ${line}` };
   };
@@ -287,21 +259,8 @@ vi.mock("node:child_process", async (importOriginal) => {
       const child = Object.assign(new EventEmitter(), {
         stdout: new EventEmitter(),
         stderr: new EventEmitter(),
-        kill: () => {
-          if ("hangs" in answer && fakeRegistry.cfStopsOnKill) {
-            setImmediate(() => {
-              fakeRegistry.cfHanging = false;
-              child.emit("exit", null, "SIGKILL");
-              child.emit("close", null, "SIGKILL");
-            });
-          }
-          return true;
-        },
+        kill: () => true,
       });
-      if ("hangs" in answer) {
-        fakeRegistry.cfHanging = true;
-        return child;
-      }
       setImmediate(() => {
         if (answer.stdout !== undefined) child.stdout.emit("data", Buffer.from(answer.stdout));
         if (answer.stderr !== undefined) child.stderr.emit("data", Buffer.from(answer.stderr));
@@ -328,6 +287,8 @@ const singletonRefusal = JSON.stringify({
 });
 const registryDeletes = (): readonly string[] =>
   fakeRegistry.registryRequests.filter((request) => request.method === "DELETE").map((request) => request.ref);
+/** The tags Eden sent a DELETE for, in order. */
+const tagDeletes = (): readonly string[] => registryDeletes().filter((ref) => !ref.includes("@"));
 
 type FakeRegistrySetup = {
   readonly entries: Readonly<Record<string, readonly string[]>>;
@@ -337,7 +298,6 @@ type FakeRegistrySetup = {
   readonly listing?: typeof fakeRegistry.listing;
   readonly whoamiAccountId?: typeof fakeRegistry.whoamiAccountId;
   readonly onRead?: typeof fakeRegistry.onRead;
-  readonly cfFailure?: typeof fakeRegistry.cfFailure;
   readonly credentialAccountId?: string;
 };
 
@@ -361,21 +321,15 @@ function startFakeRegistry(setup: FakeRegistrySetup): void {
     digests: new Map(),
     pageSize: setup.pageSize ?? 1_000,
     deletable: setup.deletable ?? (() => true),
-    cfHangs: undefined,
-    cfStopsOnKill: true,
-    cfHanging: false,
     manifestRead: () => undefined,
     answer: setup.answer ?? (() => ({ status: 404, body: "" })),
     listing: setup.listing ?? (() => undefined),
     whoamiAccountId: setup.whoamiAccountId ?? (() => "account-test"),
     onRead: setup.onRead ?? (() => undefined),
     reads: 0,
-    cfFailure: setup.cfFailure ??
-      ((ref: string) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 403 Forbidden`),
     credentialAccountId: setup.credentialAccountId ?? "account-test",
     clock: 0,
     leaving: [],
-    cfDeletes: [],
     credentialCalls: 0,
     listings: 0,
     registryRequests: [],
@@ -2359,14 +2313,23 @@ describe("eden destroy", () => {
     });
     expect(exitCode).toBe(0);
     expect(output).toHaveLength(1);
-    expect(new Set(fakeRegistry.cfDeletes)).toEqual(new Set([
+    expect(new Set(tagDeletes())).toEqual(new Set([
       destroyRegistryImage,
       snapshot,
       `${secondRepository}:candidate`,
       `${secondRepository}:rootfs-set-custom`,
     ]));
     expect(fakeRegistry.credentialCalls).toBe(1);
-    expect(registryDeletes()).toEqual([snapshot, image, snapshotManifest, chain, earlierImage]);
+    expect(registryDeletes()).toEqual([
+      `${secondRepository}:candidate`,
+      `${secondRepository}:rootfs-set-custom`,
+      destroyRegistryImage,
+      snapshot,
+      image,
+      snapshotManifest,
+      chain,
+      earlierImage,
+    ]);
     for (const request of fakeRegistry.registryRequests) {
       expect(request).toMatchObject({
         host: "registry.cloudflare.com",
@@ -2431,7 +2394,7 @@ describe("eden destroy", () => {
       answer: () => answer,
     });
     expect(exitCode).toBe(1);
-    expect(registryDeletes()).toEqual([`${destroyRegistryRepository}@${manifest("c")}`]);
+    expect(registryDeletes()).toEqual([destroyRegistryImage, `${destroyRegistryRepository}@${manifest("c")}`]);
     const result = JSON.parse(output[0] as string) as Record<string, unknown>;
     expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
     expect(result).not.toHaveProperty("registryObjectsKept");
@@ -2453,8 +2416,8 @@ describe("eden destroy", () => {
       },
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.cfDeletes).toEqual([destroyRegistryImage, late]);
-    expect(registryDeletes()).toEqual([late, lateManifest]);
+    expect(tagDeletes()).toEqual([destroyRegistryImage, late]);
+    expect(registryDeletes()).toEqual([destroyRegistryImage, late, lateManifest]);
     expect(JSON.parse(output[0] as string)).toMatchObject({
       ok: true,
       status: "destroyed",
@@ -2476,7 +2439,7 @@ describe("eden destroy", () => {
       },
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.cfDeletes).toEqual([
+    expect(tagDeletes()).toEqual([
       destroyRegistryImage,
       `${destroyRegistryRepository}:late-1`,
       `${destroyRegistryRepository}:late-2`,
@@ -2516,7 +2479,7 @@ describe("eden destroy", () => {
       listing: () => listing,
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.cfDeletes).toEqual([]);
+    expect(tagDeletes()).toEqual([]);
     expect(registryDeletes()).toEqual([]);
     const result = JSON.parse(output[0] as string) as { readonly error: { readonly remediation: string } };
     expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
@@ -2540,7 +2503,7 @@ describe("eden destroy", () => {
       listing: (_repository, _nth, last) => answer(last),
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.cfDeletes).toEqual([]);
+    expect(tagDeletes()).toEqual([]);
     // Destroy's first read, the cleanup and the final read each give up on their own listing.
     expect(fakeRegistry.registryRequests.map((request) => request.method)).toEqual(Array(requests).fill("GET"));
     expect(JSON.parse(output[0] as string)).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
@@ -2563,8 +2526,7 @@ describe("eden destroy", () => {
       listing: (_repository, _nth, last) => fakeRegistry.reads === 2 ? answer(last) : undefined,
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.cfDeletes).toEqual([destroyRegistryImage]);
-    expect(registryDeletes()).toEqual([]);
+    expect(registryDeletes()).toEqual([destroyRegistryImage]);
     expect(JSON.parse(output[0] as string)).toMatchObject({
       ok: false,
       status: "failed",
@@ -2581,7 +2543,7 @@ describe("eden destroy", () => {
       whoamiAccountId: () => fakeRegistry.reads === 0 ? "account-test" : "another-account",
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.cfDeletes).toEqual([destroyRegistryImage]);
+    expect(tagDeletes()).toEqual([destroyRegistryImage]);
     // Nothing is read from the other account, so no second credential is asked for.
     expect(fakeRegistry.credentialCalls).toBe(1);
     expect(JSON.parse(output[0] as string)).toMatchObject({
@@ -2606,7 +2568,7 @@ describe("eden destroy", () => {
       },
     });
     expect(exitCode).toBe(0);
-    expect(registryDeletes()).toEqual([early, late]);
+    expect(registryDeletes()).toEqual([destroyRegistryImage, early, late]);
     // The second delete was accepted at 25 seconds, so its wait ends at 55.
     expect(fakeRegistry.clock).toBe(55_000);
     expect(JSON.parse(output[0] as string)).toMatchObject({
@@ -2676,7 +2638,7 @@ describe("eden destroy", () => {
       pageSize: 1,
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.cfDeletes).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
+    expect(tagDeletes()).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
   });
 
   test("reads a listing that takes several pages", async () => {
@@ -2687,11 +2649,13 @@ describe("eden destroy", () => {
       pageSize: 2,
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.cfDeletes).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
+    expect(tagDeletes()).toEqual(tags.map((tag) => `${destroyRegistryRepository}:${tag}`));
     // Three pages and the empty one that ends a listing, for destroy's first
-    // read and again for the cleanup; then one empty listing after the
-    // deletes and one for the final read.
-    expect(fakeRegistry.registryRequests.map((request) => request.method)).toEqual(Array(10).fill("GET"));
+    // read and again for the cleanup; a DELETE per tag; then one empty
+    // listing after the deletes and one for the final read.
+    expect(fakeRegistry.registryRequests.map((request) => request.method)).toEqual([
+      ...Array(8).fill("GET"), ...Array(5).fill("DELETE"), "GET", "GET",
+    ]);
   });
 
   test("fails when another repository's tag is refused with a different answer", async () => {
@@ -2710,8 +2674,8 @@ describe("eden destroy", () => {
         : { status: 403, body: JSON.stringify({ errors: [{ code: "DENIED", message: "access denied" }] }) },
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.cfDeletes).toContain(other);
-    expect(new Set(registryDeletes())).toEqual(new Set([snapshot, other]));
+    expect(tagDeletes()).toContain(other);
+    expect(new Set(registryDeletes())).toEqual(new Set([destroyRegistryImage, `${secondRepository}:candidate`, snapshot, other]));
     expect(fakeRegistry.credentialCalls).toBe(1);
     const result = JSON.parse(output[0] as string) as Record<string, unknown>;
     expect(result).toMatchObject({
@@ -2765,12 +2729,12 @@ describe("eden destroy", () => {
     });
     expect(exitCode).toBe(1);
     // Without a credential for this account nothing is listed, so nothing is deleted.
-    expect(fakeRegistry.cfDeletes).toEqual(credentialAccountId === undefined ? [destroyRegistryImage, snapshot] : []);
+    expect(tagDeletes()).toEqual(credentialAccountId === undefined ? [destroyRegistryImage, snapshot] : []);
     expect(fakeRegistry.registryRequests.map((request) => request.method)).toEqual(
       // A listing is a page and the empty page that ends it: destroy's first
       // read and the cleanup's, then after the delete the cleanup's and the final read's.
       credentialAccountId === undefined
-        ? ["GET", "GET", "GET", "GET", "DELETE", "GET", "GET", "GET", "GET"]
+        ? ["GET", "GET", "GET", "GET", "DELETE", "DELETE", "GET", "GET", "GET", "GET"]
         : [],
     );
     const result = JSON.parse(output[0] as string) as Record<string, unknown>;
@@ -2778,43 +2742,63 @@ describe("eden destroy", () => {
     expect(result).not.toHaveProperty("registryObjectsKept");
   });
 
-  test("sends no delete of its own when cf deletes every tag", async () => {
+  test("deletes every tag with one DELETE of its own, on its own connection, and sends nothing else", async () => {
     const { root } = await createDeployedFixture();
     const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
       entries: { [destroyRegistryRepository]: ["candidate", "rootfs-set-custom"] },
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.cfDeletes).toHaveLength(2);
     expect(fakeRegistry.credentialCalls).toBe(1);
-    expect(registryDeletes()).toEqual([]);
+    expect(registryDeletes()).toEqual([destroyRegistryImage, `${destroyRegistryRepository}:rootfs-set-custom`]);
+    // Listings and the two DELETEs; no request to collect layers.
+    expect(new Set(fakeRegistry.registryRequests.map((request) => request.method))).toEqual(new Set(["GET", "DELETE"]));
+    for (const request of fakeRegistry.registryRequests) {
+      expect(request).toMatchObject({ host: "registry.cloudflare.com", ownAgent: true, verifiesPeer: true, authorized: true });
+    }
     const result = JSON.parse(output[0] as string) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: true, status: "destroyed" });
     expect(result).not.toHaveProperty("warnings");
   });
 
-  test.each([
-    ["cf could not read the tag", (ref: string) => `Failed to retrieve info for ${ref}: 403 Forbidden`],
-    ["the registry answered cf's delete with 500", (ref: string) => `Failed to delete ${ref} (digest: sha256:${"0".repeat(64)}): 500 Internal Server Error`],
-    ["cf named another tag", () => `Failed to delete ${destroyRegistryRepository}:other (digest: sha256:${"0".repeat(64)}): 403 Forbidden`],
-  ] as const)("sends no delete of its own when %s", async (_name, cfFailure) => {
+  test("does not follow a redirect on a tag DELETE, and fails with the tag unproven", async () => {
     const { root } = await createDeployedFixture();
-    const snapshot = `${destroyRegistryRepository}:rootfs-snapshot-aaa`;
+    const other = "eden-eve-another-target";
     const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
-      entries: { [destroyRegistryRepository]: ["candidate", "rootfs-snapshot-aaa"] },
-      deletable: (ref) => ref !== snapshot,
-      cfFailure,
-      answer: () => ({ status: 403, body: snapshotRefusal }),
+      entries: { [destroyRegistryRepository]: ["candidate"], [other]: ["candidate"] },
+      deletable: () => false,
+      // A same-origin redirect to the same tag in another repository of the account.
+      answer: () => ({ status: 307, body: "", location: `/v2/account-test/${other}/manifests/candidate` }),
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.cfDeletes).toContain(snapshot);
-    expect(registryDeletes()).toEqual([]);
+    expect(registryDeletes()).toEqual([destroyRegistryImage]);
+    expect(fakeRegistry.registryRequests.filter((request) => request.ref.startsWith(other))).toEqual([]);
+    expect(fakeRegistry.listed(other)).toEqual(["candidate"]);
+    const result = JSON.parse(output[0] as string) as Record<string, unknown>;
+    expect(result).toMatchObject({ ok: false, status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
+    expect(JSON.stringify(result.error)).toContain(destroyRegistryRepository);
+    expect(result).not.toHaveProperty("registryObjectsKept");
+  });
+
+  test.each([
+    ["answers 500", { status: 500, body: "" }],
+    ["answers 200", { status: 200, body: "" }],
+    ["does not answer", "error"],
+  ] as const)("sends a tag DELETE once and fails when the registry %s", async (_name, answer) => {
+    const { root } = await createDeployedFixture();
+    const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
+      entries: { [destroyRegistryRepository]: ["candidate"] },
+      deletable: () => false,
+      answer: () => answer,
+    });
+    expect(exitCode).toBe(1);
+    expect(registryDeletes()).toEqual([destroyRegistryImage]);
     expect(JSON.parse(output[0] as string)).toMatchObject({
       status: "failed",
       error: { code: "EVE_DESTROY_IMAGES_RETAINED" },
     });
   });
 
-  test("stops asking the registry after 60 seconds without an answer, and still asks cf to delete every tag", async () => {
+  test("stops asking the registry after 60 seconds without an answer", async () => {
     const { root } = await createDeployedFixture();
     const snapshotTags = ["rootfs-snapshot-a", "rootfs-snapshot-b", "rootfs-snapshot-c", "rootfs-snapshot-d"];
     const { exitCode, output } = await destroyAgainstFakeRegistry(root, {
@@ -2823,11 +2807,13 @@ describe("eden destroy", () => {
       answer: () => "stall",
     });
     expect(exitCode).toBe(1);
-    // The second wait starts with 29,999.75 ms left; the tags after it are still deleted.
-    expect(fakeRegistry.cfDeletes).toHaveLength(6);
-    expect(fakeRegistry.cfDeletes.at(-1)).toBe(`${destroyRegistryRepository}:z-last`);
-    expect(registryDeletes()).toHaveLength(2);
-    expect(fakeRegistry.entries.get(destroyRegistryRepository)).toEqual(snapshotTags);
+    // The second wait starts with 29,999.75 ms left; after it nothing more is sent.
+    expect(registryDeletes()).toEqual([
+      `${destroyRegistryRepository}:a-first`,
+      `${destroyRegistryRepository}:rootfs-snapshot-a`,
+      `${destroyRegistryRepository}:rootfs-snapshot-b`,
+    ]);
+    expect(fakeRegistry.entries.get(destroyRegistryRepository)).toEqual([...snapshotTags, "z-last"]);
     const result = JSON.parse(output[0] as string) as { readonly error: { readonly remediation: string } };
     expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
     expect(result.error.remediation).toContain("direct requests to registry.cloudflare.com");
@@ -2842,7 +2828,6 @@ describe("eden destroy", () => {
       answer: (ref) => ref.endsWith("-ok") ? { status: 403, body: snapshotRefusal } : "stall",
     });
     expect(exitCode).toBe(1);
-    expect(fakeRegistry.cfDeletes).toHaveLength(4);
     expect(registryDeletes()).toHaveLength(3);
     const result = JSON.parse(output[0] as string) as Record<string, unknown>;
     expect(result).toMatchObject({ status: "failed", error: { code: "EVE_DESTROY_IMAGES_RETAINED" } });
@@ -2897,8 +2882,7 @@ describe("eden destroy", () => {
       json: false,
     });
     expect(exitCode).toBe(0);
-    expect(fakeRegistry.cfDeletes).toHaveLength(201);
-    expect(registryDeletes()).toHaveLength(200);
+    expect(registryDeletes()).toHaveLength(201);
     expect(fakeRegistry.credentialCalls).toBe(1);
     const lines = output.join("\n").split("\n");
     for (const tag of snapshotTags) {
@@ -4137,7 +4121,7 @@ describe("eden deploy in-place update", () => {
     } finally {
       fakeRegistry.active = false;
     }
-    expect(new Set(fakeRegistry.cfDeletes)).toEqual(new Set([priorImage, snapshot, other]));
+    expect(new Set(tagDeletes())).toEqual(new Set([priorImage, snapshot, other]));
     const result = JSON.parse(output[0] as string) as {
       readonly checks: readonly { readonly id: string; readonly status: string }[];
       readonly warnings: readonly { readonly id: string }[];
@@ -4195,7 +4179,7 @@ describe("eden deploy in-place update", () => {
     }
     expect(JSON.parse(output[0] as string)).toMatchObject({ ok: false, error: { code: "EVE_IMAGE_IDENTITY_MISMATCH" } });
     expect(operations).toEqual([]);
-    expect(fakeRegistry.cfDeletes).toEqual([]);
+    expect(tagDeletes()).toEqual([]);
     expect(fakeRegistry.registryRequests).toEqual([]);
     const current = await realpath(join(root, ".eden", "eve-deploy", "targets", `preview-${updateName}`, "CURRENT"));
     expect(current).toContain("gen-prior");
@@ -4227,7 +4211,7 @@ describe("eden deploy in-place update", () => {
     } finally {
       fakeRegistry.active = false;
     }
-    expect(fakeRegistry.cfDeletes).toEqual([]);
+    expect(tagDeletes()).toEqual([]);
     expect(fakeRegistry.registryRequests).toEqual([]);
     const result = JSON.parse(output[0] as string) as {
       readonly deployment: { readonly imageReference: string };
@@ -4549,22 +4533,26 @@ describe("eden deploy in-place update", () => {
       expect(promotedTag).not.toBe(priorTag);
       if (prior !== "own") {
         // The older image keeps its tag, so destroy can still remove it. Nothing is deleted.
-        expect(fakeRegistry.cfDeletes).toEqual([]);
+        expect(tagDeletes()).toEqual([]);
         expect(registryDeletes()).toEqual([]);
         if (prior === "unrecorded") expect(fakeRegistry.registryRequests.slice(requestsBefore)).toEqual([]);
         expect(fakeRegistry.listed(repository)).toEqual(["candidate", promotedTag, manifest("c"), manifest("d"), manifest("e")]);
         expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).toBe("skipped");
       } else {
-        // Every request of the cleanup: a listing, what the tag names, cf's delete of
-        // that tag, and listings until the image has left. Eden sends no delete of its own.
-        expect(fakeRegistry.cfDeletes).toEqual([`${repository}:${priorTag}`]);
+        // Every request of the cleanup: a listing, what the tag names, one DELETE
+        // of that tag, listings until the image has left, and the registry's own
+        // answer for the tag and the digest. Nothing asks the registry to collect layers.
+        expect(registryDeletes()).toEqual([`${repository}:${priorTag}`]);
         // A listing is two requests: its page, and the empty page that ends it.
         const listing = [`GET ${repository}`, `GET ${repository}`];
         expect(fakeRegistry.registryRequests.slice(requestsBefore).map((sent) => `${String(sent.method)} ${sent.ref}`)).toEqual([
           ...listing,
           `HEAD ${repository}:${priorTag}`,
+          `DELETE ${repository}:${priorTag}`,
           ...listing,
           ...listing,
+          `GET ${repository}:${priorTag}`,
+          `GET ${repository}@${manifest("c")}`,
         ]);
         expect(fakeRegistry.listed(repository)).toEqual([promotedTag, manifest("d")]);
         expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")).toMatchObject({
@@ -4586,7 +4574,7 @@ describe("eden deploy in-place update", () => {
       const { repository } = await deploy("generation-two", manifest("c"));
       state.healthy = false;
       expect((await deploy("generation-three", manifest("d"))).code).not.toBe(0);
-      expect(fakeRegistry.cfDeletes).toEqual([]);
+      expect(tagDeletes()).toEqual([]);
       expect(registryDeletes()).toEqual([]);
       expect(fakeRegistry.listed(repository)).toEqual(
         [...state.pushed.map((pushed) => pushed.slice(repository.length + 1)), manifest("c"), manifest("d")].sort(),
@@ -4615,34 +4603,37 @@ describe("eden deploy in-place update", () => {
     }
   });
 
-  /** While a cf that never exits runs, its time limit, and the wait for an exit after a kill that fails, take no time. */
-  function shortCfTimeouts(): () => void {
-    const realSetTimeout = globalThis.setTimeout;
-    const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(
-      ((handler: () => void, timeoutMs?: number) => realSetTimeout(
-        handler,
-        fakeRegistry.cfHanging && (timeoutMs === 120_000 || (timeoutMs === 2_000 && !fakeRegistry.cfStopsOnKill)) ? 0 : timeoutMs,
-      )) as unknown as typeof setTimeout,
-    );
-    return () => timers.mockRestore();
-  }
-
   test.each([
-    ["cf ran out of time after its tag delete, and the registry knows neither the tag nor the digest", "unknown"],
-    ["cf ran out of time and did not stop", "still-running"],
-    ["cf ran out of time, and the listing omits the image while the registry still serves its manifest", "stale-listing"],
-    ["cf ran out of time, and the registry's 404 for the tag says more than MANIFEST_UNKNOWN for it", "extra-field"],
-    ["cf ran out of time before its tag delete", "not-deleted"],
-  ] as const)("a same-version update whose cf delete never exits: %s", async (_name, scenario) => {
+    ["the registry accepts the DELETE and then knows neither the tag nor the digest", "unknown"],
+    ["the listing omits the image while the registry still serves its manifest", "stale-listing"],
+    ["the registry's 404 for the tag says more than MANIFEST_UNKNOWN for it", "extra-field"],
+    ["the registry accepts the DELETE and still lists the tag", "still-listed"],
+    ["the registry answers the DELETE with 500", "refused"],
+    ["the registry answers the DELETE with a redirect", "redirect"],
+    ["the registry does not answer the DELETE", "no-answer"],
+  ] as const)("a same-version update sends one DELETE for the tag it replaces: %s", async (_name, scenario) => {
     const root = await createRoot();
-    const { state, deploy, stop } = await inPlaceUpdates(root);
-    const restore = shortCfTimeouts();
+    const { state, images, deploy, stop } = await inPlaceUpdates(root);
     try {
       const { repository } = await deploy("generation-two", manifest("c"));
       const prior = state.pushed[0] as string;
       const tag = prior.slice(repository.length + 1);
-      fakeRegistry.cfHangs = scenario === "not-deleted" ? "before-delete" : "after-delete";
-      fakeRegistry.cfStopsOnKill = scenario !== "still-running";
+      const other = `${repository}-other`;
+      if (scenario === "still-listed") {
+        // The registry accepts the DELETE and keeps listing the tag.
+        state.tagsDeletable = false;
+        fakeRegistry.answer = (ref) => ({ status: ref.includes("@") ? 204 : 202, body: "" });
+      }
+      if (scenario === "refused" || scenario === "no-answer" || scenario === "redirect") {
+        state.tagsDeletable = false;
+        fakeRegistry.answer = scenario === "refused"
+          ? () => ({ status: 500, body: "" })
+          : scenario === "no-answer"
+          ? () => "error"
+          : () => ({ status: 307, body: "", location: `/v2/account-test/${other}/manifests/${tag}` });
+        fakeRegistry.entries.set(other, [tag]);
+        images.set(`${other}:${tag}`, manifest("c"));
+      }
       if (scenario === "stale-listing") fakeRegistry.manifestRead = () => ({ status: 200, body: "{}" });
       if (scenario === "extra-field") {
         fakeRegistry.manifestRead = (ref) => ({
@@ -4653,19 +4644,24 @@ describe("eden deploy in-place update", () => {
         });
       }
       const requestsBefore = fakeRegistry.registryRequests.length;
+      const startedAt = fakeRegistry.clock;
       const second = await deploy("generation-three", manifest("d"));
       expect(second.code).toBe(0);
       expect(second.result.ok).toBe(true);
-      expect(fakeRegistry.cfDeletes).toEqual([prior]);
+      // One DELETE, never repeated, and nothing sent to any other repository or to collect layers.
+      expect(tagDeletes()).toEqual([prior]);
+      expect(registryDeletes()).toEqual([prior]);
       const listing = [`GET ${repository}`, `GET ${repository}`];
       const sent = fakeRegistry.registryRequests.slice(requestsBefore).map((request) => `${String(request.method)} ${request.ref}`);
+      expect(sent.filter((request) => !request.startsWith(`GET ${repository}`) && !request.startsWith(`HEAD ${repository}`) && !request.startsWith(`DELETE ${repository}`))).toEqual([]);
+      if (scenario === "redirect") expect(fakeRegistry.listed(other)).toEqual([tag]);
       const warning = second.result.warnings.find((entry) => entry.id === "EVE_SUPERSEDED_IMAGE_NOT_DELETED") as
         { readonly message?: string } | undefined;
       const lead = `The update is healthy and promoted, but Eden could not show that the superseded image ${repository}@${manifest("c")} left Cloudflare's registry. `;
-      const stopped = " cf containers images delete ran out of time and was stopped.";
       if (scenario === "unknown") {
-        // The listing, then the registry's own answer for the tag and for the digest.
-        expect(sent).toEqual([...listing, `HEAD ${prior}`, ...listing, ...listing, `GET ${prior}`, `GET ${repository}@${manifest("c")}`]);
+        // The image leaves 5 seconds after its tag: one listing before, one after, then the registry's own answer for each.
+        expect(sent).toEqual([...listing, `HEAD ${prior}`, `DELETE ${prior}`, ...listing, ...listing, `GET ${prior}`, `GET ${repository}@${manifest("c")}`]);
+        expect(fakeRegistry.clock - startedAt).toBe(5_000);
         expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")).toMatchObject({
           status: "passed",
           message: "The superseded image was deleted from the registry by its tag after promotion.",
@@ -4674,46 +4670,43 @@ describe("eden deploy in-place update", () => {
         return;
       }
       expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).not.toBe("passed");
-      if (scenario === "still-running") {
-        // Nothing is read while cf may still run.
-        expect(sent).toEqual([...listing, `HEAD ${prior}`]);
-        expect(warning?.message).toBe(lead + "cf containers images delete ran out of time and did not stop, so it may still run. Eden did not read the registry after it.");
-      } else if (scenario === "stale-listing" || scenario === "extra-field") {
-        expect(sent).toEqual([...listing, `HEAD ${prior}`, ...listing, ...listing, `GET ${prior}`]);
-        expect(warning?.message).toBe(lead + `The listing no longer had the tag ${tag} or the image's sha256: entry, but the registry did not answer a manifest read for the tag with MANIFEST_UNKNOWN.` + stopped);
+      if (scenario === "refused" || scenario === "redirect" || scenario === "no-answer") {
+        // Nothing is read after a DELETE the registry did not accept.
+        expect(sent).toEqual([...listing, `HEAD ${prior}`, `DELETE ${prior}`]);
+        expect(warning?.message).toBe(lead + {
+          refused: `The registry answered Eden's DELETE of the tag ${tag} with 500.`,
+          redirect: `The registry answered Eden's DELETE of the tag ${tag} with 307, a redirect, which Eden does not follow.`,
+          "no-answer": `Eden got no answer it could use to its DELETE of the tag ${tag}, so it does not know whether the registry deleted it. Eden did not send the DELETE again.`,
+        }[scenario]);
+      } else if (scenario === "still-listed") {
+        expect(warning?.message).toBe(lead + `The registry still listed the tag ${tag} in a listing begun 30 seconds after it accepted the DELETE.`);
       } else {
-        expect(sent.filter((request) => request.startsWith("GET ") && request.includes(":") && !request.endsWith(repository))).toEqual([]);
-        expect(warning?.message).toBe(lead + `The registry still listed the tag ${tag} in a listing begun 30 seconds after cf returned.` + stopped);
+        // Each listing that omits the image is followed by a read of the tag's manifest, for 30 seconds.
+        expect(sent.slice(0, 6)).toEqual([...listing, `HEAD ${prior}`, `DELETE ${prior}`, ...listing]);
+        expect(sent.filter((request) => request === `GET ${prior}`).length).toBeGreaterThan(1);
+        expect(warning?.message).toBe(lead + `The listing no longer had the tag ${tag} or the image's sha256: entry, but the registry did not answer a manifest read for the tag with MANIFEST_UNKNOWN 30 seconds after it accepted the DELETE.`);
       }
     } finally {
-      restore();
       stop();
     }
   });
 
-  test.each([
-    ["cf reports a failure", "cf-fails"],
-    ["the tag names no image", "unresolved"],
-  ] as const)("the warning for a superseded image that was not deleted says which step failed: %s", async (_name, failure) => {
+  test("the warning for a superseded image whose tag names no image says which step failed", async () => {
     const root = await createRoot();
     const { state, images, deploy, stop } = await inPlaceUpdates(root);
     try {
       const { repository } = await deploy("generation-two", manifest("c"));
       const prior = state.pushed[0] as string;
       const tag = prior.slice(repository.length + 1);
-      if (failure === "unresolved") images.delete(prior);
-      else state.tagsDeletable = false;
+      images.delete(prior);
       const second = await deploy("generation-three", manifest("d"));
       expect(second.code).toBe(0);
       expect(second.result.ok).toBe(true);
-      expect(fakeRegistry.cfDeletes).toEqual(failure === "unresolved" ? [] : [prior]);
+      expect(registryDeletes()).toEqual([]);
       const warning = second.result.warnings.find((entry) => entry.id === "EVE_SUPERSEDED_IMAGE_NOT_DELETED") as
         { readonly message?: string } | undefined;
       expect(warning?.message).toBe(
-        `The update is healthy and promoted, but Eden could not show that the superseded image ${repository}@${manifest("c")} left Cloudflare's registry. ` + {
-          "cf-fails": `cf containers images delete exited 1: Failed to delete ${prior} (digest: sha256:${"0".repeat(64)}): 403 Forbidden`,
-          unresolved: `The registry did not answer a HEAD for the tag ${tag} with one digest.`,
-        }[failure],
+        `The update is healthy and promoted, but Eden could not show that the superseded image ${repository}@${manifest("c")} left Cloudflare's registry. The registry did not answer a HEAD for the tag ${tag} with one digest.`,
       );
     } finally {
       stop();
@@ -4773,7 +4766,7 @@ describe("eden deploy in-place update", () => {
       state.worldRetires = false;
       const second = await deploy("generation-three", manifest("d"));
       expect(second.result.checks.find((entry) => entry.id === "VAL-LIFE-007")?.status).toBe("failed");
-      expect(fakeRegistry.cfDeletes).toEqual([]);
+      expect(tagDeletes()).toEqual([]);
       expect(registryDeletes()).toEqual([]);
       expect(fakeRegistry.listed(repository)).toEqual(expect.arrayContaining(["generation-pending", manifest("e"), manifest("c")]));
     } finally {

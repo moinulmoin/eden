@@ -1100,27 +1100,27 @@ The reason names the step that failed:
   the registry sends, or got no answer.
 - `The registry did not answer a HEAD for the tag <tag> with one digest.`:
   Eden could not tie the tag to the image, so it deleted nothing.
-- `cf containers images delete exited <code>: <cf's error>`: cf reported a
-  failure of its own, such as `403 Forbidden` from the registry.
+- `The registry answered Eden's DELETE of the tag <tag> with <status>.`:
+  the registry did not accept the delete. For a `3xx` status the reason
+  adds `, a redirect, which Eden does not follow`; Eden sends nothing to
+  where it points.
+- `Eden got no answer it could use to its DELETE of the tag <tag>, so it
+  does not know whether the registry deleted it. Eden did not send the
+  DELETE again.`: no answer within 30 seconds, a failed connection, or a
+  registry credential the registry refused. Eden reads nothing after it.
 - `The registry still listed the tag <tag> in a listing begun 30 seconds
-  after cf returned.`, or the image's `sha256:` entry instead of the tag.
-- `cf containers images delete ran out of time and did not stop, so it may
-  still run. Eden did not read the registry after it.`
-- `cf containers images delete ended without an exit code of its own.`: cf
-  did not start, or something other than Eden stopped it.
+  after it accepted the DELETE.`, or the image's `sha256:` entry instead of
+  the tag.
 - `The listing no longer had the tag <tag> or the image's sha256: entry, but
   the registry did not answer a manifest read for the tag with
-  MANIFEST_UNKNOWN.`, or for the digest: the registry may still hold the
-  image.
+  MANIFEST_UNKNOWN 30 seconds after it accepted the DELETE.`, or for the
+  digest: the registry may still hold the image.
 
-When cf ran out of time and stopped, the reason ends with `cf containers
-images delete ran out of time and was stopped.` After its tag delete, cf
-asks the registry to collect unused layers. On 2026-11-26 the registry sent
-no answer to that request within 300 seconds, so cf was stopped after 120
-seconds. Without cf's exit 0, Eden counts the image as deleted only when the
-listing has neither the tag nor its `sha256:` entry and the registry answers
-a `GET` of the manifest of each with `404` `MANIFEST_UNKNOWN` for that exact
-entry. The update then passes `VAL-LIFE-007` with no warning.
+Eden counts the image as deleted only when the registry accepted the
+`DELETE` of its tag, and then the listing has neither the tag nor its
+`sha256:` entry and the registry answers a `GET` of the manifest of each
+with `404` `MANIFEST_UNKNOWN` for that exact entry. The update then passes
+`VAL-LIFE-007` with no warning.
 
 - `eden destroy` tries to delete everything the registry lists for the
   target, and reports what Cloudflare keeps.
@@ -1688,8 +1688,8 @@ each one as `{ "ref", "class" }`. A `ref` is `<repository>:<tag>`, or
 Cloudflare's registry lists every tag of a repository, and one `sha256:`
 entry for every manifest, with or without a tag.
 `cf containers images list` shows only the tags. Eden reads the
-registry's own listing, asks `cf` to delete each tag, and sends its own
-delete for each `sha256:` entry. It does not check which manifests have a
+registry's own listing and sends one `DELETE` of its own for each tag and
+each `sha256:` entry. It does not check which manifests have a
 tag. An object is listed here only on the registry's own answer to the
 delete of that exact object; its name is never enough. The class says what
 the registry answered, not what the object is. All three answers were
@@ -1704,9 +1704,8 @@ observed on 2026-11-18:
 Each accepted delete gets its own 30 seconds, so cleanup of a repository
 can take that long after its last accepted delete.
 
-When the registry answers `cf`'s delete of a tag with `403`, Eden
-repeats the delete for that same tag against the registry and reads the
-answer. An object still listed without a kept answer, or an unreadable
+Eden sends no `DELETE` twice, even one that got no answer, and follows
+no redirect. An object still listed without a kept answer, or an unreadable
 final listing, fails destroy with
 [`EVE_DESTROY_IMAGES_RETAINED`](#eve_destroy_images_retained). Eden's
 requests go straight to `registry.cloudflare.com` and never through a

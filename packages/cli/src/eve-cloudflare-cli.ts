@@ -85,8 +85,6 @@ export interface CloudflareCliResult {
   readonly stderr: string;
   /** Set when cf was started, was told to stop, and did not report that it had stopped. */
   readonly running?: true;
-  /** Set when cf ran out of its time and Eden stopped it; with `running`, cf may still run. */
-  readonly timedOut?: true;
 }
 
 export type CloudflareCliRunner = (
@@ -208,7 +206,6 @@ async function runCf(
           stdout: Buffer.concat(stdout).toString("utf8"),
           stderr: Buffer.concat(stderr).toString("utf8"),
           ...(running ? { running: true as const } : {}),
-          ...(timedOut ? { timedOut: true as const } : {}),
         });
       };
       // Out of time: cf is killed, and the result waits until it is gone.
@@ -244,40 +241,4 @@ export function cloudflareCliJson(result: CloudflareCliResult): { readonly value
   } catch {
     return undefined;
   }
-}
-
-/** The lines of the one error box with this title that cf printed and exited 1 on, and nothing else. */
-function errorBox(result: CloudflareCliResult, title: string): readonly string[] | undefined {
-  if (result.exitCode !== 1 || result.stdout.length > 0) return undefined;
-  const lines = result.stderr.split("\n").map((line) => line.replace(/\r$/u, ""));
-  const start = lines.findIndex((line) => line.startsWith("┌ "));
-  if (lines[start] !== `┌ ${title}` || lines.some((line, at) => at !== start && line.startsWith("┌"))) return undefined;
-  const end = lines.indexOf("└", start);
-  if (end === -1) return undefined;
-  // Outside the box cf prints only blank lines and one "→" hint.
-  const outside = [...lines.slice(0, start), ...lines.slice(end + 1)];
-  if (outside.some((line) => line.trim().length > 0 && !line.startsWith("→ "))) return undefined;
-  const inner = lines.slice(start + 1, end);
-  if (inner.some((line) => line !== "│" && !line.startsWith("│ "))) return undefined;
-  return inner.map((line) => line.slice(2));
-}
-
-/**
- * The message of the one error of its own that cf printed, or undefined for
- * anything else. cf wraps a long message over several lines of its box,
- * breaking at spaces, read on 2026-11-20:
- *
- *   ┌ Error
- *   │ Failed to delete
- *   │ <repository>:<tag>
- *   │ (digest:
- *   │ sha256:<digest>): 403
- *   │ Forbidden
- *   └
- */
-export function cloudflareCliError(result: CloudflareCliResult): string | undefined {
-  const text = errorBox(result, "Error");
-  return text === undefined || text.length === 0 || text.some((line) => line.length === 0)
-    ? undefined
-    : text.join(" ");
 }

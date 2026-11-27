@@ -40,20 +40,34 @@
 
 ### Fixed
 
-- A same-version update deletes the image it replaced again. After it
-  deletes the tag, `cf containers images delete` asks Cloudflare's registry
-  to collect unused layers. On 2026-11-26 the registry sent no answer to that
-  request within 300 seconds, so cf ran into its 120 second limit, and Eden
-  reported `EVE_SUPERSEDED_IMAGE_NOT_DELETED` even though the tag was gone.
-  Every live check has failed this step since 2026-11-22. When cf runs out
-  of time and has stopped, Eden now reads the listing, and then the manifest
-  of the tag and of the digest. `VAL-LIFE-007` passes only when the listing
-  has neither and the registry answers both reads with `MANIFEST_UNKNOWN`.
-  When cf may still run, Eden reads nothing and warns. In the observed runs
-  the registry did not answer, and an update then waited the full two
-  minutes for cf.
+- A same-version update deletes the image it replaced again, without
+  waiting for `cf`. Eden used `cf containers images delete` for the tag.
+  After the tag delete, cf asks Cloudflare's registry to collect unused
+  layers, and since about 2026-11-22 the registry has not answered that
+  request. cf then ran into Eden's 120 second limit, and Eden reported
+  `EVE_SUPERSEDED_IMAGE_NOT_DELETED` even though the tag was gone; every live
+  check failed this step. Eden now sends the tag `DELETE` to the registry
+  itself, once. `VAL-LIFE-007` passes only when the registry accepts it, and
+  then, within 30 seconds, the listing has neither the tag nor the image's
+  `sha256:` entry and the registry answers a `GET` of the manifest of each
+  with `404` `MANIFEST_UNKNOWN`.
+- `eden destroy`, and the retirement of an Eve version after an upgrade,
+  delete tags the same way, so they no longer wait for `cf` on each tag.
+- A tag delete no longer follows a redirect. cf followed a redirect to
+  another repository of the same account with the same credential, so a
+  redirected delete could remove a tag Eden never meant to touch. Eden reads
+  a redirect as the registry's answer: the tag is unproven, and Eden sends
+  nothing to where it points. Cloudflare's registry has not been seen to
+  answer with a redirect.
+- Eden no longer asks the registry to collect unused layers
+  (`PUT /v2/gc/layers`). On 2026-11-27 that request got no answer three
+  times, within 5, 90 and 300 seconds, and the layer of a deleted image was
+  still served 13 minutes after its tag was deleted, 10 minutes after the
+  first of those requests. Eden does not know whether or when Cloudflare
+  frees that storage.
 - `EVE_SUPERSEDED_IMAGE_NOT_DELETED` now ends with the step that failed: the
-  listing, the tag lookup, cf's own error, cf still running, a manifest the
+  listing, the tag lookup, the registry's answer to the `DELETE` (with its
+  status, and whether it was a redirect), no answer to it, a manifest the
   registry still serves, or an image still listed after the delete.
 
 ## 0.15.2 — 2026-11-23

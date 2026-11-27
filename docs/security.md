@@ -145,19 +145,21 @@ repository, Eden:
 
 - reads the registry's listing of the repository, because `cf` lists
   tags only;
-- deletes each `sha256:` entry of the listing by digest, because `cf`
-  deletes tags only. The registry lists one such entry for every manifest,
-  with or without a tag;
-- repeats the delete of a tag when the registry answered `cf`'s delete
-  of that tag with `403`, to read the registry's answer, because `cf`
-  prints only the status. Eden repeats no tag delete after any other
-  `cf` failure;
-- for the image a same-version update replaced, when `cf`'s tag delete
-  ran out of time and `cf` stopped, reads the manifest of that tag and of
+- deletes each tag and each `sha256:` entry of the listing with one
+  `DELETE` of its own. The registry lists one `sha256:` entry for every
+  manifest, with or without a tag. Eden never sends a `DELETE` again,
+  even when it got no answer, because the first one may have landed. A
+  redirect is an answer like any other: Eden does not follow it, and the
+  entry is unproven;
+- for the image a same-version update replaced, after the registry
+  accepted the `DELETE` of its tag, reads the manifest of that tag and of
   that digest with `GET`. Only the registry's `404` `MANIFEST_UNKNOWN`
-  for exactly that tag and that digest counts as proof that they are gone.
-  Eden sends no delete of its own there, and reads nothing while `cf` may
-  still run.
+  for exactly that tag and that digest, with neither in the listing,
+  counts as proof that they are gone.
+
+Eden does not ask the registry to collect unused layers. `cf containers
+images delete` sends `PUT /v2/gc/layers` after its tag delete; Eden does
+not send it, and runs no `cf` command against the registry.
 
 For these, Eden asks `cf` for a registry credential
 (`cf containers registries credentials generate`)
@@ -340,7 +342,6 @@ the account in the deployment record, which the login must name:
 | `deploy --prebuilt` | deploy | The checked account, also named as `settings.accountId` in the Build Output's `config.json`. `cf` refuses the deploy before any request when the two differ |
 | `containers applications create`, `workers triggers deploy --prebuilt` | deploy, only to finish a publish that `cf deploy` left half done | The checked account |
 | `containers registries credentials generate` | deploy, destroy | The checked account |
-| `containers images delete --force` | deploy (superseded images), destroy | The checked account |
 | `workers delete --force`, `containers applications delete --force` | destroy | The checked account. Before it deletes the Worker, `cf workers delete` reads the Worker, its Durable Object namespaces, and the account's Container applications. Without `--delete-containers`, which Eden never passes, it deletes no application; Eden deletes the one it checked with `containers applications delete` |
 
 Eden reads and deletes no secret through `cf`. A login that changes
@@ -372,9 +373,11 @@ login cannot act on the checked account, the command fails.
   last page within twenty pages, with counts that match its entries.
   Each read asks `cf` for the account once and runs every other command on
   that account, and destroy reads nothing from an account other than the
-  recorded one. `cf` runs destroy's Worker, Container application, and
-  image deletes with `CLOUDFLARE_ACCOUNT_ID` set to the recorded account, so
-  a login that changes mid-run cannot move a delete to another account. Eden removes only that target and
+  recorded one. `cf` runs destroy's Worker and Container application
+  deletes with `CLOUDFLARE_ACCOUNT_ID` set to the recorded account, so
+  a login that changes mid-run cannot move a delete to another account.
+  Eden sends the image deletes itself, with a registry credential it has
+  checked names the recorded account. Eden removes only that target and
   checks its registry repositories for anything other than
   [objects Cloudflare keeps](./troubleshooting.md#eve_registry_objects_kept).
   It never deletes by name prefix.

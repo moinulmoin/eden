@@ -78,6 +78,8 @@ const cloud = vi.hoisted(() => {
     pinned: [] as (string | undefined)[],
     /** The registry repositories whose listing was asked for. */
     listed: new Set<string>(),
+    /** The account each registry request named. */
+    registryAccounts: [] as string[],
     deleted: [] as string[],
     /** Each secret cf uploaded, as account/worker/name. */
     secrets: [] as string[],
@@ -133,11 +135,22 @@ vi.mock("node:https", async (importOriginal) => {
     request: ((options: Https.RequestOptions, onResponse: (response: EventEmitter) => void) => {
       if (!cloud.active) return actual.request(options, onResponse as Parameters<typeof actual.request>[1]);
       const url = new URL(String(options.path), "https://registry.cloudflare.com");
-      const [, , account = "", repository = ""] = url.pathname.split("/");
+      const [, , account = "", repository = "", , tag = ""] = url.pathname.split("/");
       cloud.listed.add(repository);
+      cloud.registryAccounts.push(account);
       const request = Object.assign(new EventEmitter(), {
         destroy: () => undefined,
         end: () => setImmediate(() => {
+          if (options.method === "DELETE") {
+            // The registry answered a tag DELETE with 204 on 2026-11-27.
+            cloud.tags = cloud.tags.filter((present) => present !== tag);
+            cloud.deleted.push("image:" + repository + ":" + tag);
+            const response = Object.assign(new EventEmitter(), { statusCode: 204, headers: {} });
+            onResponse(response);
+            response.emit("end");
+            response.emit("close");
+            return;
+          }
           const last = url.searchParams.get("last");
           const tags = cloud.tags.filter((tag) => last === null || tag > last);
           // The registry's own form: the request's URL, then a second query naming the cursor.
@@ -174,7 +187,7 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
   const command = [
     "auth whoami",
     "workers delete", "workers secrets bulk-edit", "workers triggers deploy", "containers applications create", "containers applications delete",
-    "containers registries credentials", "containers images delete", "containers push", "deploy",
+    "containers registries credentials", "containers push", "deploy",
   ].find((known) => line === known || line.startsWith(known + " "));
   let config: string | undefined;
   try {
@@ -269,12 +282,6 @@ async function cf(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv):
     cloud.containers.delete(entry);
     cloud.deleted.push("container:" + entry);
     return ok({ message: "Application " + args[3] + " has been deleted." });
-  }
-  if (command === "containers images delete") {
-    const tag = (args[3] ?? "").split(":")[1] ?? "";
-    cloud.tags = cloud.tags.filter((present) => present !== tag);
-    cloud.deleted.push("image:" + args[3]);
-    return { exitCode: 0 };
   }
   return { exitCode: 1, stderr: "Unexpected cf call: " + args.join(" ") };
 }
@@ -534,6 +541,7 @@ beforeEach(() => {
     triggers: [],
     runs: [],
     listed: new Set<string>(),
+    registryAccounts: [],
     deleted: [],
     secrets: [],
     pushed: [],
@@ -743,7 +751,7 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     await expect(lstat(current)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  test("every cf delete is pinned to the recorded account, so a login that changes after the reads cannot move it", async () => {
+  test("every delete is pinned to the recorded account, so a login that changes after the reads cannot move it", async () => {
     const { root } = await deployedProject();
     cloud.workers.add(worker).add("account-other/eve-destroy-fixture");
     cloud.containers.add(container);
@@ -751,7 +759,9 @@ describe("eden destroy clears CURRENT only on strong evidence (MOI-242)", () => 
     cloud.onMutation = () => { cloud.loginAccount = "account-other"; };
     const { exitCode, result } = await destroy(root);
     expect({ exitCode, status: result.status }).toEqual({ exitCode: 0, status: "destroyed" });
-    expect(cloud.pinned).toEqual(["account-test", "account-test", "account-test"]);
+    // cf deletes the Worker and the Container application; Eden deletes the tag on the recorded account's registry.
+    expect(cloud.pinned).toEqual(["account-test", "account-test"]);
+    expect(new Set(cloud.registryAccounts)).toEqual(new Set(["account-test"]));
     expect(cloud.deleted).toEqual(["worker:" + worker, "container:" + container, "image:" + repository + ":candidate"]);
     expect([...cloud.workers]).toEqual(["account-other/eve-destroy-fixture"]);
   });
