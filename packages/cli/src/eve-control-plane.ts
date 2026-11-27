@@ -6158,6 +6158,9 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
       credential === undefined || credential.accountId !== accountId ||
       performance.now() - credential.requestedAt >= 4 * 60_000
     ) {
+      // A new credential gets no more of cf's time than the deadline leaves.
+      const mintMs = Math.floor(Math.min(30_000, deadline - performance.now()));
+      if (mintMs < 1) return undefined;
       const requestedAt = performance.now();
       const minted = cloudflareCliJson(await cf({
         args: [
@@ -6165,7 +6168,7 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
           "--permissions", "push", "--permissions", "pull", "--expiration-minutes", "5",
         ],
         accountId,
-        timeoutMs: 30_000,
+        timeoutMs: mintMs,
       }))?.value;
       const value = typeof minted !== "object" || minted === null
         ? {}
@@ -6174,7 +6177,8 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
         value.account_id !== accountId || value.registry_host !== CLOUDFLARE_REGISTRY_HOST ||
         typeof value.username !== "string" || typeof value.password !== "string"
       ) {
-        credentialUnavailable = true;
+        // Only a failure with cf's full time says the login cannot give one.
+        credentialUnavailable = mintMs === 30_000;
         return undefined;
       }
       credential = {
