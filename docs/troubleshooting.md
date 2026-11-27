@@ -1100,27 +1100,32 @@ The reason names the step that failed:
   the registry sends, or got no answer.
 - `The registry did not answer a HEAD for the tag <tag> with one digest.`:
   Eden could not tie the tag to the image, so it deleted nothing.
-- `cf containers images delete exited <code>: <cf's error>`: cf reported a
-  failure of its own, such as `403 Forbidden` from the registry.
-- `The registry still listed the tag <tag> in a listing begun 30 seconds
-  after cf returned.`, or the image's `sha256:` entry instead of the tag.
-- `cf containers images delete ran out of time and did not stop, so it may
-  still run. Eden did not read the registry after it.`
-- `cf containers images delete ended without an exit code of its own.`: cf
-  did not start, or something other than Eden stopped it.
+- `The registry answered Eden's DELETE of the tag <tag> with <status>.`:
+  the registry did not accept the delete. For a `3xx` status the reason
+  adds `, a redirect, which Eden does not follow`; Eden sends nothing to
+  where it points.
+- `Eden got no answer it could use to its DELETE of the tag <tag>, so it
+  does not know whether the registry deleted it. Eden did not send the
+  DELETE again.`: no answer within 30 seconds, a failed connection, or a
+  registry credential the registry refused. Eden reads nothing after it.
+- `The registry still listed the tag <tag>.`, or the image's `sha256:` entry
+  instead of the tag, followed by `The 30 seconds Eden allows after the
+  registry accepted the DELETE ran out.`
 - `The listing no longer had the tag <tag> or the image's sha256: entry, but
   the registry did not answer a manifest read for the tag with
-  MANIFEST_UNKNOWN.`, or for the digest: the registry may still hold the
-  image.
+  MANIFEST_UNKNOWN in time.`, or for the digest, followed by the same
+  sentence: the registry may still hold the image, or its answers came after
+  the 30 seconds.
+- `Eden's first listing after the delete did not finish in time.`, followed
+  by the same sentence.
 
-When cf ran out of time and stopped, the reason ends with `cf containers
-images delete ran out of time and was stopped.` After its tag delete, cf
-asks the registry to collect unused layers. On 2026-11-26 the registry sent
-no answer to that request within 300 seconds, so cf was stopped after 120
-seconds. Without cf's exit 0, Eden counts the image as deleted only when the
-listing has neither the tag nor its `sha256:` entry and the registry answers
-a `GET` of the manifest of each with `404` `MANIFEST_UNKNOWN` for that exact
-entry. The update then passes `VAL-LIFE-007` with no warning.
+Eden counts the image as deleted only when the registry accepted the
+`DELETE` of its tag, and then the listing has neither the tag nor its
+`sha256:` entry and the registry answers a `GET` of the manifest of each
+with `404` `MANIFEST_UNKNOWN` for that exact entry. Every one of those reads
+must finish within 30 seconds of the registry's acceptance; a read that
+finishes later does not count, however it was answered. The update then
+passes `VAL-LIFE-007` with no warning.
 
 - `eden destroy` tries to delete everything the registry lists for the
   target, and reports what Cloudflare keeps.
@@ -1688,8 +1693,8 @@ each one as `{ "ref", "class" }`. A `ref` is `<repository>:<tag>`, or
 Cloudflare's registry lists every tag of a repository, and one `sha256:`
 entry for every manifest, with or without a tag.
 `cf containers images list` shows only the tags. Eden reads the
-registry's own listing, asks `cf` to delete each tag, and sends its own
-delete for each `sha256:` entry. It does not check which manifests have a
+registry's own listing and sends one `DELETE` of its own for each tag and
+each `sha256:` entry. It does not check which manifests have a
 tag. An object is listed here only on the registry's own answer to the
 delete of that exact object; its name is never enough. The class says what
 the registry answered, not what the object is. All three answers were
@@ -1697,16 +1702,15 @@ observed on 2026-11-18:
 
 | `class` | The registry's answer to the delete | Where it was seen |
 | --- | --- | --- |
-| `refused-snapshot` | `403` with one error: code `DENIED`, message `snapshot manifests cannot be deleted through this API` | A container snapshot: its tags, seen so far as `rootfs-snapshot-*` and `rootfs-set-*`, and its manifest. A target has them once it has slept or moved to a new Eve version. |
+| `refused-snapshot` | `403` with exactly `{"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}`: one error, no other field, and a `detail` of `null`. An answer that names a repository or tag, or adds any field, is not this answer | A container snapshot: its tags, seen so far as `rootfs-snapshot-*` and `rootfs-set-*`, and its manifest. A target has them once it has slept or moved to a new Eve version. |
 | `refused-singleton-artifact` | `409` with the code `SINGLETON_ARTIFACT_EXISTS`, the artifact type `application/vnd.cloudchamber.btrfs-chain.v1` and two digests | The chain artifact that Cloudflare makes for each pushed image. Eden does not know whether either digest in the answer is the one it asked to delete. |
 | `accepted-still-listed` | A delete by digest answered `202` or `204`, and a listing Eden began at least 30 seconds later still has the entry | The earlier image of a repository that got a second push under the same tag, as Eden `0.13.x` and older pushed. It had no tag. |
 
 Each accepted delete gets its own 30 seconds, so cleanup of a repository
 can take that long after its last accepted delete.
 
-When the registry answers `cf`'s delete of a tag with `403`, Eden
-repeats the delete for that same tag against the registry and reads the
-answer. An object still listed without a kept answer, or an unreadable
+Eden sends no `DELETE` twice, even one that got no answer, and follows
+no redirect. An object still listed without a kept answer, or an unreadable
 final listing, fails destroy with
 [`EVE_DESTROY_IMAGES_RETAINED`](#eve_destroy_images_retained). Eden's
 requests go straight to `registry.cloudflare.com` and never through a

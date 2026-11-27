@@ -76,7 +76,6 @@ import {
 } from "./eve-runtime-config.js";
 import {
   cfAuthCommand,
-  cloudflareCliError,
   cloudflareCliJson,
   runCloudflareCli,
   type CloudflareCliResult,
@@ -4151,7 +4150,7 @@ async function runEveDeployment(
           !("retired" in result) || !Array.isArray(result.retired) ||
           ids.some((id) => !(result.retired as unknown[]).includes(id))) throw new Error("Retirement was not proven.");
       const deleteRegistryRepository = options.deleteRegistryRepository ??
-        registryRepositoryDeleter(cloudflareRegistry(options.cloudflareCli ?? runCloudflareCli), options.cloudflareCli ?? runCloudflareCli);
+        registryRepositoryDeleter(cloudflareRegistry(options.cloudflareCli ?? runCloudflareCli));
       const held: string[] = [];
       for (const [id, retained] of Object.entries(retiringDeployments)) {
         const repository = ownedRegistryRepository({
@@ -4217,7 +4216,7 @@ async function runEveDeployment(
       let deleted: EveRegistryRepositoryDeleteOutcome = "indeterminate";
       try {
         deleted = await (options.deleteRegistryRepository ??
-          registryRepositoryDeleter(cloudflareRegistry(options.cloudflareCli ?? runCloudflareCli), options.cloudflareCli ?? runCloudflareCli))({ repository: previousRepository, accountId });
+          registryRepositoryDeleter(cloudflareRegistry(options.cloudflareCli ?? runCloudflareCli)))({ repository: previousRepository, accountId });
       } catch {
         deleted = "indeterminate";
       }
@@ -4276,7 +4275,7 @@ async function runEveDeployment(
       deleted = supersededTag === undefined || supersededTag === releaseId || !EVE_RELEASE_IMAGE_TAG.test(supersededTag)
         ? "absent"
         : await (options.deleteRegistryRepository ??
-          registryRepositoryDeleter(cloudflareRegistry(options.cloudflareCli ?? runCloudflareCli), options.cloudflareCli ?? runCloudflareCli))({
+          registryRepositoryDeleter(cloudflareRegistry(options.cloudflareCli ?? runCloudflareCli)))({
           repository: inPlaceRepository,
           accountId,
           image: { digest: supersededImage.digest, tag: supersededTag },
@@ -5981,17 +5980,24 @@ function registryObjectsKeptWarning(kept: readonly EveRegistryObjectKept[]): Eve
   };
 }
 
-/** True only for the registry's structured refusal to delete a snapshot manifest. */
+/**
+ * True only for the registry's refusal to delete a snapshot tag or
+ * manifest, exactly as it answered on 2026-11-18 and since: status 403 and
+ * `{"errors":[{"code":"DENIED","message":"snapshot manifests cannot be deleted through this API","detail":null}]}`,
+ * with no other field anywhere. The refusal names no repository or entry,
+ * so an answer that names any, or says anything else, is not this refusal.
+ */
 function isSnapshotDeleteRefusal(status: number, body: string): boolean {
   if (status !== 403) return false;
   const parsed = exactJson(body);
-  const errors = typeof parsed === "object" && parsed !== null
-    ? (parsed as { readonly errors?: unknown }).errors
+  const errors = typeof parsed === "object" && parsed !== null && Object.keys(parsed).join() === "errors"
+    ? (parsed as { readonly errors: unknown }).errors
     : undefined;
   if (!Array.isArray(errors) || errors.length !== 1) return false;
-  const error = errors[0] as { readonly code?: unknown; readonly message?: unknown } | null;
-  return typeof error === "object" && error !== null &&
-    error.code === "DENIED" && error.message === SNAPSHOT_DELETE_REFUSAL;
+  const error: unknown = errors[0];
+  if (typeof error !== "object" || error === null || Object.keys(error).sort().join() !== "code,detail,message") return false;
+  const { code, message, detail } = error as { readonly code: unknown; readonly message: unknown; readonly detail: unknown };
+  return code === "DENIED" && message === SNAPSHOT_DELETE_REFUSAL && detail === null;
 }
 
 /**
@@ -6081,19 +6087,23 @@ interface CloudflareRegistry {
    * `sha256:` entry per manifest, which cf's image list leaves out.
    * Empty for a repository the registry does not know. Undefined when the
    * listing could not be read in full: any page that is not exactly what
-   * `registryListingPage` accepts, or no end within 100 pages.
+   * `registryListingPage` accepts, or no end within 100 pages. With
+   * `deadline` (a `performance.now()` time), no request runs past it.
    */
-  readonly list: (accountId: string, repository: string) => Promise<readonly string[] | undefined>;
+  readonly list: (accountId: string, repository: string, deadline?: number) => Promise<readonly string[] | undefined>;
   /**
-   * The registry's answer to deleting one entry: it accepted the delete, or
-   * it refused in one of the two ways Cloudflare keeps an object. Undefined
-   * for any other answer and for none.
+   * The registry's answer to one DELETE of an entry, a tag or a `sha256:`
+   * digest: its status, and `answer` when it accepted the delete or refused
+   * in one of the two ways Cloudflare keeps an object. A redirect is an
+   * answer like any other and is not followed. Undefined when there was no
+   * answer, or the registry refused the credential; the DELETE is then
+   * never sent again, because it may have landed.
    */
   readonly delete: (
     accountId: string,
     repository: string,
     entry: string,
-  ) => Promise<"accepted" | "refused-snapshot" | "refused-singleton-artifact" | undefined>;
+  ) => Promise<{ readonly status: number; readonly answer?: "accepted" | "refused-snapshot" | "refused-singleton-artifact" } | undefined>;
   /**
    * The digest of the manifest a tag names, from the registry's answer to a
    * HEAD for it. Undefined for any answer but 200 with one `sha256:` digest.
@@ -6104,8 +6114,9 @@ interface CloudflareRegistry {
    * a `sha256:` entry with 404 and its own error for exactly that entry:
    * `{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown","detail":{"Tag":"<entry>"}}]}`,
    * as it did on 2026-11-26. A HEAD's 404 has no body, so it cannot say this.
+   * With `deadline`, the request does not run past it.
    */
-  readonly unknown: (accountId: string, repository: string, entry: string) => Promise<boolean>;
+  readonly unknown: (accountId: string, repository: string, entry: string, deadline?: number) => Promise<boolean>;
 }
 
 /**
@@ -6135,6 +6146,7 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
     rest: string,
     bodyFor: readonly number[],
     maxBytes: number,
+    deadline = Number.POSITIVE_INFINITY,
   ): Promise<{ readonly status: number; readonly body: string; readonly link?: string; readonly digest?: string } | undefined> => {
     if (
       credentialUnavailable ||
@@ -6146,6 +6158,9 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
       credential === undefined || credential.accountId !== accountId ||
       performance.now() - credential.requestedAt >= 4 * 60_000
     ) {
+      // A new credential gets no more of cf's time than the deadline leaves.
+      const mintMs = Math.floor(Math.min(30_000, deadline - performance.now()));
+      if (mintMs < 1) return undefined;
       const requestedAt = performance.now();
       const minted = cloudflareCliJson(await cf({
         args: [
@@ -6153,7 +6168,7 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
           "--permissions", "push", "--permissions", "pull", "--expiration-minutes", "5",
         ],
         accountId,
-        timeoutMs: 30_000,
+        timeoutMs: mintMs,
       }))?.value;
       const value = typeof minted !== "object" || minted === null
         ? {}
@@ -6162,7 +6177,8 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
         value.account_id !== accountId || value.registry_host !== CLOUDFLARE_REGISTRY_HOST ||
         typeof value.username !== "string" || typeof value.password !== "string"
       ) {
-        credentialUnavailable = true;
+        // Only a failure with cf's full time says the login cannot give one.
+        credentialUnavailable = mintMs === 30_000;
         return undefined;
       }
       credential = {
@@ -6173,11 +6189,13 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
       };
     }
     const sentAt = performance.now();
+    const timeoutMs = Math.floor(Math.min(30_000, REGISTRY_UNANSWERED_BUDGET_MS - unansweredMs, deadline - sentAt));
+    if (timeoutMs < 1) return undefined;
     const response = await registryRequest(
       method,
       `/v2/${accountId}/${repository}/${rest}`,
       credential.authorization,
-      Math.floor(Math.min(30_000, REGISTRY_UNANSWERED_BUDGET_MS - unansweredMs)),
+      timeoutMs,
       bodyFor,
       maxBytes,
     );
@@ -6194,14 +6212,14 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
     return response;
   };
   return {
-    list: async (accountId, repository) => {
+    list: async (accountId, repository, deadline) => {
       const entries: string[] = [];
       // The registry pages by the last entry of the page before and ends with an empty page.
       for (let page = 0; page < 100; page += 1) {
         const last = entries.at(-1);
         const rest = `tags/list?n=${REGISTRY_PAGE_ENTRIES}${last === undefined ? "" : `&last=${encodeURIComponent(last)}`}`;
         const read = registryListingPage(
-          await send("GET", accountId, repository, rest, [200], 1_048_576),
+          await send("GET", accountId, repository, rest, [200], 1_048_576, deadline),
           `/v2/${accountId}/${repository}/${rest}`,
           `${accountId}/${repository}`,
           last,
@@ -6218,12 +6236,11 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
         "DELETE", accountId, repository, `manifests/${entry}`, [403, 409], 4_096,
       );
       if (response === undefined) return undefined;
-      // 204 is what the registry answered; 202 is what the OCI specification names.
-      if (response.status === 202 || response.status === 204) return "accepted";
-      if (isSnapshotDeleteRefusal(response.status, response.body)) return "refused-snapshot";
-      return isSingletonArtifactRefusal(response.status, response.body)
-        ? "refused-singleton-artifact"
-        : undefined;
+      const { status, body } = response;
+      // 204 is what the registry answered for tags and digests; 202 is what the OCI specification names.
+      if (status === 202 || status === 204) return { status, answer: "accepted" };
+      if (isSnapshotDeleteRefusal(status, body)) return { status, answer: "refused-snapshot" };
+      return isSingletonArtifactRefusal(status, body) ? { status, answer: "refused-singleton-artifact" } : { status };
     },
     resolve: async (accountId, repository, tag) => {
       if (!REGISTRY_ENTRY.test(tag) || tag.startsWith("sha256:")) return undefined;
@@ -6232,9 +6249,9 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
         ? response.digest
         : undefined;
     },
-    unknown: async (accountId, repository, entry) => {
+    unknown: async (accountId, repository, entry, deadline) => {
       if (!REGISTRY_ENTRY.test(entry)) return false;
-      const response = await send("GET", accountId, repository, `manifests/${entry}`, [404], 4_096);
+      const response = await send("GET", accountId, repository, `manifests/${entry}`, [404], 4_096, deadline);
       if (response?.status !== 404) return false;
       const parsed = exactJson(response.body);
       const errors = typeof parsed === "object" && parsed !== null && Object.keys(parsed).join() === "errors"
@@ -6257,19 +6274,14 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
  * Cloudflare added for container snapshots) and every `sha256:` entry,
  * which the registry lists for each manifest, tagged or not. Given
  * `image`, it deletes only that image's tag instead, when the registry
- * resolves the tag to it. A tag gets its
- * own cf delete, which also collects unreferenced layers. A `sha256:`
- * entry gets Eden's delete by digest, because cf lists and deletes
- * tags only.
+ * resolves the tag to it. Every delete is one DELETE of Eden's own on the
+ * registry connection `registry` describes, and none is sent twice.
  *
  * Cloudflare keeps some objects (observed on 2026-11-18), and each is kept
  * only on the registry's own answer to the delete of that object; a name is
  * never evidence:
- * - `refused-snapshot`: the registry refuses to delete a snapshot. cf
- *   prints only `403 Forbidden` for a tag, so when the registry answered
- *   cf's DELETE with 403, the runner repeats the delete for that tag
- *   against the registry and reads the answer. Any other cf failure
- *   gets no request of Eden's own.
+ * - `refused-snapshot`: the registry refuses to delete a snapshot tag or
+ *   manifest with its structured 403.
  * - `refused-singleton-artifact`: the registry refuses the delete by digest
  *   with `SINGLETON_ARTIFACT_EXISTS` for a chain artifact.
  * - `accepted-still-listed`: the registry accepted the delete by digest, and
@@ -6280,17 +6292,14 @@ function cloudflareRegistry(cf: CloudflareCliRunner): CloudflareRegistry {
  * REGISTRY_DELETE_PASSES passes in all. Whatever is listed at the end with
  * none of these answers is unproven, and the caller fails.
  */
-function registryRepositoryDeleter(
-  registry: CloudflareRegistry,
-  cf: CloudflareCliRunner,
-): EveRegistryRepositoryDeleteRunner {
+function registryRepositoryDeleter(registry: CloudflareRegistry): EveRegistryRepositoryDeleteRunner {
   return async ({ repository, accountId, image }) => {
     const list = async (): Promise<{ readonly at: number; readonly entries: readonly string[] | undefined }> => ({
       at: performance.now(),
       entries: await registry.list(accountId, repository),
     });
     if (image !== undefined) {
-      // One image: the only delete is cf's, of its tag. The digest is
+      // One image: the only delete is Eden's, of its tag. The digest is
       // used to check what the tag names and to see the image leave.
       const unproven = (reason: string) => ({ kept: [], unproven: true as const, reason });
       const listed = await registry.list(accountId, repository);
@@ -6299,44 +6308,37 @@ function registryRepositoryDeleter(
       const named = await registry.resolve(accountId, repository, image.tag).catch(() => undefined);
       if (named === undefined) return unproven(`The registry did not answer a HEAD for the tag ${image.tag} with one digest.`);
       if (named !== image.digest) return "absent";
-      const deleted = await cf({
-        args: ["containers", "images", "delete", `${repository}:${image.tag}`, "--force"],
-        accountId,
-      });
-      // cf deletes the tag and then asks the registry to collect layers. On
-      // 2026-11-26 the registry sent no answer to that second request within
-      // 300 seconds, so cf ran out of time after the tag delete. cf's exit 0
-      // is the registry's acknowledgment of the DELETE; without it, Eden
-      // reads only once cf has stopped, and needs the registry's own answer
-      // that neither the tag nor the digest is known.
-      if (deleted.exitCode !== undefined && deleted.exitCode !== 0) {
-        const error = cloudflareCliError(deleted);
-        return unproven(`cf containers images delete exited ${deleted.exitCode}${error === undefined ? "." : `: ${safeText(error)}`}`);
+      const deleted = await registry.delete(accountId, repository, image.tag).catch(() => undefined);
+      if (deleted === undefined) {
+        return unproven(`Eden got no answer it could use to its DELETE of the tag ${image.tag}, so it does not know whether the registry deleted it. Eden did not send the DELETE again.`);
       }
-      if (deleted.running === true) {
-        return unproven("cf containers images delete ran out of time and did not stop, so it may still run. Eden did not read the registry after it.");
+      if (deleted.answer !== "accepted") {
+        return unproven(`The registry answered Eden's DELETE of the tag ${image.tag} with ${deleted.status}${deleted.status >= 300 && deleted.status < 400 ? ", a redirect, which Eden does not follow" : ""}.`);
       }
-      if (deleted.exitCode === undefined && deleted.timedOut !== true) {
-        return unproven("cf containers images delete ended without an exit code of its own.");
-      }
-      const cfNote = deleted.exitCode === undefined ? " cf containers images delete ran out of time and was stopped." : "";
-      // A tagged image left the listing about 15 seconds after its tag was deleted.
-      const deletedAt = performance.now();
+      // A tagged image left the listing about 15 seconds after its tag was
+      // deleted. It is gone only when, before one deadline that starts at the
+      // registry's acceptance, a listing has neither the tag nor the digest
+      // and the registry answers a read of each with MANIFEST_UNKNOWN. A read
+      // that ends after the deadline does not count.
+      const deadline = performance.now() + REGISTRY_REMOVAL_WAIT_MS;
+      const expired = (seen: string) =>
+        unproven(`${seen} The ${REGISTRY_REMOVAL_WAIT_MS / 1_000} seconds Eden allows after the registry accepted the DELETE ran out.`);
+      let seen = "Eden's first listing after the delete did not finish in time.";
       for (;;) {
-        const { at, entries } = await list();
-        if (entries === undefined) return unproven(`Eden could not read the registry's listing of the repository after the delete.${cfNote}`);
+        const entries = await registry.list(accountId, repository, deadline);
+        if (performance.now() >= deadline) return expired(seen);
+        if (entries === undefined) return unproven("Eden could not read the registry's listing of the repository after the delete.");
         if (!entries.includes(image.tag) && !entries.includes(image.digest)) {
-          if (deleted.exitCode === 0) return "deleted";
-          const tagUnknown = await registry.unknown(accountId, repository, image.tag).catch(() => false);
-          const digestUnknown = tagUnknown && await registry.unknown(accountId, repository, image.digest).catch(() => false);
-          return digestUnknown
-            ? "deleted"
-            : unproven(`The listing no longer had the tag ${image.tag} or the image's sha256: entry, but the registry did not answer a manifest read for the ${tagUnknown ? "digest" : "tag"} with MANIFEST_UNKNOWN.${cfNote}`);
+          const tagUnknown = await registry.unknown(accountId, repository, image.tag, deadline).catch(() => false);
+          const digestUnknown = tagUnknown && await registry.unknown(accountId, repository, image.digest, deadline).catch(() => false);
+          if (digestUnknown && performance.now() < deadline) return "deleted";
+          seen = `The listing no longer had the tag ${image.tag} or the image's sha256: entry, but the registry did not answer a manifest read for the ${tagUnknown ? "digest" : "tag"} with MANIFEST_UNKNOWN in time.`;
+        } else {
+          seen = `The registry still listed ${entries.includes(image.tag) ? `the tag ${image.tag}` : "the image's sha256: entry"}.`;
         }
-        if (at - deletedAt >= REGISTRY_REMOVAL_WAIT_MS) {
-          return unproven(`The registry still listed ${entries.includes(image.tag) ? `the tag ${image.tag}` : "the image's sha256: entry"} in a listing begun ${REGISTRY_REMOVAL_WAIT_MS / 1_000} seconds after cf returned.${cfNote}`);
-        }
-        await waitForActivation(5_000);
+        const left = deadline - performance.now();
+        if (left <= 0) return expired(seen);
+        await waitForActivation(Math.min(5_000, left));
       }
     }
     let listing = await list();
@@ -6363,21 +6365,7 @@ function registryRepositoryDeleter(
             .sort((a, b) => Number(untagged(a)) - Number(untagged(b)))
         ) {
           // Whatever goes wrong while asking, the entry is unproven and the loop goes on.
-          const ask = () => registry.delete(accountId, repository, entry).catch(() => undefined);
-          const tagDelete = untagged(entry) ? undefined : await cf({
-            args: ["containers", "images", "delete", `${repository}:${entry}`, "--force"],
-            accountId,
-          });
-          const answer = tagDelete === undefined
-            ? await ask()
-            : tagDelete.exitCode === 0
-            ? "accepted"
-            // cf prints this only when the registry answered its own DELETE with 403.
-            : /^sha256:[0-9a-f]{64}\): 403 Forbidden$/u.test(
-                cloudflareCliError(tagDelete)?.split(`Failed to delete ${repository}:${entry} (digest: `)[1] ?? "",
-              ) && cloudflareCliError(tagDelete)?.startsWith("Failed to delete ") === true
-            ? await ask()
-            : undefined;
+          const answer = (await registry.delete(accountId, repository, entry).catch(() => undefined))?.answer;
           answers.set(
             entry,
             answer === "accepted"
@@ -6859,7 +6847,7 @@ async function runEveDestroyLocked(
     const repositoryDeletes = new Map<string, EveRegistryRepositoryDeleteOutcome>();
     if (ownedRegistryRepositories.length > 0) {
       const deleteRegistryRepository =
-        options.deleteRegistryRepository ?? registryRepositoryDeleter(registry, cf);
+        options.deleteRegistryRepository ?? registryRepositoryDeleter(registry);
       // Everything the registry lists inside an owned repository is deleted:
       // every tag and every manifest's own entry. Each repository is listed
       // again here, so an entry that appeared after the first read is not
