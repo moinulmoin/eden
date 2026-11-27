@@ -4,6 +4,28 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## cf 1.0.0-rc.6 (2026-11-27)
+
+Run on macOS with Docker `29.8.2` and Node `24.22.3`, with `cf`
+`1.0.0-rc.6` and an OAuth login; `CLOUDFLARE_API_TOKEN` was not set.
+
+- `cf auth whoami` with `CLOUDFLARE_API_BASE_URL` set to a local listener
+  sent `GET` requests for `/accounts?page=1`, `/memberships?page=1` and
+  `/user`, each with the login's bearer token and the user agent
+  `cf-cli/1.0.0-rc.6`, and exited 0. Eden's token capture takes the first.
+- The full `pnpm run check:live` passed all 18 steps at `4ef2df0`, on
+  target `eden-live-20261127-44f22796` (`10:18:04Z` to `10:40:25Z`), from
+  Eve `0.91.0` to `1.5.0`. The interrupted first deploy was finished with
+  `containers applications create` and `workers triggers deploy`. The
+  same-version update passed `VAL-LIFE-007` with no warning. Destroy
+  reported 18 kept objects (15 `refused-snapshot`, 3
+  `refused-singleton-artifact`, none `accepted-still-listed`), and the
+  registry listed nothing else for the target.
+- `eden preflight` with `CLOUDFLARE_ACCOUNT_ID` set to an account the login
+  does not have stopped after 1.5 seconds with
+  `VAL-CLI-007-CLOUDFLARE-ACCESS` and exit code 1, before it built
+  anything.
+
 ## Same-version update cleanup fix (2026-11-26)
 
 Run on macOS with Docker `29.8.2` and Node `24.22.3`, with `cf`

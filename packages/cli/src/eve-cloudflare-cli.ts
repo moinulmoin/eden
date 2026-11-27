@@ -5,8 +5,10 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-/** The one cf version Eden runs. Tested on Cloudflare on 2026-11-20. */
-export const CF_VERSION = "1.0.0-rc.2";
+/** The one cf version Eden runs: the exact version this package depends on. */
+export const CF_VERSION: string = (
+  createRequire(import.meta.url)("../package.json") as { readonly dependencies: { readonly cf: string } }
+).dependencies.cf;
 
 /** The cf command users run by hand, at the version Eden runs. */
 export const CF_COMMAND = `npx cf@${CF_VERSION}`;

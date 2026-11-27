@@ -31,7 +31,7 @@ What you get on your own account:
 From inside an npm or pnpm Eve project, with Docker running:
 
 ```sh
-npx cf@1.0.0-rc.2 auth login
+npx cf@1.0.0-rc.6 auth login
 npx @moinulmoin/eden preflight --env-file ~/.config/my-agent/preview.env
 npx @moinulmoin/eden deploy --env-file ~/.config/my-agent/preview.env
 ```
@@ -105,11 +105,14 @@ nothing on Cloudflare.
 - a sign-in with Cloudflare's `cf` CLI, or `CLOUDFLARE_API_TOKEN` set:
 
   ```sh
-  npx cf@1.0.0-rc.2 auth login
+  npx cf@1.0.0-rc.6 auth login
   ```
 
   Eden 0.14 and earlier used the Wrangler login. `cf` does not read it, so
-  sign in once after upgrading.
+  sign in once after upgrading. A new `cf` login also asks for billing read
+  and write access, which Eden never uses. A login you already have keeps
+  its scopes, and you can revoke `cf`'s access under
+  [Manage OAuth authorizations](https://dash.cloudflare.com/?to=/profile/access-management/authorization) in the Cloudflare dashboard.
 
 - Docker or OrbStack with Linux/amd64 container support
 - an Eve project with one root `package-lock.json`, or an exact

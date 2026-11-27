@@ -129,7 +129,7 @@ agent's commands and the rest of the container.
 
 ## What Eden can change in your Cloudflare account
 
-Eden acts through your `cf` sign-in (`npx cf@1.0.0-rc.2 auth whoami`), or
+Eden acts through your `cf` sign-in (`npx cf@1.0.0-rc.6 auth whoami`), or
 through `CLOUDFLARE_API_TOKEN` when you set it, and
 never switches accounts silently. For each target it creates one Worker, one
 Container application, its Durable Objects, registry images, and, only when
@@ -188,7 +188,13 @@ Eden does not store or print the credential.
 ### What Eden can and cannot read
 
 `cf auth login` keeps its login in the operating system's keychain when one
-is available, and in an encrypted file otherwise. Eden reads neither. Eden
+is available, and in an encrypted file otherwise. Eden reads neither.
+In `cf` `1.0.0-rc.6`, a new login asks for `cf`'s default scopes, which
+include `billing:read` and `billing:write`. Eden never uses them: none of
+its own reads calls a billing endpoint, and in the code of `cf`
+`1.0.0-rc.6` none of the `cf` commands below does either. A login made
+before keeps the scopes it has. You can revoke `cf`'s access under
+[Manage OAuth authorizations](https://dash.cloudflare.com/?to=/profile/access-management/authorization) in the Cloudflare dashboard; `cf` is then signed out. Eden
 0.14 and earlier read Wrangler's saved token from disk; this version only
 checks whether Wrangler's login file exists, to explain a signed-out `cf`,
 and never opens it.
@@ -220,7 +226,7 @@ which `cf` made the reads. A narrower set of permissions was not tested, and
 no API token was run against this build's own reads.
 
 Without the variable, Eden uses the token of your `cf` login.
-`cf 1.0.0-rc.2` has no command that prints it, so Eden gets it this way:
+`cf 1.0.0-rc.6` has no command that prints it, so Eden gets it this way:
 
 1. Eden opens a listener on `127.0.0.1`, on a port the system picks, before
    it starts `cf`.
@@ -229,10 +235,11 @@ Without the variable, Eden uses the token of your `cf` login.
    For this one command Eden passes `cf` no proxy variables and turns its
    telemetry off.
 3. `cf` asks the listener who it is and sends its login's token, as it would
-   to Cloudflare. On 2026-11-20 one `cf auth whoami` sent three such
-   requests, for `/accounts`, `/memberships` and `/user`. Eden takes the
-   token from the first request that has the random path, is a `GET` of one
-   of those three, and names `cf-cli/1.0.0-rc.2` as its user agent.
+   to Cloudflare. On 2026-11-20 (`cf` `1.0.0-rc.2`) and on 2026-11-27
+   (`1.0.0-rc.6`) one `cf auth whoami` sent three such requests, for
+   `/accounts`, `/memberships` and `/user`. Eden takes the token from the
+   first request that has the random path, is a `GET` of one of those three,
+   and names the pinned `cf` as its user agent (`cf-cli/1.0.0-rc.6`).
 4. The listener answers every request `401` itself and sends none of them
    anywhere.
 5. The listener keeps its port until `cf` has exited, also when Eden stops
@@ -295,7 +302,7 @@ account or the token.
 Eden names the `cf` login in every command: the profile in
 `CLOUDFLARE_AUTH_PROFILE`, else `default`. A folder's `cf auth activate`
 binding never chooses another. To check the login Eden reads, add the
-profile: `npx cf@1.0.0-rc.2 auth whoami --profile default`. Eden's
+profile: `npx cf@1.0.0-rc.6 auth whoami --profile default`. Eden's
 remediations print the command with the profile. `CLOUDFLARE_AUTH_USE_KEYRING`
 is passed to `cf`, so `cf` looks for the login where you told it to keep it.
 
@@ -330,11 +337,11 @@ the account in the deployment record, which the login must name:
 | `auth whoami` against Eden's own listener | preflight, deploy, destroy, when `CLOUDFLARE_API_TOKEN` is not set | The login's own; see [How Eden reads Cloudflare's API](#how-eden-reads-cloudflares-api) |
 | `containers push --tag` | deploy | The checked account |
 | `workers secrets bulk-edit` | deploy (an update, for Eden's deployment-control token) | The checked account |
-| `deploy --prebuilt` | deploy | The checked account, also named as `settings.accountId` in the Build Output's `config.json`, which `cf` reads before the variable |
+| `deploy --prebuilt` | deploy | The checked account, also named as `settings.accountId` in the Build Output's `config.json`. `cf` refuses the deploy before any request when the two differ |
 | `containers applications create`, `workers triggers deploy --prebuilt` | deploy, only to finish a publish that `cf deploy` left half done | The checked account |
 | `containers registries credentials generate` | deploy, destroy | The checked account |
 | `containers images delete --force` | deploy (superseded images), destroy | The checked account |
-| `workers delete --force`, `containers applications delete --force` | destroy | The checked account |
+| `workers delete --force`, `containers applications delete --force` | destroy | The checked account. Before it deletes the Worker, `cf workers delete` reads the Worker, its Durable Object namespaces, and the account's Container applications. Without `--delete-containers`, which Eden never passes, it deletes no application; Eden deletes the one it checked with `containers applications delete` |
 
 Eden reads and deletes no secret through `cf`. A login that changes
 mid-run cannot move one of these commands to another account. If the new

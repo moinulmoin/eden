@@ -19,6 +19,19 @@
 
 ### Changed
 
+- Eden now runs Cloudflare's `cf` CLI `1.0.0-rc.6` instead of `1.0.0-rc.2`.
+  Run `npx cf@1.0.0-rc.6 auth whoami` to check your login; an existing
+  `cf` login keeps working and keeps its scopes. A new `cf auth login` also
+  asks for billing read and write access, which Eden never uses; you can
+  revoke `cf`'s access in the Cloudflare dashboard. `cf deploy` now refuses a
+  `CLOUDFLARE_ACCOUNT_ID` that differs from the account in the Build
+  Output. Eden writes the checked account into both, and a
+  `CLOUDFLARE_ACCOUNT_ID` your login does not have still stops
+  `eden preflight` and `eden deploy` at the Cloudflare access check,
+  before anything is built on Cloudflare. `cf workers delete` now offers to
+  delete the Worker's Container applications; `eden destroy` passes no
+  such option and deletes the one application it checked, as before. In
+  the manual cleanup steps, answer no to that question.
 - Eve `1.5.0` with `@workflow/world-postgres` `5.5.0` is now the latest
   tested pair. Neither needs a change in Eden or in the Cloudflare World.
   With the Postgres World, move to `5.5.0` together with Eve `1.5.0`: it adds

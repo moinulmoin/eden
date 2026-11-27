@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { CF_VERSION } from "../src/eve-cloudflare-cli.js";
 import { runEdenCli } from "../src/index.js";
 
 /**
@@ -44,8 +45,8 @@ const cloud = vi.hoisted(() => {
     loginToken: "cf-login-token-0123456789abcdefghij",
     /** Whether cf sends its login's token when Eden asks. */
     tokenWithheld: false,
-    /** The user agent cf asks under. */
-    agent: "cf-cli/1.0.0-rc.2",
+    /** The user agent cf asks under; each test starts with the pinned cf's. */
+    agent: "",
     /** Each "cf auth whoami" Eden ran against an API address of its own: that address. */
     captures: [] as string[],
     /** How many API reads answer 401 before the token is accepted. */
@@ -505,7 +506,7 @@ beforeEach(() => {
     workerGet: undefined,
     loginToken: "cf-login-token-0123456789abcdefghij",
     tokenWithheld: false,
-    agent: "cf-cli/1.0.0-rc.2",
+    agent: `cf-cli/${CF_VERSION}`,
     captures: [],
     rejectedReads: 0,
     apiReads: [],
@@ -1754,7 +1755,7 @@ describe("Eden reads Cloudflare's API with the token of cf's login, or with CLOU
       "does not show its workers.dev subdomain is told to check the login, not to register",
       refused(403, 10000, "Authentication error"),
       /^Eden could not read the workers\.dev subdomain of Cloudflare account 1{32}/u,
-      /^Confirm the login with npx cf@1\.0\.0-rc\.2 auth whoami --profile default, then run eden deploy again/u,
+      /^Confirm the login with npx cf@1\.0\.0-rc\.6 auth whoami --profile default, then run eden deploy again/u,
     ],
   ] as const)("an account that %s, before any write", async (_name, answer, message, remediation) => {
     const root = await deployableProject();

@@ -496,7 +496,7 @@ export async function runEdenCli(
     // The CLI that Eden runs for deploys needs this Node.
     const node = options.nodeVersion ?? process.versions.node;
     const [major = 0, minor = 0] = node.split(".").map(Number);
-    // The Node lines cf 1.0.0-rc.2 declares, from 24 up.
+    // The Node lines the pinned cf declares, from 24 up.
     if (!((major === 24 && minor >= 22) || (major === 26 && minor >= 12))) {
       throw new EveCliError({
         code: "EVE_NODE_UNSUPPORTED",

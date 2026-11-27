@@ -106,8 +106,8 @@ node --version
 
 ### `EVE_CF_UNAVAILABLE`
 
-`Eden runs Cloudflare's cf CLI 1.0.0-rc.2, which is installed with Eden, and
-could not find it.` or `Eden runs Cloudflare's cf CLI 1.0.0-rc.2 and found cf
+`Eden runs Cloudflare's cf CLI 1.0.0-rc.6, which is installed with Eden, and
+could not find it.` or `Eden runs Cloudflare's cf CLI 1.0.0-rc.6 and found cf
 <version> installed in its place.` `preflight`, `deploy`, and `destroy` stop
 with this code before they read or change anything. Eden runs only the `cf`
 version it was tested with. Install `@moinulmoin/eden` again with your
@@ -422,13 +422,13 @@ inventory through a read-only adapter and never mutates during preflight.
 fails in a few seconds.
 
 When `cf` is not signed in, or its sign-in does not show exactly one
-account, the remediation is `Run npx cf@1.0.0-rc.2 auth login --profile default, or
-set CLOUDFLARE_API_TOKEN, and confirm with npx cf@1.0.0-rc.2 auth whoami
+account, the remediation is `Run npx cf@1.0.0-rc.6 auth login --profile default, or
+set CLOUDFLARE_API_TOKEN, and confirm with npx cf@1.0.0-rc.6 auth whoami
 --profile default that it shows exactly one account. Then retry.`:
 
 ```sh
-npx cf@1.0.0-rc.2 auth login --profile default
-npx cf@1.0.0-rc.2 auth whoami --profile default
+npx cf@1.0.0-rc.6 auth login --profile default
+npx cf@1.0.0-rc.6 auth whoami --profile default
 ```
 
 Eden reads the profile `CLOUDFLARE_AUTH_PROFILE` names, else `default`, and
@@ -463,8 +463,8 @@ Eden 0.14 and earlier used Wrangler and its saved login. Eden now runs
 Cloudflare's `cf` CLI, which does not read that login. When `cf` is signed
 out and this machine has a Wrangler login file, the remediation says so:
 `Eden now uses Cloudflare's cf CLI, which does not read the Wrangler login
-this machine has. Run npx cf@1.0.0-rc.2 auth login --profile default once,
-or set CLOUDFLARE_API_TOKEN, confirm the account with npx cf@1.0.0-rc.2 auth
+this machine has. Run npx cf@1.0.0-rc.6 auth login --profile default once,
+or set CLOUDFLARE_API_TOKEN, confirm the account with npx cf@1.0.0-rc.6 auth
 whoami --profile default, then retry.` Sign in once; the `.eden/` folder and your deployed
 targets need no change. Eden only checks that the Wrangler file exists and
 never opens it.
@@ -478,7 +478,7 @@ When `cf` is signed in but the account's Containers cannot be read, the
 remediation says so. The account must be on the Workers Paid plan, which
 Cloudflare Containers requires. Review the account that `auth whoami` returns
 before you retry, or switch accounts with
-`npx cf@1.0.0-rc.2 auth login --profile default`. Name the profile in
+`npx cf@1.0.0-rc.6 auth login --profile default`. Name the profile in
 `CLOUDFLARE_AUTH_PROFILE` in place of `default` when you set one. Eden never
 selects a different Cloudflare account silently.
 
@@ -533,8 +533,8 @@ on Cloudflare. The message says which of three things happened:
 
 - `Cloudflare account <account id> has no workers.dev subdomain, which is
   part of the deployment's URL.` The API answered `404` with the one error
-  code `10007`, which is the code `cf` `1.0.0-rc.2` reads as "no subdomain
-  registered". Register one at
+  code `10007`, which is the code `cf` reads as "no subdomain registered"
+  (read in `1.0.0-rc.2` and `1.0.0-rc.6`). Register one at
   `https://dash.cloudflare.com/<account id>/workers/onboarding`, then run
   `eden deploy` again. No such account was available to test: the answer is
   known from `cf`'s code, not from a run on Cloudflare.
@@ -542,7 +542,7 @@ on Cloudflare. The message says which of three things happened:
   <account id> ... Cloudflare's API did not say that the account has none.`
   The read got no answer, an error such as an authentication error, or an
   answer Eden could not use. Confirm the login with
-  `npx cf@1.0.0-rc.2 auth whoami --profile default`, or with the profile in
+  `npx cf@1.0.0-rc.6 auth whoami --profile default`, or with the profile in
   `CLOUDFLARE_AUTH_PROFILE`, and run `eden deploy` again. The remediation
   prints the command with the profile.
 - `The authenticated Cloudflare read did not prove the exact workers.dev
@@ -774,10 +774,11 @@ and digest identity, the deploy ends as indeterminate. See
 [Indeterminate outcomes](#indeterminate-outcomes) below.
 
 The push gets ten minutes. Then Eden stops `cf`, and only `cf`. `cf`
-`1.0.0-rc.2` starts `docker push` as a process of its own, in its own
-process group, and that process is not stopped: with the pinned `cf` and a
-stand-in `docker`, the push went on and finished three seconds after Eden
-had returned. The same holds when you stop Eden with Ctrl-C or a kill
+starts `docker push` as a process of its own, in its own process group,
+and that process is not stopped: with `cf` `1.0.0-rc.2` and a stand-in
+`docker`, the push went on and finished three seconds after Eden had
+returned. The code of `1.0.0-rc.6` starts it the same way; that was read,
+not run. The same holds when you stop Eden with Ctrl-C or a kill
 during the push. So after such a deploy the Docker push may still be
 running and may still finish. The remediation, and a line on standard error
 after Ctrl-C, give the command that shows it:
@@ -799,7 +800,7 @@ record, so `eden destroy` answers `EVE_DESTROY_RECORD_UNPROVEN` and deletes
 nothing. If you give the target up at that point, list that one repository
 as [`EVE_REGISTRY_OBJECTS_KEPT`](#eve_registry_objects_kept) shows and
 delete what it lists with
-`npx cf@1.0.0-rc.2 containers images delete <repository>:<tag>`.
+`npx cf@1.0.0-rc.6 containers images delete <repository>:<tag>`.
 
 `cf containers push` signs Docker in to the registry, then runs
 `docker tag` and `docker push`. When it fails, the message starts with
@@ -819,7 +820,8 @@ Eden shows and keeps nothing that `cf` or Docker printed during the push:
 The message holds only which of these fixed cases was seen and `cf`'s exit
 code. The `cf` messages behind the rows were read from `cf` `1.0.0-rc.2`
 run with a stand-in `docker` that failed at each step, not from a failed
-push to Cloudflare's registry.
+push to Cloudflare's registry. The code of `1.0.0-rc.6` has the same
+messages.
 
 The publish is one `cf deploy --prebuilt`, which Eden never runs twice.
 `cf deploy` uploads the Worker version first, then sets up the Container
@@ -1477,8 +1479,8 @@ exact name and environment from the deployment.
 Sign in to the account that owns the deployment:
 
 ```sh
-npx cf@1.0.0-rc.2 auth whoami
-npx cf@1.0.0-rc.2 auth login
+npx cf@1.0.0-rc.6 auth whoami
+npx cf@1.0.0-rc.6 auth login
 ```
 
 `Live provider settings do not match the recorded Worker and Container
@@ -1560,7 +1562,7 @@ login's token when asked. [How Eden reads Cloudflare's API](./security.md#how-ed
 describes that step. Confirm the login and run the command again:
 
 ```sh
-npx cf@1.0.0-rc.2 auth whoami --profile default
+npx cf@1.0.0-rc.6 auth whoami --profile default
 ```
 
 If it fails the same way, set `CLOUDFLARE_API_TOKEN` to an API token for the
@@ -1590,7 +1592,7 @@ Eden reads the API the same way to learn whether the object is gone, with
 code `1609` for a Container application. An unreadable registry listing
 is reported separately, as `EVE_DESTROY_IMAGES_RETAINED`. Rerun
 `eden destroy` with the same selectors; if it keeps failing, check the
-login with `npx cf@1.0.0-rc.2 auth whoami`.
+login with `npx cf@1.0.0-rc.6 auth whoami`.
 Eden lists Container applications by exact name
 (`GET /accounts/<id>/containers/applications?name=<name>`) and follows the
 page tokens Cloudflare returns, for at most twenty pages. A count or total
@@ -1623,7 +1625,7 @@ only for a target that exists on Cloudflare.
 You can delete a listed tag by hand first:
 
 ```sh
-npx cf@1.0.0-rc.2 containers images delete <repository:tag>
+npx cf@1.0.0-rc.6 containers images delete <repository:tag>
 ```
 
 That removes no `sha256:` entry, so run `eden destroy` again afterwards. Never filter by prefix. An object with one
@@ -1746,7 +1748,7 @@ command: curl asks for it, and you paste the `password` value at its
 prompt.
 
 ```sh
-npx cf@1.0.0-rc.2 containers registries credentials generate registry.cloudflare.com --permissions push --permissions pull --expiration-minutes 5
+npx cf@1.0.0-rc.6 containers registries credentials generate registry.cloudflare.com --permissions push --permissions pull --expiration-minutes 5
 curl --noproxy '*' -u '<username>' 'https://registry.cloudflare.com/v2/<account_id>/<repository>/tags/list?n=1000'
 ```
 
@@ -1797,17 +1799,20 @@ folder upward and reads `.env` files beside it.
    plus a dash and eight hexadecimal characters:
 
    ```sh
-   npx cf@1.0.0-rc.2 auth whoami
-   npx cf@1.0.0-rc.2 workers deployments list --worker <name>
+   npx cf@1.0.0-rc.6 auth whoami
+   npx cf@1.0.0-rc.6 workers deployments list --worker <name>
    ```
 
 2. Delete the Worker. It is named exactly `<name>`. Its secrets (one per
    env-file variable), its Cron Trigger, and its Durable Object data are part
    of the Worker; with the Cloudflare World that data includes every stored
-   session. `cf` asks you to confirm the deletion.
+   session. `cf` asks you to confirm the deletion. It then lists the
+   Container applications the Worker owns and asks whether to delete them
+   too. Answer no: step 3 deletes the one Container application of this
+   target by its ID, and step 4 needs that ID.
 
    ```sh
-   npx cf@1.0.0-rc.2 workers delete <name>
+   npx cf@1.0.0-rc.6 workers delete <name>
    ```
 
 3. Delete the Container application. Its whole name is `<name>-container`.
@@ -1817,8 +1822,8 @@ folder upward and reads `.env` files beside it.
    needs it. Then delete by ID:
 
    ```sh
-   npx cf@1.0.0-rc.2 containers applications list
-   npx cf@1.0.0-rc.2 containers applications delete <application-id>
+   npx cf@1.0.0-rc.6 containers applications list
+   npx cf@1.0.0-rc.6 containers applications delete <application-id>
    ```
 
    If the Container application is already gone, the list cannot give you
@@ -1846,8 +1851,8 @@ folder upward and reads `.env` files beside it.
    makes curl connect to the registry directly, as Eden does.
 
    ```sh
-   npx cf@1.0.0-rc.2 containers images list
-   npx cf@1.0.0-rc.2 containers registries credentials generate registry.cloudflare.com --permissions push --permissions pull --expiration-minutes 5
+   npx cf@1.0.0-rc.6 containers images list
+   npx cf@1.0.0-rc.6 containers registries credentials generate registry.cloudflare.com --permissions push --permissions pull --expiration-minutes 5
    curl --noproxy '*' -u '<username>' -H 'Accept: application/vnd.oci.image.manifest.v1+json' https://registry.cloudflare.com/v2/<account_id>/<repository>/manifests/<rootfs-snapshot-tag>
    curl --noproxy '*' -L -u '<username>' https://registry.cloudflare.com/v2/<account_id>/<repository>/blobs/<config digest>
    ```
@@ -1866,7 +1871,7 @@ folder upward and reads `.env` files beside it.
    `cf` asks you to confirm each deletion.
 
    ```sh
-   npx cf@1.0.0-rc.2 containers images delete <repository>:<tag>
+   npx cf@1.0.0-rc.6 containers images delete <repository>:<tag>
    ```
 
    Cloudflare's registry refuses to delete a container snapshot (seen so far
@@ -1899,7 +1904,7 @@ folder upward and reads `.env` files beside it.
    `sha256:<digest>` in place of the tag. That entry also names the three
    answers with which Cloudflare keeps an object.
 
-5. Run `npx cf@1.0.0-rc.2 containers applications list` again to check the Container
+5. Run `npx cf@1.0.0-rc.6 containers applications list` again to check the Container
    application is gone. Read the full
    [`tags/list` listing](#eve_registry_objects_kept) for each repository
    proved in step 4. Check that only refs with one of the three kept
@@ -1909,8 +1914,8 @@ folder upward and reads `.env` files beside it.
    If they disagree, wait and run both again:
 
    ```sh
-   npx cf@1.0.0-rc.2 workers deployments list --worker <name>
-   npx cf@1.0.0-rc.2 workers get <name>
+   npx cf@1.0.0-rc.6 workers deployments list --worker <name>
+   npx cf@1.0.0-rc.6 workers get <name>
    ```
 
 Match the exact names only. A name that merely starts the same way can
@@ -1920,7 +1925,7 @@ of this.
 ### Checking for leftovers yourself
 
 ```sh
-npx cf@1.0.0-rc.2 containers applications list
+npx cf@1.0.0-rc.6 containers applications list
 ```
 
 Confirm the exact Worker and Container are gone and that the registry lists
@@ -1930,7 +1935,7 @@ For a known repository, read the full
 
 A failed destroy names the repositories it could not verify, and each kept
 object's `ref` starts with its repository. The deployment records under
-`.eden/eve-deploy/` hold each image reference. `npx cf@1.0.0-rc.2 containers images list`
+`.eden/eve-deploy/` hold each image reference. `npx cf@1.0.0-rc.6 containers images list`
 also shows them, but only for repositories that still have a tag, and it
 shows no `sha256:` entry. A failed or incomplete listing is not proof of
 cleanup, and a matching name prefix is not proof of ownership.
@@ -1959,8 +1964,8 @@ What to do:
    an attempt ended indeterminate, the attempt evidence is
    `deployment-attempt.json` in the same generation directory.
 2. Inspect the exact target in Cloudflare, and only the exact target:
-   `npx cf@1.0.0-rc.2 workers deployments list --worker <name>`,
-   `npx cf@1.0.0-rc.2 containers applications list`, and a full
+   `npx cf@1.0.0-rc.6 workers deployments list --worker <name>`,
+   `npx cf@1.0.0-rc.6 containers applications list`, and a full
    [`tags/list` listing](#eve_registry_objects_kept) for the exact
    repositories the evidence names.
 3. Retry the same exact target with the same `--project`, `--env`, and

@@ -9,7 +9,7 @@
     "stats": "node stats.mjs"
   },
   "devDependencies": {
-    "cf": "1.0.0-rc.2",
+    "cf": "1.0.0-rc.6",
     "esbuild": "0.28.2"
   }
 }

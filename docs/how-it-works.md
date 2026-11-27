@@ -88,7 +88,9 @@ until the checks in steps 1–4 have passed.
    deploy. See [Security](./security.md).
 7. **Publish** the Worker and Container application. Eden writes a Build
    Output folder under the generation's `worker/` folder and runs
-   `cf deploy --prebuilt` once, never twice. `cf deploy` uploads the Worker
+   `cf deploy --prebuilt` once, never twice. The Build Output and
+   `CLOUDFLARE_ACCOUNT_ID` both name the checked account; `cf` refuses to
+   deploy when they differ. `cf deploy` uploads the Worker
    version first, then sets up the Container application, then the
    `workers.dev` route and the schedule. When it exits with an error, Eden
    checks whether the Worker version in service carries this publish's

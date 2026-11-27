@@ -62,19 +62,24 @@ The help output must list `preflight`, `deploy`, and `destroy`.
 
 ## Authenticate with Cloudflare
 
-Deploying to Cloudflare uses Cloudflare's `cf` CLI, version `1.0.0-rc.2`, a
+Deploying to Cloudflare uses Cloudflare's `cf` CLI, version `1.0.0-rc.6`, a
 release candidate. It is installed with Eden. The account must be on the
 Workers Paid plan, which Cloudflare Containers requires. Sign in to the
 Cloudflare account that owns the target Workers:
 
 ```sh
-npx cf@1.0.0-rc.2 auth login
+npx cf@1.0.0-rc.6 auth login
 ```
+
+`cf` `1.0.0-rc.6` asks for its default scopes, which include billing read
+and write (`billing:read`, `billing:write`). Eden never uses them. A login
+made before keeps the scopes it has. You can revoke `cf`'s access under
+[Manage OAuth authorizations](https://dash.cloudflare.com/?to=/profile/access-management/authorization) in the Cloudflare dashboard; `cf` is then signed out.
 
 Confirm the selected account:
 
 ```sh
-npx cf@1.0.0-rc.2 auth whoami
+npx cf@1.0.0-rc.6 auth whoami
 ```
 
 Review the returned account before deploying. Eden needs the sign-in to show
@@ -82,7 +87,7 @@ exactly one account, and never selects a different Cloudflare account
 silently.
 
 Instead of signing in, you can set `CLOUDFLARE_API_TOKEN`. `cf` uses it as
-its login, and `npx cf@1.0.0-rc.2 auth whoami` then reports
+its login, and `npx cf@1.0.0-rc.6 auth whoami` then reports
 `"authSource": "CLOUDFLARE_API_TOKEN environment variable"`. On 2026-11-20
 a token made from Cloudflare's "Edit Cloudflare Workers" template,
 unchanged, ran preflight, a first deploy, an update, and a destroy with no
@@ -91,7 +96,7 @@ saved login. A narrower set of permissions was not tested.
 ### Moving from the Wrangler login
 
 Eden 0.14 and earlier used Wrangler and its saved login. `cf` does not read
-that login. After upgrading, run `npx cf@1.0.0-rc.2 auth login` once, or set
+that login. After upgrading, run `npx cf@1.0.0-rc.6 auth login` once, or set
 `CLOUDFLARE_API_TOKEN`. Until then `preflight` and `deploy` stop with
 [`VAL-CLI-007-CLOUDFLARE-ACCESS`](./troubleshooting.md#moving-from-the-wrangler-login-to-cf).
 The `.eden/` folder and your deployed targets need no change.
