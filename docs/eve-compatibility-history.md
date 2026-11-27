@@ -4,6 +4,30 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Registry tag deletes from Eden (2026-11-27)
+
+Run on macOS with Docker `29.8.2` and Node `24.22.3`, with `cf`
+`1.0.0-rc.6` and an OAuth login; `CLOUDFLARE_API_TOKEN` was not set.
+
+- On a disposable repository with one pushed image (a 2 MB layer of its
+  own), Eden's kind of request, `DELETE` of the tag's manifest, got `204`
+  in 2 seconds. 22 seconds later the listing was empty, and a `GET` of the
+  tag's and the digest's manifest each got `404` `MANIFEST_UNKNOWN`.
+- `PUT /v2/gc/layers`, the request `cf containers images delete` sends
+  after its tag delete, got no response headers three times: within 90
+  seconds on its own, within 5 seconds, and within 300 seconds. A `HEAD` of
+  the deleted image's layer blob answered `200` 1, 3, 5, 9 and 13.5 minutes
+  after the tag delete, before and after those requests.
+- The full `pnpm run check:live` passed all 18 steps at `5dd6c0e`, on
+  target `eden-live-20261127-c0ab18df` (`11:41:41Z` to `12:00:43Z`), from
+  Eve `0.91.0` to `1.5.0`. The same-version update took 135.3 seconds and
+  passed `VAL-LIFE-007` with no warning; the run at `7c44519`, with cf's
+  tag delete, took 257 seconds. Destroy took 47.4 seconds, against 299
+  seconds at `c2320ea`. Destroy reported 15 kept objects (12
+  `refused-snapshot`, 3 `refused-singleton-artifact`, none
+  `accepted-still-listed`), and the registry listed nothing else for the
+  target.
+
 ## cf 1.0.0-rc.6 (2026-11-27)
 
 Run on macOS with Docker `29.8.2` and Node `24.22.3`, with `cf`
