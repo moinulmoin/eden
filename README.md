@@ -31,7 +31,7 @@ What you get on your own account:
 From inside an npm or pnpm Eve project, with Docker running:
 
 ```sh
-npx cf@1.0.0-rc.2 auth login
+npx cf@1.0.0-rc.6 auth login
 npx @moinulmoin/eden preflight --env-file ~/.config/my-agent/preview.env
 npx @moinulmoin/eden deploy --env-file ~/.config/my-agent/preview.env
 ```
@@ -105,7 +105,7 @@ nothing on Cloudflare.
 - a sign-in with Cloudflare's `cf` CLI, or `CLOUDFLARE_API_TOKEN` set:
 
   ```sh
-  npx cf@1.0.0-rc.2 auth login
+  npx cf@1.0.0-rc.6 auth login
   ```
 
   Eden 0.14 and earlier used the Wrangler login. `cf` does not read it, so

@@ -5,6 +5,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
+import { CF_VERSION } from "../packages/cli/src/eve-cloudflare-cli.ts";
 import { runEdenCli } from "../packages/cli/src/index.ts";
 import {
   ownedProcessReservationCount,
@@ -17,7 +18,7 @@ import {
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const cfEntrypoint = join(repositoryRoot, "node_modules", "cf", "bin", "cf");
 // The cf command users type, at the version Eden runs.
-const CF_COMMAND = "npx cf@1.0.0-rc.2";
+const CF_COMMAND = `npx cf@${CF_VERSION}`;
 // One cf help probe takes about 0.4s. Keep the margin local to this
 // assertion rather than increasing the global Vitest timeout. Each owned
 // child also has its own shorter cancellation deadline.
@@ -180,6 +181,15 @@ test("retains the exact release NOTICE", async () => {
   expect(notice).toBe(expectedNotice);
 });
 
+test("the site, the collector, and the repository's own scripts install the cf the CLI runs", async () => {
+  expect(CF_VERSION).toBe("1.0.0-rc.6");
+  for (const manifest of ["package.json", "site/package.json", "telemetry/package.json"]) {
+    expect(JSON.parse(await readRepositoryFile(manifest)).devDependencies.cf, manifest).toBe(CF_VERSION);
+  }
+  expect(JSON.parse(await readRepositoryFile("node_modules/cf/package.json")).version).toBe(CF_VERSION);
+  expect(await readRepositoryFile("site/src/components/Requirements.astro")).toContain(`"${CF_COMMAND} auth login"`);
+});
+
 test(
   "documents only cf commands that the pinned cf has, mutating ones included",
   async () => {
@@ -197,7 +207,7 @@ test(
       const tokens = tokensForCommand(documented);
       // Every cf line a user copies names the version Eden runs.
       expect(documented, documented).toContain(`${CF_COMMAND} `);
-      const path = cfCommandPath(tokens.slice(tokens.indexOf("cf@1.0.0-rc.2") + 1));
+      const path = cfCommandPath(tokens.slice(tokens.indexOf(`cf@${CF_VERSION}`) + 1));
       expect(path.length, documented).toBeGreaterThan(0);
       const key = path.join(" ");
       documentedPaths.add(key);

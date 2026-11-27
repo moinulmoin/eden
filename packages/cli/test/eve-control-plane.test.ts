@@ -1733,8 +1733,8 @@ describe("top-level Eden Deploy commands", () => {
   });
 
   test.each([
-    [null, "Eden runs Cloudflare's cf CLI 1.0.0-rc.2, which is installed with Eden, and could not find it."],
-    ["99.0.0", "Eden runs Cloudflare's cf CLI 1.0.0-rc.2 and found cf 99.0.0 installed in its place."],
+    [null, "Eden runs Cloudflare's cf CLI 1.0.0-rc.6, which is installed with Eden, and could not find it."],
+    ["99.0.0", "Eden runs Cloudflare's cf CLI 1.0.0-rc.6 and found cf 99.0.0 installed in its place."],
   ])("a missing or different cf (%s) stops every command with one JSON error and how to reinstall", async (cfVersion, message) => {
     for (const command of ["preflight", "deploy", "destroy"]) {
       const output: string[] = [];

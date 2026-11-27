@@ -33,7 +33,7 @@
   ],
   "dependencies": {
     "@moinulmoin/eden-runtime-cloudflare": "0.15.2",
-    "cf": "1.0.0-rc.2"
+    "cf": "1.0.0-rc.6"
   },
   "scripts": {
     "build": "tsc -b",

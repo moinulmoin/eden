@@ -1654,7 +1654,7 @@ function cloudflareApiMissing(answer: CloudflareApiAnswer | undefined, code: num
 /**
  * The account's workers.dev subdomain, as Cloudflare's API gives it, or
  * that the API says the account has none: 404 with the one error 10007,
- * which is the code cf 1.0.0-rc.2 reads as "no subdomain registered".
+ * which is the code cf 1.0.0-rc.2 and 1.0.0-rc.6 read as "no subdomain registered".
  * Neither field when the read proved nothing.
  */
 async function readWorkersDevSubdomain(
@@ -2768,7 +2768,7 @@ async function readServedRelease(
  * that namespace; "absent" when the account has none of that name;
  * undefined for anything else. Cloudflare gives the application of a
  * Durable Object namespace that namespace's ID, and cf deploy requires it
- * (read in cf 1.0.0-rc.2 and on Cloudflare on 2026-11-20).
+ * (read in cf 1.0.0-rc.2 and 1.0.0-rc.6, and on Cloudflare on 2026-11-20).
  */
 async function readPublishApplication(
   api: CloudflareApiRead,

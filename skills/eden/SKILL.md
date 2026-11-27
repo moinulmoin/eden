@@ -48,7 +48,7 @@ Docs: https://github.com/moinulmoin/eden (failure and warning codes:
   stops with `EVE_NODE_UNSUPPORTED`)
 - Docker or OrbStack running, with linux/amd64 support
 - Cloudflare Workers Paid plan (Containers need it), and Cloudflare's `cf`
-  CLI signed in: `npx cf@1.0.0-rc.2 auth login` (the user must do this in a
+  CLI signed in: `npx cf@1.0.0-rc.6 auth login` (the user must do this in a
   browser), or `CLOUDFLARE_API_TOKEN` set. `cf` does not read a Wrangler
   login, which Eden 0.14 and earlier used.
 - Eden sends one anonymous usage event when preflight, deploy, or destroy
@@ -268,15 +268,15 @@ the agent sleeps takes about 10–15 seconds.
 - `VAL-CLI-007-CLOUDFLARE-ACCESS`: `cf` is not signed in, its sign-in does
   not show exactly one account, or the account lacks Workers
   Paid/Containers. It is checked before the build. The user has to fix this
-  (`npx cf@1.0.0-rc.2 auth login --profile default`, then
-  `npx cf@1.0.0-rc.2 auth whoami --profile default`; name the profile in
+  (`npx cf@1.0.0-rc.6 auth login --profile default`, then
+  `npx cf@1.0.0-rc.6 auth whoami --profile default`; name the profile in
   `CLOUDFLARE_AUTH_PROFILE` in place of `default` when one is set), or set
   `CLOUDFLARE_API_TOKEN`.
 - `EVE_NODE_UNSUPPORTED`: Node is not 24.22.0 or newer on the 24 line, or
   26.12.0 or newer on the 26 line. Install Node 24 (for example
   `nvm install 24`), then run the command again.
 - `EVE_CF_UNAVAILABLE`: the `cf` installed beside Eden is missing or is not
-  1.0.0-rc.2. Install `@moinulmoin/eden` again; do not install another `cf`
+  1.0.0-rc.6. Install `@moinulmoin/eden` again; do not install another `cf`
   over it.
 - `VAL-CLI-007-CLOUDFLARE-ACCESS` with `CLOUDFLARE_API_TOKEN` or
   `CLOUDFLARE_ACCOUNT_ID` in its remediation: signing in again does not
@@ -285,7 +285,7 @@ the agent sleeps takes about 10–15 seconds.
   token`, or `EVE_CF_LOGIN_TOKEN_UNAVAILABLE` from destroy: Eden reads
   Cloudflare's API with the token of the `cf` login, which it takes from
   `cf` on `127.0.0.1` for one command. Confirm the login with
-  `npx cf@1.0.0-rc.2 auth whoami` and retry, or have the user set
+  `npx cf@1.0.0-rc.6 auth whoami` and retry, or have the user set
   `CLOUDFLARE_API_TOKEN`, which Eden then uses and asks `cf` for nothing.
 - `node: <path>: not found` with exit status 9 and no JSON: the `--env-file`
   path does not exist. `npx` stopped before Eden started. Correct the path.
