@@ -4,6 +4,50 @@ Dated records of live runs and notes about older Eve versions. Each one
 describes what was true when it was recorded. For what Eden supports today,
 see [Eve compatibility](./eve-compatibility.md).
 
+## Live check for release 0.16.0 (2026-11-27)
+
+Run on macOS with Docker `29.8.2`, Node `24.22.3`, against the maintainer's
+Cloudflare account, with `cf` `1.0.0-rc.6` and an OAuth login, on main at
+`35113bf`. `CLOUDFLARE_API_TOKEN` was not set. The `0.16.0` release commit
+differs from `35113bf` only by version numbers, the lockfile, the
+changelog, and this record.
+
+Full run of `pnpm run check:live`, target `eden-live-20261127-c9b4c7a2`,
+`21:01:02Z` to `21:24:54Z`, Eve `0.91.0` to `1.5.0`, Eden and its runtime
+built from this workspace, the World packed from this workspace (version
+`0.15.2`), a 90-second idle window, telemetry off. All 18 steps passed on
+the first run.
+
+- `eden preflight` passed 14 checks with no warnings in 359 seconds.
+- `cf deploy` was interrupted and exited 1 after 6 refused reads of the
+  uploaded version. Eden then ran `cf containers applications create` and
+  `cf workers triggers deploy`, both exit 0, and the fresh deploy took 295
+  seconds.
+- The same-version update took 159 seconds and the deploy on Eve `1.5.0`
+  255 seconds, on the same URL. Both carried `EVE_UPDATE_IN_FLIGHT`. The
+  update reported `VAL-LIFE-007` passed: `The superseded image was deleted
+  from the registry by its tag after promotion.`
+- The first session answered after each deploy and after the sleep, with its
+  earlier turns in its stream and its file intact. A new session started
+  after the update, and one ran bash on Eve `1.5.0` after the upgrade.
+  After 165 seconds with no requests the first health request took 11.8
+  seconds, and the server process was 10 seconds old.
+- No `queueAuthMode` line on Eve `1.5.0`. An unauthenticated session request
+  got `401`, and the two workflow queue routes answered `404`.
+- `eden destroy` passed in 66 seconds and reported 15 kept objects: 12
+  `refused-snapshot` and 3 `refused-singleton-artifact`, none of them
+  `accepted-still-listed`.
+- The check's catalog read found those 15 refs and no others. The URL
+  returned 404, and the check found no Worker, no secrets, and no Container
+  application.
+
+The three packages were packed from the release tree and compared with
+`0.15.2` on npm. `@moinulmoin/eden-runtime-cloudflare` and
+`@moinulmoin/eden-world-cloudflare` differ only in `package.json`: the
+version, and for the runtime the World pin. `@moinulmoin/eden` differs in
+its code, `README.md`, `SKILL.md`, and `package.json`, where the runtime
+pin and `cf` `1.0.0-rc.6` changed.
+
 ## Registry tag deletes from Eden (2026-11-27)
 
 Run on macOS with Docker `29.8.2` and Node `24.22.3`, with `cf`

@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 — 2026-11-27
+
+Anonymous usage telemetry, registry tag deletes sent by Eden itself, `cf`
+`1.0.0-rc.6`, and Eve `1.5.0` as the latest tested Eve. Only
+`@moinulmoin/eden` changed. `@moinulmoin/eden-runtime-cloudflare` and
+`@moinulmoin/eden-world-cloudflare` `0.16.0` have the same code as `0.15.2`.
+
+The full live check passed on Cloudflare at the commit this release was cut
+from, through the `cf` OAuth login: a fresh deploy with `cf deploy`
+interrupted on purpose, a same-version update, an upgrade from Eve `0.91.0`
+to `1.5.0`, a sleep and wake, and a destroy. The update took 159 seconds and
+deleted the image it replaced. Destroy took 66 seconds. The live check runs
+with telemetry off. The record is in `docs/eve-compatibility-history.md`.
+
+### Upgrading from 0.15.2
+
+- Telemetry is on by default. When `eden preflight`, `eden deploy`, or
+  `eden destroy` ends, Eden sends one anonymous event: the command, its
+  exit code and failure code, a duration bucket, the OS, CPU architecture,
+  Node major version, Eden version, the Eve version and World kind, whether
+  it runs in CI, and a random install ID. It never sends names, account IDs,
+  paths, URLs, error messages, or secrets. Set `EDEN_TELEMETRY=0` or
+  `DO_NOT_TRACK=1` to turn it off. The README's Telemetry section lists
+  every field.
+- A new `cf auth login` asks for billing read and write access. Eden never
+  uses it. An existing login keeps working and keeps its scopes.
+- Nothing else is needed.
 
 ### Added
 
