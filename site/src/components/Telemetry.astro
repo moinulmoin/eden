@@ -1,0 +1,211 @@
+---
+import Send from "@lucide/astro/icons/send";
+import EyeOff from "@lucide/astro/icons/eye-off";
+import Server from "@lucide/astro/icons/server";
+import PowerOff from "@lucide/astro/icons/power-off";
+import CopyCommand from "./CopyCommand.astro";
+import { fields, never } from "../telemetry";
+import { links } from "../links";
+---
+
+<section class="section" id="telemetry" aria-labelledby="telemetry-title">
+  <div class="wrap">
+    <div class="section-head">
+      <div>
+        <span class="tag">06 · Telemetry</span>
+        <h2 id="telemetry-title" class="section-title">What Eden sends,<br />and how to turn it off.</h2>
+      </div>
+      <p class="section-intro">
+        Eden sends one anonymous event when <code>eden preflight</code>, <code>eden deploy</code>, or <code>eden destroy</code> ends.
+        It is on by default. <code>--help</code>, <code>--version</code>, and <code>eden skill</code> send nothing.
+      </p>
+    </div>
+
+    <div class="tel">
+      <div class="tel__panel card" data-reveal style="--i:0">
+        <div class="tel__head">
+          <Send class="icon" size={18} aria-hidden="true" />
+          <h3>The event</h3>
+          <span class="mono">exactly {fields.length} fields</span>
+        </div>
+        <dl class="tel__fields">
+          {
+            fields.map(({ name, holds }) => (
+              <div class="tel__field">
+                <dt class="mono">{name}</dt>
+                <dd set:html={holds} />
+              </div>
+            ))
+          }
+        </dl>
+      </div>
+
+      <div class="tel__panel tel__panel--side card" data-reveal style="--i:1">
+        <div class="tel__block">
+          <div class="tel__head">
+            <EyeOff class="icon" size={18} aria-hidden="true" />
+            <h3>Never sent</h3>
+          </div>
+          <p set:html={never} />
+        </div>
+
+        <div class="tel__block">
+          <div class="tel__head">
+            <Server class="icon" size={18} aria-hidden="true" />
+            <h3>Where it goes</h3>
+          </div>
+          <p>
+            An HTTPS <code>POST</code> to <code>telemetry.eden.ideaplexa.com</code>, a Cloudflare Worker whose <a href={links.telemetryCollector}>code is on GitHub</a>.
+            It writes the event to Workers Analytics Engine on the maintainer's Cloudflare account, which keeps it for
+            three months. It does not store or log IP addresses, headers, or user agents.
+          </p>
+        </div>
+
+        <div class="tel__block">
+          <div class="tel__head">
+            <PowerOff class="icon" size={18} aria-hidden="true" />
+            <h3>Turn it off</h3>
+          </div>
+          <CopyCommand command="export EDEN_TELEMETRY=0" label="Copy the command that turns telemetry off" />
+          <p>
+            Or set <code>DO_NOT_TRACK=1</code>. With either, Eden sends nothing and creates no install ID.
+            Eden also passes <code>DO_NOT_TRACK</code> to Cloudflare's <code>cf</code> CLI, which has telemetry of its own.
+          </p>
+        </div>
+
+        <div class="tel__links">
+          <a class="link-arrow" href={links.telemetry}>Telemetry in the README <span aria-hidden="true">→</span></a>
+          <a class="link-arrow" href={links.telemetrySecurity}>docs/security.md <span aria-hidden="true">→</span></a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .tel {
+    display: flex;
+    align-items: flex-start;
+    gap: 32px;
+  }
+
+  .tel__panel {
+    flex: 1.4;
+    min-width: 0;
+    padding: 8px 24px 12px;
+  }
+
+  .tel__panel--side {
+    flex: 1;
+    background: var(--paper-2);
+  }
+
+  .tel__head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 16px 0;
+  }
+
+  .tel__head h3 {
+    flex: 1;
+    margin: 0;
+    font-size: 17px;
+    font-weight: 600;
+  }
+
+  .tel__head .mono {
+    font-size: 12px;
+    color: var(--text-3);
+  }
+
+  .tel__fields {
+    margin: 0;
+  }
+
+  .tel__field {
+    display: grid;
+    grid-template-columns: 120px 1fr;
+    gap: 16px;
+    padding: 14px 0;
+    border-top: 1px solid var(--rule);
+  }
+
+  .tel__field dt {
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.6;
+  }
+
+  .tel__field dd {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--text-2);
+    overflow-wrap: anywhere;
+  }
+
+  .tel__block {
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .tel__block p {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--text-2);
+  }
+
+  .tel__block a {
+    color: var(--ink);
+    text-underline-offset: 3px;
+  }
+
+  .tel__block :global(.cmd) {
+    margin-bottom: 18px;
+  }
+
+  .tel__links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 24px;
+    padding: 18px 0 10px;
+  }
+
+  .section-intro code {
+    white-space: nowrap;
+  }
+
+  .section-intro code,
+  .tel :global(dd code),
+  .tel p code {
+    padding: 1px 4px;
+    border-radius: 5px;
+    background: var(--paper-2);
+    font-family: var(--mono);
+    font-size: 0.88em;
+    color: var(--ink);
+  }
+
+  .tel__panel--side :global(p code) {
+    background: var(--white);
+  }
+
+  @media (max-width: 900px) {
+    .tel {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 28px;
+    }
+
+    .tel__panel {
+      padding: 4px 16px 8px;
+    }
+
+    .tel__field {
+      grid-template-columns: 1fr;
+      gap: 4px;
+    }
+  }
+</style>
